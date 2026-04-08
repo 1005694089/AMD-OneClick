@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AMD OneClick - Jupyter Notebook</title>
+    <title>AMD OneClick</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * {
@@ -20,7 +20,7 @@
         }
 
         .container {
-            max-width: 480px;
+            max-width: 540px;
             margin: 0 auto;
             padding: 60px 20px;
         }
@@ -74,8 +74,8 @@
 
         .form-label {
             display: block;
-            margin-bottom: 8px;
-            font-weight: 500;
+            margin-bottom: 10px;
+            font-weight: 600;
             color: #1d1d1f;
             font-size: 14px;
         }
@@ -103,6 +103,76 @@
 
         .form-select {
             cursor: pointer;
+        }
+
+        /* Instance type cards */
+        .type-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .type-card {
+            position: relative;
+            border: 2px solid #d2d2d7;
+            border-radius: 12px;
+            padding: 16px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-align: center;
+            background: #fafafa;
+        }
+
+        .type-card:hover:not(.disabled) {
+            border-color: #86868b;
+            background: #ffffff;
+        }
+
+        .type-card.selected {
+            border-color: #1d1d1f;
+            background: #ffffff;
+            box-shadow: 0 0 0 1px #1d1d1f;
+        }
+
+        .type-card.disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        .type-card input[type="radio"] {
+            display: none;
+        }
+
+        .type-icon {
+            font-size: 28px;
+            margin-bottom: 8px;
+        }
+
+        .type-name {
+            font-weight: 600;
+            font-size: 14px;
+            color: #1d1d1f;
+            margin-bottom: 4px;
+        }
+
+        .type-desc {
+            font-size: 11px;
+            color: #86868b;
+            line-height: 1.4;
+        }
+
+        .type-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: 600;
+            margin-top: 6px;
+        }
+
+        .badge-coming {
+            background: #e8e8ed;
+            color: #86868b;
         }
 
         .btn {
@@ -252,24 +322,29 @@
                 <div class="logo-icon"><img src="https://amd-ai-academy.com/static/image.png" alt="AMD"></div>
                 <span class="logo-text">AMD OneClick</span>
             </div>
-            <p class="subtitle">GPU-Powered Jupyter Notebooks</p>
+            <p class="subtitle">GPU-Powered Cloud Instances</p>
         </div>
 
         <div class="card">
             <!-- Request Form -->
             <div id="requestForm">
                 <div class="form-group">
+                    <label class="form-label">Instance Type</label>
+                    <div class="type-grid" id="typeGrid"></div>
+                </div>
+
+                <div class="form-group">
                     <label class="form-label" for="email">Email Address</label>
-                    <input 
-                        type="email" 
-                        id="email" 
-                        class="form-input" 
+                    <input
+                        type="email"
+                        id="email"
+                        class="form-input"
                         placeholder="your@email.com"
                         required
                     >
                 </div>
 
-                <div class="form-group">
+                <div class="form-group" style="display:none;">
                     <label class="form-label" for="image">Container Image</label>
                     <select id="image" class="form-select">
                         {% for img in images %}
@@ -281,7 +356,7 @@
                 </div>
 
                 <button type="button" class="btn" id="requestBtn" onclick="requestNotebook()">
-                    Request Notebook
+                    Launch Instance
                 </button>
 
                 <div class="error-container" id="errorContainer">
@@ -293,16 +368,16 @@
             <div class="status-container" id="loadingStatus">
                 <div class="spinner"></div>
                 <p class="status-text" id="statusText">Allocating resources...</p>
-                <p class="status-message" id="statusMessage">Please wait while we prepare your notebook</p>
+                <p class="status-message" id="statusMessage">Please wait while we prepare your instance</p>
             </div>
 
             <!-- Success Status -->
             <div class="status-container" id="successStatus">
-                <div class="success-icon">✓</div>
-                <p class="status-text">Your Notebook is Ready!</p>
+                <div class="success-icon">&#10003;</div>
+                <p class="status-text">Your Instance is Ready!</p>
                 <a href="#" class="notebook-url" id="notebookUrl" target="_blank"></a>
                 <button class="btn" onclick="openNotebook()">
-                    Open Notebook
+                    Open Instance
                 </button>
                 <button class="btn btn-secondary" onclick="resetForm()">
                     Request Another
@@ -319,6 +394,35 @@
         let currentEmail = '';
         let notebookUrlValue = '';
         let pollInterval = null;
+        let selectedType = 'jupyter';
+
+        const instanceTypes = {{ instance_types_json | safe }};
+
+        (function renderTypeCards() {
+            const grid = document.getElementById('typeGrid');
+            for (const [key, t] of Object.entries(instanceTypes)) {
+                const card = document.createElement('label');
+                card.className = 'type-card' + (!t.enabled ? ' disabled' : '') + (key === 'jupyter' ? ' selected' : '');
+                card.id = 'type-card-' + key;
+                if (t.enabled) card.onclick = () => selectType(key);
+                card.innerHTML =
+                    '<input type="radio" name="instance_type" value="' + key + '"' +
+                    (key === 'jupyter' ? ' checked' : '') +
+                    (!t.enabled ? ' disabled' : '') + '>' +
+                    '<div class="type-icon">' + t.icon + '</div>' +
+                    '<div class="type-name">' + t.name + '</div>' +
+                    '<div class="type-desc">' + t.description + '</div>' +
+                    (!t.enabled ? '<span class="type-badge badge-coming">Coming Soon</span>' : '');
+                grid.appendChild(card);
+            }
+        })();
+
+        function selectType(type) {
+            selectedType = type;
+            document.querySelectorAll('.type-card').forEach(c => c.classList.remove('selected'));
+            document.getElementById('type-card-' + type).classList.add('selected');
+            document.querySelector(`input[name="instance_type"][value="${type}"]`).checked = true;
+        }
 
         async function requestNotebook() {
             const email = document.getElementById('email').value.trim();
@@ -339,7 +443,7 @@
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ email, image }),
+                    body: JSON.stringify({ email, image, instance_type: selectedType }),
                 });
 
                 const data = await response.json();
@@ -352,9 +456,8 @@
                     notebookUrlValue = data.url;
                 }
 
-                // Always start polling to wait for Jupyter to be truly ready
                 startPolling();
-                updateLoadingStatus('Preparing Environment', 'Setting up your notebook...');
+                updateLoadingStatus('Preparing Environment', 'Setting up your instance...');
 
             } catch (error) {
                 showForm();
@@ -388,24 +491,22 @@
                 'pending': { text: 'Pending', message: 'Waiting for resources...' },
                 'loading': { text: 'Loading Image', message: 'Pulling container image...' },
                 'initializing': { text: 'Initializing', message: 'Starting services...' },
-                'running': { text: 'Starting Jupyter', message: 'Almost ready...' },
+                'running': { text: 'Starting Services', message: 'Almost ready...' },
                 'jupyter_starting': { text: 'Starting Jupyter', message: 'Jupyter is initializing...' },
-                'ready': { text: 'Ready!', message: 'Your notebook is ready' },
+                'ready': { text: 'Ready!', message: 'Your instance is ready' },
             };
 
             const status = statusMap[data.status] || { text: 'Processing...', message: data.message };
             updateLoadingStatus(status.text, status.message);
 
-            // Only show success when truly ready (Jupyter is responding)
             if (data.status === 'ready') {
                 stopPolling();
                 showSuccess();
             } else if (data.status === 'failed') {
                 stopPolling();
                 showForm();
-                showError('Failed to create notebook. Please try again.');
+                showError('Failed to create instance. Please try again.');
             }
-            // Keep polling for all other states
         }
 
         function startPolling() {
@@ -477,7 +578,6 @@
             return re.test(email);
         }
 
-        // Handle Enter key
         document.getElementById('email').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 requestNotebook();

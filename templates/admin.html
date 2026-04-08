@@ -353,6 +353,7 @@
                 <thead>
                     <tr>
                         <th>Source</th>
+                        <th>Type</th>
                         <th>Status</th>
                         <th>URL</th>
                         <th>Created</th>
@@ -362,7 +363,7 @@
                 </thead>
                 <tbody id="instancesTable">
                     <tr>
-                        <td colspan="6">
+                        <td colspan="7">
                             <div class="empty-state">
                                 <div class="empty-state-icon">📭</div>
                                 <p>No instances found</p>
@@ -434,7 +435,7 @@
             if (!instances || instances.length === 0) {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="6">
+                        <td colspan="7">
                             <div class="empty-state">
                                 <div class="empty-state-icon">📭</div>
                                 <p>No instances found</p>
@@ -470,9 +471,16 @@
                     `;
                 }
                 
+                const typeIcons = { jupyter: '📓', opencode: '🤖', openclaw: '🔬' };
+                const typeName = instance.instance_type || 'jupyter';
+                const typeIcon = typeIcons[typeName] || '📓';
+
                 return `
                     <tr>
                         <td>${sourceDisplay}</td>
+                        <td>
+                            <span style="font-size:13px;">${typeIcon} ${escapeHtml(typeName)}</span>
+                        </td>
                         <td>
                             <span class="status-badge status-${instance.status}">
                                 ${instance.status}

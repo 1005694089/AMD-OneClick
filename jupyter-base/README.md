@@ -1,38 +1,24 @@
-# AMD ROCm Jupyter Base Image
+# AMD ROCm OneClick Base Image
 
-This directory contains the Dockerfile to build an AMD ROCm base image with pre-installed Jupyter Lab for fast startup.
+Base image for all AMD OneClick instance types: Jupyter, OpenCode, and OpenCLAW.
 
-## Build Instructions
+## Included Tools
 
-```bash
-# Build the image
-docker build -t vivienfanghua/amd-jupyter:latest .
-
-# Push to Docker Hub
-docker push vivienfanghua/amd-jupyter:latest
-```
-
-## Included Packages
-
-- **Jupyter Lab** - Interactive development environment
-- **ihighlight** - Syntax highlighting for notebooks
-- **ipywidgets** - Interactive widgets
-- **matplotlib** - Plotting library
-- **pandas** - Data manipulation
-- **numpy** - Numerical computing
-- **scipy** - Scientific computing
-- **scikit-learn** - Machine learning
-- **seaborn** - Statistical visualization
-- **plotly** - Interactive plots
-- **tqdm** - Progress bars
+- **Jupyter Lab** — Interactive development environment
+- **Rust / Cargo** — Rust toolchain via rustup
+- **Node.js 20** — JavaScript runtime
+- **OpenCode CLI** — AI coding agent for the terminal
+- **Data Science** — matplotlib, pandas, numpy, scipy, scikit-learn, seaborn, plotly
 
 ## Base Image
 
-Based on: `rocm/vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1`
+`rocm/vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1`
 
-This includes:
-- ROCm 7.1.1
-- PyTorch 2.8
-- vLLM 0.10.2rc1
-- Python 3.12
-- Ubuntu 24.04
+Includes ROCm 7.1.1, PyTorch 2.8, vLLM 0.10.2rc1, Python 3.12, Ubuntu 24.04.
+
+## Build & Push
+
+```bash
+docker build -t crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:latest .
+docker push crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:latest
+```

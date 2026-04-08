@@ -2,6 +2,7 @@
 FastAPI main application for AMD OneClick Notebook Manager
 """
 import hashlib
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -13,7 +14,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
 
-from .config import settings
+from .config import settings, INSTANCE_TYPES
 from .models import (
     NotebookRequest, 
     NotebookStatus, 
@@ -85,12 +86,13 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
 async def index(request: Request):
     """Render the main request page"""
     return templates.TemplateResponse(
+        request,
         "index.html",
         {
-            "request": request,
             "images": settings.AVAILABLE_IMAGES,
-            "default_image": settings.DEFAULT_IMAGE
-        }
+            "default_image": settings.DEFAULT_IMAGE,
+            "instance_types_json": json.dumps(INSTANCE_TYPES),
+        },
     )
 
 
@@ -99,59 +101,62 @@ async def request_notebook(req: NotebookRequest):
     """Request a notebook instance"""
     email = req.email.lower()
     image = req.image or settings.DEFAULT_IMAGE
-    
-    # Validate image
+    instance_type = req.instance_type or "jupyter"
+
     if image not in settings.AVAILABLE_IMAGES:
         raise HTTPException(status_code=400, detail="Invalid image selected")
-    
+
+    type_cfg = INSTANCE_TYPES.get(instance_type)
+    if not type_cfg or not type_cfg.get("enabled"):
+        raise HTTPException(status_code=400, detail="Invalid or disabled instance type")
+
     try:
-        # Check for existing instance
         existing = k8s_client.get_instance_by_email(email)
-        
+
         if existing:
             status = k8s_client.get_pod_status(email)
-            
+
             if status == "ready" or status == "running":
                 return NotebookStatus(
                     status="ready",
-                    message="Your notebook is ready!",
+                    message="Your instance is ready!",
                     url=existing["url"],
                     email=email
                 )
             elif status in ["pending", "initializing", "loading"]:
                 return NotebookStatus(
                     status=status,
-                    message="Your notebook is being prepared...",
+                    message="Your instance is being prepared...",
                     url=existing["url"],
                     email=email
                 )
             elif status == "failed":
-                # Delete failed instance and recreate
                 k8s_client.delete_instance(email)
             else:
                 return NotebookStatus(
                     status=status or "unknown",
-                    message="Checking notebook status...",
+                    message="Checking instance status...",
                     url=existing.get("url"),
                     email=email
                 )
-        
-        # Create new instance
-        instance = k8s_client.create_instance(email, image)
-        
-        # Send email notification (async, don't wait)
+
+        instance = k8s_client.create_instance(
+            email, image,
+            instance_type=instance_type,
+        )
+
         if instance.get("url"):
             send_notebook_url_email(email, instance["url"])
-        
+
         return NotebookStatus(
             status="allocating",
-            message="Allocating resources for your notebook...",
+            message="Allocating resources for your instance...",
             url=instance.get("url"),
             email=email
         )
-        
+
     except Exception as e:
-        logger.error(f"Error creating notebook for {email}: {e}")
+        logger.error(f"Error creating instance for {email}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -274,17 +279,17 @@ async def github_notebook(
     
     # Set user session cookie if new
     resp = templates.TemplateResponse(
+        request,
         "github_landing.html",
         {
-            "request": request,
             "github_org": github_info["org"],
             "github_repo": github_info["repo"],
             "github_path": github_info["path"],
             "github_branch": github_info["branch"],
             "instance_id": generated_instance_id,
             "full_path": full_path,
-            "user_session": user_session
-        }
+            "user_session": user_session,
+        },
     )
     
     # Set session cookie for this user
@@ -419,11 +424,9 @@ async def check_github_status(instance_id: str = Query(...)):
 async def admin_page(request: Request, username: str = Depends(verify_admin)):
     """Render the admin management page"""
     return templates.TemplateResponse(
+        request,
         "admin.html",
-        {
-            "request": request,
-            "username": username
-        }
+        {"username": username},
     )
 
 
@@ -443,6 +446,7 @@ async def list_instances(username: str = Depends(verify_admin)):
                 created_at=inst.get("created_at", ""),
                 last_activity=inst.get("last_activity"),
                 uptime_minutes=inst.get("uptime_minutes", 0),
+                instance_type=inst.get("instance_type", "jupyter"),
                 github_org=inst.get("github_org"),
                 github_repo=inst.get("github_repo"),
                 github_path=inst.get("github_path")
@@ -473,7 +477,7 @@ async def destroy_instance(instance_id: str, username: str = Depends(verify_admi
         )
         
     except Exception as e:
-        logger.error(f"Error destroying instance for {email}: {e}")
+        logger.error(f"Error destroying instance {instance_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -528,5 +532,6 @@ async def get_config():
         "available_images": settings.AVAILABLE_IMAGES,
         "default_image": settings.DEFAULT_IMAGE,
         "max_lifetime_hours": settings.MAX_LIFETIME_HOURS,
-        "idle_timeout_minutes": settings.IDLE_TIMEOUT_MINUTES
+        "idle_timeout_minutes": settings.IDLE_TIMEOUT_MINUTES,
+        "instance_types": INSTANCE_TYPES,
     }

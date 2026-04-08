@@ -10,6 +10,7 @@ class NotebookRequest(BaseModel):
     """Request model for creating a notebook instance"""
     email: EmailStr
     image: Optional[str] = None
+    instance_type: str = "jupyter"
 
 
 class GitHubNotebookInfo(BaseModel):
@@ -55,6 +56,7 @@ class NotebookListItem(BaseModel):
     created_at: str
     last_activity: Optional[str] = None
     uptime_minutes: int
+    instance_type: str = "jupyter"
     github_org: Optional[str] = None
     github_repo: Optional[str] = None
     github_path: Optional[str] = None

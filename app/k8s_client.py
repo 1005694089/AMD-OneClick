@@ -10,7 +10,7 @@ from typing import Optional
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-from .config import settings
+from .config import settings, INSTANCE_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -46,35 +46,15 @@ class K8sClient:
             "email-hash": hashlib.md5(email.lower().encode()).hexdigest()[:16],
         }
     
-    def _get_pod_manifest(self, email: str, instance_id: str, image: str, 
-                          github_info: Optional[dict] = None) -> dict:
-        """Generate Pod manifest"""
-        labels = self._get_labels(email, instance_id)
-        
-        annotations = {
-            "amd-oneclick/email": email,
-            "amd-oneclick/created-at": datetime.now(timezone.utc).isoformat(),
-        }
-        
-        # Add GitHub info to annotations if provided
+    def _build_startup_script(self, instance_type: str = "jupyter",
+                              github_info: Optional[dict] = None) -> str:
+        """Build startup script based on instance type"""
         if github_info:
-            annotations["amd-oneclick/github-org"] = github_info.get("org", "")
-            annotations["amd-oneclick/github-repo"] = github_info.get("repo", "")
-            annotations["amd-oneclick/github-branch"] = github_info.get("branch", "")
-            annotations["amd-oneclick/github-path"] = github_info.get("path", "")
-            annotations["amd-oneclick/github-raw-url"] = github_info.get("raw_url", "")
-        
-        # Build the startup command
-        # Note: Jupyter is pre-installed in the base image, no pip install needed
-        # DNS is configured via Pod dnsConfig to use Google DNS (8.8.8.8)
-        if github_info:
-            # Download the notebook file before starting Jupyter
             notebook_filename = github_info["path"].split("/")[-1]
-            startup_script = f"""
+            return f"""
 mkdir -p /app/notebooks
 cd /app/notebooks
 
-# Download notebook with curl (more reliable than Python urllib)
 echo "Downloading {notebook_filename}..."
 for i in 1 2 3; do
     if curl -fsSL --connect-timeout 30 --max-time 120 -o '{notebook_filename}' '{github_info["raw_url"]}'; then
@@ -92,12 +72,45 @@ fi
 
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --notebook-dir=/app/notebooks
 """
-        else:
-            startup_script = f"""
+
+        if instance_type == "opencode":
+            return f"""
+cd /app
+echo '#!/bin/bash' > /usr/local/bin/start-opencode
+echo 'echo "=== OpenCode AI Coding Agent ==="' >> /usr/local/bin/start-opencode
+echo 'echo "Run: opencode"' >> /usr/local/bin/start-opencode
+echo 'exec opencode "$@"' >> /usr/local/bin/start-opencode
+chmod +x /usr/local/bin/start-opencode
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}'
+"""
+
+        # Default: jupyter
+        return f"""
 cd /app
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}'
 """
-        
+
+    def _get_pod_manifest(self, email: str, instance_id: str, image: str,
+                          instance_type: str = "jupyter",
+                          github_info: Optional[dict] = None) -> dict:
+        """Generate Pod manifest"""
+        labels = self._get_labels(email, instance_id)
+
+        annotations = {
+            "amd-oneclick/email": email,
+            "amd-oneclick/created-at": datetime.now(timezone.utc).isoformat(),
+            "amd-oneclick/instance-type": instance_type,
+        }
+
+        if github_info:
+            annotations["amd-oneclick/github-org"] = github_info.get("org", "")
+            annotations["amd-oneclick/github-repo"] = github_info.get("repo", "")
+            annotations["amd-oneclick/github-branch"] = github_info.get("branch", "")
+            annotations["amd-oneclick/github-path"] = github_info.get("path", "")
+            annotations["amd-oneclick/github-raw-url"] = github_info.get("raw_url", "")
+
+        startup_script = self._build_startup_script(instance_type, github_info)
+
         return {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -108,6 +121,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "annotations": annotations
             },
             "spec": {
+                "securityContext": {
+                    "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
+                },
                 "dnsPolicy": "None",
                 "dnsConfig": {
                     "nameservers": ["1.1.1.1", "8.8.8.8", "8.8.4.4"],
@@ -150,7 +166,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         },
                         "env": [
                             {"name": "SHELL", "value": "/bin/bash"},
-                            {"name": "USER_EMAIL", "value": email}
+                            {"name": "USER_EMAIL", "value": email},
+                            {"name": "INSTANCE_TYPE", "value": instance_type}
                         ],
                         "volumeMounts": [
                             {"name": "shm", "mountPath": "/dev/shm"}
@@ -264,34 +281,35 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             return f"http://{settings.SERVICE_HOST}:{node_port}/lab/tree/{notebook_filename}?token={settings.NOTEBOOK_TOKEN}"
         return base_url
     
-    def create_instance(self, email: str, image: Optional[str] = None, 
+    def create_instance(self, email: str, image: Optional[str] = None,
+                        instance_type: str = "jupyter",
                         github_info: Optional[dict] = None,
                         custom_instance_id: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
-        
-        # Check if instance already exists
+
         existing = self.get_instance_by_id(instance_id)
         if existing:
             return existing
-        
-        # Allocate NodePort
+
         node_port = self._allocate_node_port()
-        
-        # Create Pod
-        pod_manifest = self._get_pod_manifest(email, instance_id, image, github_info)
+
+        pod_manifest = self._get_pod_manifest(
+            email, instance_id, image,
+            instance_type=instance_type,
+            github_info=github_info,
+        )
         try:
             self.core_v1.create_namespaced_pod(
                 namespace=self.namespace,
                 body=pod_manifest
             )
-            logger.info(f"Created pod {instance_id} for {email}")
+            logger.info(f"Created pod {instance_id} for {email} (type={instance_type})")
         except ApiException as e:
             logger.error(f"Failed to create pod: {e}")
             raise
-        
-        # Create Service
+
         svc_manifest = self._get_service_manifest(email, instance_id, node_port)
         try:
             self.core_v1.create_namespaced_service(
@@ -301,18 +319,18 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             logger.info(f"Created service {instance_id}-svc with NodePort {node_port}")
         except ApiException as e:
             logger.error(f"Failed to create service: {e}")
-            # Cleanup pod if service creation fails
             self.delete_instance_by_id(instance_id)
             raise
-        
+
         notebook_path = github_info.get("path") if github_info else None
-        
+
         return {
             "id": instance_id,
             "email": email,
             "pod_name": instance_id,
             "service_name": f"{instance_id}-svc",
             "image": image,
+            "instance_type": instance_type,
             "status": "pending",
             "created_at": datetime.now(timezone.utc),
             "node_port": node_port,
@@ -327,8 +345,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 name=instance_id,
                 namespace=self.namespace
             )
-            
-            # Get associated service
+
             try:
                 svc = self.core_v1.read_namespaced_service(
                     name=f"{instance_id}-svc",
@@ -337,10 +354,11 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 node_port = svc.spec.ports[0].node_port if svc.spec.ports else None
             except ApiException:
                 node_port = None
-            
+
             email = pod.metadata.annotations.get("amd-oneclick/email", "unknown")
             github_path = pod.metadata.annotations.get("amd-oneclick/github-path")
-            
+            instance_type = pod.metadata.annotations.get("amd-oneclick/instance-type", "jupyter")
+
             return {
                 "id": instance_id,
                 "email": email,
@@ -351,6 +369,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
                 "url": self._build_url(node_port, github_path) if node_port else None,
+                "instance_type": instance_type,
                 "github_org": pod.metadata.annotations.get("amd-oneclick/github-org"),
                 "github_repo": pod.metadata.annotations.get("amd-oneclick/github-repo"),
                 "github_path": github_path,
@@ -432,6 +451,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     uptime_delta = datetime.now(timezone.utc) - created_at.replace(tzinfo=timezone.utc)
                     uptime_minutes = int(uptime_delta.total_seconds() / 60)
                 
+                instance_type = pod.metadata.annotations.get("amd-oneclick/instance-type", "jupyter")
+
                 instances.append({
                     "id": instance_id,
                     "email": email,
@@ -443,6 +464,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     "node_port": node_port,
                     "url": self._build_url(node_port, github_path) if node_port else None,
                     "uptime_minutes": uptime_minutes,
+                    "instance_type": instance_type,
                     "github_org": github_org,
                     "github_repo": github_repo,
                     "github_path": github_path,
@@ -553,26 +575,31 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         cleaned = []
         instances = self.list_instances()
         now = datetime.now(timezone.utc)
-        
+
         for instance in instances:
             should_delete = False
             reason = ""
-            
-            # Check max lifetime
+
+            itype = instance.get("instance_type", "jupyter")
+            type_cfg = INSTANCE_TYPES.get(itype, {})
+            raw_lifetime = type_cfg.get("max_lifetime_hours")
+            max_lifetime = raw_lifetime if raw_lifetime is not None else settings.MAX_LIFETIME_HOURS
+            raw_idle = type_cfg.get("idle_timeout_minutes")
+            idle_timeout = raw_idle if raw_idle is not None else settings.IDLE_TIMEOUT_MINUTES
+
             uptime_hours = instance["uptime_minutes"] / 60
-            if uptime_hours >= settings.MAX_LIFETIME_HOURS:
+            if uptime_hours >= max_lifetime:
                 should_delete = True
-                reason = f"exceeded max lifetime ({settings.MAX_LIFETIME_HOURS}h)"
-            
-            # Check idle timeout (only for running instances)
-            elif instance["status"] == "running":
+                reason = f"exceeded max lifetime ({max_lifetime}h)"
+
+            elif instance["status"] == "running" and idle_timeout > 0:
                 last_activity = self.check_pod_activity(instance["email"])
                 if last_activity:
                     idle_minutes = (now - last_activity).total_seconds() / 60
-                    if idle_minutes >= settings.IDLE_TIMEOUT_MINUTES:
+                    if idle_minutes >= idle_timeout:
                         should_delete = True
-                        reason = f"idle for {int(idle_minutes)} minutes"
-            
+                        reason = f"idle for {int(idle_minutes)} minutes (limit {idle_timeout}m)"
+
             if should_delete:
                 if self.delete_instance(instance["email"]):
                     cleaned.append({
@@ -580,7 +607,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         "reason": reason
                     })
                     logger.info(f"Cleaned up instance for {instance['email']}: {reason}")
-        
+
         return cleaned
 
 

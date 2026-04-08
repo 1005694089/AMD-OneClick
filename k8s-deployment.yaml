@@ -43,7 +43,7 @@ metadata:
   namespace: default
 data:
   K8S_NAMESPACE: "default"
-  DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-jupyter:latest"
+  DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:latest"
   CPU_LIMIT: "16"
   MEMORY_LIMIT: "64Gi"
   GPU_LIMIT: "1"
