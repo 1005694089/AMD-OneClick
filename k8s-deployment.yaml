@@ -43,17 +43,18 @@ metadata:
   namespace: default
 data:
   K8S_NAMESPACE: "default"
-  DEFAULT_IMAGE: "docker.io/rocm/vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1"
-  PADDLEOCR_VL_IMAGE: "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/paddleocr-vl:latest-amd-all-in-one-debug-20260408"
+  DEFAULT_IMAGE: "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/rocm-vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1"
+  PADDLEOCR_VL_IMAGE: "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/paddleocr-vl:all-in-one-notebook-20260409"
   CPU_LIMIT: "128"
   MEMORY_LIMIT: "256Gi"
   GPU_LIMIT: "1"
   CPU_REQUEST: "40"
   MEMORY_REQUEST: "48Gi"
-  NOTEBOOK_IMAGE_PULL_SECRET: ""
+  NOTEBOOK_IMAGE_PULL_SECRET: "aliyun-regcred"
   IDLE_TIMEOUT_MINUTES: "10"
   MAX_LIFETIME_HOURS: "6"
-  SERVICE_HOST: "36.151.243.69"
+  SERVICE_HOST: "165.245.142.52"
+  NOTEBOOK_PROXY_HOST: "129.212.240.57"
   NODE_PORT_BASE: "30000"
   NOTEBOOK_TOKEN: "amd-oneclick"
 
@@ -84,12 +85,11 @@ spec:
         app: amd-oneclick-manager
     spec:
       serviceAccountName: amd-oneclick-manager
-      # Optional: uncomment and set your registry pull secret if needed for manager image pulls.
-      # imagePullSecrets:
-      #   - name: your-registry-secret
+      imagePullSecrets:
+        - name: aliyun-regcred
       containers:
         - name: manager
-          image: docker.io/vivienfanghua/amd-oneclick:latest
+          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/amd-oneclick-manager:latest
           imagePullPolicy: Always
           workingDir: /app
           ports:

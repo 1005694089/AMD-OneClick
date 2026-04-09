@@ -5,6 +5,7 @@
 #   ./docker/build.sh all          # Build all images
 #   ./docker/build.sh base         # Build base image only
 #   ./docker/build.sh oneclick     # Build oneclick image only  
+#   ./docker/build.sh allinone     # Build all-in-one image only
 #   ./docker/build.sh manager      # Build manager image only
 #   ./docker/build.sh push         # Push all images to Docker Hub
 
@@ -13,6 +14,7 @@ set -e
 # Image names
 BASE_IMAGE="vivienfanghua/vllm_paddle:base"
 ONECLICK_IMAGE="vivienfanghua/vllm_paddle:ppocr-oneclick"
+ALLINONE_IMAGE="vivienfanghua/vllm_paddle:all-in-one"
 MANAGER_IMAGE="vivienfanghua/amd-ppocr-vl-manager:latest"
 
 # Get script directory
@@ -37,6 +39,14 @@ build_oneclick() {
     echo "✅ OneClick image built successfully"
 }
 
+build_allinone() {
+    echo "=========================================="
+    echo "Building All-in-One Image: $ALLINONE_IMAGE"
+    echo "=========================================="
+    docker build -f docker/Dockerfile.all-in-one -t "$ALLINONE_IMAGE" .
+    echo "✅ All-in-one image built successfully"
+}
+
 build_manager() {
     echo "=========================================="
     echo "Building Manager Image: $MANAGER_IMAGE"
@@ -55,6 +65,9 @@ push_images() {
     
     echo "Pushing $ONECLICK_IMAGE..."
     docker push "$ONECLICK_IMAGE"
+
+    echo "Pushing $ALLINONE_IMAGE..."
+    docker push "$ALLINONE_IMAGE"
     
     echo "Pushing $MANAGER_IMAGE..."
     docker push "$MANAGER_IMAGE"
@@ -69,6 +82,9 @@ case "${1:-all}" in
     oneclick)
         build_oneclick
         ;;
+    allinone)
+        build_allinone
+        ;;
     manager)
         build_manager
         ;;
@@ -81,12 +97,13 @@ case "${1:-all}" in
         push_images
         ;;
     *)
-        echo "Usage: $0 {all|base|oneclick|manager|push}"
+        echo "Usage: $0 {all|base|oneclick|allinone|manager|push}"
         echo ""
         echo "Commands:"
         echo "  all       - Build all images (base → oneclick → manager)"
         echo "  base      - Build base image only (Paddle + PaddleX)"
         echo "  oneclick  - Build oneclick image only (requires base)"
+        echo "  allinone  - Build all-in-one image only"
         echo "  manager   - Build manager image only"
         echo "  push      - Push all images to Docker Hub"
         exit 1

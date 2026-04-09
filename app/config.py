@@ -12,13 +12,13 @@ class Settings:
     # Default Notebook Image
     DEFAULT_IMAGE: str = os.getenv(
         "DEFAULT_IMAGE", 
-        "docker.io/rocm/vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1"
+        "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/rocm-vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1"
     )
 
     # PaddleOCR-VL image (full notebook + OCR environment)
     PADDLEOCR_VL_IMAGE: str = os.getenv(
         "PADDLEOCR_VL_IMAGE",
-        "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/paddleocr-vl:latest-amd-all-in-one-debug-20260408",
+        "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/paddleocr-vl:all-in-one-notebook-20260409",
     )
     
     # Available Images (can be extended)
@@ -105,6 +105,7 @@ class Settings:
     
     # Service Configuration
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
+    NOTEBOOK_PROXY_HOST: Optional[str] = os.getenv("NOTEBOOK_PROXY_HOST")
     NODE_PORT_BASE: int = int(os.getenv("NODE_PORT_BASE", "30000"))
     NOTEBOOK_IMAGE_PULL_SECRET: Optional[str] = os.getenv("NOTEBOOK_IMAGE_PULL_SECRET")
     

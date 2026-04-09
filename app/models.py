@@ -10,6 +10,7 @@ class NotebookRequest(BaseModel):
     """Request model for creating a notebook instance"""
     email: EmailStr
     image: Optional[str] = None
+    instance_type: Optional[str] = None
 
 
 class GitHubNotebookInfo(BaseModel):

@@ -33,6 +33,22 @@
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
+│  crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/... │
+│  paddleocr-vl:latest-amd-all-in-one                             │
+│  (预构建 All-in-One 基础镜像)                                     │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  vivienfanghua/vllm_paddle:all-in-one                           │
+│  Dockerfile.all-in-one                                           │
+│  ─────────────────────────────────────────────────────────────  │
+│  + 复用 Aliyun all-in-one 全量环境                                │
+│  + 预置 notebook: ppocr_vl_demo.ipynb                           │
+│  + 默认启动 oneclick_entrypoint.sh (vLLM + Jupyter)             │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
 │  vivienfanghua/amd-ppocr-vl-manager:latest  (~209MB)           │
 │  Dockerfile.manager                                             │
 │  ─────────────────────────────────────────────────────────────  │
@@ -56,6 +72,9 @@
 # 只构建 OneClick 镜像 (需要先构建 base)
 ./docker/build.sh oneclick
 
+# 只构建 All-in-One 镜像
+./docker/build.sh allinone
+
 # 只构建 Manager 镜像
 ./docker/build.sh manager
 
@@ -74,7 +93,10 @@ docker build -f docker/Dockerfile.base -t vivienfanghua/vllm_paddle:base docker/
 # 2. 构建 OneClick 镜像
 docker build -f docker/Dockerfile.ppocr-oneclick -t vivienfanghua/vllm_paddle:ppocr-oneclick docker/
 
-# 3. 构建 Manager 镜像
+# 3. 构建 All-in-One 镜像 (基于 Aliyun 预构建镜像)
+docker build -f docker/Dockerfile.all-in-one -t vivienfanghua/vllm_paddle:all-in-one .
+
+# 4. 构建 Manager 镜像
 docker build -f docker/Dockerfile.manager -t vivienfanghua/amd-ppocr-vl-manager:latest .
 ```
 
@@ -84,6 +106,7 @@ docker build -f docker/Dockerfile.manager -t vivienfanghua/amd-ppocr-vl-manager:
 docker/
 ├── Dockerfile.base           # 基础镜像 (Paddle + PaddleX)
 ├── Dockerfile.ppocr-oneclick # OneClick 镜像 (+ Jupyter + 模型)
+├── Dockerfile.all-in-one     # All-in-One 镜像 (+ 预置 notebook)
 ├── Dockerfile.manager        # Manager 服务镜像
 ├── build.sh                  # 构建脚本
 ├── models/                   # 预下载的模型文件
@@ -106,6 +129,15 @@ docker/
 | `NOTEBOOK_URL` | - | 自动下载的 notebook URL |
 | `INSTANCE_ID` | - | K8s 实例 ID (用于 Nginx 代理) |
 
+### All-in-One 镜像 (`all-in-one`)
+
+`all-in-one` 默认继承并使用与 `ppocr-oneclick` 一致的运行时环境变量：
+`GPU_MEMORY_UTILIZATION`、`PADDLEX_ALL_IN_ONE_VLLM_SERVER_PORT`、`JUPYTER_PORT`、`NOTEBOOK_TOKEN`、`NOTEBOOK_URL`、`INSTANCE_ID`。
+
+预置 notebook 路径：
+
+`/workspace/PaddleX/notebooks/ppocr_vl_demo.ipynb`
+
 ## 本地运行
 
 ```bash
@@ -120,6 +152,20 @@ docker run -it --rm \
   vivienfanghua/vllm_paddle:ppocr-oneclick
 
 # 访问 Jupyter Lab: http://localhost:8888/?token=amd-oneclick
+```
+
+```bash
+# 运行 All-in-One 镜像 (需要 AMD GPU)
+docker run -it --rm \
+  -p 8888:8888 \
+  -p 8118:8118 \
+  --device /dev/kfd \
+  --device /dev/dri \
+  --group-add video \
+  -e GPU_MEMORY_UTILIZATION=0.85 \
+  vivienfanghua/vllm_paddle:all-in-one
+
+# Notebook: /workspace/PaddleX/notebooks/ppocr_vl_demo.ipynb
 ```
 
 ## K8s 部署

@@ -35,7 +35,8 @@ docker/*.whl
 *.yaml
 
 # Notebooks
-notebooks/
+notebooks/*
+!notebooks/ppocr_vl_demo.ipynb
 
 # Documentation
 *.md

@@ -1,0 +1,15 @@
+FROM crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/paddleocr-vl:latest-amd-all-in-one
+
+LABEL maintainer="vivienfanghua"
+LABEL description="AMD-OneClick all-in-one image with bundled PaddleOCR-VL demo notebook"
+LABEL version="1.0"
+
+RUN mkdir -p /workspace/PaddleX/notebooks
+COPY notebooks/ppocr_vl_demo.ipynb /workspace/PaddleX/notebooks/ppocr_vl_demo.ipynb
+
+EXPOSE 8118 8888
+
+WORKDIR /workspace/PaddleX
+
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/PaddleX/oneclick_entrypoint.sh"]

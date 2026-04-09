@@ -331,6 +331,15 @@ exec /opt/PaddleX/oneclick_entrypoint.sh
         base_lab_path = "/lab"
         if instance_type == "paddleocr_vl" and instance_id:
             base_lab_path = f"/instance/{instance_id}/lab"
+            notebook_host = (settings.NOTEBOOK_PROXY_HOST or settings.SERVICE_HOST).strip()
+            base_url = f"http://{notebook_host}{base_lab_path}?token={settings.NOTEBOOK_TOKEN}"
+            if notebook_path:
+                notebook_filename = notebook_path.split("/")[-1]
+                return (
+                    f"http://{notebook_host}"
+                    f"{base_lab_path}/tree/{notebook_filename}?token={settings.NOTEBOOK_TOKEN}"
+                )
+            return base_url
 
         base_url = f"http://{settings.SERVICE_HOST}:{node_port}{base_lab_path}?token={settings.NOTEBOOK_TOKEN}"
         if notebook_path:

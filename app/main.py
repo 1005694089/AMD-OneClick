@@ -85,11 +85,14 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
 async def index(request: Request):
     """Render the main request page"""
     return templates.TemplateResponse(
-        "index.html",
-        {
+        request=request,
+        name="index.html",
+        context={
             "request": request,
             "images": settings.AVAILABLE_IMAGES,
-            "default_image": settings.DEFAULT_IMAGE
+            "default_image": settings.DEFAULT_IMAGE,
+            "instance_types": settings.get_public_instance_types(),
+            "default_instance_type": settings.DEFAULT_INSTANCE_TYPE,
         }
     )
 
@@ -98,7 +101,14 @@ async def index(request: Request):
 async def request_notebook(req: NotebookRequest):
     """Request a notebook instance"""
     email = req.email.lower()
-    image = req.image or settings.DEFAULT_IMAGE
+    instance_type = req.instance_type or settings.DEFAULT_INSTANCE_TYPE
+    type_config = settings.get_instance_type(instance_type)
+    if not type_config:
+        raise HTTPException(status_code=400, detail="Invalid instance type selected")
+    if not type_config.get("enabled", False):
+        raise HTTPException(status_code=400, detail="Selected instance type is not available")
+
+    image = settings.get_image_for_instance_type(instance_type, req.image)
     
     # Validate image
     if image not in settings.AVAILABLE_IMAGES:
@@ -108,6 +118,13 @@ async def request_notebook(req: NotebookRequest):
         # Check for existing instance
         existing = k8s_client.get_instance_by_email(email)
         
+        if existing:
+            existing_type = existing.get("instance_type", settings.DEFAULT_INSTANCE_TYPE)
+            if existing_type != instance_type:
+                # Recreate when user requests another instance type for same email.
+                k8s_client.delete_instance(email)
+                existing = None
+
         if existing:
             status = k8s_client.get_pod_status(email)
             
@@ -137,7 +154,11 @@ async def request_notebook(req: NotebookRequest):
                 )
         
         # Create new instance
-        instance = k8s_client.create_instance(email, image)
+        instance = k8s_client.create_instance(
+            email,
+            image,
+            instance_type=instance_type,
+        )
         
         # Send email notification (async, don't wait)
         if instance.get("url"):
@@ -262,8 +283,9 @@ async def github_notebook(
     
     # Render landing page for status tracking
     return templates.TemplateResponse(
-        "github_landing.html",
-        {
+        request=request,
+        name="github_landing.html",
+        context={
             "request": request,
             "github_org": github_info["org"],
             "github_repo": github_info["repo"],
@@ -388,8 +410,9 @@ async def check_github_status(instance_id: str = Query(...)):
 async def admin_page(request: Request, username: str = Depends(verify_admin)):
     """Render the admin management page"""
     return templates.TemplateResponse(
-        "admin.html",
-        {
+        request=request,
+        name="admin.html",
+        context={
             "request": request,
             "username": username
         }
@@ -496,6 +519,8 @@ async def get_config():
     return {
         "available_images": settings.AVAILABLE_IMAGES,
         "default_image": settings.DEFAULT_IMAGE,
+        "instance_types": settings.get_public_instance_types(),
+        "default_instance_type": settings.DEFAULT_INSTANCE_TYPE,
         "max_lifetime_hours": settings.MAX_LIFETIME_HOURS,
         "idle_timeout_minutes": settings.IDLE_TIMEOUT_MINUTES
     }
