@@ -30,9 +30,13 @@ env
 # Docker directory (large files, only needed for base/oneclick builds)
 docker/models
 docker/*.whl
+# Re-include ROCm wheel needed for Dockerfile.rocm-all-in-one
+!docker/paddlepaddle_dcu-*.whl
 
 # K8s configs
 *.yaml
+# Re-include pipeline configs needed for Dockerfile.rocm-all-in-one
+!docker/configs/*.yaml
 
 # Notebooks
 notebooks/*

@@ -3,14 +3,14 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: amd-oneclick-manager
+  name: amd-oneclick-manager-paddleocr
   namespace: default
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: amd-oneclick-manager
+  name: amd-oneclick-manager-paddleocr
   namespace: default
 rules:
   - apiGroups: [""]
@@ -24,26 +24,26 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: amd-oneclick-manager
+  name: amd-oneclick-manager-paddleocr
   namespace: default
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: amd-oneclick-manager
+  name: amd-oneclick-manager-paddleocr
 subjects:
   - kind: ServiceAccount
-    name: amd-oneclick-manager
+    name: amd-oneclick-manager-paddleocr
     namespace: default
 
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: amd-oneclick-config
+  name: amd-oneclick-config-paddleocr
   namespace: default
 data:
   K8S_NAMESPACE: "default"
-  DEFAULT_IMAGE: "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/rocm-vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1"
+  DEFAULT_IMAGE: "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/paddleocr-vl:all-in-one-notebook-20260409"
   PADDLEOCR_VL_IMAGE: "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/paddleocr-vl:all-in-one-notebook-20260409"
   CPU_LIMIT: "128"
   MEMORY_LIMIT: "256Gi"
@@ -51,10 +51,11 @@ data:
   CPU_REQUEST: "40"
   MEMORY_REQUEST: "48Gi"
   NOTEBOOK_IMAGE_PULL_SECRET: "aliyun-regcred"
-  IDLE_TIMEOUT_MINUTES: "10"
-  MAX_LIFETIME_HOURS: "6"
-  SERVICE_HOST: "165.245.142.52"
-  NOTEBOOK_PROXY_HOST: "129.212.240.57"
+  # Large values effectively disable timeout culling without risky zero-value semantics.
+  IDLE_TIMEOUT_MINUTES: "10080"
+  MAX_LIFETIME_HOURS: "720"
+  SERVICE_HOST: "36.151.243.69"
+  NOTEBOOK_PROXY_HOST: ""
   NODE_PORT_BASE: "30000"
   NOTEBOOK_TOKEN: "amd-oneclick"
 
@@ -62,7 +63,7 @@ data:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: amd-oneclick-secrets
+  name: amd-oneclick-secrets-paddleocr
   namespace: default
 type: Opaque
 stringData:
@@ -72,19 +73,19 @@ stringData:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: amd-oneclick-manager
+  name: amd-oneclick-manager-paddleocr
   namespace: default
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: amd-oneclick-manager
+      app: amd-oneclick-manager-paddleocr
   template:
     metadata:
       labels:
-        app: amd-oneclick-manager
+        app: amd-oneclick-manager-paddleocr
     spec:
-      serviceAccountName: amd-oneclick-manager
+      serviceAccountName: amd-oneclick-manager-paddleocr
       imagePullSecrets:
         - name: aliyun-regcred
       containers:
@@ -92,13 +93,128 @@ spec:
           image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/amd_docker_mirage/amd-oneclick-manager:latest
           imagePullPolicy: Always
           workingDir: /app
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              # Force paddleocr_vl URL generation to use per-instance NodePort (dynamic porting).
+              python - <<'PY'
+              from pathlib import Path
+              path = Path("/app/app/k8s_client.py")
+              text = path.read_text()
+              old = """        if instance_type == "paddleocr_vl" and instance_id:
+                          base_lab_path = f"/instance/{instance_id}/lab"
+                          notebook_host = (settings.NOTEBOOK_PROXY_HOST or settings.SERVICE_HOST).strip()
+                          base_url = f"http://{notebook_host}{base_lab_path}?token={settings.NOTEBOOK_TOKEN}"
+                          if notebook_path:
+                              notebook_filename = notebook_path.split("/")[-1]
+                              return (
+                                  f"http://{notebook_host}"
+                                  f"{base_lab_path}/tree/{notebook_filename}?token={settings.NOTEBOOK_TOKEN}"
+                              )
+                          return base_url
+              """
+              new = """        if instance_type == "paddleocr_vl" and instance_id:
+                          base_lab_path = f"/instance/{instance_id}/lab"
+                          base_url = f"http://{settings.SERVICE_HOST}:{node_port}{base_lab_path}?token={settings.NOTEBOOK_TOKEN}"
+                          if notebook_path:
+                              notebook_filename = notebook_path.split("/")[-1]
+                              return (
+                                  f"http://{settings.SERVICE_HOST}:{node_port}"
+                                  f"{base_lab_path}/tree/{notebook_filename}?token={settings.NOTEBOOK_TOKEN}"
+                              )
+                          return base_url
+              """
+              if old in text:
+                  path.write_text(text.replace(old, new))
+              PY
+
+              # Patch 2: Add orphan-service cleanup, scan all services for port
+              # allocation, and handle 409 conflicts on service creation.
+              python -c "
+              import textwrap, pathlib
+              p = pathlib.Path('/app/app/k8s_client.py')
+              t = p.read_text()
+              changed = False
+
+              # 2a: insert _cleanup_orphaned_services before _allocate_node_port
+              if '_cleanup_orphaned_services' not in t:
+                  anchor = '    def _allocate_node_port(self) -> int:'
+                  method = textwrap.dedent('''
+                      def _cleanup_orphaned_services(self):
+                          cleaned = []
+                          try:
+                              services = self.core_v1.list_namespaced_service(
+                                  namespace=self.namespace,
+                                  label_selector='app=' + settings.NOTEBOOK_LABEL_PREFIX,
+                              )
+                          except ApiException as e:
+                              logger.warning('Error listing services for orphan cleanup: %s', e)
+                              return cleaned
+                          for svc in services.items:
+                              iid = svc.metadata.labels.get('instance-id')
+                              if not iid:
+                                  continue
+                              try:
+                                  self.core_v1.read_namespaced_pod(name=iid, namespace=self.namespace)
+                              except ApiException as e:
+                                  if e.status == 404:
+                                      try:
+                                          self.core_v1.delete_namespaced_service(name=svc.metadata.name, namespace=self.namespace)
+                                          cleaned.append(svc.metadata.name)
+                                          logger.info('Cleaned orphaned service %s (pod %s gone)', svc.metadata.name, iid)
+                                      except ApiException as de:
+                                          logger.warning('Failed to delete orphaned svc %s: %s', svc.metadata.name, de)
+                          return cleaned
+
+                  ''').strip()
+                  method = '    ' + method.replace(chr(10), chr(10) + '    ') + chr(10) + chr(10)
+                  if anchor in t:
+                      t = t.replace(anchor, method + anchor)
+                      changed = True
+
+              # 2b: scan ALL services for port allocation (drop label_selector)
+              old_ls = 'label_selector=f\"app={settings.NOTEBOOK_LABEL_PREFIX}\"'
+              # only replace inside _allocate_node_port
+              marker = '_allocate_node_port'
+              idx = t.find(marker)
+              if idx != -1:
+                  ls_pos = t.find(old_ls, idx)
+                  if ls_pos != -1 and ls_pos < idx + 600:
+                      end = ls_pos + len(old_ls)
+                      # find the surrounding line and remove it
+                      line_start = t.rfind(chr(10), 0, ls_pos) + 1
+                      line_end = t.find(chr(10), ls_pos)
+                      t = t[:line_start] + t[line_end:]
+                      changed = True
+
+              # 2c: call orphan cleanup before allocating port
+              old_alloc = '        # Allocate NodePort'
+              new_alloc = '        # Clean up orphaned services before allocating a port\n        self._cleanup_orphaned_services()\n\n        # Allocate NodePort'
+              if 'self._cleanup_orphaned_services()' not in t and old_alloc in t:
+                  t = t.replace(old_alloc, new_alloc, 1)
+                  changed = True
+
+              # 2d: handle 409 on service create (8-space except, 12-space body)
+              old_svc = '        except ApiException as e:\n            logger.error(f\"Failed to create service: {e}\")\n            # Cleanup pod if service creation fails\n            self.delete_instance_by_id(instance_id)\n            raise'
+              new_svc = '        except ApiException as e:\n            if e.status == 409:\n                logger.warning(\"Service %s-svc exists, replacing\", instance_id)\n                try:\n                    self.core_v1.delete_namespaced_service(name=f\"{instance_id}-svc\", namespace=self.namespace)\n                    self.core_v1.create_namespaced_service(namespace=self.namespace, body=svc_manifest)\n                    logger.info(\"Replaced service %s-svc NodePort %s\", instance_id, node_port)\n                except ApiException as retry_err:\n                    logger.error(\"Failed to replace service: %s\", retry_err)\n                    self.delete_instance_by_id(instance_id)\n                    raise retry_err\n            else:\n                logger.error(f\"Failed to create service: {e}\")\n                self.delete_instance_by_id(instance_id)\n                raise'
+              if 'e.status == 409' not in t and old_svc in t:
+                  t = t.replace(old_svc, new_svc, 1)
+                  changed = True
+
+              if changed:
+                  p.write_text(t)
+                  print('k8s_client.py patched successfully')
+              else:
+                  print('k8s_client.py already patched or no match')
+              "
+              exec uvicorn app.main:app --host 0.0.0.0 --port 8000
           ports:
             - containerPort: 8000
           envFrom:
             - configMapRef:
-                name: amd-oneclick-config
+                name: amd-oneclick-config-paddleocr
             - secretRef:
-                name: amd-oneclick-secrets
+                name: amd-oneclick-secrets-paddleocr
           resources:
             limits:
               cpu: "2"
@@ -123,13 +239,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: amd-oneclick-manager
+  name: amd-oneclick-manager-paddleocr
   namespace: default
 spec:
   selector:
-    app: amd-oneclick-manager
+    app: amd-oneclick-manager-paddleocr
   type: NodePort
   ports:
     - port: 80
       targetPort: 8000
-      nodePort: 30086
+      nodePort: 30443

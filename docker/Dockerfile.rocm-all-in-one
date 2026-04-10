@@ -1,0 +1,153 @@
+# Dockerfile.rocm-all-in-one - ROCm-compatible PaddleOCR-VL All-in-One Image
+#
+# Base: rocm/vllm-dev (ROCm 7.2, Python 3.12, vLLM pre-installed)
+# Paddle: pre-built ROCm wheel (WITH_ROCM=ON, gfx1201/RDNA4)
+#
+# Build (from project root):
+#   cp /path/to/paddlepaddle_dcu-*.whl docker/
+#   docker build -f docker/Dockerfile.rocm-all-in-one -t vivienfanghua/vllm_paddle:rocm-all-in-one .
+#
+# Run:
+#   docker run -it --rm -p 8888:8888 -p 8118:8118 \
+#     --device /dev/kfd --device /dev/dri --group-add video \
+#     vivienfanghua/vllm_paddle:rocm-all-in-one
+
+FROM rocm/vllm-dev:rocm7.2_navi_ubuntu24.04_py3.12_pytorch_2.9_vllm_0.14.0rc0
+
+LABEL maintainer="M4jupitercannon"
+LABEL description="PaddleOCR-VL All-in-One with ROCm support (HIP 7.2, gfx1201)"
+LABEL version="2.0"
+
+# ============================================================
+# System Dependencies
+# ============================================================
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        libgl1 \
+        libglib2.0-0 \
+        patchelf \
+        rsync \
+        tini \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================================
+# Environment Variables
+# ============================================================
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH=/opt/rocm/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+    GPU_MEMORY_UTILIZATION=0.85 \
+    PADDLEX_ALL_IN_ONE_VLLM_SERVER_PORT=8118
+
+# ============================================================
+# PaddlePaddle ROCm (pre-built wheel, WITH_ROCM=ON)
+# ============================================================
+COPY docker/paddlepaddle_dcu-3.4.0.dev20260404-cp312-cp312-linux_x86_64.whl /tmp/
+RUN pip install --no-cache-dir /tmp/paddlepaddle_dcu-3.4.0.dev20260404-cp312-cp312-linux_x86_64.whl \
+    && rm /tmp/paddlepaddle_dcu-3.4.0.dev20260404-cp312-cp312-linux_x86_64.whl
+
+# ============================================================
+# PaddleX + OCR Dependencies
+# ============================================================
+RUN git clone --depth 1 -b feat/rocm-vllm-native-benchmark-debug-20260408 \
+        https://github.com/M4jupitercannon/PaddleX.git /opt/PaddleX \
+    && cd /opt/PaddleX \
+    && pip install --no-cache-dir -e ".[ocr]"
+
+RUN pip install --no-cache-dir \
+        "fsspec==2025.9.0" \
+        "numpy==2.2.6" \
+        "PyYAML==6.0.2" \
+        "scikit-image==0.25.2" \
+        "einops" \
+        "jupyter" \
+        "jupyterlab" \
+        "openai>=1.63" \
+        "paddleocr==3.4.0" \
+        "setuptools==79.0.1" \
+        "transformers<5.0.0" \
+        "uvloop" \
+        "opencv-python" \
+        "scikit-learn" \
+        "scipy" \
+        "shapely" \
+        "pyclipper" \
+        "pypdfium2" \
+        "beautifulsoup4" \
+        "lxml" \
+        "premailer" \
+        "openpyxl" \
+        "ftfy" \
+        "imagesize" \
+        "python-bidi"
+
+# ============================================================
+# Test Datasets & Benchmark Assets
+# ============================================================
+RUN mkdir -p /opt/paddlex/datasets /opt/paddlex/benchmarks /opt/PaddleX/test
+
+# Precision dataset (1355 images)
+RUN wget -q -O /tmp/images.tar \
+        "https://paddle-model-ecology.bj.bcebos.com/paddlex/PaddleX3.0/deploy/internal/tmp/images.tar" \
+    && mkdir -p /opt/paddlex/datasets/images \
+    && tar xf /tmp/images.tar -C /opt/paddlex/datasets/images \
+    && rm /tmp/images.tar
+
+# Speed dataset (omni1.5 PDFs)
+RUN wget -q -O /tmp/omni1_5_pdfs.tar \
+        "https://paddle-model-ecology.bj.bcebos.com/paddlex/PaddleX3.0/deploy/internal/tmp/omni1_5_pdfs.tar" \
+    && mkdir -p /opt/paddlex/datasets/omni1_5_pdfs \
+    && tar xf /tmp/omni1_5_pdfs.tar -C /opt/paddlex/datasets/omni1_5_pdfs \
+    && rm /tmp/omni1_5_pdfs.tar
+
+# Benchmark scripts
+RUN wget -q -O /tmp/ocr-vlm-benchmark.tar \
+        "https://paddle-model-ecology.bj.bcebos.com/paddlex/PaddleX3.0/deploy/internal/tmp/ocr-vlm-benchmark-f29cfe4.tar" \
+    && mkdir -p /opt/paddlex/benchmarks \
+    && tar xf /tmp/ocr-vlm-benchmark.tar -C /opt/paddlex/benchmarks \
+    && rm /tmp/ocr-vlm-benchmark.tar
+
+# Demo test image
+RUN wget -q -O /opt/PaddleX/test/paddleocr_vl_demo.png \
+        "https://paddle-model-ecology.bj.bcebos.com/paddlex/imgs/demo_image/paddleocr_vl_demo.png"
+
+# ============================================================
+# Pipeline Configuration
+# ============================================================
+RUN mkdir -p /opt/paddlex/configs
+COPY docker/configs/PaddleOCR-VL-1.5.native.local.yaml /opt/paddlex/configs/PaddleOCR-VL-1.5.native.local.yaml
+COPY docker/configs/PaddleOCR-VL-1.5.vllm-server.local.yaml /opt/paddlex/configs/PaddleOCR-VL-1.5.vllm-server.local.yaml
+
+# ============================================================
+# Entrypoint & Verification Scripts
+# ============================================================
+COPY docker/oneclick_entrypoint.sh /opt/PaddleX/oneclick_entrypoint.sh
+COPY docker/verify_inference.sh /opt/PaddleX/verify_inference.sh
+RUN chmod +x /opt/PaddleX/oneclick_entrypoint.sh /opt/PaddleX/verify_inference.sh
+
+# ============================================================
+# Workspace Setup
+# ============================================================
+RUN mkdir -p /workspace/PaddleX/notebooks
+COPY notebooks/ /workspace/PaddleX/notebooks/
+
+# ============================================================
+# Build-time Verification (MUST pass or build fails)
+# ============================================================
+RUN python -c "import paddle; v=paddle.__version__; r=paddle.is_compiled_with_rocm(); print(f'Paddle {v}, ROCm compiled: {r}'); assert r, 'FATAL: paddlepaddle is NOT compiled with ROCm'" \
+    && python -c "import paddlex; print('PaddleX imported OK')" \
+    && python -c "from paddleocr import PaddleOCRVL; print('PaddleOCRVL imported OK')"
+
+# ============================================================
+# Ports & Entrypoint
+# ============================================================
+EXPOSE 8118 8888
+
+WORKDIR /workspace/PaddleX
+
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/PaddleX/oneclick_entrypoint.sh"]

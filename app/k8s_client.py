@@ -37,7 +37,7 @@ class K8sClient:
         """Generate a unique instance ID from email"""
         hash_str = hashlib.md5(email.lower().encode()).hexdigest()[:8]
         return f"nb-{hash_str}"
-    
+
     def _get_labels(self, email: str, instance_id: str) -> dict:
         """Generate labels for K8s resources"""
         return {
@@ -256,14 +256,48 @@ exec /opt/PaddleX/oneclick_entrypoint.sh
             }
         }
     
-    def _allocate_node_port(self) -> int:
-        """Allocate an available NodePort"""
-        used_ports = set()
-        
+    def _cleanup_orphaned_services(self) -> list[str]:
+        """Delete services labeled as notebook instances whose pods no longer exist."""
+        cleaned: list[str] = []
         try:
             services = self.core_v1.list_namespaced_service(
                 namespace=self.namespace,
-                label_selector=f"app={settings.NOTEBOOK_LABEL_PREFIX}"
+                label_selector=f"app={settings.NOTEBOOK_LABEL_PREFIX}",
+            )
+        except ApiException as e:
+            logger.warning(f"Error listing services for orphan cleanup: {e}")
+            return cleaned
+
+        for svc in services.items:
+            instance_id = svc.metadata.labels.get("instance-id")
+            if not instance_id:
+                continue
+            try:
+                self.core_v1.read_namespaced_pod(
+                    name=instance_id, namespace=self.namespace
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    try:
+                        self.core_v1.delete_namespaced_service(
+                            name=svc.metadata.name, namespace=self.namespace
+                        )
+                        cleaned.append(svc.metadata.name)
+                        logger.info(
+                            f"Cleaned orphaned service {svc.metadata.name} "
+                            f"(pod {instance_id} not found)"
+                        )
+                    except ApiException as del_err:
+                        logger.warning(f"Failed to delete orphaned service {svc.metadata.name}: {del_err}")
+        return cleaned
+
+    def _allocate_node_port(self) -> int:
+        """Allocate an available NodePort, scanning all services in the namespace."""
+        used_ports = set()
+
+        try:
+            services = self.core_v1.list_namespaced_service(
+                namespace=self.namespace,
             )
             for svc in services.items:
                 for port in svc.spec.ports or []:
@@ -363,6 +397,9 @@ exec /opt/PaddleX/oneclick_entrypoint.sh
         existing = self.get_instance_by_id(instance_id)
         if existing:
             return existing
+
+        # Clean up orphaned services before allocating a port
+        self._cleanup_orphaned_services()
         
         # Allocate NodePort
         node_port = self._allocate_node_port()
@@ -385,7 +422,7 @@ exec /opt/PaddleX/oneclick_entrypoint.sh
             logger.error(f"Failed to create pod: {e}")
             raise
         
-        # Create Service
+        # Create Service (replace stale one on 409 conflict)
         svc_manifest = self._get_service_manifest(email, instance_id, node_port)
         try:
             self.core_v1.create_namespaced_service(
@@ -394,10 +431,24 @@ exec /opt/PaddleX/oneclick_entrypoint.sh
             )
             logger.info(f"Created service {instance_id}-svc with NodePort {node_port}")
         except ApiException as e:
-            logger.error(f"Failed to create service: {e}")
-            # Cleanup pod if service creation fails
-            self.delete_instance_by_id(instance_id)
-            raise
+            if e.status == 409:
+                logger.warning(f"Service {instance_id}-svc already exists, replacing it")
+                try:
+                    self.core_v1.delete_namespaced_service(
+                        name=f"{instance_id}-svc", namespace=self.namespace
+                    )
+                    self.core_v1.create_namespaced_service(
+                        namespace=self.namespace, body=svc_manifest
+                    )
+                    logger.info(f"Replaced service {instance_id}-svc with NodePort {node_port}")
+                except ApiException as retry_err:
+                    logger.error(f"Failed to replace service: {retry_err}")
+                    self.delete_instance_by_id(instance_id)
+                    raise retry_err
+            else:
+                logger.error(f"Failed to create service: {e}")
+                self.delete_instance_by_id(instance_id)
+                raise
         
         notebook_path = github_info.get("path") if github_info else None
         

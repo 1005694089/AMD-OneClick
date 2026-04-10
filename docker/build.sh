@@ -7,6 +7,7 @@
 #   ./docker/build.sh oneclick     # Build oneclick image only  
 #   ./docker/build.sh allinone     # Build all-in-one image only
 #   ./docker/build.sh manager      # Build manager image only
+#   ./docker/build.sh rocm-allinone # Build ROCm all-in-one image only
 #   ./docker/build.sh push         # Push all images to Docker Hub
 
 set -e
@@ -16,6 +17,7 @@ BASE_IMAGE="vivienfanghua/vllm_paddle:base"
 ONECLICK_IMAGE="vivienfanghua/vllm_paddle:ppocr-oneclick"
 ALLINONE_IMAGE="vivienfanghua/vllm_paddle:all-in-one"
 MANAGER_IMAGE="vivienfanghua/amd-ppocr-vl-manager:latest"
+ROCM_ALLINONE_IMAGE="vivienfanghua/vllm_paddle:rocm-all-in-one"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +49,20 @@ build_allinone() {
     echo "✅ All-in-one image built successfully"
 }
 
+build_rocm_allinone() {
+    echo "=========================================="
+    echo "Building ROCm All-in-One Image: $ROCM_ALLINONE_IMAGE"
+    echo "=========================================="
+    if [[ ! -f docker/paddlepaddle_dcu-*.whl ]]; then
+        echo "ERROR: No paddlepaddle_dcu-*.whl found in docker/"
+        echo "Copy the ROCm wheel first:"
+        echo "  cp /path/to/paddlepaddle_dcu-*.whl docker/"
+        exit 1
+    fi
+    docker build -f docker/Dockerfile.rocm-all-in-one -t "$ROCM_ALLINONE_IMAGE" .
+    echo "ROCm all-in-one image built successfully"
+}
+
 build_manager() {
     echo "=========================================="
     echo "Building Manager Image: $MANAGER_IMAGE"
@@ -71,8 +87,11 @@ push_images() {
     
     echo "Pushing $MANAGER_IMAGE..."
     docker push "$MANAGER_IMAGE"
+
+    echo "Pushing $ROCM_ALLINONE_IMAGE..."
+    docker push "$ROCM_ALLINONE_IMAGE"
     
-    echo "✅ All images pushed successfully"
+    echo "All images pushed successfully"
 }
 
 case "${1:-all}" in
@@ -84,6 +103,9 @@ case "${1:-all}" in
         ;;
     allinone)
         build_allinone
+        ;;
+    rocm-allinone)
+        build_rocm_allinone
         ;;
     manager)
         build_manager
@@ -97,15 +119,16 @@ case "${1:-all}" in
         push_images
         ;;
     *)
-        echo "Usage: $0 {all|base|oneclick|allinone|manager|push}"
+        echo "Usage: $0 {all|base|oneclick|allinone|rocm-allinone|manager|push}"
         echo ""
         echo "Commands:"
-        echo "  all       - Build all images (base → oneclick → manager)"
-        echo "  base      - Build base image only (Paddle + PaddleX)"
-        echo "  oneclick  - Build oneclick image only (requires base)"
-        echo "  allinone  - Build all-in-one image only"
-        echo "  manager   - Build manager image only"
-        echo "  push      - Push all images to Docker Hub"
+        echo "  all            - Build all images (base → oneclick → manager)"
+        echo "  base           - Build base image only (Paddle + PaddleX)"
+        echo "  oneclick       - Build oneclick image only (requires base)"
+        echo "  allinone       - Build all-in-one image only"
+        echo "  rocm-allinone  - Build ROCm all-in-one image (ROCm wheel + PaddleX)"
+        echo "  manager        - Build manager image only"
+        echo "  push           - Push all images to Docker Hub"
         exit 1
         ;;
 esac
