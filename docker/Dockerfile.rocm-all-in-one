@@ -130,10 +130,19 @@ COPY docker/verify_inference.sh /opt/PaddleX/verify_inference.sh
 RUN chmod +x /opt/PaddleX/oneclick_entrypoint.sh /opt/PaddleX/verify_inference.sh
 
 # ============================================================
+# Paddle Source (for reference/debugging)
+# ============================================================
+RUN git clone --depth 1 -b feat/rocm-ocr-vl-all-in-one-images-20260404 \
+        https://github.com/M4jupitercannon/Paddle.git /workspace/Paddle
+
+# ============================================================
 # Workspace Setup
 # ============================================================
-RUN mkdir -p /workspace/PaddleX/notebooks
-COPY notebooks/ /workspace/PaddleX/notebooks/
+# Symlink /workspace/PaddleX -> /opt/PaddleX so source code is visible
+# under the workspace, while keeping the editable pip install intact.
+RUN ln -snf /opt/PaddleX /workspace/PaddleX
+RUN mkdir -p /opt/PaddleX/notebooks
+COPY notebooks/ /opt/PaddleX/notebooks/
 
 # ============================================================
 # Build-time Verification (MUST pass or build fails)
