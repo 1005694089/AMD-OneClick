@@ -132,8 +132,8 @@ RUN chmod +x /opt/PaddleX/oneclick_entrypoint.sh /opt/PaddleX/verify_inference.s
 # ============================================================
 # Paddle Source (for reference/debugging)
 # ============================================================
-RUN git clone --depth 1 -b feat/rocm-ocr-vl-all-in-one-images-20260404 \
-        https://github.com/M4jupitercannon/Paddle.git /workspace/Paddle
+RUN git clone --depth 1 \
+        https://github.com/ROCm/Paddle.git /workspace/Paddle
 
 # ============================================================
 # Workspace Setup
