@@ -12,13 +12,13 @@ Base image for all AMD OneClick instance types: Jupyter, OpenCode, and OpenCLAW.
 
 ## Base Image
 
-`rocm/vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1`
+`rocm/vllm-dev:rocm7.2.1_navi_ubuntu24.04_py3.12_pytorch_2.9_vllm_0.16.0`
 
-Includes ROCm 7.1.1, PyTorch 2.8, vLLM 0.10.2rc1, Python 3.12, Ubuntu 24.04.
+Includes ROCm 7.2.1, PyTorch 2.9, vLLM 0.16.0, Python 3.12, Ubuntu 24.04.
 
 ## Build & Push
 
 ```bash
-docker build -t crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:latest .
-docker push crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:latest
+docker build -t crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416 .
+docker push crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416
 ```

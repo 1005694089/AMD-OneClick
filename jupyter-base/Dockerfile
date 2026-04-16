@@ -1,6 +1,6 @@
 # AMD ROCm Base Image
 # Pre-installed with Jupyter Lab, Rust/Cargo, and OpenCode CLI
-FROM docker.io/rocm/vllm-dev:rocm7.1.1_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1
+FROM docker.io/rocm/vllm-dev:rocm7.2.1_navi_ubuntu24.04_py3.12_pytorch_2.9_vllm_0.16.0
 
 LABEL maintainer="AMD OneClick Team"
 LABEL description="AMD ROCm base image with Jupyter Lab, Rust, and OpenCode"
