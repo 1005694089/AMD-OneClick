@@ -11,7 +11,8 @@ ENV SHELL=/bin/bash
 WORKDIR /app
 
 # Install system dependencies (Node.js 20.x, build tools)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+RUN rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     build-essential \
