@@ -1,0 +1,161 @@
+# AMD OneClick Manager v2 - isolated deployment for OAuth/Credits rollout
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: amd-oneclick-manager-v2
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: amd-oneclick-manager-v2
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: amd-oneclick-manager-v2
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: amd-oneclick-manager-v2
+subjects:
+  - kind: ServiceAccount
+    name: amd-oneclick-manager-v2
+    namespace: default
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amd-oneclick-config-v2
+  namespace: default
+data:
+  K8S_NAMESPACE: "default"
+  DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+  CPU_LIMIT: "16"
+  MEMORY_LIMIT: "64Gi"
+  GPU_LIMIT: "1"
+  CPU_REQUEST: "8"
+  MEMORY_REQUEST: "32Gi"
+  IDLE_TIMEOUT_MINUTES: "10"
+  MAX_LIFETIME_HOURS: "6"
+  SERVICE_HOST: "36.151.243.69"
+  NODE_PORT_BASE: "30000"
+  NOTEBOOK_TOKEN: "amd-oneclick"
+  DATABASE_PATH: "/data/amd-oneclick.db"
+  GITHUB_REDIRECT_URI: "http://36.151.243.69:30088/auth/github/callback"
+  MODELSCOPE_REDIRECT_URI: "http://36.151.243.69:30088/auth/modelscope/callback"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: amd-oneclick-secrets-v2
+  namespace: default
+type: Opaque
+stringData:
+  ADMIN_PASSWORD: "admin123"
+  SESSION_SECRET: "amd-oneclick-v2-session-secret"
+  GITHUB_CLIENT_ID: "Ov23li7y77PVcEKykqXV"
+  GITHUB_CLIENT_SECRET: "6f40a5e5b81c328f77c7cdd6e9bad7157a62f2a7"
+  MODELSCOPE_CLIENT_ID: ""
+  MODELSCOPE_CLIENT_SECRET: ""
+  MODELSCOPE_AUTH_URL: "https://modelscope.cn/oauth/authorize"
+  MODELSCOPE_TOKEN_URL: "https://modelscope.cn/oauth/token"
+  MODELSCOPE_USERINFO_URL: "https://modelscope.cn/api/v1/user"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amd-oneclick-manager-v2
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amd-oneclick-manager-v2
+  template:
+    metadata:
+      labels:
+        app: amd-oneclick-manager-v2
+    spec:
+      serviceAccountName: amd-oneclick-manager-v2
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 8.8.4.4
+        searches:
+          - default.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+        options:
+          - name: ndots
+            value: "5"
+      containers:
+        - name: manager
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:oauth-credit-manager
+          imagePullPolicy: Always
+          workingDir: /app
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: amd-oneclick-config-v2
+            - secretRef:
+                name: amd-oneclick-secrets-v2
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/lib/amd-oneclick-manager-v2
+            type: DirectoryOrCreate
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amd-oneclick-manager-v2
+  namespace: default
+spec:
+  selector:
+    app: amd-oneclick-manager-v2
+  type: NodePort
+  ports:
+    - port: 80
+      targetPort: 8000
+      nodePort: 30088

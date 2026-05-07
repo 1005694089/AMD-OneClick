@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Profile - AMD Radeon Cloud</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/reset.css" />
+  <script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
+  <style>
+    body { margin:0; background:#f5f6fb; }
+    #root { min-height:100vh; }
+    .app-header { height:64px; display:flex; align-items:center; justify-content:space-between; padding:0 28px; background:#fff; border-bottom:1px solid #edf0f5; position:sticky; top:0; z-index:20; }
+    .left-header { display:flex; align-items:center; gap:32px; }
+    .brand { display:flex; align-items:center; gap:12px; font-weight:800; font-size:20px; }
+    .brand img { width:40px; height:40px; object-fit:contain; }
+    .content { max-width:980px; margin:0 auto; padding:40px 24px 64px; }
+    .profile-hero { background:#050505; color:#fff; border-radius:24px; padding:34px; margin-bottom:24px; }
+    .profile-grid { display:grid; grid-template-columns: 1fr 1fr; gap:18px; }
+    .avatar-name { max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    @media (max-width:820px) { .app-header { padding:0 16px; } .left-header .ant-menu { display:none; } .profile-grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const { Avatar, Button, Card, Descriptions, Dropdown, Layout, Menu, Space, Statistic, Typography, Alert } = antd;
+    const { Header, Content } = Layout;
+    const { Title, Text, Paragraph } = Typography;
+    const user = {{ (user or {}) | tojson }};
+    const activeInstance = {{ (active_instance or {}) | tojson }};
+    const githubEnabled = {{ github_enabled | tojson }};
+    const modelscopeEnabled = {{ modelscope_enabled | tojson }};
+
+    function avatarNode(u, size=48) {
+      if (!u || !u.email) return React.createElement(Avatar, { size, style:{ background:'linear-gradient(135deg,#8ea7ff,#b865ff)' } }, '?');
+      if (u.avatar_url) return React.createElement(Avatar, { src:u.avatar_url, size });
+      return React.createElement(Avatar, { size, style:{ background:'linear-gradient(135deg,#8ea7ff,#b865ff)' } }, (u.email||'?')[0].toUpperCase());
+    }
+
+    function UserMenu() {
+      if (!user || !user.email) {
+        const items = [
+          githubEnabled ? { key:'github', label:React.createElement('a', {href:'/auth/github/login'}, 'Login with GitHub') } : null,
+          modelscopeEnabled ? { key:'modelscope', label:React.createElement('a', {href:'/auth/modelscope/login'}, 'Login with ModelScope') } : null,
+        ].filter(Boolean);
+        return React.createElement(Dropdown, { menu:{items}, placement:'bottomRight', trigger:['click'] }, React.createElement(Button, {shape:'round'}, 'Login'));
+      }
+      const items = [
+        { key:'profile', label:React.createElement('a', {href:'/profile'}, 'Profile') },
+        { key:'github', label:React.createElement('a', {href:'/auth/github/login'}, 'Switch to GitHub') },
+        { key:'modelscope', label:React.createElement('a', {href:'/auth/modelscope/login'}, 'Switch to ModelScope') },
+        { type:'divider' },
+        { key:'logout', label:React.createElement('a', {href:'/auth/logout'}, 'Logout') },
+      ];
+      return React.createElement(Dropdown, { menu:{items}, placement:'bottomRight', trigger:['click'] }, React.createElement(Button, {type:'text'}, React.createElement(Space, null, avatarNode(user, 36), React.createElement('span', {className:'avatar-name'}, user.name || user.email))));
+    }
+
+    function App() {
+      return React.createElement(Layout, null,
+        React.createElement(Header, {className:'app-header'},
+          React.createElement('div', {className:'left-header'},
+            React.createElement('div', {className:'brand'}, React.createElement('img', {src:'https://amd-ai-academy.com/static/image.png'}), React.createElement('span', null, 'AMD Radeon Cloud')),
+            React.createElement(Menu, {mode:'horizontal', selectedKeys:['profile'], items:[{key:'notebook',label:React.createElement('a',{href:'/'},'Notebook')},{key:'space',label:'Space'},{key:'contest',label:'Contest'}], style:{borderBottom:0,minWidth:300}})
+          ),
+          React.createElement(UserMenu)
+        ),
+        React.createElement(Content, {className:'content'},
+          user && user.email ? React.createElement(React.Fragment, null,
+            React.createElement('section', {className:'profile-hero'},
+              React.createElement(Space, {size:22, align:'center'},
+                avatarNode(user, 88),
+                React.createElement('div', null,
+                  React.createElement(Text, {style:{color:'#aaa7bc'}}, user.provider || 'user'),
+                  React.createElement(Title, {level:1, style:{color:'#fff', margin:'6px 0'}}, user.name || user.email),
+                  React.createElement(Text, {style:{color:'#c5c2cf'}}, user.email)
+                )
+              )
+            ),
+            React.createElement('div', {className:'profile-grid'},
+              React.createElement(Card, null, React.createElement(Statistic, {title:'Credits Available', value:user.credits}), React.createElement(Paragraph, {type:'secondary', style:{marginTop:16}}, 'Usage costs 1 credit per GPU per hour. Each account can keep one active instance.')),
+              React.createElement(Card, {title:'Active Instance'}, activeInstance && activeInstance.instance_id ? React.createElement(React.Fragment, null,
+                React.createElement(Descriptions, {column:1, size:'small', items:[
+                  {key:'id', label:'Instance', children:activeInstance.instance_id},
+                  {key:'gpu', label:'GPU', children:`${activeInstance.gpu_count} GPU`},
+                  {key:'image', label:'Image', children:activeInstance.image},
+                ]}),
+                activeInstance.node_port && React.createElement(Button, {type:'primary', href:`http://36.151.243.69:${activeInstance.node_port}/lab?token=amd-oneclick`, target:'_blank', style:{marginTop:16}}, 'Open Notebook')
+              ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
+            ),
+            React.createElement(Space, {style:{marginTop:24}}, React.createElement(Button, {type:'primary', href:'/'}, 'Launch Notebook'), React.createElement(Button, {href:'/auth/logout'}, 'Logout'))
+          ) : React.createElement(React.Fragment, null,
+            React.createElement('section', {className:'profile-hero'}, React.createElement(Text, {style:{color:'#aaa7bc'}}, 'Account'), React.createElement(Title, {level:1, style:{color:'#fff', marginTop:8}}, 'Sign in to AMD Radeon Cloud'), React.createElement(Paragraph, {style:{color:'#c5c2cf', maxWidth:620}}, 'Use GitHub or ModelScope to claim credits and launch GPU notebooks.')),
+            React.createElement('div', {className:'profile-grid'},
+              React.createElement(Card, {title:'GitHub'}, React.createElement(Paragraph, {type:'secondary'}, 'Recommended for GitHub-based developer workflows.'), githubEnabled ? React.createElement(Button, {type:'primary', href:'/auth/github/login'}, 'Continue with GitHub') : React.createElement(Alert, {type:'warning', message:'GitHub OAuth is not configured'})),
+              React.createElement(Card, {title:'ModelScope'}, React.createElement(Paragraph, {type:'secondary'}, 'Use your ModelScope identity and avatar.'), modelscopeEnabled ? React.createElement(Button, {type:'primary', href:'/auth/modelscope/login'}, 'Continue with ModelScope') : React.createElement(Alert, {type:'warning', message:'ModelScope OAuth is not configured'}))
+            )
+          )
+        )
+      );
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+  </script>
+</body>
+</html>

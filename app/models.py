@@ -8,9 +8,18 @@ from pydantic import BaseModel, EmailStr
 
 class NotebookRequest(BaseModel):
     """Request model for creating a notebook instance"""
-    email: EmailStr
+    email: Optional[EmailStr] = None
     image: Optional[str] = None
     instance_type: str = "jupyter"
+    gpu_count: int = 1
+
+
+class ImageRequest(BaseModel):
+    """Request model for managing image catalog entries"""
+    name: str
+    image: str
+    description: Optional[str] = ""
+    enabled: bool = True
 
 
 class GitHubNotebookInfo(BaseModel):
@@ -57,6 +66,7 @@ class NotebookListItem(BaseModel):
     last_activity: Optional[str] = None
     uptime_minutes: int
     instance_type: str = "jupyter"
+    gpu_count: int = 1
     github_org: Optional[str] = None
     github_repo: Optional[str] = None
     github_path: Optional[str] = None

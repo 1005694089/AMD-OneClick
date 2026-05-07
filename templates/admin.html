@@ -304,6 +304,32 @@
             animation: slideIn 0.3s ease;
         }
 
+        .image-manager {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 32px;
+        }
+
+        .image-form {
+            display: grid;
+            grid-template-columns: 1fr 2fr 1fr auto;
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .image-form input {
+            padding: 10px;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+        }
+
+        .image-list {
+            margin-top: 16px;
+            font-size: 13px;
+        }
+
         @keyframes slideIn {
             from {
                 transform: translateY(20px);
@@ -346,6 +372,17 @@
                 <div class="stat-value" id="pendingInstances">0</div>
                 <div class="stat-label">Pending</div>
             </div>
+        </div>
+
+        <div class="image-manager">
+            <h3>Image Catalog</h3>
+            <div class="image-form">
+                <input id="imageName" placeholder="Display name">
+                <input id="imageRef" placeholder="Registry image reference">
+                <input id="imageDesc" placeholder="Description">
+                <button class="btn btn-primary" onclick="createImage()">Add Image</button>
+            </div>
+            <div class="image-list" id="imageList">Loading images...</div>
         </div>
 
         <div class="table-container">
@@ -413,6 +450,57 @@
             const data = await fetchInstances();
             updateStats(data);
             renderTable(data.instances);
+            refreshImages();
+        }
+
+        async function refreshImages() {
+            try {
+                const response = await fetch('/api/admin/images');
+                const data = await response.json();
+                document.getElementById('imageList').innerHTML = data.images.map(img => `
+                    <div style="display:flex;justify-content:space-between;gap:12px;padding:8px;border-bottom:1px solid #eee;">
+                        <div>
+                            <strong>${escapeHtml(img.name)}</strong>
+                            <span style="color:#666;">${img.enabled ? 'enabled' : 'disabled'}</span><br>
+                            <code>${escapeHtml(img.image)}</code>
+                        </div>
+                        <button class="btn btn-sm btn-danger" onclick="deleteImage(${img.id})">Delete</button>
+                    </div>
+                `).join('');
+            } catch (error) {
+                document.getElementById('imageList').textContent = 'Failed to load images';
+            }
+        }
+
+        async function createImage() {
+            const payload = {
+                name: document.getElementById('imageName').value.trim(),
+                image: document.getElementById('imageRef').value.trim(),
+                description: document.getElementById('imageDesc').value.trim(),
+                enabled: true,
+            };
+            if (!payload.name || !payload.image) {
+                showToast('Image name and reference are required');
+                return;
+            }
+            const response = await fetch('/api/admin/images', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (response.ok) {
+                showToast('Image added');
+                refreshImages();
+            } else {
+                showToast('Failed to add image');
+            }
+        }
+
+        async function deleteImage(id) {
+            if (!confirm('Delete this image?')) return;
+            const response = await fetch(`/api/admin/images/${id}`, { method: 'DELETE' });
+            showToast(response.ok ? 'Image deleted' : 'Failed to delete image');
+            refreshImages();
         }
 
         function updateStats(data) {

@@ -92,6 +92,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
 
     def _get_pod_manifest(self, email: str, instance_id: str, image: str,
                           instance_type: str = "jupyter",
+                          gpu_count: int = 1,
                           github_info: Optional[dict] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
@@ -126,7 +127,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 },
                 "dnsPolicy": "None",
                 "dnsConfig": {
-                    "nameservers": ["1.1.1.1", "8.8.8.8", "8.8.4.4"],
+                    "nameservers": ["8.8.8.8", "8.8.4.4"],
                     "searches": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
                     "options": [
                         {"name": "ndots", "value": "5"}
@@ -156,12 +157,12 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                             "limits": {
                                 "cpu": settings.CPU_LIMIT,
                                 "memory": settings.MEMORY_LIMIT,
-                                "amd.com/gpu": settings.GPU_LIMIT
+                                "amd.com/gpu": str(gpu_count)
                             },
                             "requests": {
                                 "cpu": settings.CPU_REQUEST,
                                 "memory": settings.MEMORY_REQUEST,
-                                "amd.com/gpu": settings.GPU_LIMIT
+                                "amd.com/gpu": str(gpu_count)
                             }
                         },
                         "env": [
@@ -283,6 +284,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
     
     def create_instance(self, email: str, image: Optional[str] = None,
                         instance_type: str = "jupyter",
+                        gpu_count: int = 1,
                         github_info: Optional[dict] = None,
                         custom_instance_id: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
@@ -298,6 +300,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         pod_manifest = self._get_pod_manifest(
             email, instance_id, image,
             instance_type=instance_type,
+            gpu_count=gpu_count,
             github_info=github_info,
         )
         try:
@@ -331,6 +334,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             "service_name": f"{instance_id}-svc",
             "image": image,
             "instance_type": instance_type,
+            "gpu_count": gpu_count,
             "status": "pending",
             "created_at": datetime.now(timezone.utc),
             "node_port": node_port,
@@ -358,6 +362,11 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             email = pod.metadata.annotations.get("amd-oneclick/email", "unknown")
             github_path = pod.metadata.annotations.get("amd-oneclick/github-path")
             instance_type = pod.metadata.annotations.get("amd-oneclick/instance-type", "jupyter")
+            gpu_count = 1
+            try:
+                gpu_count = int(pod.spec.containers[0].resources.requests.get("amd.com/gpu", 1))
+            except Exception:
+                pass
 
             return {
                 "id": instance_id,
@@ -370,6 +379,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "node_port": node_port,
                 "url": self._build_url(node_port, github_path) if node_port else None,
                 "instance_type": instance_type,
+                "gpu_count": gpu_count,
                 "github_org": pod.metadata.annotations.get("amd-oneclick/github-org"),
                 "github_repo": pod.metadata.annotations.get("amd-oneclick/github-repo"),
                 "github_path": github_path,
@@ -452,6 +462,11 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     uptime_minutes = int(uptime_delta.total_seconds() / 60)
                 
                 instance_type = pod.metadata.annotations.get("amd-oneclick/instance-type", "jupyter")
+                gpu_count = 1
+                try:
+                    gpu_count = int(pod.spec.containers[0].resources.requests.get("amd.com/gpu", 1))
+                except Exception:
+                    pass
 
                 instances.append({
                     "id": instance_id,
@@ -465,6 +480,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     "url": self._build_url(node_port, github_path) if node_port else None,
                     "uptime_minutes": uptime_minutes,
                     "instance_type": instance_type,
+                    "gpu_count": gpu_count,
                     "github_org": github_org,
                     "github_repo": github_repo,
                     "github_path": github_path,

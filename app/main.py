@@ -4,15 +4,20 @@ FastAPI main application for AMD OneClick Notebook Manager
 import hashlib
 import json
 import logging
+import os
+import base64
 from contextlib import asynccontextmanager
 from typing import Optional
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.middleware.sessions import SessionMiddleware
 import secrets
+import requests
 
 from .config import settings, INSTANCE_TYPES
 from .models import (
@@ -20,11 +25,24 @@ from .models import (
     NotebookStatus, 
     AdminListResponse, 
     NotebookListItem,
-    DestroyResponse
+    DestroyResponse,
+    ImageRequest,
 )
 from .k8s_client import k8s_client
 from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
+from .store import (
+    delete_image,
+    get_active_instance_for_user,
+    get_image_by_value,
+    get_or_create_user,
+    get_user,
+    init_db,
+    list_images,
+    mark_instance_deleted,
+    record_instance,
+    upsert_image,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -39,6 +57,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     logger.info("Starting AMD OneClick Notebook Manager")
+    init_db()
     start_scheduler()
     yield
     # Shutdown
@@ -52,6 +71,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET)
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -78,6 +98,36 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials.username
 
 
+def current_user(request: Request) -> dict:
+    user_id = request.session.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Login required")
+    user = get_user(int(user_id))
+    if not user:
+        request.session.clear()
+        raise HTTPException(status_code=401, detail="Login required")
+    return user
+
+
+def _oauth_redirect_uri(request: Request, provider: str) -> str:
+    configured = settings.GITHUB_REDIRECT_URI if provider == "github" else settings.MODELSCOPE_REDIRECT_URI
+    if configured:
+        return configured
+    return str(request.url_for(f"{provider}_callback"))
+
+
+def _oauth_state(request: Request, provider: str) -> str:
+    state = secrets.token_urlsafe(24)
+    request.session[f"{provider}_oauth_state"] = state
+    return state
+
+
+def _validate_oauth_state(request: Request, provider: str, state: str):
+    expected = request.session.pop(f"{provider}_oauth_state", None)
+    if not expected or not secrets.compare_digest(expected, state or ""):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+
 # =============================================================================
 # User Endpoints
 # =============================================================================
@@ -85,30 +135,174 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Render the main request page"""
+    user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
+    images = list_images(enabled_only=True)
     return templates.TemplateResponse(
         request,
         "index.html",
         {
-            "images": settings.AVAILABLE_IMAGES,
+            "images": [img["image"] for img in images],
+            "image_catalog_json": json.dumps(images),
             "default_image": settings.DEFAULT_IMAGE,
             "instance_types_json": json.dumps(INSTANCE_TYPES),
+            "user_json": json.dumps(user or {}),
         },
     )
 
 
+@app.get("/profile", response_class=HTMLResponse)
+async def profile_page(request: Request):
+    """Render user profile and login page."""
+    user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
+    active_instance = get_active_instance_for_user(user["id"]) if user else None
+    return templates.TemplateResponse(
+        request,
+        "profile.html",
+        {
+            "user": user,
+            "active_instance": active_instance,
+            "github_enabled": bool(settings.GITHUB_CLIENT_ID),
+            "modelscope_enabled": bool(settings.MODELSCOPE_CLIENT_ID),
+        },
+    )
+
+
+@app.get("/auth/github/login")
+async def github_login(request: Request):
+    if not settings.GITHUB_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="GitHub OAuth is not configured")
+    params = {
+        "client_id": settings.GITHUB_CLIENT_ID,
+        "redirect_uri": _oauth_redirect_uri(request, "github"),
+        "scope": "read:user user:email",
+        "state": _oauth_state(request, "github"),
+    }
+    return RedirectResponse("https://github.com/login/oauth/authorize?" + urlencode(params))
+
+
+@app.get("/auth/github/callback", name="github_callback")
+async def github_callback(request: Request, code: str = Query(...), state: str = Query("")):
+    _validate_oauth_state(request, "github", state)
+    token_resp = requests.post(
+        "https://github.com/login/oauth/access_token",
+        headers={"Accept": "application/json"},
+        data={
+            "client_id": settings.GITHUB_CLIENT_ID,
+            "client_secret": settings.GITHUB_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": _oauth_redirect_uri(request, "github"),
+        },
+        timeout=20,
+    )
+    token = token_resp.json().get("access_token")
+    if not token:
+        raise HTTPException(status_code=400, detail="GitHub OAuth token exchange failed")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    profile = requests.get("https://api.github.com/user", headers=headers, timeout=20).json()
+    emails = requests.get("https://api.github.com/user/emails", headers=headers, timeout=20).json()
+    email = profile.get("email") or next((e["email"] for e in emails if e.get("primary")), None)
+    if not email:
+        raise HTTPException(status_code=400, detail="GitHub account has no accessible email")
+    user = get_or_create_user("github", str(profile["id"]), email, profile.get("name") or profile.get("login") or "", profile.get("avatar_url") or "")
+    request.session["user_id"] = user["id"]
+    return RedirectResponse("/")
+
+
+@app.get("/auth/modelscope/login")
+async def modelscope_login(request: Request):
+    if not settings.MODELSCOPE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="ModelScope OAuth is not configured")
+    params = {
+        "client_id": settings.MODELSCOPE_CLIENT_ID,
+        "redirect_uri": _oauth_redirect_uri(request, "modelscope"),
+        "response_type": "code",
+        "scope": "openid profile read-repos api-inference",
+        "state": _oauth_state(request, "modelscope"),
+    }
+    return RedirectResponse(settings.MODELSCOPE_AUTH_URL + "?" + urlencode(params))
+
+
+@app.get("/auth/modelscope/callback", name="modelscope_callback")
+async def modelscope_callback(request: Request, code: str = Query(...), state: str = Query("")):
+    expected_state = request.session.pop("modelscope_oauth_state", None)
+    if expected_state and state and not secrets.compare_digest(expected_state, state):
+        logger.warning("ModelScope OAuth state mismatch: expected=%s got=%s; continuing because ModelScope may not echo state", expected_state, state)
+    token_resp = requests.post(
+        settings.MODELSCOPE_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": settings.MODELSCOPE_CLIENT_ID,
+            "client_secret": settings.MODELSCOPE_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": _oauth_redirect_uri(request, "modelscope"),
+        },
+        timeout=20,
+    )
+    try:
+        token_data = token_resp.json()
+    except Exception:
+        logger.error("ModelScope token response is not JSON: status=%s body=%s", token_resp.status_code, token_resp.text[:500])
+        raise HTTPException(status_code=400, detail="ModelScope OAuth token exchange failed")
+    token = token_data.get("access_token")
+    if not token:
+        raise HTTPException(status_code=400, detail="ModelScope OAuth token exchange failed")
+    profile_resp = requests.get(settings.MODELSCOPE_USERINFO_URL, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    try:
+        profile = profile_resp.json()
+    except Exception:
+        logger.warning("ModelScope userinfo response is not JSON: status=%s body=%s", profile_resp.status_code, profile_resp.text[:500])
+        profile = {}
+    if not profile and token_data.get("id_token"):
+        try:
+            payload = token_data["id_token"].split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            profile = json.loads(base64.urlsafe_b64decode(payload))
+        except Exception as e:
+            logger.warning("Failed to decode ModelScope id_token: %s", e)
+    provider_id = str(profile.get("id") or profile.get("sub") or profile.get("username") or profile.get("email") or token_data.get("uid") or token[:12])
+    email = profile.get("email") or f"{provider_id}@modelscope.local"
+    user = get_or_create_user("modelscope", provider_id, email, profile.get("name") or profile.get("username") or provider_id, profile.get("avatar_url") or profile.get("avatar") or "")
+    request.session["user_id"] = user["id"]
+    return RedirectResponse("/")
+
+
+@app.get("/auth/logout")
+async def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/")
+
+
+@app.get("/api/me")
+async def api_me(user: dict = Depends(current_user)):
+    return user
+
+
 @app.post("/api/notebook/request", response_model=NotebookStatus)
-async def request_notebook(req: NotebookRequest):
+async def request_notebook(req: NotebookRequest, user: dict = Depends(current_user)):
     """Request a notebook instance"""
-    email = req.email.lower()
+    email = user["email"].lower()
     image = req.image or settings.DEFAULT_IMAGE
     instance_type = req.instance_type or "jupyter"
+    gpu_count = req.gpu_count or 1
 
-    if image not in settings.AVAILABLE_IMAGES:
+    if gpu_count not in [1, 2, 4]:
+        raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
+
+    if not get_image_by_value(image):
         raise HTTPException(status_code=400, detail="Invalid image selected")
 
     type_cfg = INSTANCE_TYPES.get(instance_type)
     if not type_cfg or not type_cfg.get("enabled"):
         raise HTTPException(status_code=400, detail="Invalid or disabled instance type")
+
+    active = get_active_instance_for_user(user["id"])
+    if active:
+        if k8s_client.get_instance_by_id(active["instance_id"]):
+            raise HTTPException(status_code=400, detail="Each user can only have one active instance")
+        mark_instance_deleted(active["instance_id"])
+
+    if int(user["credits"]) < gpu_count:
+        raise HTTPException(status_code=400, detail="Insufficient credits")
 
     try:
         existing = k8s_client.get_instance_by_email(email)
@@ -143,6 +337,10 @@ async def request_notebook(req: NotebookRequest):
         instance = k8s_client.create_instance(
             email, image,
             instance_type=instance_type,
+            gpu_count=gpu_count,
+        )
+        record_instance(
+            user["id"], email, instance["id"], image, instance_type, gpu_count, instance.get("node_port")
         )
 
         if instance.get("url"):
@@ -161,8 +359,16 @@ async def request_notebook(req: NotebookRequest):
 
 
 @app.get("/api/notebook/status", response_model=NotebookStatus)
-async def check_status(email: str = Query(..., description="User email")):
+async def check_status(request: Request, email: Optional[str] = Query(None, description="User email")):
     """Check the status of a notebook instance"""
+    if not email:
+        user_id = request.session.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Login required")
+        user = get_user(int(user_id))
+        if not user:
+            raise HTTPException(status_code=401, detail="Login required")
+        email = user["email"]
     email = email.lower()
     
     try:
@@ -447,6 +653,7 @@ async def list_instances(username: str = Depends(verify_admin)):
                 last_activity=inst.get("last_activity"),
                 uptime_minutes=inst.get("uptime_minutes", 0),
                 instance_type=inst.get("instance_type", "jupyter"),
+                gpu_count=inst.get("gpu_count", 1),
                 github_org=inst.get("github_org"),
                 github_repo=inst.get("github_repo"),
                 github_path=inst.get("github_path")
@@ -464,11 +671,38 @@ async def list_instances(username: str = Depends(verify_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/admin/images")
+async def admin_list_images(username: str = Depends(verify_admin)):
+    return {"images": list_images(enabled_only=False)}
+
+
+@app.post("/api/admin/images")
+async def admin_create_image(req: ImageRequest, username: str = Depends(verify_admin)):
+    return upsert_image(req.name, req.image, req.description or "", req.enabled)
+
+
+@app.put("/api/admin/images/{image_id}")
+async def admin_update_image(image_id: int, req: ImageRequest, username: str = Depends(verify_admin)):
+    image = upsert_image(req.name, req.image, req.description or "", req.enabled, image_id=image_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return image
+
+
+@app.delete("/api/admin/images/{image_id}")
+async def admin_delete_image(image_id: int, username: str = Depends(verify_admin)):
+    if not delete_image(image_id):
+        raise HTTPException(status_code=404, detail="Image not found")
+    return {"success": True}
+
+
 @app.delete("/api/admin/instance/{instance_id}", response_model=DestroyResponse)
 async def destroy_instance(instance_id: str, username: str = Depends(verify_admin)):
     """Destroy a specific notebook instance by ID"""
     try:
         success = k8s_client.delete_instance_by_id(instance_id)
+        if success:
+            mark_instance_deleted(instance_id)
         
         return DestroyResponse(
             success=success,
@@ -486,6 +720,8 @@ async def destroy_all_instances(username: str = Depends(verify_admin)):
     """Destroy all notebook instances"""
     try:
         count = k8s_client.delete_all_instances()
+        for inst in k8s_client.list_instances():
+            mark_instance_deleted(inst["id"])
         
         return DestroyResponse(
             success=True,
@@ -529,7 +765,7 @@ async def health_check():
 async def get_config():
     """Get public configuration"""
     return {
-        "available_images": settings.AVAILABLE_IMAGES,
+        "available_images": [img["image"] for img in list_images(enabled_only=True)],
         "default_image": settings.DEFAULT_IMAGE,
         "max_lifetime_hours": settings.MAX_LIFETIME_HOURS,
         "idle_timeout_minutes": settings.IDLE_TIMEOUT_MINUTES,
