@@ -6,18 +6,22 @@ import json
 import logging
 import os
 import base64
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie
+from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.middleware.sessions import SessionMiddleware
 import secrets
+import httpx
 import requests
+import websockets
 
 from .config import settings, INSTANCE_TYPES
 from .models import (
@@ -34,6 +38,7 @@ from .scheduler import start_scheduler, stop_scheduler
 from .store import (
     delete_image,
     get_active_instance_for_user,
+    get_charged_credits_for_instance,
     get_image_by_value,
     get_or_create_user,
     get_user,
@@ -41,6 +46,7 @@ from .store import (
     list_images,
     mark_instance_deleted,
     record_instance,
+    update_image_sync_status,
     upsert_image,
 )
 
@@ -128,6 +134,34 @@ def _validate_oauth_state(request: Request, provider: str, state: str):
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
 
+def _instance_service_base(instance_id: str) -> str:
+    try:
+        svc = k8s_client.core_v1.read_namespaced_service(
+            name=f"{instance_id}-svc",
+            namespace=k8s_client.namespace,
+        )
+    except Exception:
+        raise HTTPException(status_code=404, detail="Instance service not found")
+    return f"http://{svc.spec.cluster_ip}:{settings.NOTEBOOK_PORT}"
+
+
+def _proxy_headers(headers) -> dict:
+    skip = {
+        "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailers", "transfer-encoding", "upgrade", "content-length",
+    }
+    return {k: v for k, v in headers.items() if k.lower() not in skip}
+
+
+def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
+    public_prefix = f"/instances/{instance_id}/"
+    if location.startswith(target_base):
+        return location.replace(target_base, public_prefix.rstrip("/"), 1)
+    if location.startswith("/"):
+        return location
+    return location
+
+
 # =============================================================================
 # User Endpoints
 # =============================================================================
@@ -155,6 +189,13 @@ async def profile_page(request: Request):
     """Render user profile and login page."""
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
     active_instance = get_active_instance_for_user(user["id"]) if user else None
+    if active_instance:
+        created_at = datetime.fromisoformat(active_instance["created_at"])
+        now = datetime.now(timezone.utc)
+        runtime_seconds = max(0, int((now - created_at).total_seconds()))
+        active_instance["runtime_minutes"] = runtime_seconds // 60
+        active_instance["runtime_hours_display"] = round(runtime_seconds / 3600, 2)
+        active_instance["credits_consumed"] = get_charged_credits_for_instance(active_instance["instance_id"])
     return templates.TemplateResponse(
         request,
         "profile.html",
@@ -227,17 +268,21 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
     expected_state = request.session.pop("modelscope_oauth_state", None)
     if expected_state and state and not secrets.compare_digest(expected_state, state):
         logger.warning("ModelScope OAuth state mismatch: expected=%s got=%s; continuing because ModelScope may not echo state", expected_state, state)
-    token_resp = requests.post(
-        settings.MODELSCOPE_TOKEN_URL,
-        data={
-            "grant_type": "authorization_code",
-            "client_id": settings.MODELSCOPE_CLIENT_ID,
-            "client_secret": settings.MODELSCOPE_CLIENT_SECRET,
-            "code": code,
-            "redirect_uri": _oauth_redirect_uri(request, "modelscope"),
-        },
-        timeout=20,
-    )
+    try:
+        token_resp = requests.post(
+            settings.MODELSCOPE_TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": settings.MODELSCOPE_CLIENT_ID,
+                "client_secret": settings.MODELSCOPE_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": _oauth_redirect_uri(request, "modelscope"),
+            },
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        logger.error("ModelScope OAuth token request failed: %s", e)
+        raise HTTPException(status_code=502, detail="ModelScope OAuth token request failed")
     try:
         token_data = token_resp.json()
     except Exception:
@@ -246,9 +291,13 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
     token = token_data.get("access_token")
     if not token:
         raise HTTPException(status_code=400, detail="ModelScope OAuth token exchange failed")
-    profile_resp = requests.get(settings.MODELSCOPE_USERINFO_URL, headers={"Authorization": f"Bearer {token}"}, timeout=20)
     try:
-        profile = profile_resp.json()
+        profile_resp = requests.get(settings.MODELSCOPE_USERINFO_URL, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    except requests.RequestException as e:
+        logger.warning("ModelScope userinfo request failed: %s", e)
+        profile_resp = None
+    try:
+        profile = profile_resp.json() if profile_resp else {}
     except Exception:
         logger.warning("ModelScope userinfo response is not JSON: status=%s body=%s", profile_resp.status_code, profile_resp.text[:500])
         profile = {}
@@ -305,39 +354,12 @@ async def request_notebook(req: NotebookRequest, user: dict = Depends(current_us
         raise HTTPException(status_code=400, detail="Insufficient credits")
 
     try:
-        existing = k8s_client.get_instance_by_email(email)
-
-        if existing:
-            status = k8s_client.get_pod_status(email)
-
-            if status == "ready" or status == "running":
-                return NotebookStatus(
-                    status="ready",
-                    message="Your instance is ready!",
-                    url=existing["url"],
-                    email=email
-                )
-            elif status in ["pending", "initializing", "loading"]:
-                return NotebookStatus(
-                    status=status,
-                    message="Your instance is being prepared...",
-                    url=existing["url"],
-                    email=email
-                )
-            elif status == "failed":
-                k8s_client.delete_instance(email)
-            else:
-                return NotebookStatus(
-                    status=status or "unknown",
-                    message="Checking instance status...",
-                    url=existing.get("url"),
-                    email=email
-                )
-
+        instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
         instance = k8s_client.create_instance(
             email, image,
             instance_type=instance_type,
             gpu_count=gpu_count,
+            custom_instance_id=instance_id,
         )
         record_instance(
             user["id"], email, instance["id"], image, instance_type, gpu_count, instance.get("node_port")
@@ -361,27 +383,33 @@ async def request_notebook(req: NotebookRequest, user: dict = Depends(current_us
 @app.get("/api/notebook/status", response_model=NotebookStatus)
 async def check_status(request: Request, email: Optional[str] = Query(None, description="User email")):
     """Check the status of a notebook instance"""
-    if not email:
-        user_id = request.session.get("user_id")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Login required")
-        user = get_user(int(user_id))
-        if not user:
-            raise HTTPException(status_code=401, detail="Login required")
-        email = user["email"]
-    email = email.lower()
+    user_id = request.session.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Login required")
+    user = get_user(int(user_id))
+    if not user:
+        raise HTTPException(status_code=401, detail="Login required")
+    email = user["email"].lower()
     
     try:
-        instance = k8s_client.get_instance_by_email(email)
-        
-        if not instance:
+        active = get_active_instance_for_user(user["id"])
+        if not active:
             return NotebookStatus(
                 status="not_found",
-                message="No notebook instance found for this email",
+                message="No notebook instance found for this user",
+                email=email
+            )
+        instance = k8s_client.get_instance_by_id(active["instance_id"])
+        
+        if not instance:
+            mark_instance_deleted(active["instance_id"])
+            return NotebookStatus(
+                status="not_found",
+                message="No notebook instance found for this user",
                 email=email
             )
         
-        status = k8s_client.get_pod_status(email)
+        status = k8s_client.get_pod_status(email, instance_id=active["instance_id"])
         
         status_messages = {
             "ready": "Your notebook is ready!",
@@ -623,6 +651,81 @@ async def check_github_status(instance_id: str = Query(...)):
 
 
 # =============================================================================
+# Instance Path Proxy
+# =============================================================================
+
+@app.api_route("/instances/{instance_id}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def proxy_instance_http(instance_id: str, path: str, request: Request):
+    """Proxy HTTP traffic to a Jupyter instance using its path-based base_url."""
+    target_base = _instance_service_base(instance_id)
+    target_url = f"{target_base}/instances/{instance_id}/{path}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+
+    body = await request.body()
+    timeout = httpx.Timeout(3600.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        upstream = await client.request(
+            request.method,
+            target_url,
+            headers=_proxy_headers(request.headers),
+            content=body,
+        )
+
+    response_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
+    }
+    if "location" in response_headers:
+        response_headers["location"] = _rewrite_location(response_headers["location"], instance_id, target_base)
+    return Response(content=upstream.content, status_code=upstream.status_code, headers=response_headers)
+
+
+@app.websocket("/instances/{instance_id}/{path:path}")
+async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path: str):
+    """Proxy WebSocket traffic for Jupyter terminals/kernels under /instances/<id>/."""
+    await websocket.accept()
+    try:
+        target_base = _instance_service_base(instance_id).replace("http://", "ws://")
+        target_url = f"{target_base}/instances/{instance_id}/{path}"
+        if websocket.url.query:
+            target_url += f"?{websocket.url.query}"
+
+        headers = []
+        if websocket.headers.get("cookie"):
+            headers.append(("cookie", websocket.headers["cookie"]))
+
+        async with websockets.connect(target_url, additional_headers=headers, open_timeout=10) as upstream:
+            async def client_to_upstream():
+                while True:
+                    msg = await websocket.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        await upstream.close()
+                        break
+                    if msg.get("text") is not None:
+                        await upstream.send(msg["text"])
+                    elif msg.get("bytes") is not None:
+                        await upstream.send(msg["bytes"])
+
+            async def upstream_to_client():
+                async for msg in upstream:
+                    if isinstance(msg, bytes):
+                        await websocket.send_bytes(msg)
+                    else:
+                        await websocket.send_text(msg)
+
+            await asyncio.gather(client_to_upstream(), upstream_to_client())
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        logger.error(f"WebSocket proxy failed for {instance_id}/{path}: {e}")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
+
+# =============================================================================
 # Admin Endpoints
 # =============================================================================
 
@@ -673,12 +776,32 @@ async def list_instances(username: str = Depends(verify_admin)):
 
 @app.get("/api/admin/images")
 async def admin_list_images(username: str = Depends(verify_admin)):
+    for image in list_images(enabled_only=False):
+        sync = k8s_client.get_image_sync_status(image["id"])
+        if image.get("sync_status") != sync["status"] or image.get("ready_count") != sync["ready_count"]:
+            update_image_sync_status(
+                image["id"],
+                sync["status"],
+                sync["desired_count"],
+                sync["ready_count"],
+                sync["message"],
+                sync["completed"],
+            )
     return {"images": list_images(enabled_only=False)}
 
 
 @app.post("/api/admin/images")
 async def admin_create_image(req: ImageRequest, username: str = Depends(verify_admin)):
-    return upsert_image(req.name, req.image, req.description or "", req.enabled)
+    image = upsert_image(req.name, req.image, req.description or "", req.enabled)
+    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    return update_image_sync_status(
+        image["id"],
+        sync["status"],
+        sync["desired_count"],
+        sync["ready_count"],
+        sync["message"],
+        sync["completed"],
+    )
 
 
 @app.put("/api/admin/images/{image_id}")
@@ -686,11 +809,36 @@ async def admin_update_image(image_id: int, req: ImageRequest, username: str = D
     image = upsert_image(req.name, req.image, req.description or "", req.enabled, image_id=image_id)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
-    return image
+    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    return update_image_sync_status(
+        image["id"],
+        sync["status"],
+        sync["desired_count"],
+        sync["ready_count"],
+        sync["message"],
+        sync["completed"],
+    )
+
+
+@app.post("/api/admin/images/{image_id}/sync")
+async def admin_sync_image(image_id: int, username: str = Depends(verify_admin)):
+    image = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    return update_image_sync_status(
+        image["id"],
+        sync["status"],
+        sync["desired_count"],
+        sync["ready_count"],
+        sync["message"],
+        sync["completed"],
+    )
 
 
 @app.delete("/api/admin/images/{image_id}")
 async def admin_delete_image(image_id: int, username: str = Depends(verify_admin)):
+    k8s_client.delete_image_sync(image_id)
     if not delete_image(image_id):
         raise HTTPException(status_code=404, detail="Image not found")
     return {"success": True}

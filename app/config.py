@@ -61,7 +61,7 @@ class Settings:
 
     NOTEBOOK_TOKEN: str = os.getenv("NOTEBOOK_TOKEN", "amd-oneclick")
     NOTEBOOK_PORT: int = 8888
-    NOTEBOOK_LABEL_PREFIX: str = "amd-oneclick"
+    NOTEBOOK_LABEL_PREFIX: str = os.getenv("NOTEBOOK_LABEL_PREFIX", "amd-oneclick")
 
     CPU_LIMIT: str = os.getenv("CPU_LIMIT", "16")
     MEMORY_LIMIT: str = os.getenv("MEMORY_LIMIT", "64Gi")
@@ -82,6 +82,7 @@ class Settings:
     SMTP_FROM: str = os.getenv("SMTP_FROM", "noreply@amd-oneclick.local")
 
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
+    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     NODE_PORT_BASE: int = int(os.getenv("NODE_PORT_BASE", "30000"))
 
     PYPI_MIRROR: str = "https://pypi.tuna.tsinghua.edu.cn/simple"

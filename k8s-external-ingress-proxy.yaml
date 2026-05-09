@@ -1,0 +1,114 @@
+# External ingress proxy deployed on the default kubeconfig cluster (DO).
+# DNS should point radeon.oneclickamd.ai to the existing ingress controller IP:
+# 134.199.132.159
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: amd-radeon-cloud-proxy
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amd-radeon-cloud-nginx
+  namespace: amd-radeon-cloud-proxy
+data:
+  default.conf: |
+    server {
+      listen 80;
+      server_name _;
+
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+
+      location / {
+        proxy_pass http://36.151.243.69:30088;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amd-radeon-cloud-nginx
+  namespace: amd-radeon-cloud-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: amd-radeon-cloud-nginx
+  template:
+    metadata:
+      labels:
+        app: amd-radeon-cloud-nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: amd-radeon-cloud-nginx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amd-radeon-cloud-nginx
+  namespace: amd-radeon-cloud-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: amd-radeon-cloud-nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: amd-radeon-cloud
+  namespace: amd-radeon-cloud-proxy
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - radeon.oneclickamd.ai
+      secretName: radeon-oneclickamd-ai-tls
+  rules:
+    - host: radeon.oneclickamd.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: amd-radeon-cloud-nginx
+                port:
+                  number: 80

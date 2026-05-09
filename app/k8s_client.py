@@ -3,6 +3,7 @@ Kubernetes client for managing notebook instances
 """
 import hashlib
 import logging
+import re
 import socket
 from datetime import datetime, timezone
 from typing import Optional
@@ -46,7 +47,11 @@ class K8sClient:
             "email-hash": hashlib.md5(email.lower().encode()).hexdigest()[:16],
         }
     
-    def _build_startup_script(self, instance_type: str = "jupyter",
+    def _jupyter_base_url(self, instance_id: str) -> str:
+        return f"/instances/{instance_id}/"
+
+    def _build_startup_script(self, instance_id: str,
+                              instance_type: str = "jupyter",
                               github_info: Optional[dict] = None) -> str:
         """Build startup script based on instance type"""
         if github_info:
@@ -70,24 +75,21 @@ if [ ! -f '{notebook_filename}' ]; then
     echo "Warning: Failed to download notebook, starting with empty directory"
 fi
 
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --notebook-dir=/app/notebooks
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir=/app/notebooks
 """
 
         if instance_type == "opencode":
             return f"""
+export PATH="/root/.opencode/bin:$PATH"
 cd /app
-echo '#!/bin/bash' > /usr/local/bin/start-opencode
-echo 'echo "=== OpenCode AI Coding Agent ==="' >> /usr/local/bin/start-opencode
-echo 'echo "Run: opencode"' >> /usr/local/bin/start-opencode
-echo 'exec opencode "$@"' >> /usr/local/bin/start-opencode
-chmod +x /usr/local/bin/start-opencode
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}'
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}'
 """
 
         # Default: jupyter
         return f"""
+export PATH="/root/.opencode/bin:$PATH"
 cd /app
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}'
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}'
 """
 
     def _get_pod_manifest(self, email: str, instance_id: str, image: str,
@@ -101,6 +103,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             "amd-oneclick/email": email,
             "amd-oneclick/created-at": datetime.now(timezone.utc).isoformat(),
             "amd-oneclick/instance-type": instance_type,
+            "amd-oneclick/path-proxy": "true",
         }
 
         if github_info:
@@ -110,7 +113,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/github-path"] = github_info.get("path", "")
             annotations["amd-oneclick/github-raw-url"] = github_info.get("raw_url", "")
 
-        startup_script = self._build_startup_script(instance_type, github_info)
+        startup_script = self._build_startup_script(instance_id, instance_type, github_info)
 
         return {
             "apiVersion": "v1",
@@ -219,10 +222,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         used_ports = set()
         
         try:
-            services = self.core_v1.list_namespaced_service(
-                namespace=self.namespace,
-                label_selector=f"app={settings.NOTEBOOK_LABEL_PREFIX}"
-            )
+            services = self.core_v1.list_namespaced_service(namespace=self.namespace)
             for svc in services.items:
                 for port in svc.spec.ports or []:
                     if port.node_port:
@@ -236,6 +236,94 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             port += 1
         
         return port
+
+    def _prepull_name(self, image_id: int) -> str:
+        return f"image-prepull-catalog-{image_id}"
+
+    def _prepull_labels(self, image_id: int) -> dict:
+        return {
+            "app": "amd-oneclick-image-prepull",
+            "image-id": str(image_id),
+        }
+
+    def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
+        """Create or replace a DaemonSet that pulls the image on every node."""
+        name = self._prepull_name(image_id)
+        labels = self._prepull_labels(image_id)
+
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(name=name, namespace=self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        body = {
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": {
+                "name": name,
+                "namespace": self.namespace,
+                "labels": labels,
+            },
+            "spec": {
+                "selector": {"matchLabels": labels},
+                "template": {
+                    "metadata": {"labels": labels},
+                    "spec": {
+                        "tolerations": [{"operator": "Exists"}],
+                        "containers": [
+                            {
+                                "name": "pull",
+                                "image": image,
+                                "imagePullPolicy": "Always",
+                                "command": ["sh", "-c", "echo image ready on $(hostname) && sleep 3600"],
+                                "resources": {
+                                    "requests": {"cpu": "10m", "memory": "16Mi"},
+                                    "limits": {"cpu": "100m", "memory": "64Mi"},
+                                },
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+        self.apps_v1.create_namespaced_daemon_set(namespace=self.namespace, body=body)
+        return self.get_image_sync_status(image_id)
+
+    def get_image_sync_status(self, image_id: int) -> dict:
+        """Return DaemonSet sync status for an image catalog entry."""
+        name = self._prepull_name(image_id)
+        try:
+            ds = self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
+            desired = ds.status.desired_number_scheduled or 0
+            ready = ds.status.number_ready or 0
+            target = max(1, int(desired * 0.8 + 0.999)) if desired else 0
+            status = "ready" if target > 0 and ready >= target else "pulling"
+            message = f"{ready}/{desired} nodes ready (threshold {target}, 80%)"
+            return {
+                "status": status,
+                "desired_count": desired,
+                "ready_count": ready,
+                "message": message,
+                "completed": status == "ready",
+            }
+        except ApiException as e:
+            if e.status == 404:
+                return {
+                    "status": "pending",
+                    "desired_count": 0,
+                    "ready_count": 0,
+                    "message": "not synced",
+                    "completed": False,
+                }
+            raise
+
+    def delete_image_sync(self, image_id: int):
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(name=self._prepull_name(image_id), namespace=self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
     
     def get_instance_by_email(self, email: str) -> Optional[dict]:
         """Get existing notebook instance for an email"""
@@ -266,15 +354,21 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "status": pod.status.phase.lower(),
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
-                "url": self._build_url(node_port) if node_port else None
+                "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None
             }
         except ApiException as e:
             if e.status == 404:
                 return None
             raise
     
-    def _build_url(self, node_port: int, notebook_path: Optional[str] = None) -> str:
+    def _build_url(self, node_port: int, notebook_path: Optional[str] = None, instance_id: Optional[str] = None, use_path_proxy: bool = False) -> str:
         """Build notebook URL"""
+        if use_path_proxy and settings.PUBLIC_BASE_URL and instance_id:
+            base = settings.PUBLIC_BASE_URL.rstrip("/")
+            if notebook_path:
+                notebook_filename = notebook_path.split("/")[-1]
+                return f"{base}/instances/{instance_id}/lab/tree/{notebook_filename}?token={settings.NOTEBOOK_TOKEN}"
+            return f"{base}/instances/{instance_id}/lab?token={settings.NOTEBOOK_TOKEN}"
         base_url = f"http://{settings.SERVICE_HOST}:{node_port}/lab?token={settings.NOTEBOOK_TOKEN}"
         if notebook_path:
             # Add notebook path to URL for direct open
@@ -313,17 +407,28 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             logger.error(f"Failed to create pod: {e}")
             raise
 
-        svc_manifest = self._get_service_manifest(email, instance_id, node_port)
-        try:
-            self.core_v1.create_namespaced_service(
-                namespace=self.namespace,
-                body=svc_manifest
-            )
-            logger.info(f"Created service {instance_id}-svc with NodePort {node_port}")
-        except ApiException as e:
-            logger.error(f"Failed to create service: {e}")
+        service_created = False
+        for _ in range(20):
+            svc_manifest = self._get_service_manifest(email, instance_id, node_port)
+            try:
+                self.core_v1.create_namespaced_service(
+                    namespace=self.namespace,
+                    body=svc_manifest
+                )
+                logger.info(f"Created service {instance_id}-svc with NodePort {node_port}")
+                service_created = True
+                break
+            except ApiException as e:
+                if e.status == 422:
+                    logger.warning(f"NodePort {node_port} rejected by API server, retrying next port: {e}")
+                    node_port += 1
+                    continue
+                logger.error(f"Failed to create service: {e}")
+                self.delete_instance_by_id(instance_id)
+                raise
+        if not service_created:
             self.delete_instance_by_id(instance_id)
-            raise
+            raise RuntimeError("Unable to allocate NodePort for service")
 
         notebook_path = github_info.get("path") if github_info else None
 
@@ -338,7 +443,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             "status": "pending",
             "created_at": datetime.now(timezone.utc),
             "node_port": node_port,
-            "url": self._build_url(node_port, notebook_path),
+            "url": self._build_url(node_port, notebook_path, instance_id, use_path_proxy=True),
             "github_info": github_info
         }
     
@@ -377,7 +482,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "status": pod.status.phase.lower(),
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
-                "url": self._build_url(node_port, github_path) if node_port else None,
+                "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                 "instance_type": instance_type,
                 "gpu_count": gpu_count,
                 "github_org": pod.metadata.annotations.get("amd-oneclick/github-org"),
@@ -477,7 +582,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     "status": pod.status.phase.lower() if pod.status.phase else "unknown",
                     "created_at": created_at.isoformat() if created_at else None,
                     "node_port": node_port,
-                    "url": self._build_url(node_port, github_path) if node_port else None,
+                    "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                     "uptime_minutes": uptime_minutes,
                     "instance_type": instance_type,
                     "gpu_count": gpu_count,

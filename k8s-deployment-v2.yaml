@@ -13,6 +13,9 @@ metadata:
   name: amd-oneclick-manager-v2
   namespace: default
 rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -37,6 +40,73 @@ subjects:
 
 ---
 apiVersion: v1
+kind: Secret
+metadata:
+  name: amd-oneclick-postgres
+  namespace: default
+type: Opaque
+stringData:
+  POSTGRES_DB: "amd_oneclick"
+  POSTGRES_USER: "amd_oneclick"
+  POSTGRES_PASSWORD: "<replace-with-postgres-password>"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amd-oneclick-postgres
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amd-oneclick-postgres
+  template:
+    metadata:
+      labels:
+        app: amd-oneclick-postgres
+    spec:
+      nodeName: wx-ms-w7900d-0005
+      containers:
+        - name: postgres
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: amd-oneclick-postgres
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: pgdata
+          hostPath:
+            path: /var/lib/amd-oneclick-postgres
+            type: DirectoryOrCreate
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amd-oneclick-postgres
+  namespace: default
+spec:
+  selector:
+    app: amd-oneclick-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: amd-oneclick-config-v2
@@ -52,11 +122,12 @@ data:
   IDLE_TIMEOUT_MINUTES: "10"
   MAX_LIFETIME_HOURS: "6"
   SERVICE_HOST: "36.151.243.69"
+  PUBLIC_BASE_URL: "https://radeon.oneclickamd.ai"
   NODE_PORT_BASE: "30000"
   NOTEBOOK_TOKEN: "amd-oneclick"
-  DATABASE_PATH: "/data/amd-oneclick.db"
-  GITHUB_REDIRECT_URI: "http://36.151.243.69:30088/auth/github/callback"
-  MODELSCOPE_REDIRECT_URI: "http://36.151.243.69:30088/auth/modelscope/callback"
+  NOTEBOOK_LABEL_PREFIX: "amd-oneclick-v2"
+  GITHUB_REDIRECT_URI: "https://radeon.oneclickamd.ai/auth/github/callback"
+  MODELSCOPE_REDIRECT_URI: "https://radeon.oneclickamd.ai/auth/modelscope/callback"
 
 ---
 apiVersion: v1
@@ -66,12 +137,12 @@ metadata:
   namespace: default
 type: Opaque
 stringData:
-  ADMIN_PASSWORD: "admin123"
-  SESSION_SECRET: "amd-oneclick-v2-session-secret"
-  GITHUB_CLIENT_ID: "Ov23li7y77PVcEKykqXV"
-  GITHUB_CLIENT_SECRET: "6f40a5e5b81c328f77c7cdd6e9bad7157a62f2a7"
-  MODELSCOPE_CLIENT_ID: ""
-  MODELSCOPE_CLIENT_SECRET: ""
+  ADMIN_PASSWORD: "<replace-with-admin-password>"
+  SESSION_SECRET: "<replace-with-random-session-secret>"
+  GITHUB_CLIENT_ID: "<replace-with-github-client-id>"
+  GITHUB_CLIENT_SECRET: "<replace-with-github-client-secret>"
+  MODELSCOPE_CLIENT_ID: "<replace-with-modelscope-client-id>"
+  MODELSCOPE_CLIENT_SECRET: "<replace-with-modelscope-client-secret>"
   MODELSCOPE_AUTH_URL: "https://modelscope.cn/oauth/authorize"
   MODELSCOPE_TOKEN_URL: "https://modelscope.cn/oauth/token"
   MODELSCOPE_USERINFO_URL: "https://modelscope.cn/api/v1/user"
@@ -92,23 +163,20 @@ spec:
       labels:
         app: amd-oneclick-manager-v2
     spec:
+      nodeName: wx-ms-w7900d-0005
       serviceAccountName: amd-oneclick-manager-v2
       dnsPolicy: None
       dnsConfig:
         nameservers:
           - 8.8.8.8
           - 8.8.4.4
-        searches:
-          - default.svc.cluster.local
-          - svc.cluster.local
-          - cluster.local
         options:
           - name: ndots
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:oauth-credit-manager
-          imagePullPolicy: Always
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:path-proxy-safe-20260509
+          imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
             - containerPort: 8000
@@ -117,9 +185,8 @@ spec:
                 name: amd-oneclick-config-v2
             - secretRef:
                 name: amd-oneclick-secrets-v2
-          volumeMounts:
-            - name: data
-              mountPath: /data
+            - secretRef:
+                name: amd-oneclick-postgres
           resources:
             limits:
               cpu: "2"
@@ -139,12 +206,6 @@ spec:
               port: 8000
             initialDelaySeconds: 60
             periodSeconds: 10
-      volumes:
-        - name: data
-          hostPath:
-            path: /var/lib/amd-oneclick-manager-v2
-            type: DirectoryOrCreate
-
 ---
 apiVersion: v1
 kind: Service

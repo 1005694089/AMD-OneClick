@@ -82,9 +82,14 @@
             React.createElement('div', {className:'profile-grid'},
               React.createElement(Card, null, React.createElement(Statistic, {title:'Credits Available', value:user.credits}), React.createElement(Paragraph, {type:'secondary', style:{marginTop:16}}, 'Usage costs 1 credit per GPU per hour. Each account can keep one active instance.')),
               React.createElement(Card, {title:'Active Instance'}, activeInstance && activeInstance.instance_id ? React.createElement(React.Fragment, null,
+                React.createElement('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:18}},
+                  React.createElement(Statistic, {title:'Running Time', value:activeInstance.runtime_hours_display || 0, suffix:'hours', precision:2}),
+                  React.createElement(Statistic, {title:'Credits Consumed', value:activeInstance.credits_consumed || 0})
+                ),
                 React.createElement(Descriptions, {column:1, size:'small', items:[
                   {key:'id', label:'Instance', children:activeInstance.instance_id},
                   {key:'gpu', label:'GPU', children:`${activeInstance.gpu_count} GPU`},
+                  {key:'runtime', label:'Runtime', children:`${activeInstance.runtime_minutes || 0} minutes`},
                   {key:'image', label:'Image', children:activeInstance.image},
                 ]}),
                 activeInstance.node_port && React.createElement(Button, {type:'primary', href:`http://36.151.243.69:${activeInstance.node_port}/lab?token=amd-oneclick`, target:'_blank', style:{marginTop:16}}, 'Open Notebook')
