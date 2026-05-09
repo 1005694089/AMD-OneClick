@@ -175,7 +175,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:path-proxy-safe-20260509
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:profile-delete-current-20260509
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

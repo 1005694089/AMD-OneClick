@@ -162,6 +162,21 @@ def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
     return location
 
 
+def _request_with_retries(method: str, url: str, retries: int = 3, **kwargs) -> requests.Response:
+    last_error = None
+    timeout = kwargs.pop("timeout", 30)
+    for attempt in range(1, retries + 1):
+        try:
+            return requests.request(method, url, timeout=timeout, **kwargs)
+        except requests.RequestException as e:
+            last_error = e
+            logger.warning("HTTP %s %s failed on attempt %s/%s: %s", method, url, attempt, retries, e)
+            if attempt < retries:
+                import time
+                time.sleep(min(2 * attempt, 5))
+    raise last_error
+
+
 # =============================================================================
 # User Endpoints
 # =============================================================================
@@ -431,6 +446,31 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
         
     except Exception as e:
         logger.error(f"Error checking status for {email}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/notebook/current", response_model=DestroyResponse)
+async def destroy_current_notebook(user: dict = Depends(current_user)):
+    """Destroy the current user's active notebook instance."""
+    active = get_active_instance_for_user(user["id"])
+    if not active:
+        return DestroyResponse(
+            success=False,
+            message="No active instance found",
+            destroyed_count=0,
+        )
+
+    instance_id = active["instance_id"]
+    try:
+        deleted = k8s_client.delete_instance_by_id(instance_id)
+        mark_instance_deleted(instance_id)
+        return DestroyResponse(
+            success=True,
+            message=f"Instance {instance_id} {'destroyed' if deleted else 'marked deleted'}",
+            destroyed_count=1 if deleted else 0,
+        )
+    except Exception as e:
+        logger.error(f"Error destroying current user instance {instance_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

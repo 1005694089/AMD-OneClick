@@ -26,7 +26,7 @@
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Descriptions, Dropdown, Layout, Menu, Space, Statistic, Typography, Alert } = antd;
+    const { Avatar, Button, Card, Descriptions, Dropdown, Layout, Menu, Popconfirm, Space, Statistic, Typography, Alert, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const user = {{ (user or {}) | tojson }};
@@ -56,6 +56,21 @@
         { key:'logout', label:React.createElement('a', {href:'/auth/logout'}, 'Logout') },
       ];
       return React.createElement(Dropdown, { menu:{items}, placement:'bottomRight', trigger:['click'] }, React.createElement(Button, {type:'text'}, React.createElement(Space, null, avatarNode(user, 36), React.createElement('span', {className:'avatar-name'}, user.name || user.email))));
+    }
+
+
+    async function destroyCurrentInstance() {
+      const res = await fetch('/api/notebook/current', { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        message.success('Instance destroyed');
+        window.location.reload();
+      } else if (res.ok) {
+        message.info(data.message || 'No active instance');
+        window.location.reload();
+      } else {
+        message.error(data.detail || 'Failed to destroy instance');
+      }
     }
 
     function App() {
@@ -92,7 +107,10 @@
                   {key:'runtime', label:'Runtime', children:`${activeInstance.runtime_minutes || 0} minutes`},
                   {key:'image', label:'Image', children:activeInstance.image},
                 ]}),
-                activeInstance.node_port && React.createElement(Button, {type:'primary', href:`http://36.151.243.69:${activeInstance.node_port}/lab?token=amd-oneclick`, target:'_blank', style:{marginTop:16}}, 'Open Notebook')
+                React.createElement(Space, {style:{marginTop:16}},
+                  activeInstance.node_port && React.createElement(Button, {type:'primary', href:`http://36.151.243.69:${activeInstance.node_port}/lab?token=amd-oneclick`, target:'_blank'}, 'Open Notebook'),
+                  React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current notebook instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))
+                )
               ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
             ),
             React.createElement(Space, {style:{marginTop:24}}, React.createElement(Button, {type:'primary', href:'/'}, 'Launch Notebook'), React.createElement(Button, {href:'/auth/logout'}, 'Logout'))
