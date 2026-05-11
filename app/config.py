@@ -72,6 +72,11 @@ class Settings:
     # supplementalGroups for AMD GPU device access (video + render)
     GPU_SUPPLEMENTAL_GROUPS: list = [44, 109]
 
+    # Host-level Hugging Face cache shared by model-sync jobs and notebook instances.
+    HF_CACHE_HOST_PATH: str = os.getenv("HF_CACHE_HOST_PATH", "/var/lib/amd-oneclick/hf-cache")
+    HF_CACHE_MOUNT_PATH: str = os.getenv("HF_CACHE_MOUNT_PATH", "/root/.cache/huggingface")
+    HF_HUB_DISABLE_XET: str = os.getenv("HF_HUB_DISABLE_XET", "1")
+
     IDLE_TIMEOUT_MINUTES: int = int(os.getenv("IDLE_TIMEOUT_MINUTES", "10"))
     MAX_LIFETIME_HOURS: int = int(os.getenv("MAX_LIFETIME_HOURS", "6"))
 

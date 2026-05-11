@@ -818,7 +818,12 @@ async def list_instances(username: str = Depends(verify_admin)):
 async def admin_list_images(username: str = Depends(verify_admin)):
     for image in list_images(enabled_only=False):
         sync = k8s_client.get_image_sync_status(image["id"])
-        if image.get("sync_status") != sync["status"] or image.get("ready_count") != sync["ready_count"]:
+        if (
+            image.get("sync_status") != sync["status"]
+            or image.get("desired_count") != sync["desired_count"]
+            or image.get("ready_count") != sync["ready_count"]
+            or image.get("sync_message") != sync["message"]
+        ):
             update_image_sync_status(
                 image["id"],
                 sync["status"],

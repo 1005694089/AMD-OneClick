@@ -119,6 +119,9 @@ data:
   GPU_LIMIT: "1"
   CPU_REQUEST: "8"
   MEMORY_REQUEST: "32Gi"
+  HF_CACHE_HOST_PATH: "/var/lib/amd-oneclick/hf-cache"
+  HF_CACHE_MOUNT_PATH: "/root/.cache/huggingface"
+  HF_HUB_DISABLE_XET: "1"
   IDLE_TIMEOUT_MINUTES: "10"
   MAX_LIFETIME_HOURS: "6"
   SERVICE_HOST: "36.151.243.69"
@@ -175,7 +178,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:profile-delete-current-20260509
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:prepull-stable-20260511-1750
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

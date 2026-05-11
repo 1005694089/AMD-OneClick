@@ -171,10 +171,14 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         "env": [
                             {"name": "SHELL", "value": "/bin/bash"},
                             {"name": "USER_EMAIL", "value": email},
-                            {"name": "INSTANCE_TYPE", "value": instance_type}
+                            {"name": "INSTANCE_TYPE", "value": instance_type},
+                            {"name": "HF_HOME", "value": settings.HF_CACHE_MOUNT_PATH},
+                            {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
+                            {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET}
                         ],
                         "volumeMounts": [
-                            {"name": "shm", "mountPath": "/dev/shm"}
+                            {"name": "shm", "mountPath": "/dev/shm"},
+                            {"name": "hf-cache", "mountPath": settings.HF_CACHE_MOUNT_PATH}
                         ]
                     }
                 ],
@@ -184,6 +188,13 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         "emptyDir": {
                             "medium": "Memory",
                             "sizeLimit": "64Gi"
+                        }
+                    },
+                    {
+                        "name": "hf-cache",
+                        "hostPath": {
+                            "path": settings.HF_CACHE_HOST_PATH,
+                            "type": "DirectoryOrCreate"
                         }
                     }
                 ],
@@ -248,6 +259,10 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
 
     def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
         """Create or replace a DaemonSet that pulls the image on every node."""
+        image = image.strip()
+        if not image:
+            raise ValueError("image must not be empty")
+
         name = self._prepull_name(image_id)
         labels = self._prepull_labels(image_id)
 
@@ -276,7 +291,11 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                                 "name": "pull",
                                 "image": image,
                                 "imagePullPolicy": "Always",
-                                "command": ["sh", "-c", "echo image ready on $(hostname) && sleep 3600"],
+                                "command": [
+                                    "sh",
+                                    "-c",
+                                    "echo image ready on $(hostname); while true; do sleep 86400; done",
+                                ],
                                 "resources": {
                                     "requests": {"cpu": "10m", "memory": "16Mi"},
                                     "limits": {"cpu": "100m", "memory": "64Mi"},
@@ -296,10 +315,29 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         try:
             ds = self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
             desired = ds.status.desired_number_scheduled or 0
-            ready = ds.status.number_ready or 0
+            ds_uid = ds.metadata.uid
+            image = ds.spec.template.spec.containers[0].image
+            pulled_nodes = set()
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=self.namespace,
+                label_selector=f"app=amd-oneclick-image-prepull,image-id={image_id}",
+            )
+            for pod in pods.items:
+                if not pod.spec.node_name:
+                    continue
+                if not any(ref.uid == ds_uid for ref in (pod.metadata.owner_references or [])):
+                    continue
+                statuses = pod.status.container_statuses or []
+                if not statuses:
+                    continue
+                status = statuses[0]
+                if status.image == image and status.image_id:
+                    pulled_nodes.add(pod.spec.node_name)
+
+            ready = len(pulled_nodes)
             target = max(1, int(desired * 0.8 + 0.999)) if desired else 0
             status = "ready" if target > 0 and ready >= target else "pulling"
-            message = f"{ready}/{desired} nodes ready (threshold {target}, 80%)"
+            message = f"{ready}/{desired} nodes pulled (threshold {target}, 80%)"
             return {
                 "status": status,
                 "desired_count": desired,

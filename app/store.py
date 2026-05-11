@@ -206,6 +206,14 @@ def list_images(enabled_only: bool = False) -> list[dict]:
 
 
 def upsert_image(name: str, image: str, description: str = "", enabled: bool = True, image_id: Optional[int] = None) -> dict:
+    name = name.strip()
+    image = image.strip()
+    description = (description or "").strip()
+    if not name:
+        raise ValueError("image name must not be empty")
+    if not image:
+        raise ValueError("image must not be empty")
+
     now = utc_now()
     with engine.begin() as conn:
         values = dict(
