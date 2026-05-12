@@ -178,7 +178,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:prepull-stable-20260511-1750
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:admin-users-20260512-1107
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

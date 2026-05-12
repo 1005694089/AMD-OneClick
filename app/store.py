@@ -197,6 +197,36 @@ def get_user(user_id: int) -> Optional[dict]:
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
 
 
+def list_users() -> list[dict]:
+    stmt = select(users).order_by(users.c.id.desc())
+    with engine.begin() as conn:
+        return [dict(r) for r in conn.execute(stmt).mappings().all()]
+
+
+def grant_user_credits(user_id: int, amount: int, reason: str = "manual admin grant") -> Optional[dict]:
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+
+    now = utc_now()
+    reason = (reason or "manual admin grant").strip() or "manual admin grant"
+    with engine.begin() as conn:
+        user = conn.execute(select(users).where(users.c.id == user_id).with_for_update()).mappings().first()
+        if not user:
+            return None
+
+        conn.execute(update(users).where(users.c.id == user_id).values(credits=users.c.credits + amount, updated_at=now))
+        conn.execute(
+            credit_ledger.insert().values(
+                user_id=user_id,
+                delta=amount,
+                reason=reason,
+                instance_id=None,
+                created_at=now,
+            )
+        )
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
 def list_images(enabled_only: bool = False) -> list[dict]:
     stmt = select(images).order_by(images.c.id)
     if enabled_only:

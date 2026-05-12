@@ -26,25 +26,30 @@
 <body>
 <div id="root"></div>
 <script>
-const { Button, Card, Form, Input, Layout, Menu, Modal, Space, Statistic, Table, Tag, Typography, Popconfirm, message } = antd;
+const { Button, Card, Form, Input, InputNumber, Layout, Menu, Modal, Space, Statistic, Table, Tag, Typography, Popconfirm, message } = antd;
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
 
 function App(){
   const [images,setImages]=React.useState([]);
   const [instances,setInstances]=React.useState([]);
+  const [users,setUsers]=React.useState([]);
   const [loading,setLoading]=React.useState(false);
   const [form]=Form.useForm();
+  const [creditForm]=Form.useForm();
   const [imageModalOpen,setImageModalOpen]=React.useState(false);
+  const [creditModalUser,setCreditModalUser]=React.useState(null);
 
   async function load(){
     setLoading(true);
     try{
-      const [imgRes, instRes] = await Promise.all([fetch('/api/admin/images'), fetch('/api/admin/instances')]);
+      const [imgRes, instRes, userRes] = await Promise.all([fetch('/api/admin/images'), fetch('/api/admin/instances'), fetch('/api/admin/users')]);
       const imgData = await imgRes.json();
       const instData = await instRes.json();
+      const userData = await userRes.json();
       setImages(imgData.images||[]);
       setInstances(instData.instances||[]);
+      setUsers(userData.users||[]);
     }catch(e){ message.error('Failed to load admin data'); }
     setLoading(false);
   }
@@ -57,6 +62,14 @@ function App(){
   async function syncImage(id){ const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Sync started':'Sync failed'); load(); }
   async function deleteImage(id){ const r=await fetch(`/api/admin/images/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Deleted':'Delete failed'); load(); }
   async function deleteInstance(id){ const r=await fetch(`/api/admin/instance/${encodeURIComponent(id)}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Destroyed':'Destroy failed'); load(); }
+  async function grantCredits(values){
+    if(!creditModalUser) return;
+    const res=await fetch(`/api/admin/users/${creditModalUser.id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
+    if(res.ok){ message.success('Credits granted'); creditForm.resetFields(); setCreditModalUser(null); load(); } else {
+      const data = await res.json().catch(()=>({detail:'Failed to grant credits'}));
+      message.error(data.detail || 'Failed to grant credits');
+    }
+  }
 
   const imageColumns=[
     {title:'Name',dataIndex:'name',width:180},
@@ -76,6 +89,15 @@ function App(){
     {title:'URL',dataIndex:'url',render:v=>v?React.createElement('a',{href:v,target:'_blank'},'Open'):'-'},
     {title:'Actions',render:(_,r)=>React.createElement(Popconfirm,{title:'Destroy instance?',onConfirm:()=>deleteInstance(r.id)},React.createElement(Button,{danger:true,size:'small'},'Destroy'))}
   ];
+  const userColumns=[
+    {title:'ID',dataIndex:'id',width:80},
+    {title:'Email',dataIndex:'email',width:240,render:v=>React.createElement(Text,{copyable:true},v)},
+    {title:'Name',dataIndex:'name',width:180,render:v=>v||'-'},
+    {title:'Provider',dataIndex:'provider',width:120,render:v=>React.createElement(Tag,null,v)},
+    {title:'Credits',dataIndex:'credits',width:120,sorter:(a,b)=>(a.credits||0)-(b.credits||0)},
+    {title:'Created',dataIndex:'created_at',width:190,render:v=>v?dayjs(v).format('YYYY-MM-DD HH:mm'):'-'},
+    {title:'Actions',width:160,render:(_,r)=>React.createElement(Button,{size:'small',type:'primary',onClick:()=>{setCreditModalUser(r); creditForm.setFieldsValue({amount:1000,reason:'manual admin grant'});}},'Grant Credits')}
+  ];
 
   return React.createElement(Layout,null,
     React.createElement(Header,{className:'header'},
@@ -88,7 +110,8 @@ function App(){
         React.createElement(Button,{type:'primary',onClick:()=>setImageModalOpen(true)},'Add Image')
       ),
       React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
-        React.createElement(Card,null,React.createElement(Space,{size:32},React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Instances',value:instances.length}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
+        React.createElement(Card,null,React.createElement(Space,{size:32},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Instances',value:instances.length}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
+        React.createElement(Card,{title:'Users'},React.createElement(Table,{rowKey:'id',columns:userColumns,dataSource:users,loading,pagination:{pageSize:10},scroll:{x:1100},size:'middle'})),
         React.createElement(Card,{title:'Image Catalog'},React.createElement(Table,{rowKey:'id',columns:imageColumns,dataSource:images,loading,pagination:false,scroll:{x:1100},size:'middle'})),
         React.createElement(Card,{title:'Instances'},React.createElement(Table,{rowKey:'id',columns:instColumns,dataSource:instances,loading,pagination:false,scroll:{x:900},size:'middle'}))
       ),
@@ -98,6 +121,13 @@ function App(){
           React.createElement(Form.Item,{name:'image',label:'Image reference',rules:[{required:true}]},React.createElement(Input.TextArea,{autoSize:true,placeholder:'registry/repo/image:tag'})),
           React.createElement(Form.Item,{name:'description',label:'Description'},React.createElement(Input,{placeholder:'optional'})),
           React.createElement(Button,{type:'primary',htmlType:'submit',block:true},'Add and Sync')
+        )
+      ),
+      React.createElement(Modal,{title:creditModalUser?`Grant Credits: ${creditModalUser.email}`:'Grant Credits',open:!!creditModalUser,onCancel:()=>setCreditModalUser(null),footer:null,destroyOnClose:true},
+        React.createElement(Form,{form:creditForm,layout:'vertical',onFinish:grantCredits},
+          React.createElement(Form.Item,{name:'amount',label:'Amount',rules:[{required:true,message:'Amount is required'}]},React.createElement(InputNumber,{min:1,precision:0,style:{width:'100%'},placeholder:'1000'})),
+          React.createElement(Form.Item,{name:'reason',label:'Reason'},React.createElement(Input,{placeholder:'manual admin grant'})),
+          React.createElement(Button,{type:'primary',htmlType:'submit',block:true},'Grant')
         )
       )
     )

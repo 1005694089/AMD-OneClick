@@ -31,6 +31,7 @@ from .models import (
     NotebookListItem,
     DestroyResponse,
     ImageRequest,
+    CreditGrantRequest,
 )
 from .k8s_client import k8s_client
 from .email_service import send_notebook_url_email
@@ -42,8 +43,10 @@ from .store import (
     get_image_by_value,
     get_or_create_user,
     get_user,
+    grant_user_credits,
     init_db,
     list_images,
+    list_users,
     mark_instance_deleted,
     record_instance,
     update_image_sync_status,
@@ -812,6 +815,22 @@ async def list_instances(username: str = Depends(verify_admin)):
     except Exception as e:
         logger.error(f"Error listing instances: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(username: str = Depends(verify_admin)):
+    return {"users": list_users()}
+
+
+@app.post("/api/admin/users/{user_id}/credits")
+async def admin_grant_credits(user_id: int, req: CreditGrantRequest, username: str = Depends(verify_admin)):
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="amount must be positive")
+
+    user = grant_user_credits(user_id, req.amount, req.reason or "manual admin grant")
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user": user}
 
 
 @app.get("/api/admin/images")

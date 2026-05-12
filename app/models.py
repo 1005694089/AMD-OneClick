@@ -22,6 +22,12 @@ class ImageRequest(BaseModel):
     enabled: bool = True
 
 
+class CreditGrantRequest(BaseModel):
+    """Request model for manually granting credits to a user"""
+    amount: int
+    reason: Optional[str] = "manual admin grant"
+
+
 class GitHubNotebookInfo(BaseModel):
     """GitHub notebook information"""
     org: str
