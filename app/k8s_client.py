@@ -4,9 +4,12 @@ Kubernetes client for managing notebook instances
 import hashlib
 import logging
 import re
+import shlex
 import socket
+import time
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import quote
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -55,14 +58,45 @@ class K8sClient:
                               github_info: Optional[dict] = None) -> str:
         """Build startup script based on instance type"""
         if github_info:
-            notebook_filename = github_info["path"].split("/")[-1]
+            notebook_path = github_info["path"].lstrip("/")
+            notebook_filename = notebook_path.split("/")[-1]
+            repo_url = github_info.get("repo_url") or github_info.get("clone_url")
+            if repo_url:
+                repo_url_q = shlex.quote(repo_url)
+                branch_q = shlex.quote(github_info.get("branch") or "main")
+                notebook_path_q = shlex.quote(notebook_path)
+                return f"""
+set -e
+export PATH="/root/.opencode/bin:$PATH"
+mkdir -p /app/workspace
+rm -rf /app/workspace/repo
+
+echo "Cloning {repo_url}..."
+for i in 1 2 3; do
+    rm -rf /app/workspace/repo
+    if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} /app/workspace/repo; then
+        echo "Repository cloned"
+        break
+    fi
+    echo "Git clone attempt $i failed, retrying..."
+    sleep $((i * 3))
+done
+
+cd /app/workspace/repo
+if [ ! -f {notebook_path_q} ]; then
+    echo "Notebook not found: {notebook_path}"
+    find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
+fi
+
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir=/app/workspace/repo
+"""
             return f"""
 mkdir -p /app/notebooks
 cd /app/notebooks
 
 echo "Downloading {notebook_filename}..."
 for i in 1 2 3; do
-    if curl -fsSL --connect-timeout 30 --max-time 120 -o '{notebook_filename}' '{github_info["raw_url"]}'; then
+    if curl -fsSL --connect-timeout 30 --max-time 120 -o {shlex.quote(notebook_filename)} {shlex.quote(github_info["raw_url"])}; then
         echo "Downloaded: {notebook_filename}"
         break
     else
@@ -71,7 +105,7 @@ for i in 1 2 3; do
     fi
 done
 
-if [ ! -f '{notebook_filename}' ]; then
+if [ ! -f {shlex.quote(notebook_filename)} ]; then
     echo "Warning: Failed to download notebook, starting with empty directory"
 fi
 
@@ -112,6 +146,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/github-branch"] = github_info.get("branch", "")
             annotations["amd-oneclick/github-path"] = github_info.get("path", "")
             annotations["amd-oneclick/github-raw-url"] = github_info.get("raw_url", "")
+            annotations["amd-oneclick/github-repo-url"] = github_info.get("repo_url", "")
+            annotations["amd-oneclick/template-id"] = github_info.get("template_id", "")
+            annotations["amd-oneclick/template-title"] = github_info.get("template_title", "")
 
         startup_script = self._build_startup_script(instance_id, instance_type, github_info)
 
@@ -136,6 +173,12 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         {"name": "ndots", "value": "5"}
                     ]
                 },
+                "hostAliases": [
+                    {
+                        "ip": "36.151.243.83",
+                        "hostnames": ["github.com"]
+                    }
+                ],
                 "tolerations": [
                     {
                         "key": "amd.com/gpu",
@@ -404,14 +447,13 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         if use_path_proxy and settings.PUBLIC_BASE_URL and instance_id:
             base = settings.PUBLIC_BASE_URL.rstrip("/")
             if notebook_path:
-                notebook_filename = notebook_path.split("/")[-1]
-                return f"{base}/instances/{instance_id}/lab/tree/{notebook_filename}?token={settings.NOTEBOOK_TOKEN}"
+                encoded_path = quote(notebook_path.lstrip("/"), safe="/")
+                return f"{base}/instances/{instance_id}/lab/tree/{encoded_path}?token={settings.NOTEBOOK_TOKEN}"
             return f"{base}/instances/{instance_id}/lab?token={settings.NOTEBOOK_TOKEN}"
         base_url = f"http://{settings.SERVICE_HOST}:{node_port}/lab?token={settings.NOTEBOOK_TOKEN}"
         if notebook_path:
-            # Add notebook path to URL for direct open
-            notebook_filename = notebook_path.split("/")[-1]
-            return f"http://{settings.SERVICE_HOST}:{node_port}/lab/tree/{notebook_filename}?token={settings.NOTEBOOK_TOKEN}"
+            encoded_path = quote(notebook_path.lstrip("/"), safe="/")
+            return f"http://{settings.SERVICE_HOST}:{node_port}/lab/tree/{encoded_path}?token={settings.NOTEBOOK_TOKEN}"
         return base_url
     
     def create_instance(self, email: str, image: Optional[str] = None,
@@ -435,15 +477,21 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             gpu_count=gpu_count,
             github_info=github_info,
         )
-        try:
-            self.core_v1.create_namespaced_pod(
-                namespace=self.namespace,
-                body=pod_manifest
-            )
-            logger.info(f"Created pod {instance_id} for {email} (type={instance_type})")
-        except ApiException as e:
-            logger.error(f"Failed to create pod: {e}")
-            raise
+        for attempt in range(1, 7):
+            try:
+                self.core_v1.create_namespaced_pod(
+                    namespace=self.namespace,
+                    body=pod_manifest
+                )
+                logger.info(f"Created pod {instance_id} for {email} (type={instance_type})")
+                break
+            except ApiException as e:
+                if e.status == 409 and attempt < 6:
+                    logger.warning("Pod %s still exists while creating; waiting for deletion before retry %s", instance_id, attempt)
+                    time.sleep(5)
+                    continue
+                logger.error(f"Failed to create pod: {e}")
+                raise
 
         service_created = False
         for _ in range(20):
@@ -492,6 +540,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 name=instance_id,
                 namespace=self.namespace
             )
+            if pod.metadata.deletion_timestamp:
+                return None
 
             try:
                 svc = self.core_v1.read_namespaced_service(
@@ -526,6 +576,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "github_org": pod.metadata.annotations.get("amd-oneclick/github-org"),
                 "github_repo": pod.metadata.annotations.get("amd-oneclick/github-repo"),
                 "github_path": github_path,
+                "template_id": pod.metadata.annotations.get("amd-oneclick/template-id"),
+                "template_title": pod.metadata.annotations.get("amd-oneclick/template-title"),
             }
         except ApiException as e:
             if e.status == 404:

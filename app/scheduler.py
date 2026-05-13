@@ -58,6 +58,21 @@ async def cleanup_job():
         logger.error(f"Cleanup job failed: {e}")
 
 
+async def template_preview_sync_job():
+    """Periodic job to refresh notebook template preview caches."""
+    from .template_sync import sync_due_template_previews
+
+    logger.info("Running template preview sync job...")
+    try:
+        results = await sync_due_template_previews(limit=5)
+        if results:
+            logger.info("Synced %s template previews", len(results))
+        else:
+            logger.info("No template previews need syncing")
+    except Exception as e:
+        logger.error(f"Template preview sync job failed: {e}")
+
+
 def start_scheduler():
     """Start the background scheduler"""
     scheduler.add_job(
@@ -67,8 +82,15 @@ def start_scheduler():
         name="Cleanup idle and expired instances",
         replace_existing=True
     )
+    scheduler.add_job(
+        template_preview_sync_job,
+        trigger=IntervalTrigger(minutes=2),
+        id="template_preview_sync_job",
+        name="Sync notebook template preview cache",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info("Scheduler started, cleanup and billing runs every 1 minute")
+    logger.info("Scheduler started; cleanup runs every 1 minute and template preview sync every 2 minutes")
 
 
 def stop_scheduler():

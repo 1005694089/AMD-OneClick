@@ -17,9 +17,10 @@
     .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; font-size: 20px; }
     .brand img { width: 40px; height: 40px; object-fit: contain; }
     .hero { background: #050505; color: #fff; text-align: center; padding: 56px 24px 76px; }
+    .hero.gallery-hero { padding: 34px 24px 70px; }
     .hero h1 { margin: 8px 0 10px; color: #fff; font-size: 36px; letter-spacing: -0.03em; }
     .hero p { margin: 0 auto; max-width: 680px; color: #b6b4c2; line-height: 1.65; }
-    .content { max-width: 860px; margin: -44px auto 64px; padding: 0 24px; }
+    .content { max-width: 1180px; margin: -44px auto 64px; padding: 0 24px; }
     .launch-card { width: 720px; max-width: 100%; margin: 0 auto; }
     .launch-card .ant-card-body { width: 100%; }
     .fixed-select { width: 100% !important; min-width: 0 !important; }
@@ -29,17 +30,36 @@
     .image-option-label { display:block; max-width: 620px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
     .launch-card { box-shadow: 0 18px 45px rgba(20, 20, 60, .08); border-radius: 18px; }
     .avatar-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .template-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:18px; margin-top:24px; }
+    .template-card { height:100%; overflow:hidden; border-radius:18px; box-shadow: 0 14px 32px rgba(25, 28, 65, .07); }
+    .template-cover { height:118px; margin:-24px -24px 18px; padding:22px; background:linear-gradient(135deg,#d8edff,#f2dcff); position:relative; overflow:hidden; }
+    .template-cover:after { content:""; position:absolute; right:-28px; top:22px; width:120px; height:120px; border-radius:32px; border:14px solid rgba(255,255,255,.45); transform:rotate(8deg); }
+    .template-title { display:block; min-height:48px; font-size:17px; line-height:1.4; font-weight:800; color:#273049; }
+    .template-desc { height:44px; overflow:hidden; color:#6c7283; line-height:1.55; margin-top:8px; }
+    .template-meta { margin-top:14px; min-height:24px; display:flex; gap:6px; flex-wrap:wrap; }
+    .guide-panel { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:16px; margin:0 0 28px; }
+    .guide-step { background:#fff; border:1px solid #edf0f6; border-radius:18px; padding:20px; box-shadow:0 14px 34px rgba(25,28,65,.06); }
+    .guide-step .num { width:34px; height:34px; display:inline-flex; align-items:center; justify-content:center; border-radius:12px; background:#15151f; color:#fff; font-weight:800; margin-bottom:14px; }
+    .guide-step h3 { margin:0 0 8px; font-size:17px; color:#252b3f; }
+    .guide-step p { margin:0; color:#747b8c; line-height:1.6; }
+    .section-title { display:flex; justify-content:space-between; align-items:flex-end; gap:16px; margin:34px 0 4px; }
+    .section-title h2 { margin:0; font-size:28px; letter-spacing:-.03em; }
+    .section-title p { margin:6px 0 0; color:#747b8c; }
+    @media (max-width: 1020px) { .template-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    @media (max-width: 900px) { .guide-panel { grid-template-columns: 1fr; } }
+    @media (max-width: 680px) { .template-grid { grid-template-columns: 1fr; } }
     @media (max-width: 820px) { .app-header { padding: 0 16px; } .left-header .ant-menu { display: none; } .content { margin-top: -32px; } .hero h1 { font-size: 30px; } }
   </style>
 </head>
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Divider, Dropdown, Form, Layout, Menu, Select, Space, Typography, message } = antd;
+    const { Avatar, Button, Card, Divider, Dropdown, Form, Layout, Menu, Select, Space, Tag, Typography, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const currentUser = {{ user_json | safe }};
     const images = {{ image_catalog_json | safe }};
+    const notebookTemplates = {{ notebook_templates_json | safe }};
     const defaultImage = {{ default_image | tojson }};
 
     function avatarNode(user) {
@@ -69,50 +89,109 @@
 
     function App() {
       const [form] = Form.useForm();
-      const [loading, setLoading] = React.useState(false);
+      const [notebookLoading, setNotebookLoading] = React.useState(false);
+      const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
       const [readyUrl, setReadyUrl] = React.useState('');
+      const [readyTemplateId, setReadyTemplateId] = React.useState(null);
+      const initialTab = new URLSearchParams(window.location.search).get('tab') === 'notebook' ? 'notebook' : 'gallery';
+      const [activeTab, setActiveTab] = React.useState(initialTab);
       const imageOptions = (images || []).map(img => ({ label: React.createElement('span', { className: 'image-option-label', title: img.image }, img.name ? `${img.name} (${img.image.split('/').pop()})` : img.image.split('/').pop()), value: img.image }));
 
       async function launch() {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const values = await form.validateFields();
-        setLoading(true); setReadyUrl('');
+        setNotebookLoading(true); setReadyUrl(''); setReadyTemplateId(null);
         try {
           const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, instance_type: 'opencode' }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
-          pollStatus(data.url); message.success('Instance requested');
-        } catch (err) { setLoading(false); message.error(err.message); }
+          pollStatus(data.url, { type: 'notebook' }); message.success('Instance requested');
+        } catch (err) { setNotebookLoading(false); message.error(err.message); }
       }
-      function pollStatus(initialUrl) {
+      async function launchTemplate(tpl) {
+        if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
+        const gpuCount = form.getFieldValue('gpu_count') || 1;
+        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyTemplateId(null);
+        try {
+          const res = await fetch(`/api/templates/${tpl.id}/launch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gpu_count: gpuCount }) });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Launch failed');
+          pollStatus(data.url, { type: 'template', templateId: tpl.id }); message.success(`Launching ${tpl.title}`);
+        } catch (err) { setLaunchingTemplateId(null); message.error(err.message); }
+      }
+      function finishPolling(target) {
+        if (target && target.type === 'template') setLaunchingTemplateId(null);
+        else setNotebookLoading(false);
+      }
+      function pollStatus(initialUrl, target) {
         let url = initialUrl || '';
+        let attempts = 0;
         const timer = setInterval(async () => {
+          attempts += 1;
           try {
             const res = await fetch('/api/notebook/status');
             const data = await res.json();
             if (data.url) url = data.url;
-            if (data.status === 'ready') { clearInterval(timer); setLoading(false); setReadyUrl(url); message.success('Notebook is ready'); }
-            if (data.status === 'failed') { clearInterval(timer); setLoading(false); message.error('Instance failed'); }
+            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setReadyUrl(url); if (target && target.templateId) setReadyTemplateId(target.templateId); message.success('Notebook is ready'); }
+            if (data.status === 'failed') { clearInterval(timer); finishPolling(target); message.error('Instance failed'); }
+            if (data.status === 'not_found') { clearInterval(timer); finishPolling(target); message.error(data.message || 'Instance not found'); }
+            if (attempts >= 240) { clearInterval(timer); finishPolling(target); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
           } catch (e) {}
         }, 3000);
+      }
+      function renderNotebookLaunch() {
+        return React.createElement(Card, { className: 'launch-card', title: 'Notebook', extra: React.createElement(Text, { type: 'secondary' }, 'Default: OpenCode') },
+          React.createElement(Form, { form, layout: 'vertical', initialValues: { image: defaultImage, gpu_count: 1 } },
+            React.createElement(Form.Item, { label: 'Account' }, React.createElement(Select, { disabled: true, value: currentUser && currentUser.email ? currentUser.email : 'Login required', options: [{ value: currentUser && currentUser.email ? currentUser.email : 'Login required', label: currentUser && currentUser.email ? currentUser.email : 'Login required' }] })),
+            React.createElement(Form.Item, { label: 'Container Image', name: 'image', rules: [{ required: true }] }, React.createElement(Select, { options: imageOptions, className: 'fixed-select', popupMatchSelectWidth: true, style: { width: '100%' }, listHeight: 360 })),
+            React.createElement(Form.Item, { label: 'GPU Count', name: 'gpu_count', rules: [{ required: true }] }, React.createElement(Select, { options: [{ value: 1, label: '1 GPU / 1 credit per hour' }, { value: 2, label: '2 GPUs / 2 credits per hour' }, { value: 4, label: '4 GPUs / 4 credits per hour' }] })),
+            React.createElement(Button, { type: 'primary', size: 'large', block: true, loading: notebookLoading, onClick: launch }, 'Launch Notebook')
+          ), readyUrl && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Button, { href: readyUrl, target: '_blank', block: true }, 'Open Notebook'))
+        );
+      }
+      function renderGallery() {
+        return React.createElement(React.Fragment, null,
+          React.createElement('div', { className: 'guide-panel' },
+            React.createElement('div', { className: 'guide-step' }, React.createElement('span', { className: 'num' }, '1'), React.createElement('h3', null, 'Pick a template'), React.createElement('p', null, 'Browse ready-to-run notebooks prepared with the right image, repo, and entry file.')),
+            React.createElement('div', { className: 'guide-step' }, React.createElement('span', { className: 'num' }, '2'), React.createElement('h3', null, 'Preview the notebook'), React.createElement('p', null, 'Open the notebook content first and check whether it matches your workshop or experiment.')),
+            React.createElement('div', { className: 'guide-step' }, React.createElement('span', { className: 'num' }, '3'), React.createElement('h3', null, 'Launch on AMD GPUs'), React.createElement('p', null, 'Start a personalized instance that clones the repo and opens the notebook directly.'))
+          ),
+          React.createElement('div', { className: 'section-title' },
+            React.createElement('div', null, React.createElement('h2', null, 'Choose a Template'), React.createElement('p', null, 'Templates for workshops, demos, and guided experiments.')),
+            React.createElement(Text, { type: 'secondary' }, `${notebookTemplates.length} templates`)
+          ),
+          React.createElement('div', { className: 'template-grid' },
+            (notebookTemplates || []).map((tpl) => React.createElement(Card, { key: tpl.id, className: 'template-card' },
+              React.createElement('div', { className: 'template-cover', style: tpl.cover_url ? { backgroundImage: `linear-gradient(135deg,rgba(216,237,255,.72),rgba(242,220,255,.72)),url(${tpl.cover_url})`, backgroundSize: 'cover', backgroundPosition: 'center' } : {} },
+                React.createElement(Text, { style: { color: '#5962d6', fontWeight: 800 } }, tpl.category || 'Notebook')
+              ),
+              React.createElement('span', { className: 'template-title' }, tpl.title),
+              React.createElement('div', { className: 'template-desc' }, tpl.description || `${tpl.repo_url} · ${tpl.notebook_path}`),
+              React.createElement('div', { className: 'template-meta' }, (tpl.tags || []).slice(0, 4).map(tag => React.createElement(Tag, { key: tag }, tag))),
+              React.createElement(Divider, { style: { margin: '16px 0 14px' } }),
+              React.createElement(Space, null,
+                React.createElement(Button, { href: `/templates/${tpl.id}/preview`, target: '_blank' }, 'Preview'),
+                React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: launchingTemplateId && launchingTemplateId !== tpl.id, onClick: () => launchTemplate(tpl) }, 'Launch'),
+                readyTemplateId === tpl.id && readyUrl && React.createElement(Button, { href: readyUrl, target: '_blank' }, 'Open Notebook')
+              )
+            ))
+          )
+        );
       }
       return React.createElement(Layout, null,
         React.createElement(Header, { className: 'app-header' },
           React.createElement('div', { className: 'left-header' },
             React.createElement('div', { className: 'brand' }, React.createElement('img', { src: 'https://amd-ai-academy.com/static/image.png' }), React.createElement('span', null, 'AMD Radeon Cloud')),
-            React.createElement(Menu, { mode: 'horizontal', selectedKeys: ['notebook'], items: [{ key: 'notebook', label: 'Notebook' }, { key: 'space', label: 'Space' }, { key: 'contest', label: 'Contest' }], style: { borderBottom: 0, minWidth: 300 } })
+            React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'notebook', label: 'Notebook' }, { key: 'space', label: 'Space', disabled: true }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 360 } })
           ), React.createElement(UserMenu)
         ),
-        React.createElement('section', { className: 'hero' }, React.createElement(Text, { style: { color: '#aaa7bc' } }, currentUser && currentUser.email ? `Good day, ${currentUser.name || currentUser.email}` : 'Welcome to AMD Radeon Cloud'), React.createElement(Title, { level: 1 }, 'Launch GPU Notebook'), React.createElement(Paragraph, null, 'Start an OpenCode-ready Jupyter notebook on AMD GPUs. Choose an image and GPU count, then launch.')),
+        React.createElement('section', { className: activeTab === 'gallery' ? 'hero gallery-hero' : 'hero' },
+          React.createElement(Text, { style: { color: '#aaa7bc' } }, currentUser && currentUser.email ? `Good day, ${currentUser.name || currentUser.email}` : 'Welcome to AMD Radeon Cloud'),
+          activeTab !== 'gallery' && React.createElement(Title, { level: 1 }, 'Launch GPU Notebook'),
+          activeTab !== 'gallery' && React.createElement(Paragraph, null, 'Start a blank OpenCode-ready Jupyter notebook on AMD GPUs. Choose an image and GPU count, then launch.')
+        ),
         React.createElement(Content, { className: 'content' },
-          React.createElement(Card, { className: 'launch-card', title: 'Notebook', extra: React.createElement(Text, { type: 'secondary' }, 'Default: OpenCode') },
-            React.createElement(Form, { form, layout: 'vertical', initialValues: { image: defaultImage, gpu_count: 1 } },
-              React.createElement(Form.Item, { label: 'Account' }, React.createElement(Select, { disabled: true, value: currentUser && currentUser.email ? currentUser.email : 'Login required', options: [{ value: currentUser && currentUser.email ? currentUser.email : 'Login required', label: currentUser && currentUser.email ? currentUser.email : 'Login required' }] })),
-              React.createElement(Form.Item, { label: 'Container Image', name: 'image', rules: [{ required: true }] }, React.createElement(Select, { options: imageOptions, className: 'fixed-select', popupMatchSelectWidth: true, style: { width: '100%' }, listHeight: 360 })),
-              React.createElement(Form.Item, { label: 'GPU Count', name: 'gpu_count', rules: [{ required: true }] }, React.createElement(Select, { options: [{ value: 1, label: '1 GPU / 1 credit per hour' }, { value: 2, label: '2 GPUs / 2 credits per hour' }, { value: 4, label: '4 GPUs / 4 credits per hour' }] })),
-              React.createElement(Button, { type: 'primary', size: 'large', block: true, loading, onClick: launch }, 'Launch Notebook')
-            ), readyUrl && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Button, { href: readyUrl, target: '_blank', block: true }, 'Open Notebook'))
-          )
+          activeTab === 'gallery' ? renderGallery() : renderNotebookLaunch()
         )
       );
     }

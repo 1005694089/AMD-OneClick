@@ -10,7 +10,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -32,23 +32,34 @@ from .models import (
     DestroyResponse,
     ImageRequest,
     CreditGrantRequest,
+    NotebookTemplateRequest,
+    TemplateLaunchRequest,
 )
 from .k8s_client import k8s_client
 from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
+from .template_sync import sync_template_preview
 from .store import (
     delete_image,
+    delete_notebook_template,
     get_active_instance_for_user,
     get_charged_credits_for_instance,
     get_image_by_value,
+    get_notebook_template,
     get_or_create_user,
+    get_template_preview_asset,
+    get_template_preview_cache,
     get_user,
     grant_user_credits,
+    ensure_template_preview_cache,
     init_db,
     list_images,
+    list_notebook_templates,
     list_users,
     mark_instance_deleted,
     record_instance,
+    template_preview_fingerprint,
+    upsert_notebook_template,
     update_image_sync_status,
     upsert_image,
 )
@@ -118,6 +129,19 @@ def current_user(request: Request) -> dict:
     return user
 
 
+def session_user(request: Request) -> Optional[dict]:
+    user_id = request.session.get("user_id")
+    if not user_id:
+        return None
+    return get_user(int(user_id))
+
+
+def current_editor(user: dict = Depends(current_user)) -> dict:
+    if not user.get("is_editor"):
+        raise HTTPException(status_code=403, detail="Editor permission required")
+    return user
+
+
 def _oauth_redirect_uri(request: Request, provider: str) -> str:
     configured = settings.GITHUB_REDIRECT_URI if provider == "github" else settings.MODELSCOPE_REDIRECT_URI
     if configured:
@@ -129,6 +153,143 @@ def _oauth_state(request: Request, provider: str) -> str:
     state = secrets.token_urlsafe(24)
     request.session[f"{provider}_oauth_state"] = state
     return state
+
+
+def _github_repo_parts(repo_url: str) -> tuple[str, str]:
+    raw = repo_url.strip()
+    if raw.startswith("git@github.com:"):
+        path = raw.split(":", 1)[1]
+    else:
+        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+        host = parsed.netloc.lower()
+        if host == "github":
+            raise ValueError("GitHub repo URL must use github.com, e.g. https://github.com/org/repo")
+        if host not in {"github.com", "www.github.com"}:
+            raise ValueError("Only GitHub repository URLs are supported for templates")
+        path = parsed.path.lstrip("/")
+
+    path = path.removesuffix(".git").rstrip("/")
+    parts = path.split("/")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        raise ValueError("Invalid GitHub repository URL, expected https://github.com/org/repo")
+    return parts[0], parts[1]
+
+
+def _github_clone_url(repo_url: str) -> str:
+    org, repo = _github_repo_parts(repo_url)
+    return f"http://github.com/{org}/{repo}.git"
+
+
+def _github_raw_url(repo_url: str, branch: str, notebook_path: str) -> str:
+    org, repo = _github_repo_parts(repo_url)
+    return f"https://raw.githubusercontent.com/{org}/{repo}/{branch}/{notebook_path.lstrip('/')}"
+
+
+def _github_raw_url_candidates(repo_url: str, branch: str, notebook_path: str) -> list[str]:
+    org, repo = _github_repo_parts(repo_url)
+    path = notebook_path.lstrip("/")
+    return [
+        f"https://raw.githubusercontent.com/{org}/{repo}/{branch}/{path}",
+        f"https://github.com/{org}/{repo}/raw/{branch}/{path}",
+        f"http://github.com/{org}/{repo}/raw/{branch}/{path}",
+    ]
+
+
+def _template_asset_base_path(template_id: int, notebook_path: str) -> str:
+    parent = notebook_path.lstrip("/").rsplit("/", 1)
+    directory = parent[0].strip("/") if len(parent) == 2 else ""
+    if directory:
+        return f"/templates/{template_id}/assets/{directory}/"
+    return f"/templates/{template_id}/assets/"
+
+
+def _template_github_info(template: dict) -> dict:
+    org, repo = _github_repo_parts(template["repo_url"])
+    return {
+        "org": org,
+        "repo": repo,
+        "branch": template["branch"],
+        "path": template["notebook_path"].lstrip("/"),
+        "raw_url": _github_raw_url(template["repo_url"], template["branch"], template["notebook_path"]),
+        "repo_url": _github_clone_url(template["repo_url"]),
+        "template_id": str(template["id"]),
+        "template_title": template["title"],
+    }
+
+
+def _save_notebook_template(
+    req: NotebookTemplateRequest,
+    template_id: Optional[int] = None,
+    owner_user_id: Optional[int] = None,
+    sort_order: Optional[int] = None,
+    enabled_override: Optional[bool] = None,
+) -> dict:
+    if not get_image_by_value(req.image):
+        raise ValueError("Template image must be an enabled image catalog entry")
+    _github_repo_parts(req.repo_url)
+    template = upsert_notebook_template(
+        req.title,
+        req.slug or "",
+        req.description or "",
+        req.category or "",
+        req.tags or "",
+        req.image,
+        req.repo_url,
+        req.branch,
+        req.notebook_path,
+        req.cover_url or "",
+        req.enabled if enabled_override is None else enabled_override,
+        req.sort_order if sort_order is None else sort_order,
+        template_id=template_id,
+        owner_user_id=owner_user_id,
+        upsert_on_slug_conflict=owner_user_id is None,
+    )
+    ensure_template_preview_cache(template, force=True)
+    _schedule_template_preview_sync(template["id"], force=True)
+    return template
+
+
+def _template_accessible_to_user(template_id: int, user: Optional[dict]) -> Optional[dict]:
+    template = get_notebook_template(template_id, enabled_only=True)
+    if template:
+        return template
+    if user:
+        return get_notebook_template(template_id, owner_user_id=user["id"])
+    return None
+
+
+def _can_manage_template(template: dict, user: Optional[dict]) -> bool:
+    if not template or not user:
+        return False
+    return template.get("owner_user_id") == user["id"]
+
+
+def _schedule_template_preview_sync(template_id: int, force: bool = False):
+    try:
+        asyncio.create_task(sync_template_preview(template_id, force=force))
+    except RuntimeError:
+        logger.warning("No running event loop available to schedule template preview sync")
+
+
+def _preview_cache_public(cache: Optional[dict]) -> dict:
+    if not cache:
+        return {}
+    return {
+        key: cache.get(key)
+        for key in [
+            "template_id",
+            "repo_url",
+            "branch",
+            "notebook_path",
+            "source_fingerprint",
+            "status",
+            "error_message",
+            "last_synced_at",
+            "next_sync_at",
+            "created_at",
+            "updated_at",
+        ]
+    }
 
 
 def _validate_oauth_state(request: Request, provider: str, state: str):
@@ -189,12 +350,14 @@ async def index(request: Request):
     """Render the main request page"""
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
     images = list_images(enabled_only=True)
+    notebook_templates = list_notebook_templates(enabled_only=True)
     return templates.TemplateResponse(
         request,
         "index.html",
         {
             "images": [img["image"] for img in images],
             "image_catalog_json": json.dumps(images),
+            "notebook_templates_json": json.dumps(notebook_templates),
             "default_image": settings.DEFAULT_IMAGE,
             "instance_types_json": json.dumps(INSTANCE_TYPES),
             "user_json": json.dumps(user or {}),
@@ -208,12 +371,21 @@ async def profile_page(request: Request):
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
     active_instance = get_active_instance_for_user(user["id"]) if user else None
     if active_instance:
-        created_at = datetime.fromisoformat(active_instance["created_at"])
-        now = datetime.now(timezone.utc)
-        runtime_seconds = max(0, int((now - created_at).total_seconds()))
-        active_instance["runtime_minutes"] = runtime_seconds // 60
-        active_instance["runtime_hours_display"] = round(runtime_seconds / 3600, 2)
-        active_instance["credits_consumed"] = get_charged_credits_for_instance(active_instance["instance_id"])
+        live_instance = k8s_client.get_instance_by_id(active_instance["instance_id"])
+        if not live_instance:
+            mark_instance_deleted(active_instance["instance_id"])
+            active_instance = None
+        else:
+            created_at = datetime.fromisoformat(active_instance["created_at"])
+            now = datetime.now(timezone.utc)
+            runtime_seconds = max(0, int((now - created_at).total_seconds()))
+            active_instance["runtime_minutes"] = runtime_seconds // 60
+            active_instance["runtime_hours_display"] = round(runtime_seconds / 3600, 2)
+            active_instance["credits_consumed"] = get_charged_credits_for_instance(active_instance["instance_id"])
+            active_instance["url"] = live_instance.get("url")
+            active_instance["github_path"] = live_instance.get("github_path")
+            active_instance["template_id"] = live_instance.get("template_id")
+            active_instance["template_title"] = live_instance.get("template_title")
     return templates.TemplateResponse(
         request,
         "profile.html",
@@ -474,6 +646,182 @@ async def destroy_current_notebook(user: dict = Depends(current_user)):
         )
     except Exception as e:
         logger.error(f"Error destroying current user instance {instance_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Notebook Template Endpoints
+# =============================================================================
+
+@app.get("/api/templates")
+async def list_public_templates():
+    return {"templates": list_notebook_templates(enabled_only=True)}
+
+
+@app.get("/api/profile/templates")
+@app.get("/api/editor/templates")
+async def profile_list_templates(user: dict = Depends(current_user)):
+    return {
+        "templates": list_notebook_templates(enabled_only=False, owner_user_id=user["id"]),
+        "images": list_images(enabled_only=True),
+    }
+
+
+@app.post("/api/profile/templates")
+@app.post("/api/editor/templates")
+async def profile_create_template(req: NotebookTemplateRequest, user: dict = Depends(current_user)):
+    try:
+        return _save_notebook_template(req, owner_user_id=user["id"], sort_order=0, enabled_override=bool(user.get("is_editor")))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/api/profile/templates/{template_id}")
+@app.put("/api/editor/templates/{template_id}")
+async def profile_update_template(template_id: int, req: NotebookTemplateRequest, user: dict = Depends(current_user)):
+    if not get_notebook_template(template_id, owner_user_id=user["id"]):
+        raise HTTPException(status_code=404, detail="Template not found")
+    try:
+        return _save_notebook_template(req, template_id=template_id, owner_user_id=user["id"], sort_order=0, enabled_override=req.enabled if user.get("is_editor") else False)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/profile/templates/{template_id}")
+@app.delete("/api/editor/templates/{template_id}")
+async def profile_delete_template(template_id: int, user: dict = Depends(current_user)):
+    if not delete_notebook_template(template_id, owner_user_id=user["id"]):
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"success": True}
+
+
+@app.get("/api/templates/{template_id}/preview-status")
+async def template_preview_status(request: Request, template_id: int):
+    template = _template_accessible_to_user(template_id, session_user(request))
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    cache = get_template_preview_cache(template_id)
+    if not cache or cache.get("source_fingerprint") != template_preview_fingerprint(template):
+        cache = ensure_template_preview_cache(template, force=True)
+        _schedule_template_preview_sync(template_id, force=True)
+    return {"template_id": template_id, "preview": _preview_cache_public(cache)}
+
+
+@app.post("/api/profile/templates/{template_id}/sync-preview")
+async def profile_sync_template_preview(template_id: int, user: dict = Depends(current_user)):
+    template = get_notebook_template(template_id, owner_user_id=user["id"])
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    cache = ensure_template_preview_cache(template, force=True)
+    _schedule_template_preview_sync(template_id, force=True)
+    return {"template_id": template_id, "preview": _preview_cache_public(cache)}
+
+
+@app.get("/templates/{template_id}/preview", response_class=HTMLResponse)
+async def preview_notebook_template(request: Request, template_id: int):
+    user = session_user(request)
+    template = _template_accessible_to_user(template_id, user)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+
+    cache = get_template_preview_cache(template_id)
+    if not cache or cache.get("source_fingerprint") != template_preview_fingerprint(template):
+        cache = ensure_template_preview_cache(template, force=True)
+        _schedule_template_preview_sync(template_id, force=True)
+
+    notebook = None
+    if cache and cache.get("notebook_json") and cache.get("status") in {"ready", "stale"}:
+        try:
+            notebook = json.loads(cache["notebook_json"])
+        except Exception as e:
+            logger.error("Cached notebook template %s is invalid JSON: %s", template_id, e)
+
+    if notebook is None:
+        return templates.TemplateResponse(
+            request,
+            "notebook_preview_status.html",
+            {
+                "template_json": json.dumps(template),
+                "preview_json": json.dumps(cache or {}),
+                "can_retry": _can_manage_template(template, user),
+            },
+            status_code=200,
+        )
+
+    return templates.TemplateResponse(
+        request,
+        "notebook_preview.html",
+        {
+            "template_json": json.dumps(template),
+            "notebook_json": json.dumps(notebook),
+            "asset_base_url": _template_asset_base_path(template_id, template["notebook_path"]),
+            "preview_json": json.dumps(cache or {}),
+        },
+    )
+
+
+@app.get("/templates/{template_id}/assets/{asset_path:path}")
+async def preview_notebook_template_asset(request: Request, template_id: int, asset_path: str):
+    template = _template_accessible_to_user(template_id, session_user(request))
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+
+    asset = get_template_preview_asset(template_id, asset_path)
+    if asset:
+        return Response(
+            content=asset["content"],
+            media_type=asset.get("content_type") or "application/octet-stream",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+    _schedule_template_preview_sync(template_id, force=True)
+    raise HTTPException(status_code=404, detail="Template asset not found")
+
+
+@app.post("/api/templates/{template_id}/launch", response_model=NotebookStatus)
+async def launch_notebook_template(template_id: int, req: TemplateLaunchRequest, user: dict = Depends(current_user)):
+    template = _template_accessible_to_user(template_id, user)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+
+    gpu_count = req.gpu_count or 1
+    if gpu_count not in [1, 2, 4]:
+        raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
+    if not get_image_by_value(template["image"]):
+        raise HTTPException(status_code=400, detail="Template image is disabled or not in the image catalog")
+
+    active = get_active_instance_for_user(user["id"])
+    if active:
+        if k8s_client.get_instance_by_id(active["instance_id"]):
+            raise HTTPException(status_code=400, detail="Each user can only have one active instance")
+        mark_instance_deleted(active["instance_id"])
+
+    if int(user["credits"]) < gpu_count:
+        raise HTTPException(status_code=400, detail="Insufficient credits")
+
+    email = user["email"].lower()
+    try:
+        github_info = _template_github_info(template)
+        instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
+        instance = k8s_client.create_instance(
+            email,
+            template["image"],
+            instance_type="opencode",
+            gpu_count=gpu_count,
+            github_info=github_info,
+            custom_instance_id=instance_id,
+        )
+        record_instance(user["id"], email, instance["id"], template["image"], "opencode", gpu_count, instance.get("node_port"))
+        if instance.get("url"):
+            send_notebook_url_email(email, instance["url"])
+        return NotebookStatus(
+            status="allocating",
+            message="Allocating resources for your notebook template...",
+            url=instance.get("url"),
+            email=email,
+            instance_id=instance["id"],
+        )
+    except Exception as e:
+        logger.error("Error launching template %s for %s: %s", template_id, email, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -831,6 +1179,46 @@ async def admin_grant_credits(user_id: int, req: CreditGrantRequest, username: s
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return {"user": user}
+
+
+@app.get("/api/admin/templates")
+async def admin_list_templates(username: str = Depends(verify_admin)):
+    return {"templates": list_notebook_templates(enabled_only=False)}
+
+
+@app.post("/api/admin/templates")
+async def admin_create_template(req: NotebookTemplateRequest, username: str = Depends(verify_admin)):
+    try:
+        return _save_notebook_template(req)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/api/admin/templates/{template_id}")
+async def admin_update_template(template_id: int, req: NotebookTemplateRequest, username: str = Depends(verify_admin)):
+    if not get_notebook_template(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    try:
+        return _save_notebook_template(req, template_id=template_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/admin/templates/{template_id}")
+async def admin_delete_template(template_id: int, username: str = Depends(verify_admin)):
+    if not delete_notebook_template(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"success": True}
+
+
+@app.post("/api/admin/templates/{template_id}/sync-preview")
+async def admin_sync_template_preview(template_id: int, username: str = Depends(verify_admin)):
+    template = get_notebook_template(template_id, enabled_only=False)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    cache = ensure_template_preview_cache(template, force=True)
+    _schedule_template_preview_sync(template_id, force=True)
+    return {"template_id": template_id, "preview": _preview_cache_public(cache)}
 
 
 @app.get("/api/admin/images")

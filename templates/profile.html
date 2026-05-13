@@ -16,9 +16,10 @@
     .left-header { display:flex; align-items:center; gap:32px; }
     .brand { display:flex; align-items:center; gap:12px; font-weight:800; font-size:20px; }
     .brand img { width:40px; height:40px; object-fit:contain; }
-    .content { max-width:980px; margin:0 auto; padding:40px 24px 64px; }
+    .content { max-width:1120px; margin:0 auto; padding:40px 24px 64px; }
     .profile-hero { background:#050505; color:#fff; border-radius:24px; padding:34px; margin-bottom:24px; }
     .profile-grid { display:grid; grid-template-columns: 1fr 1fr; gap:18px; }
+    .editor-panel { margin-top:24px; }
     .avatar-name { max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     @media (max-width:820px) { .app-header { padding:0 16px; } .left-header .ant-menu { display:none; } .profile-grid { grid-template-columns:1fr; } }
   </style>
@@ -26,7 +27,7 @@
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Descriptions, Dropdown, Layout, Menu, Popconfirm, Space, Statistic, Typography, Alert, message } = antd;
+    const { Avatar, Button, Card, Descriptions, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Select, Space, Statistic, Table, Tag, Typography, Alert, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const user = {{ (user or {}) | tojson }};
@@ -74,11 +75,180 @@
     }
 
     function App() {
+      const [templateForm] = Form.useForm();
+      const [editorTemplates, setEditorTemplates] = React.useState([]);
+      const [editorImages, setEditorImages] = React.useState([]);
+      const [editorLoading, setEditorLoading] = React.useState(false);
+      const [templateModalOpen, setTemplateModalOpen] = React.useState(false);
+      const [editingTemplate, setEditingTemplate] = React.useState(null);
+      const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
+      const isEditor = !!(user && user.is_editor);
+
+      async function loadEditorTemplates() {
+        if (!user || !user.email) return;
+        setEditorLoading(true);
+        try {
+          const res = await fetch('/api/profile/templates');
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Failed to load templates');
+          setEditorTemplates(data.templates || []);
+          setEditorImages(data.images || []);
+        } catch (e) {
+          message.error(e.message || 'Failed to load templates');
+        }
+        setEditorLoading(false);
+      }
+
+      React.useEffect(() => { loadEditorTemplates(); }, [user && user.email]);
+
+      function openTemplateModal(record) {
+        setEditingTemplate(record || null);
+        const defaultImage = editorImages[0] && editorImages[0].image;
+        templateForm.setFieldsValue(record ? {
+          ...record,
+          tags: (record.tags || []).join(', '),
+        } : {
+          branch: 'main',
+          image: defaultImage,
+        });
+        setTemplateModalOpen(true);
+      }
+
+      async function saveTemplate(values) {
+        const payload = {
+          ...values,
+          slug: editingTemplate ? editingTemplate.slug : '',
+          tags: values.tags || '',
+          enabled: isEditor ? (editingTemplate ? editingTemplate.enabled !== false : true) : false,
+          sort_order: 0,
+        };
+        const url = editingTemplate ? `/api/profile/templates/${editingTemplate.id}` : '/api/profile/templates';
+        const res = await fetch(url, {
+          method: editingTemplate ? 'PUT' : 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          message.success(editingTemplate ? 'Template updated' : 'Template added');
+          templateForm.resetFields();
+          setEditingTemplate(null);
+          setTemplateModalOpen(false);
+          loadEditorTemplates();
+        } else {
+          message.error(data.detail || 'Template save failed');
+        }
+      }
+
+      async function deleteTemplate(id) {
+        const res = await fetch(`/api/profile/templates/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          message.success('Template deleted');
+          loadEditorTemplates();
+        } else {
+          const data = await res.json().catch(() => ({}));
+          message.error(data.detail || 'Delete failed');
+        }
+      }
+
+      async function launchTemplate(record) {
+        setLaunchingTemplateId(record.id);
+        try {
+          const res = await fetch(`/api/templates/${record.id}/launch`, {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({gpu_count:1}),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Launch failed');
+          message.info('Launching notebook template...');
+          pollNotebookReady();
+        } catch (e) {
+          message.error(e.message || 'Launch failed');
+          setLaunchingTemplateId(null);
+        }
+      }
+
+      function pollNotebookReady() {
+        let attempts = 0;
+        const timer = setInterval(async () => {
+          attempts += 1;
+          try {
+            const res = await fetch('/api/notebook/status');
+            const data = await res.json();
+            if (data.status === 'ready') {
+              clearInterval(timer);
+              setLaunchingTemplateId(null);
+              message.success('Notebook is ready');
+              if (data.url) window.open(data.url, '_blank');
+              window.location.reload();
+            } else if (data.status === 'failed' || data.status === 'not_found') {
+              clearInterval(timer);
+              setLaunchingTemplateId(null);
+              message.error(data.message || 'Launch failed');
+            }
+            if (attempts >= 240) {
+              clearInterval(timer);
+              setLaunchingTemplateId(null);
+              message.warning('Launch is taking longer than expected. Please check Profile later.');
+            }
+          } catch (e) {}
+        }, 3000);
+      }
+
+      const templateColumns = [
+        {title:'Title',dataIndex:'title',width:220,render:(v,r)=>React.createElement('div',null,React.createElement('strong',null,v),React.createElement('br'),React.createElement(Text,{type:'secondary'},r.category || 'Uncategorized'))},
+        {title:'Image',dataIndex:'image',width:280,render:v=>React.createElement(Text,{code:true,copyable:true,style:{display:'block',maxWidth:260,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},title:v},v)},
+        {title:'Notebook',width:320,render:(_,r)=>React.createElement('div',null,React.createElement(Text,{code:true,copyable:true,style:{display:'block',maxWidth:300,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},title:r.repo_url},r.repo_url),React.createElement(Text,{type:'secondary'},`${r.branch}/${r.notebook_path}`))},
+        {title:'Visibility',dataIndex:'enabled',width:120,render:v=>React.createElement(Tag,{color:v?'green':'blue'},v?'Gallery':'Profile only')},
+        {title:'Actions',width:280,render:(_,r)=>React.createElement(Space,null,
+          React.createElement(Button,{size:'small',href:`/templates/${r.id}/preview`,target:'_blank'},'Preview'),
+          React.createElement(Button,{size:'small',type:'primary',loading:launchingTemplateId===r.id,onClick:()=>launchTemplate(r)},'Launch'),
+          React.createElement(Button,{size:'small',onClick:()=>openTemplateModal(r)},'Edit'),
+          React.createElement(Popconfirm,{title:'Delete template?',description:'This only removes the template record.',onConfirm:()=>deleteTemplate(r.id)},React.createElement(Button,{size:'small',danger:true},'Delete'))
+        )}
+      ];
+
+      function renderEditorTemplates() {
+        if (!user || !user.email) return null;
+        return React.createElement(Card, {
+          className:'editor-panel',
+          title:'My Templates',
+          extra:React.createElement(Button, {type:'primary', onClick:()=>openTemplateModal(null)}, 'Add Template')
+        },
+          React.createElement(Paragraph, {type:'secondary'}, isEditor ? 'Create Gallery templates from GitHub notebooks. Slug and display order are handled automatically.' : 'Create private GitHub notebook templates for your own Profile. They are not added to the public Gallery.'),
+          React.createElement(Table, {rowKey:'id', columns:templateColumns, dataSource:editorTemplates, loading:editorLoading, pagination:false, scroll:{x:980}, size:'middle'}),
+          React.createElement(Modal, {title:editingTemplate?'Edit Template':'Add Template', open:templateModalOpen, onCancel:()=>{setTemplateModalOpen(false); setEditingTemplate(null); templateForm.resetFields();}, footer:null, destroyOnClose:true, width:760},
+            React.createElement(Form, {form:templateForm, layout:'vertical', onFinish:saveTemplate},
+              React.createElement(Form.Item, {name:'title', label:'Title', rules:[{required:true,message:'Title is required'}]}, React.createElement(Input, {placeholder:'10-minute Skill Agent'})),
+              React.createElement(Form.Item, {name:'description', label:'Description'}, React.createElement(Input.TextArea, {autoSize:true, placeholder:'Short user-facing description'})),
+              React.createElement(Space, {style:{width:'100%'}, size:16},
+                React.createElement(Form.Item, {name:'category', label:'Category', style:{width:180}}, React.createElement(Input, {placeholder:'LLM'})),
+                React.createElement(Form.Item, {name:'tags', label:'Tags', style:{flex:1}}, React.createElement(Input, {placeholder:'tutorial, Qwen3, agent'}))
+              ),
+              React.createElement(Form.Item, {name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}]}, React.createElement(Select, {options:editorImages.map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`}))})),
+              React.createElement(Form.Item, {name:'repo_url', label:'GitHub Repo URL', rules:[{required:true,message:'GitHub repo is required'}]}, React.createElement(Input, {placeholder:'https://github.com/org/repo'})),
+              React.createElement(Space, {style:{width:'100%'}, size:16},
+                React.createElement(Form.Item, {name:'branch', label:'Branch', rules:[{required:true,message:'Branch is required'}], style:{width:180}}, React.createElement(Input, {placeholder:'main'})),
+                React.createElement(Form.Item, {name:'notebook_path', label:'Notebook Path', rules:[{required:true,message:'Notebook path is required'}], style:{flex:1}}, React.createElement(Input, {placeholder:'notebooks/workshop.ipynb'}))
+              ),
+              React.createElement(Form.Item, {name:'cover_url', label:'Cover URL'}, React.createElement(Input, {placeholder:'optional'})),
+              React.createElement(Button, {type:'primary', htmlType:'submit', block:true}, editingTemplate?'Save Template':'Add Template')
+            )
+          )
+        );
+      }
+
       return React.createElement(Layout, null,
         React.createElement(Header, {className:'app-header'},
           React.createElement('div', {className:'left-header'},
             React.createElement('div', {className:'brand'}, React.createElement('img', {src:'https://amd-ai-academy.com/static/image.png'}), React.createElement('span', null, 'AMD Radeon Cloud')),
-            React.createElement(Menu, {mode:'horizontal', selectedKeys:['profile'], items:[{key:'notebook',label:React.createElement('a',{href:'/'},'Notebook')},{key:'space',label:'Space'},{key:'contest',label:'Contest'}], style:{borderBottom:0,minWidth:300}})
+            React.createElement(Menu, {mode:'horizontal', selectedKeys:[], items:[
+              {key:'gallery',label:React.createElement('a',{href:'/'},'Gallery')},
+              {key:'notebook',label:React.createElement('a',{href:'/?tab=notebook'},'Notebook')},
+              {key:'space',label:'Space',disabled:true},
+              {key:'contest',label:'Contest',disabled:true}
+            ], style:{borderBottom:0,minWidth:360}})
           ),
           React.createElement(UserMenu)
         ),
@@ -106,14 +276,16 @@
                   {key:'gpu', label:'GPU', children:`${activeInstance.gpu_count} GPU`},
                   {key:'runtime', label:'Runtime', children:`${activeInstance.runtime_minutes || 0} minutes`},
                   {key:'image', label:'Image', children:activeInstance.image},
-                ]}),
+                  activeInstance.template_title ? {key:'template', label:'Template', children:activeInstance.template_title} : null,
+                  activeInstance.github_path ? {key:'notebook', label:'Notebook', children:activeInstance.github_path} : null,
+                ].filter(Boolean)}),
                 React.createElement(Space, {style:{marginTop:16}},
-                  activeInstance.node_port && React.createElement(Button, {type:'primary', href:`http://36.151.243.69:${activeInstance.node_port}/lab?token=amd-oneclick`, target:'_blank'}, 'Open Notebook'),
+                  activeInstance.url && React.createElement(Button, {type:'primary', href:activeInstance.url, target:'_blank'}, 'Open Notebook'),
                   React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current notebook instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))
                 )
               ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
             ),
-            React.createElement(Space, {style:{marginTop:24}}, React.createElement(Button, {type:'primary', href:'/'}, 'Launch Notebook'), React.createElement(Button, {href:'/auth/logout'}, 'Logout'))
+            renderEditorTemplates()
           ) : React.createElement(React.Fragment, null,
             React.createElement('section', {className:'profile-hero'}, React.createElement(Text, {style:{color:'#aaa7bc'}}, 'Account'), React.createElement(Title, {level:1, style:{color:'#fff', marginTop:8}}, 'Sign in to AMD Radeon Cloud'), React.createElement(Paragraph, {style:{color:'#c5c2cf', maxWidth:620}}, 'Use GitHub or ModelScope to claim credits and launch GPU notebooks.')),
             React.createElement('div', {className:'profile-grid'},

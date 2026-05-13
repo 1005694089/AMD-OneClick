@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Notebook Preview - AMD Radeon Cloud</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/reset.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <style>
+    body { margin: 0; background: #f7f8fc; color: #1f2430; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .topbar { height: 64px; display:flex; align-items:center; justify-content:space-between; padding:0 28px; background:#fff; border-bottom:1px solid #edf0f5; position:sticky; top:0; z-index:10; }
+    .brand { display:flex; align-items:center; gap:12px; font-size:20px; font-weight:800; }
+    .brand img { width:40px; height:40px; object-fit:contain; }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 30px 24px 80px; }
+    .hero { background: linear-gradient(135deg,#15151f,#30304e); color:#fff; border-radius:24px; padding:30px; margin-bottom:22px; box-shadow: 0 24px 50px rgba(32,32,72,.18); }
+    .hero h1 { margin:0 0 10px; font-size:34px; letter-spacing:-.03em; }
+    .hero p { margin:0; color:#d8d8e8; max-width:760px; line-height:1.7; }
+    .actions { margin-top:20px; display:flex; gap:12px; flex-wrap:wrap; }
+    .btn { border:0; border-radius:999px; padding:10px 18px; background:#fff; color:#171726; text-decoration:none; font-weight:700; cursor:pointer; }
+    .btn.secondary { background:rgba(255,255,255,.13); color:#fff; border:1px solid rgba(255,255,255,.24); }
+    .status { display:none; margin-top:16px; padding:12px 14px; border-radius:14px; background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.18); color:#fff; }
+    .status a { color:#fff; font-weight:800; }
+    .cache-note { display:none; margin:0 0 18px; padding:12px 14px; border-radius:14px; background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; }
+    .meta { margin-top:16px; display:flex; gap:10px; flex-wrap:wrap; color:#ececff; }
+    .pill { background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.18); border-radius:999px; padding:5px 10px; font-size:12px; }
+    .notebook { background:#fff; border:1px solid #e8ebf3; border-radius:18px; overflow:hidden; }
+    .cell { padding:22px 28px; border-bottom:1px solid #eef1f7; }
+    .cell:last-child { border-bottom:0; }
+    .markdown { font-size:15px; line-height:1.75; color:#242938; }
+    .markdown > *:first-child { margin-top:0; }
+    .markdown > *:last-child { margin-bottom:0; }
+    .markdown h1,.markdown h2,.markdown h3,.markdown h4 { color:#111827; letter-spacing:-.025em; line-height:1.25; font-weight:800; }
+    .markdown h1 { font-size:30px; margin:8px 0 18px; padding-bottom:12px; border-bottom:1px solid #e7eaf2; }
+    .markdown h2 { font-size:24px; margin:26px 0 14px; padding-left:14px; border-left:5px solid #6d7cff; }
+    .markdown h3 { font-size:19px; margin:22px 0 10px; }
+    .markdown h4 { font-size:16px; margin:18px 0 8px; }
+    .markdown p { margin:10px 0 14px; }
+    .markdown strong { color:#111827; font-weight:800; }
+    .markdown em { color:#4b5565; }
+    .markdown ul,.markdown ol { margin:10px 0 16px 24px; padding:0; }
+    .markdown li { margin:6px 0; padding-left:4px; }
+    .markdown blockquote { margin:16px 0; padding:12px 16px; border-left:4px solid #9aa7ff; background:#f5f7ff; color:#3f4658; border-radius:0 12px 12px 0; }
+    .markdown hr { border:0; border-top:1px solid #e7eaf2; margin:26px 0; }
+    .markdown a { color:#315efb; text-decoration:none; font-weight:650; }
+    .markdown a:hover { text-decoration:underline; }
+    .markdown code { padding:2px 6px; border-radius:7px; background:#f0f2f7; color:#c2410c; font-size:.92em; }
+    .markdown pre code { padding:0; background:transparent; color:inherit; }
+    .markdown table { width:100%; border-collapse:separate; border-spacing:0; margin:18px 0; overflow:hidden; border:1px solid #e6e9f2; border-radius:12px; }
+    .markdown th,.markdown td { padding:10px 12px; border-bottom:1px solid #e6e9f2; text-align:left; vertical-align:top; }
+    .markdown th { background:#f7f8fc; font-weight:800; color:#1f2937; }
+    .markdown tr:last-child td { border-bottom:0; }
+    .markdown img { max-width:100%; border-radius:14px; border:1px solid #e8ebf3; background:#fff; }
+    pre { margin:0; padding:16px; overflow:auto; border-radius:12px; background:#11131a; color:#eef2ff; line-height:1.55; }
+    .output { margin-top:12px; padding:14px; border-radius:12px; background:#f3f5fa; white-space:pre-wrap; overflow:auto; color:#333847; }
+    .prompt { font-size:12px; font-weight:700; color:#8c94aa; margin-bottom:8px; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand"><img src="https://amd-ai-academy.com/static/image.png" alt="AMD" /><span>AMD Radeon Cloud</span></div>
+    <a class="btn secondary" style="background:#f0f2f7;color:#24283a;border-color:#e3e6ef" href="/">Back to Notebook</a>
+  </div>
+  <main class="wrap">
+    <section class="hero">
+      <h1 id="title"></h1>
+      <p id="description"></p>
+      <div class="meta" id="meta"></div>
+      <div class="actions">
+        <button class="btn" id="launchBtn">Launch This Notebook</button>
+        <a class="btn secondary" id="githubLink" target="_blank" rel="noreferrer">View on GitHub</a>
+      </div>
+      <div class="status" id="launchStatus"></div>
+    </section>
+    <div class="cache-note" id="cacheNote"></div>
+    <section class="notebook" id="notebook"></section>
+  </main>
+  <script>
+    const template = {{ template_json | safe }};
+    const notebook = {{ notebook_json | safe }};
+    const assetBaseUrl = {{ asset_base_url | tojson }};
+    const preview = {{ preview_json | default('{}') | safe }};
+
+    function textOf(source) {
+      if (Array.isArray(source)) return source.join('');
+      return source || '';
+    }
+
+    function renderOutputs(outputs) {
+      return (outputs || []).map(output => {
+        const text = textOf(output.text || (output.data && (output.data['text/plain'] || output.data['text/html'])) || '');
+        if (!text) return '';
+        return `<div class="output">${escapeHtml(text)}</div>`;
+      }).join('');
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+
+    function resolveAssetUrl(url) {
+      const clean = String(url || '').trim();
+      if (!clean || /^(https?:|data:|\/|#)/i.test(clean)) return clean;
+      return assetBaseUrl + clean.split('/').map(encodeURIComponent).join('/');
+    }
+
+    function rewriteMarkdownAssets(markdown) {
+      return textOf(markdown).replace(/!\[([^\]]*)\]\(([^)\s]+)([^)]*)\)/g, (match, alt, url, rest) => {
+        return `![${alt}](${resolveAssetUrl(url)}${rest || ''})`;
+      });
+    }
+
+    document.getElementById('title').textContent = template.title;
+    document.getElementById('description').textContent = template.description || 'Preview this notebook template before launching a GPU instance.';
+    document.getElementById('githubLink').href = `${template.repo_url.replace(/\.git$/, '')}/blob/${template.branch}/${template.notebook_path}`;
+    document.getElementById('meta').innerHTML = [
+      template.category,
+      `${template.branch}`,
+      template.image && template.image.split('/').pop(),
+      ...(template.tags || [])
+    ].filter(Boolean).map(item => `<span class="pill">${escapeHtml(item)}</span>`).join('');
+    if (preview.status === 'stale') {
+      const note = document.getElementById('cacheNote');
+      note.style.display = 'block';
+      note.textContent = `Showing the last cached preview. Latest sync failed: ${preview.error_message || 'unknown error'}`;
+    }
+
+    document.getElementById('notebook').innerHTML = (notebook.cells || []).map((cell, index) => {
+      if (cell.cell_type === 'markdown') {
+        return `<article class="cell markdown">${marked.parse(rewriteMarkdownAssets(cell.source))}</article>`;
+      }
+      if (cell.cell_type === 'code') {
+        return `<article class="cell"><div class="prompt">In [${index + 1}]</div><pre><code>${escapeHtml(textOf(cell.source))}</code></pre>${renderOutputs(cell.outputs)}</article>`;
+      }
+      return `<article class="cell"><pre><code>${escapeHtml(textOf(cell.source))}</code></pre></article>`;
+    }).join('');
+
+    function setStatus(html) {
+      const node = document.getElementById('launchStatus');
+      node.style.display = 'block';
+      node.innerHTML = html;
+    }
+
+    function pollStatus(initialUrl) {
+      let url = initialUrl || '';
+      let attempts = 0;
+      const timer = setInterval(async () => {
+        attempts += 1;
+        try {
+          const res = await fetch('/api/notebook/status');
+          const data = await res.json();
+          if (data.url) url = data.url;
+          if (data.status === 'ready') {
+            clearInterval(timer);
+            setStatus(`Notebook is ready. <a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">Open Notebook</a>`);
+          } else if (data.status === 'failed' || data.status === 'not_found') {
+            clearInterval(timer);
+            setStatus(escapeHtml(data.message || 'Launch failed'));
+          } else {
+            setStatus(escapeHtml(data.message || 'Launching notebook...'));
+          }
+          if (attempts >= 240) {
+            clearInterval(timer);
+            setStatus('Launch is taking longer than expected. Please return to the home page or profile later.');
+          }
+        } catch (e) {}
+      }, 3000);
+    }
+
+    document.getElementById('launchBtn').onclick = async () => {
+      const button = document.getElementById('launchBtn');
+      button.disabled = true;
+      button.textContent = 'Launching...';
+      setStatus('Creating your notebook instance...');
+      try {
+        const res = await fetch(`/api/templates/${template.id}/launch`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ gpu_count: 1 })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || 'Launch failed');
+        }
+        pollStatus(data.url);
+      } catch (err) {
+        button.disabled = false;
+        button.textContent = 'Launch This Notebook';
+        setStatus(escapeHtml(err.message || 'Launch failed'));
+      }
+    };
+  </script>
+</body>
+</html>

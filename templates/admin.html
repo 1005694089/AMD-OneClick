@@ -26,7 +26,7 @@
 <body>
 <div id="root"></div>
 <script>
-const { Button, Card, Form, Input, InputNumber, Layout, Menu, Modal, Space, Statistic, Table, Tag, Typography, Popconfirm, message } = antd;
+const { Button, Card, Form, Input, InputNumber, Layout, Menu, Modal, Select, Space, Statistic, Table, Tag, Typography, Popconfirm, message } = antd;
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
 
@@ -34,22 +34,28 @@ function App(){
   const [images,setImages]=React.useState([]);
   const [instances,setInstances]=React.useState([]);
   const [users,setUsers]=React.useState([]);
+  const [templates,setTemplates]=React.useState([]);
   const [loading,setLoading]=React.useState(false);
   const [form]=Form.useForm();
+  const [templateForm]=Form.useForm();
   const [creditForm]=Form.useForm();
   const [imageModalOpen,setImageModalOpen]=React.useState(false);
+  const [templateModalOpen,setTemplateModalOpen]=React.useState(false);
+  const [editingTemplate,setEditingTemplate]=React.useState(null);
   const [creditModalUser,setCreditModalUser]=React.useState(null);
 
   async function load(){
     setLoading(true);
     try{
-      const [imgRes, instRes, userRes] = await Promise.all([fetch('/api/admin/images'), fetch('/api/admin/instances'), fetch('/api/admin/users')]);
+      const [imgRes, instRes, userRes, tplRes] = await Promise.all([fetch('/api/admin/images'), fetch('/api/admin/instances'), fetch('/api/admin/users'), fetch('/api/admin/templates')]);
       const imgData = await imgRes.json();
       const instData = await instRes.json();
       const userData = await userRes.json();
+      const tplData = await tplRes.json();
       setImages(imgData.images||[]);
       setInstances(instData.instances||[]);
       setUsers(userData.users||[]);
+      setTemplates(tplData.templates||[]);
     }catch(e){ message.error('Failed to load admin data'); }
     setLoading(false);
   }
@@ -62,6 +68,21 @@ function App(){
   async function syncImage(id){ const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Sync started':'Sync failed'); load(); }
   async function deleteImage(id){ const r=await fetch(`/api/admin/images/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Deleted':'Delete failed'); load(); }
   async function deleteInstance(id){ const r=await fetch(`/api/admin/instance/${encodeURIComponent(id)}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Destroyed':'Destroy failed'); load(); }
+  function openTemplateModal(record){
+    setEditingTemplate(record||null);
+    templateForm.setFieldsValue(record ? {...record, tags:(record.tags||[]).join(', ')} : {branch:'main', enabled:true, sort_order:0});
+    setTemplateModalOpen(true);
+  }
+  async function saveTemplate(values){
+    const payload = {...values, enabled: values.enabled !== false, tags: values.tags || ''};
+    const url = editingTemplate ? `/api/admin/templates/${editingTemplate.id}` : '/api/admin/templates';
+    const res = await fetch(url,{method:editingTemplate?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    if(res.ok){ message.success(editingTemplate?'Template updated':'Template added'); templateForm.resetFields(); setEditingTemplate(null); setTemplateModalOpen(false); load(); } else {
+      const data = await res.json().catch(()=>({detail:'Template save failed'}));
+      message.error(data.detail || 'Template save failed');
+    }
+  }
+  async function deleteTemplate(id){ const r=await fetch(`/api/admin/templates/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Template deleted':'Delete failed'); load(); }
   async function grantCredits(values){
     if(!creditModalUser) return;
     const res=await fetch(`/api/admin/users/${creditModalUser.id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
@@ -79,6 +100,18 @@ function App(){
     {title:'Actions',width:170,render:(_,r)=>React.createElement(Space,null,
       React.createElement(Button,{size:'small',onClick:()=>syncImage(r.id)},'Sync'),
       React.createElement(Popconfirm,{title:'Delete image?',onConfirm:()=>deleteImage(r.id)},React.createElement(Button,{size:'small',danger:true},'Delete'))
+    )}
+  ];
+  const templateColumns=[
+    {title:'Title',dataIndex:'title',width:220,render:(v,r)=>React.createElement('div',null,React.createElement('strong',null,v),React.createElement('br'),React.createElement(Text,{type:'secondary'},r.slug))},
+    {title:'Category',dataIndex:'category',width:140,render:v=>v||'-'},
+    {title:'Image',dataIndex:'image',width:320,render:v=>React.createElement(Text,{code:true,copyable:true,className:'table-code',title:v},v)},
+    {title:'Notebook',width:360,render:(_,r)=>React.createElement('div',null,React.createElement(Text,{code:true,copyable:true,className:'table-code',title:r.repo_url},r.repo_url),React.createElement('br'),React.createElement(Text,{type:'secondary'},`${r.branch}/${r.notebook_path}`))},
+    {title:'Status',dataIndex:'enabled',width:100,render:v=>React.createElement(Tag,{color:v?'green':'default'},v?'enabled':'disabled')},
+    {title:'Actions',width:210,render:(_,r)=>React.createElement(Space,null,
+      React.createElement(Button,{size:'small',href:`/templates/${r.id}/preview`,target:'_blank'},'Preview'),
+      React.createElement(Button,{size:'small',onClick:()=>openTemplateModal(r)},'Edit'),
+      React.createElement(Popconfirm,{title:'Delete template?',onConfirm:()=>deleteTemplate(r.id)},React.createElement(Button,{size:'small',danger:true},'Delete'))
     )}
   ];
   const instColumns=[
@@ -107,11 +140,15 @@ function App(){
     React.createElement(Content,{className:'content'},
       React.createElement('div',{className:'toolbar'},
         React.createElement('div',null,React.createElement(Title,{level:2,style:{margin:0}},'Admin Console'),React.createElement(Text,{type:'secondary'},'Manage images and running instances')),
-        React.createElement(Button,{type:'primary',onClick:()=>setImageModalOpen(true)},'Add Image')
+        React.createElement(Space,null,
+          React.createElement(Button,{onClick:()=>openTemplateModal(null)},'Add Template'),
+          React.createElement(Button,{type:'primary',onClick:()=>setImageModalOpen(true)},'Add Image')
+        )
       ),
       React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
-        React.createElement(Card,null,React.createElement(Space,{size:32},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Instances',value:instances.length}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
+        React.createElement(Card,null,React.createElement(Space,{size:32},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Templates',value:templates.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Instances',value:instances.length}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
         React.createElement(Card,{title:'Users'},React.createElement(Table,{rowKey:'id',columns:userColumns,dataSource:users,loading,pagination:{pageSize:10},scroll:{x:1100},size:'middle'})),
+        React.createElement(Card,{title:'Notebook Templates'},React.createElement(Table,{rowKey:'id',columns:templateColumns,dataSource:templates,loading,pagination:false,scroll:{x:1400},size:'middle'})),
         React.createElement(Card,{title:'Image Catalog'},React.createElement(Table,{rowKey:'id',columns:imageColumns,dataSource:images,loading,pagination:false,scroll:{x:1100},size:'middle'})),
         React.createElement(Card,{title:'Instances'},React.createElement(Table,{rowKey:'id',columns:instColumns,dataSource:instances,loading,pagination:false,scroll:{x:900},size:'middle'}))
       ),
@@ -121,6 +158,29 @@ function App(){
           React.createElement(Form.Item,{name:'image',label:'Image reference',rules:[{required:true}]},React.createElement(Input.TextArea,{autoSize:true,placeholder:'registry/repo/image:tag'})),
           React.createElement(Form.Item,{name:'description',label:'Description'},React.createElement(Input,{placeholder:'optional'})),
           React.createElement(Button,{type:'primary',htmlType:'submit',block:true},'Add and Sync')
+        )
+      ),
+      React.createElement(Modal,{title:editingTemplate?'Edit Template':'Add Template',open:templateModalOpen,onCancel:()=>{setTemplateModalOpen(false);setEditingTemplate(null);},footer:null,destroyOnClose:true,width:760},
+        React.createElement(Form,{form:templateForm,layout:'vertical',onFinish:saveTemplate},
+          React.createElement(Space,{style:{width:'100%'},size:16},
+            React.createElement(Form.Item,{name:'title',label:'Title',rules:[{required:true}],style:{flex:1}},React.createElement(Input,{placeholder:'10-minute Skill Agent'})),
+            React.createElement(Form.Item,{name:'slug',label:'Slug',rules:[{required:true}],style:{width:220}},React.createElement(Input,{placeholder:'skill-agent'}))
+          ),
+          React.createElement(Form.Item,{name:'description',label:'Description'},React.createElement(Input.TextArea,{autoSize:true,placeholder:'Short user-facing description'})),
+          React.createElement(Space,{style:{width:'100%'},size:16},
+            React.createElement(Form.Item,{name:'category',label:'Category',style:{width:180}},React.createElement(Input,{placeholder:'LLM'})),
+            React.createElement(Form.Item,{name:'tags',label:'Tags',style:{flex:1}},React.createElement(Input,{placeholder:'tutorial, Qwen3, agent'})),
+            React.createElement(Form.Item,{name:'sort_order',label:'Sort',style:{width:120}},React.createElement(InputNumber,{style:{width:'100%'},precision:0}))
+          ),
+          React.createElement(Form.Item,{name:'image',label:'Container Image',rules:[{required:true}]},React.createElement(Select,{options:images.filter(i=>i.enabled).map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`}))})),
+          React.createElement(Form.Item,{name:'repo_url',label:'GitHub Repo URL',rules:[{required:true}]},React.createElement(Input,{placeholder:'https://github.com/org/repo'})),
+          React.createElement(Space,{style:{width:'100%'},size:16},
+            React.createElement(Form.Item,{name:'branch',label:'Branch',rules:[{required:true}],style:{width:180}},React.createElement(Input,{placeholder:'main'})),
+            React.createElement(Form.Item,{name:'notebook_path',label:'Notebook Path',rules:[{required:true}],style:{flex:1}},React.createElement(Input,{placeholder:'notebooks/workshop.ipynb'}))
+          ),
+          React.createElement(Form.Item,{name:'cover_url',label:'Cover URL'},React.createElement(Input,{placeholder:'optional'})),
+          React.createElement(Form.Item,{name:'enabled',label:'Enabled'},React.createElement(Select,{options:[{value:true,label:'Enabled'},{value:false,label:'Disabled'}]})),
+          React.createElement(Button,{type:'primary',htmlType:'submit',block:true},editingTemplate?'Save Template':'Add Template')
         )
       ),
       React.createElement(Modal,{title:creditModalUser?`Grant Credits: ${creditModalUser.email}`:'Grant Credits',open:!!creditModalUser,onCancel:()=>setCreditModalUser(null),footer:null,destroyOnClose:true},

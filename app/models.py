@@ -28,6 +28,27 @@ class CreditGrantRequest(BaseModel):
     reason: Optional[str] = "manual admin grant"
 
 
+class NotebookTemplateRequest(BaseModel):
+    """Request model for managing notebook templates"""
+    title: str
+    slug: Optional[str] = ""
+    description: Optional[str] = ""
+    category: Optional[str] = ""
+    tags: Optional[list[str] | str] = ""
+    image: str
+    repo_url: str
+    branch: str = "main"
+    notebook_path: str
+    cover_url: Optional[str] = ""
+    enabled: bool = True
+    sort_order: int = 0
+
+
+class TemplateLaunchRequest(BaseModel):
+    """Request model for launching an instance from a notebook template"""
+    gpu_count: int = 1
+
+
 class GitHubNotebookInfo(BaseModel):
     """GitHub notebook information"""
     org: str
