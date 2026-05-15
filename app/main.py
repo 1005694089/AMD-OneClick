@@ -40,6 +40,7 @@ from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
 from .template_sync import sync_template_preview
 from .store import (
+    clear_template_preview_cache,
     delete_image,
     delete_notebook_template,
     get_active_instance_for_user,
@@ -204,6 +205,8 @@ def _template_asset_base_path(template_id: int, notebook_path: str) -> str:
 
 
 def _template_github_info(template: dict) -> dict:
+    if not template.get("repo_url") or not template.get("notebook_path"):
+        return {}
     org, repo = _github_repo_parts(template["repo_url"])
     return {
         "org": org,
@@ -226,7 +229,12 @@ def _save_notebook_template(
 ) -> dict:
     if not get_image_by_value(req.image):
         raise ValueError("Template image must be an enabled image catalog entry")
-    _github_repo_parts(req.repo_url)
+    has_repo = bool((req.repo_url or "").strip())
+    has_notebook = bool((req.notebook_path or "").strip())
+    if has_repo != has_notebook:
+        raise ValueError("GitHub repo URL and notebook path must be provided together, or both left empty for an image-only template")
+    if has_repo:
+        _github_repo_parts(req.repo_url or "")
     template = upsert_notebook_template(
         req.title,
         req.slug or "",
@@ -234,9 +242,9 @@ def _save_notebook_template(
         req.category or "",
         req.tags or "",
         req.image,
-        req.repo_url,
+        req.repo_url or "",
         req.branch,
-        req.notebook_path,
+        req.notebook_path or "",
         req.cover_url or "",
         req.enabled if enabled_override is None else enabled_override,
         req.sort_order if sort_order is None else sort_order,
@@ -244,8 +252,11 @@ def _save_notebook_template(
         owner_user_id=owner_user_id,
         upsert_on_slug_conflict=owner_user_id is None,
     )
-    ensure_template_preview_cache(template, force=True)
-    _schedule_template_preview_sync(template["id"], force=True)
+    if template.get("repo_url") and template.get("notebook_path"):
+        ensure_template_preview_cache(template, force=True)
+        _schedule_template_preview_sync(template["id"], force=True)
+    else:
+        clear_template_preview_cache(template["id"])
     return template
 
 
@@ -700,6 +711,8 @@ async def template_preview_status(request: Request, template_id: int):
     template = _template_accessible_to_user(template_id, session_user(request))
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if not template.get("repo_url") or not template.get("notebook_path"):
+        return {"template_id": template_id, "preview": {"template_id": template_id, "status": "image_only"}}
     cache = get_template_preview_cache(template_id)
     if not cache or cache.get("source_fingerprint") != template_preview_fingerprint(template):
         cache = ensure_template_preview_cache(template, force=True)
@@ -712,6 +725,8 @@ async def profile_sync_template_preview(template_id: int, user: dict = Depends(c
     template = get_notebook_template(template_id, owner_user_id=user["id"])
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if not template.get("repo_url") or not template.get("notebook_path"):
+        return {"template_id": template_id, "preview": {"template_id": template_id, "status": "image_only"}}
     cache = ensure_template_preview_cache(template, force=True)
     _schedule_template_preview_sync(template_id, force=True)
     return {"template_id": template_id, "preview": _preview_cache_public(cache)}
@@ -723,6 +738,17 @@ async def preview_notebook_template(request: Request, template_id: int):
     template = _template_accessible_to_user(template_id, user)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if not template.get("repo_url") or not template.get("notebook_path"):
+        return templates.TemplateResponse(
+            request,
+            "notebook_preview_status.html",
+            {
+                "template_json": json.dumps(template),
+                "preview_json": json.dumps({"template_id": template_id, "status": "image_only"}),
+                "can_retry": False,
+            },
+            status_code=200,
+        )
 
     cache = get_template_preview_cache(template_id)
     if not cache or cache.get("source_fingerprint") != template_preview_fingerprint(template):
@@ -765,6 +791,8 @@ async def preview_notebook_template_asset(request: Request, template_id: int, as
     template = _template_accessible_to_user(template_id, session_user(request))
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if not template.get("repo_url") or not template.get("notebook_path"):
+        raise HTTPException(status_code=404, detail="Image-only templates do not have preview assets")
 
     asset = get_template_preview_asset(template_id, asset_path)
     if asset:
@@ -800,7 +828,7 @@ async def launch_notebook_template(template_id: int, req: TemplateLaunchRequest,
 
     email = user["email"].lower()
     try:
-        github_info = _template_github_info(template)
+        github_info = _template_github_info(template) if template.get("repo_url") and template.get("notebook_path") else None
         instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
         instance = k8s_client.create_instance(
             email,
@@ -1216,6 +1244,8 @@ async def admin_sync_template_preview(template_id: int, username: str = Depends(
     template = get_notebook_template(template_id, enabled_only=False)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if not template.get("repo_url") or not template.get("notebook_path"):
+        return {"template_id": template_id, "preview": {"template_id": template_id, "status": "image_only"}}
     cache = ensure_template_preview_cache(template, force=True)
     _schedule_template_preview_sync(template_id, force=True)
     return {"template_id": template_id, "preview": _preview_cache_public(cache)}

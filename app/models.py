@@ -36,9 +36,9 @@ class NotebookTemplateRequest(BaseModel):
     category: Optional[str] = ""
     tags: Optional[list[str] | str] = ""
     image: str
-    repo_url: str
+    repo_url: Optional[str] = ""
     branch: str = "main"
-    notebook_path: str
+    notebook_path: Optional[str] = ""
     cover_url: Optional[str] = ""
     enabled: bool = True
     sort_order: int = 0

@@ -199,10 +199,10 @@
       const templateColumns = [
         {title:'Title',dataIndex:'title',width:220,render:(v,r)=>React.createElement('div',null,React.createElement('strong',null,v),React.createElement('br'),React.createElement(Text,{type:'secondary'},r.category || 'Uncategorized'))},
         {title:'Image',dataIndex:'image',width:280,render:v=>React.createElement(Text,{code:true,copyable:true,style:{display:'block',maxWidth:260,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},title:v},v)},
-        {title:'Notebook',width:320,render:(_,r)=>React.createElement('div',null,React.createElement(Text,{code:true,copyable:true,style:{display:'block',maxWidth:300,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},title:r.repo_url},r.repo_url),React.createElement(Text,{type:'secondary'},`${r.branch}/${r.notebook_path}`))},
+        {title:'Source',width:320,render:(_,r)=>r.repo_url&&r.notebook_path?React.createElement('div',null,React.createElement(Text,{code:true,copyable:true,style:{display:'block',maxWidth:300,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},title:r.repo_url},r.repo_url),React.createElement(Text,{type:'secondary'},`${r.branch}/${r.notebook_path}`)):React.createElement(Tag,{color:'blue'},'Image only')},
         {title:'Visibility',dataIndex:'enabled',width:120,render:v=>React.createElement(Tag,{color:v?'green':'blue'},v?'Gallery':'Profile only')},
         {title:'Actions',width:280,render:(_,r)=>React.createElement(Space,null,
-          React.createElement(Button,{size:'small',href:`/templates/${r.id}/preview`,target:'_blank'},'Preview'),
+          r.repo_url&&r.notebook_path&&React.createElement(Button,{size:'small',href:`/templates/${r.id}/preview`,target:'_blank'},'Preview'),
           React.createElement(Button,{size:'small',type:'primary',loading:launchingTemplateId===r.id,onClick:()=>launchTemplate(r)},'Launch'),
           React.createElement(Button,{size:'small',onClick:()=>openTemplateModal(r)},'Edit'),
           React.createElement(Popconfirm,{title:'Delete template?',description:'This only removes the template record.',onConfirm:()=>deleteTemplate(r.id)},React.createElement(Button,{size:'small',danger:true},'Delete'))
@@ -227,10 +227,10 @@
                 React.createElement(Form.Item, {name:'tags', label:'Tags', style:{flex:1}}, React.createElement(Input, {placeholder:'tutorial, Qwen3, agent'}))
               ),
               React.createElement(Form.Item, {name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}]}, React.createElement(Select, {options:editorImages.map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`}))})),
-              React.createElement(Form.Item, {name:'repo_url', label:'GitHub Repo URL', rules:[{required:true,message:'GitHub repo is required'}]}, React.createElement(Input, {placeholder:'https://github.com/org/repo'})),
+              React.createElement(Form.Item, {name:'repo_url', label:'GitHub Repo URL'}, React.createElement(Input, {placeholder:'optional, e.g. https://github.com/org/repo'})),
               React.createElement(Space, {style:{width:'100%'}, size:16},
-                React.createElement(Form.Item, {name:'branch', label:'Branch', rules:[{required:true,message:'Branch is required'}], style:{width:180}}, React.createElement(Input, {placeholder:'main'})),
-                React.createElement(Form.Item, {name:'notebook_path', label:'Notebook Path', rules:[{required:true,message:'Notebook path is required'}], style:{flex:1}}, React.createElement(Input, {placeholder:'notebooks/workshop.ipynb'}))
+                React.createElement(Form.Item, {name:'branch', label:'Branch', style:{width:180}}, React.createElement(Input, {placeholder:'main'})),
+                React.createElement(Form.Item, {name:'notebook_path', label:'Notebook Path', style:{flex:1}}, React.createElement(Input, {placeholder:'optional, e.g. notebooks/workshop.ipynb'}))
               ),
               React.createElement(Form.Item, {name:'cover_url', label:'Cover URL'}, React.createElement(Input, {placeholder:'optional'})),
               React.createElement(Button, {type:'primary', htmlType:'submit', block:true}, editingTemplate?'Save Template':'Add Template')
@@ -245,10 +245,9 @@
             React.createElement('div', {className:'brand'}, React.createElement('img', {src:'https://amd-ai-academy.com/static/image.png'}), React.createElement('span', null, 'AMD Radeon Cloud')),
             React.createElement(Menu, {mode:'horizontal', selectedKeys:[], items:[
               {key:'gallery',label:React.createElement('a',{href:'/'},'Gallery')},
-              {key:'notebook',label:React.createElement('a',{href:'/?tab=notebook'},'Notebook')},
               {key:'space',label:'Space',disabled:true},
               {key:'contest',label:'Contest',disabled:true}
-            ], style:{borderBottom:0,minWidth:360}})
+            ], style:{borderBottom:0,minWidth:300}})
           ),
           React.createElement(UserMenu)
         ),

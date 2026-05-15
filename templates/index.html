@@ -17,10 +17,25 @@
     .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; font-size: 20px; }
     .brand img { width: 40px; height: 40px; object-fit: contain; }
     .hero { background: #050505; color: #fff; text-align: center; padding: 56px 24px 76px; }
-    .hero.gallery-hero { padding: 34px 24px 70px; }
+    .hero.gallery-hero { padding: 0; background: linear-gradient(135deg,#f8fbff 0%,#f3efff 52%,#eefcff 100%); color:#23283a; text-align:left; border-bottom:1px solid #edf1f8; }
+    .gallery-hero-inner { max-width:1180px; margin:0 auto; padding:42px 24px 56px; display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:36px; align-items:center; }
+    .gallery-eyebrow { color:#5b62d6; font-weight:900; letter-spacing:.02em; margin-bottom:10px; }
+    .gallery-hero h1 { margin:0 0 10px; color:#20263a; font-size:36px; letter-spacing:-.04em; }
+    .gallery-hero p { margin:0; max-width:560px; color:#647086; line-height:1.65; }
+    .gallery-search { margin-top:22px; max-width:560px; display:flex; gap:12px; align-items:center; }
+    .gallery-art { min-height:190px; position:relative; }
+    .art-card { position:absolute; width:174px; height:112px; border-radius:18px; padding:16px; box-shadow:0 18px 44px rgba(62,76,130,.14); background:#fff; transform:rotate(-5deg); }
+    .art-card:nth-child(1) { left:10px; top:44px; background:#dbf7ff; }
+    .art-card:nth-child(2) { left:118px; top:20px; background:#e9fff1; transform:rotate(3deg); z-index:2; }
+    .art-card:nth-child(3) { right:12px; top:54px; background:#f2e7ff; transform:rotate(7deg); }
+    .art-card strong { display:block; font-size:16px; color:#2d3754; line-height:1.3; }
+    .art-card span { display:block; margin-top:18px; font-size:12px; color:#6b758c; }
     .hero h1 { margin: 8px 0 10px; color: #fff; font-size: 36px; letter-spacing: -0.03em; }
     .hero p { margin: 0 auto; max-width: 680px; color: #b6b4c2; line-height: 1.65; }
+    .gallery-hero h1 { color:#20263a; }
+    .gallery-hero p { color:#647086; margin:0; }
     .content { max-width: 1180px; margin: -44px auto 64px; padding: 0 24px; }
+    .content.gallery-content { margin-top:28px; }
     .launch-card { width: 720px; max-width: 100%; margin: 0 auto; }
     .launch-card .ant-card-body { width: 100%; }
     .fixed-select { width: 100% !important; min-width: 0 !important; }
@@ -30,31 +45,30 @@
     .image-option-label { display:block; max-width: 620px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
     .launch-card { box-shadow: 0 18px 45px rgba(20, 20, 60, .08); border-radius: 18px; }
     .avatar-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .template-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:18px; margin-top:24px; }
-    .template-card { height:100%; overflow:hidden; border-radius:18px; box-shadow: 0 14px 32px rgba(25, 28, 65, .07); }
-    .template-cover { height:118px; margin:-24px -24px 18px; padding:22px; background:linear-gradient(135deg,#d8edff,#f2dcff); position:relative; overflow:hidden; }
+    .gallery-bar { display:flex; justify-content:space-between; align-items:center; gap:16px; margin:0 0 18px; }
+    .tag-rail { display:flex; flex-wrap:wrap; gap:10px; }
+    .tag-pill { border:1px solid #e1e6f2; background:#fff; color:#566175; border-radius:999px; padding:7px 13px; cursor:pointer; font-weight:650; }
+    .tag-pill.active { background:#20263a; border-color:#20263a; color:#fff; }
+    .template-grid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:18px; margin-top:18px; align-items:stretch; }
+    .template-card { height:100%; min-height:338px; overflow:hidden; border-radius:18px; box-shadow: 0 14px 32px rgba(25, 28, 65, .07); }
+    .template-card .ant-card-body { height:100%; display:flex; flex-direction:column; }
+    .template-cover { flex:0 0 112px; height:112px; margin:-24px -24px 16px; padding:18px; background:linear-gradient(135deg,#d8edff,#f2dcff); position:relative; overflow:hidden; }
     .template-cover:after { content:""; position:absolute; right:-28px; top:22px; width:120px; height:120px; border-radius:32px; border:14px solid rgba(255,255,255,.45); transform:rotate(8deg); }
-    .template-title { display:block; min-height:48px; font-size:17px; line-height:1.4; font-weight:800; color:#273049; }
-    .template-desc { height:44px; overflow:hidden; color:#6c7283; line-height:1.55; margin-top:8px; }
-    .template-meta { margin-top:14px; min-height:24px; display:flex; gap:6px; flex-wrap:wrap; }
-    .guide-panel { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:16px; margin:0 0 28px; }
-    .guide-step { background:#fff; border:1px solid #edf0f6; border-radius:18px; padding:20px; box-shadow:0 14px 34px rgba(25,28,65,.06); }
-    .guide-step .num { width:34px; height:34px; display:inline-flex; align-items:center; justify-content:center; border-radius:12px; background:#15151f; color:#fff; font-weight:800; margin-bottom:14px; }
-    .guide-step h3 { margin:0 0 8px; font-size:17px; color:#252b3f; }
-    .guide-step p { margin:0; color:#747b8c; line-height:1.6; }
-    .section-title { display:flex; justify-content:space-between; align-items:flex-end; gap:16px; margin:34px 0 4px; }
-    .section-title h2 { margin:0; font-size:28px; letter-spacing:-.03em; }
-    .section-title p { margin:6px 0 0; color:#747b8c; }
-    @media (max-width: 1020px) { .template-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
-    @media (max-width: 900px) { .guide-panel { grid-template-columns: 1fr; } }
+    .template-title { display:-webkit-box; height:44px; overflow:hidden; line-clamp:2; -webkit-line-clamp:2; -webkit-box-orient:vertical; font-size:16px; line-height:22px; font-weight:850; color:#273049; }
+    .template-desc { display:-webkit-box; height:40px; overflow:hidden; line-clamp:2; -webkit-line-clamp:2; -webkit-box-orient:vertical; color:#6c7283; line-height:20px; margin-top:8px; font-size:13px; }
+    .template-meta { margin-top:14px; height:24px; display:flex; gap:6px; flex-wrap:nowrap; overflow:hidden; }
+    .template-actions { margin-top:auto; padding-top:16px; display:flex; gap:8px; align-items:center; }
+    .empty-gallery { padding:46px; text-align:center; background:#fff; border:1px dashed #d9e0ef; border-radius:18px; color:#747b8c; }
+    @media (max-width: 1120px) { .template-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } .gallery-hero-inner { grid-template-columns:1fr; } .gallery-art { display:none; } }
+    @media (max-width: 900px) { .gallery-bar { align-items:flex-start; flex-direction:column; } .template-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
     @media (max-width: 680px) { .template-grid { grid-template-columns: 1fr; } }
-    @media (max-width: 820px) { .app-header { padding: 0 16px; } .left-header .ant-menu { display: none; } .content { margin-top: -32px; } .hero h1 { font-size: 30px; } }
+    @media (max-width: 820px) { .app-header { padding: 0 16px; } .left-header .ant-menu { display: none; } .content { margin-top: -32px; } .content.gallery-content { margin-top:24px; } .hero h1 { font-size: 30px; } }
   </style>
 </head>
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Divider, Dropdown, Form, Layout, Menu, Select, Space, Tag, Typography, message } = antd;
+    const { Avatar, Button, Card, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Select, Space, Tag, Typography, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const currentUser = {{ user_json | safe }};
@@ -89,13 +103,50 @@
 
     function App() {
       const [form] = Form.useForm();
+      const [createForm] = Form.useForm();
       const [notebookLoading, setNotebookLoading] = React.useState(false);
       const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
       const [readyUrl, setReadyUrl] = React.useState('');
       const [readyTemplateId, setReadyTemplateId] = React.useState(null);
+      const [createModalOpen, setCreateModalOpen] = React.useState(false);
+      const [createLoading, setCreateLoading] = React.useState(false);
       const initialTab = new URLSearchParams(window.location.search).get('tab') === 'notebook' ? 'notebook' : 'gallery';
       const [activeTab, setActiveTab] = React.useState(initialTab);
+      const [gallerySearch, setGallerySearch] = React.useState('');
+      const [activeTag, setActiveTag] = React.useState('All');
       const imageOptions = (images || []).map(img => ({ label: React.createElement('span', { className: 'image-option-label', title: img.image }, img.name ? `${img.name} (${img.image.split('/').pop()})` : img.image.split('/').pop()), value: img.image }));
+      const galleryTags = ['All', ...Array.from(new Set((notebookTemplates || []).flatMap(tpl => [tpl.category, ...(tpl.tags || [])].filter(Boolean))))].slice(0, 12);
+      const filteredTemplates = (notebookTemplates || []).filter(tpl => {
+        const text = `${tpl.title || ''} ${tpl.description || ''} ${tpl.category || ''} ${(tpl.tags || []).join(' ')}`.toLowerCase();
+        const matchesSearch = !gallerySearch.trim() || text.includes(gallerySearch.trim().toLowerCase());
+        const matchesTag = activeTag === 'All' || tpl.category === activeTag || (tpl.tags || []).includes(activeTag);
+        return matchesSearch && matchesTag;
+      });
+      const hasNotebook = tpl => !!(tpl && tpl.repo_url && tpl.notebook_path);
+
+      function openCreateModal() {
+        createForm.setFieldsValue({ image: defaultImage, branch: 'main', category: 'Workspace' });
+        setCreateModalOpen(true);
+      }
+
+      async function createTemplate(values) {
+        if (!currentUser || !currentUser.email) return;
+        setCreateLoading(true);
+        try {
+          const payload = { ...values, tags: values.tags || '', enabled: !!currentUser.is_editor, sort_order: 0 };
+          const res = await fetch('/api/profile/templates', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Template create failed');
+          message.success('Template created');
+          setCreateModalOpen(false);
+          createForm.resetFields();
+          window.location.reload();
+        } catch (err) {
+          message.error(err.message || 'Template create failed');
+        } finally {
+          setCreateLoading(false);
+        }
+      }
 
       async function launch() {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
@@ -151,26 +202,22 @@
       }
       function renderGallery() {
         return React.createElement(React.Fragment, null,
-          React.createElement('div', { className: 'guide-panel' },
-            React.createElement('div', { className: 'guide-step' }, React.createElement('span', { className: 'num' }, '1'), React.createElement('h3', null, 'Pick a template'), React.createElement('p', null, 'Browse ready-to-run notebooks prepared with the right image, repo, and entry file.')),
-            React.createElement('div', { className: 'guide-step' }, React.createElement('span', { className: 'num' }, '2'), React.createElement('h3', null, 'Preview the notebook'), React.createElement('p', null, 'Open the notebook content first and check whether it matches your workshop or experiment.')),
-            React.createElement('div', { className: 'guide-step' }, React.createElement('span', { className: 'num' }, '3'), React.createElement('h3', null, 'Launch on AMD GPUs'), React.createElement('p', null, 'Start a personalized instance that clones the repo and opens the notebook directly.'))
+          React.createElement('div', { className: 'gallery-bar' },
+            React.createElement('div', { className: 'tag-rail' },
+              galleryTags.map(tag => React.createElement('button', { key: tag, className: `tag-pill ${activeTag === tag ? 'active' : ''}`, onClick: () => setActiveTag(tag) }, tag))
+            ),
+            React.createElement(Text, { type: 'secondary' }, `${filteredTemplates.length} of ${notebookTemplates.length}`)
           ),
-          React.createElement('div', { className: 'section-title' },
-            React.createElement('div', null, React.createElement('h2', null, 'Choose a Template'), React.createElement('p', null, 'Templates for workshops, demos, and guided experiments.')),
-            React.createElement(Text, { type: 'secondary' }, `${notebookTemplates.length} templates`)
-          ),
-          React.createElement('div', { className: 'template-grid' },
-            (notebookTemplates || []).map((tpl) => React.createElement(Card, { key: tpl.id, className: 'template-card' },
+          filteredTemplates.length === 0 ? React.createElement('div', { className: 'empty-gallery' }, 'No templates match this search or tag.') : React.createElement('div', { className: 'template-grid' },
+            filteredTemplates.map((tpl) => React.createElement(Card, { key: tpl.id, className: 'template-card' },
               React.createElement('div', { className: 'template-cover', style: tpl.cover_url ? { backgroundImage: `linear-gradient(135deg,rgba(216,237,255,.72),rgba(242,220,255,.72)),url(${tpl.cover_url})`, backgroundSize: 'cover', backgroundPosition: 'center' } : {} },
                 React.createElement(Text, { style: { color: '#5962d6', fontWeight: 800 } }, tpl.category || 'Notebook')
               ),
               React.createElement('span', { className: 'template-title' }, tpl.title),
-              React.createElement('div', { className: 'template-desc' }, tpl.description || `${tpl.repo_url} · ${tpl.notebook_path}`),
-              React.createElement('div', { className: 'template-meta' }, (tpl.tags || []).slice(0, 4).map(tag => React.createElement(Tag, { key: tag }, tag))),
-              React.createElement(Divider, { style: { margin: '16px 0 14px' } }),
-              React.createElement(Space, null,
-                React.createElement(Button, { href: `/templates/${tpl.id}/preview`, target: '_blank' }, 'Preview'),
+              React.createElement('div', { className: 'template-desc' }, tpl.description || (hasNotebook(tpl) ? `${tpl.repo_url} · ${tpl.notebook_path}` : `${tpl.image.split('/').pop()} workspace`)),
+              React.createElement('div', { className: 'template-meta' }, (tpl.tags || []).slice(0, 3).map(tag => React.createElement(Tag, { key: tag }, tag))),
+              React.createElement('div', { className: 'template-actions' },
+                hasNotebook(tpl) && React.createElement(Button, { href: `/templates/${tpl.id}/preview`, target: '_blank' }, 'Preview'),
                 React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: launchingTemplateId && launchingTemplateId !== tpl.id, onClick: () => launchTemplate(tpl) }, 'Launch'),
                 readyTemplateId === tpl.id && readyUrl && React.createElement(Button, { href: readyUrl, target: '_blank' }, 'Open Notebook')
               )
@@ -182,16 +229,55 @@
         React.createElement(Header, { className: 'app-header' },
           React.createElement('div', { className: 'left-header' },
             React.createElement('div', { className: 'brand' }, React.createElement('img', { src: 'https://amd-ai-academy.com/static/image.png' }), React.createElement('span', null, 'AMD Radeon Cloud')),
-            React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'notebook', label: 'Notebook' }, { key: 'space', label: 'Space', disabled: true }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 360 } })
+            React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'space', label: 'Space', disabled: true }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 300 } })
           ), React.createElement(UserMenu)
         ),
         React.createElement('section', { className: activeTab === 'gallery' ? 'hero gallery-hero' : 'hero' },
-          React.createElement(Text, { style: { color: '#aaa7bc' } }, currentUser && currentUser.email ? `Good day, ${currentUser.name || currentUser.email}` : 'Welcome to AMD Radeon Cloud'),
+          activeTab === 'gallery' ? React.createElement('div', { className: 'gallery-hero-inner' },
+            React.createElement('div', null,
+              React.createElement('div', { className: 'gallery-eyebrow' }, 'AMD Radeon Cloud Gallery'),
+              React.createElement('h1', null, 'Explore runnable GPU notebooks'),
+              React.createElement('p', null, 'Choose a prepared notebook or workspace, then launch it on AMD GPUs.'),
+              React.createElement('div', { className: 'gallery-search' },
+                React.createElement(Input.Search, { size: 'large', allowClear: true, placeholder: 'Search notebooks, tags, or topics', value: gallerySearch, onChange: e => setGallerySearch(e.target.value), onSearch: value => setGallerySearch(value) }),
+                React.createElement(Button, { size: 'large', type: 'primary', onClick: openCreateModal }, 'Create Template')
+              )
+            ),
+            React.createElement('div', { className: 'gallery-art' },
+              React.createElement('div', { className: 'art-card' }, React.createElement('strong', null, 'Kernel Lab'), React.createElement('span', null, 'ROCm · Triton')),
+              React.createElement('div', { className: 'art-card' }, React.createElement('strong', null, 'Skill Agent'), React.createElement('span', null, 'Agent · Notebook')),
+              React.createElement('div', { className: 'art-card' }, React.createElement('strong', null, 'LLM Inference'), React.createElement('span', null, 'vLLM · AMD GPU'))
+            )
+          ) : React.createElement(Text, { style: { color: '#aaa7bc' } }, currentUser && currentUser.email ? `Good day, ${currentUser.name || currentUser.email}` : 'Welcome to AMD Radeon Cloud'),
           activeTab !== 'gallery' && React.createElement(Title, { level: 1 }, 'Launch GPU Notebook'),
           activeTab !== 'gallery' && React.createElement(Paragraph, null, 'Start a blank OpenCode-ready Jupyter notebook on AMD GPUs. Choose an image and GPU count, then launch.')
         ),
-        React.createElement(Content, { className: 'content' },
+        React.createElement(Content, { className: activeTab === 'gallery' ? 'content gallery-content' : 'content' },
           activeTab === 'gallery' ? renderGallery() : renderNotebookLaunch()
+        ),
+        React.createElement(Modal, { title:'Create Template', open:createModalOpen, onCancel:()=>setCreateModalOpen(false), footer:null, destroyOnClose:true, width:760 },
+          currentUser && currentUser.email ? React.createElement(Form, { form:createForm, layout:'vertical', onFinish:createTemplate },
+            React.createElement(Form.Item, { name:'title', label:'Title', rules:[{required:true,message:'Title is required'}] }, React.createElement(Input, { placeholder:'Blank OpenCode Workspace' })),
+            React.createElement(Form.Item, { name:'description', label:'Description' }, React.createElement(Input.TextArea, { autoSize:true, placeholder:'Short description shown on the Gallery card' })),
+            React.createElement(Space, { style:{width:'100%'}, size:16 },
+              React.createElement(Form.Item, { name:'category', label:'Category', style:{width:180} }, React.createElement(Input, { placeholder:'Workspace' })),
+              React.createElement(Form.Item, { name:'tags', label:'Tags', style:{flex:1} }, React.createElement(Input, { placeholder:'workspace, opencode' }))
+            ),
+            React.createElement(Form.Item, { name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}] }, React.createElement(Select, { options:imageOptions, className:'fixed-select', popupMatchSelectWidth:true, listHeight:360 })),
+            React.createElement(Form.Item, { name:'repo_url', label:'GitHub Repo URL' }, React.createElement(Input, { placeholder:'Optional. Leave empty for an image-only workspace.' })),
+            React.createElement(Space, { style:{width:'100%'}, size:16 },
+              React.createElement(Form.Item, { name:'branch', label:'Branch', style:{width:180} }, React.createElement(Input, { placeholder:'main' })),
+              React.createElement(Form.Item, { name:'notebook_path', label:'Notebook Path', style:{flex:1} }, React.createElement(Input, { placeholder:'Optional, e.g. notebooks/workshop.ipynb' }))
+            ),
+            React.createElement(Form.Item, { name:'cover_url', label:'Cover URL' }, React.createElement(Input, { placeholder:'Optional image URL' })),
+            React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:createLoading }, 'Create Template')
+          ) : React.createElement('div', null,
+            React.createElement(Paragraph, null, 'Login first to create your own Gallery template.'),
+            React.createElement(Space, null,
+              React.createElement(Button, { type:'primary', href:'/auth/github/login' }, 'Login with GitHub'),
+              React.createElement(Button, { href:'/auth/modelscope/login' }, 'Login with ModelScope')
+            )
+          )
         )
       );
     }

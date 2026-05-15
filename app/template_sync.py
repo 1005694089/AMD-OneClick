@@ -118,6 +118,8 @@ async def sync_template_preview(template_id: int, force: bool = False) -> dict:
     template = get_notebook_template(template_id, enabled_only=False)
     if not template:
         raise ValueError(f"Template {template_id} not found")
+    if not template.get("repo_url") or not template.get("notebook_path"):
+        return {"template_id": template_id, "status": "image_only"}
 
     ensure_template_preview_cache(template, force=force)
     mark_template_preview_syncing(template_id)
@@ -158,7 +160,8 @@ async def sync_template_preview(template_id: int, force: bool = False) -> dict:
 
 async def sync_due_template_previews(limit: int = 5) -> list[dict]:
     for template in list_notebook_templates(enabled_only=False):
-        ensure_template_preview_cache(template)
+        if template.get("repo_url") and template.get("notebook_path"):
+            ensure_template_preview_cache(template)
 
     now = datetime.now(timezone.utc).isoformat()
     results = []

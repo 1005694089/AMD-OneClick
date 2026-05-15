@@ -189,6 +189,7 @@ def init_db():
     with engine.begin() as conn:
         ensure_schema_columns(conn)
         ensure_default_image(conn)
+        ensure_default_blank_template(conn)
 
 
 def ensure_schema_columns(conn):
@@ -217,6 +218,32 @@ def ensure_default_image(conn):
             description="Default ROCm Jupyter/OpenCode image",
             enabled=True,
             sync_status="ready",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def ensure_default_blank_template(conn):
+    now = utc_now()
+    exists = conn.execute(select(notebook_templates.c.id).where(notebook_templates.c.slug == "blank-opencode-workspace")).first()
+    if exists:
+        return
+    conn.execute(
+        notebook_templates.insert().values(
+            title="Blank OpenCode Workspace",
+            slug="blank-opencode-workspace",
+            description="Start an empty JupyterLab workspace with OpenCode and your selected AMD GPU image.",
+            category="Workspace",
+            tags="workspace,opencode",
+            image=settings.DEFAULT_IMAGE,
+            repo_url="",
+            branch="main",
+            notebook_path="",
+            cover_url="",
+            enabled=True,
+            sort_order=-100,
+            owner_user_id=None,
             created_at=now,
             updated_at=now,
         )
@@ -385,9 +412,9 @@ def upsert_notebook_template(
     title = title.strip()
     slug = _normalize_slug(slug, title)
     image = image.strip()
-    repo_url = repo_url.strip()
+    repo_url = (repo_url or "").strip()
     branch = (branch or "main").strip()
-    notebook_path = notebook_path.strip().lstrip("/")
+    notebook_path = (notebook_path or "").strip().lstrip("/")
     values = dict(
         title=title,
         slug=slug,
@@ -409,9 +436,9 @@ def upsert_notebook_template(
         raise ValueError("template title must not be empty")
     if not image:
         raise ValueError("template image must not be empty")
-    if not repo_url:
-        raise ValueError("template repo_url must not be empty")
-    if not notebook_path.endswith(".ipynb"):
+    if bool(repo_url) != bool(notebook_path):
+        raise ValueError("repo_url and notebook_path must be provided together, or both left empty for an image-only template")
+    if notebook_path and not notebook_path.endswith(".ipynb"):
         raise ValueError("template notebook_path must point to an .ipynb file")
 
     with engine.begin() as conn:
@@ -472,6 +499,12 @@ def get_template_preview_cache(template_id: int) -> Optional[dict]:
             .mappings()
             .first()
         )
+
+
+def clear_template_preview_cache(template_id: int) -> None:
+    with engine.begin() as conn:
+        conn.execute(template_preview_assets.delete().where(template_preview_assets.c.template_id == template_id))
+        conn.execute(template_preview_cache.delete().where(template_preview_cache.c.template_id == template_id))
 
 
 def ensure_template_preview_cache(template: dict, force: bool = False) -> dict:
