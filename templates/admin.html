@@ -36,6 +36,7 @@ function App(){
   const [users,setUsers]=React.useState([]);
   const [templates,setTemplates]=React.useState([]);
   const [loading,setLoading]=React.useState(false);
+  const [userSearch,setUserSearch]=React.useState('');
   const [form]=Form.useForm();
   const [templateForm]=Form.useForm();
   const [creditForm]=Form.useForm();
@@ -59,7 +60,7 @@ function App(){
     }catch(e){ message.error('Failed to load admin data'); }
     setLoading(false);
   }
-  React.useEffect(()=>{ load(); const t=setInterval(load,10000); return()=>clearInterval(t); },[]);
+  React.useEffect(()=>{ load(); },[]);
 
   async function addImage(values){
     const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...values, enabled:true})});
@@ -131,6 +132,13 @@ function App(){
     {title:'Created',dataIndex:'created_at',width:190,render:v=>v?dayjs(v).format('YYYY-MM-DD HH:mm'):'-'},
     {title:'Actions',width:160,render:(_,r)=>React.createElement(Button,{size:'small',type:'primary',onClick:()=>{setCreditModalUser(r); creditForm.setFieldsValue({amount:1000,reason:'manual admin grant'});}},'Grant Credits')}
   ];
+  const filteredUsers = users.filter(user => {
+    const keyword = userSearch.trim().toLowerCase();
+    if(!keyword) return true;
+    return [user.email,user.name,user.provider,user.provider_id,String(user.id)]
+      .filter(Boolean)
+      .some(value => String(value).toLowerCase().includes(keyword));
+  });
 
   return React.createElement(Layout,null,
     React.createElement(Header,{className:'header'},
@@ -147,7 +155,7 @@ function App(){
       ),
       React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
         React.createElement(Card,null,React.createElement(Space,{size:32},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Templates',value:templates.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Instances',value:instances.length}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
-        React.createElement(Card,{title:'Users'},React.createElement(Table,{rowKey:'id',columns:userColumns,dataSource:users,loading,pagination:{pageSize:10},scroll:{x:1100},size:'middle'})),
+        React.createElement(Card,{title:'Users',extra:React.createElement(Input.Search,{allowClear:true,placeholder:'Search email, name, provider, or ID',value:userSearch,onChange:e=>setUserSearch(e.target.value),onSearch:setUserSearch,style:{width:320}})},React.createElement(Table,{rowKey:'id',columns:userColumns,dataSource:filteredUsers,loading,pagination:{pageSize:10,showSizeChanger:true},scroll:{x:1100},size:'middle'})),
         React.createElement(Card,{title:'Notebook Templates'},React.createElement(Table,{rowKey:'id',columns:templateColumns,dataSource:templates,loading,pagination:false,scroll:{x:1400},size:'middle'})),
         React.createElement(Card,{title:'Image Catalog'},React.createElement(Table,{rowKey:'id',columns:imageColumns,dataSource:images,loading,pagination:false,scroll:{x:1100},size:'middle'})),
         React.createElement(Card,{title:'Instances'},React.createElement(Table,{rowKey:'id',columns:instColumns,dataSource:instances,loading,pagination:false,scroll:{x:900},size:'middle'}))
