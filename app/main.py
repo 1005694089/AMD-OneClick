@@ -269,6 +269,31 @@ def _template_accessible_to_user(template_id: int, user: Optional[dict]) -> Opti
     return None
 
 
+def _active_instance_context(user: Optional[dict]) -> Optional[dict]:
+    if not user:
+        return None
+    active_instance = get_active_instance_for_user(user["id"])
+    if not active_instance:
+        return None
+
+    live_instance = k8s_client.get_instance_by_id(active_instance["instance_id"])
+    if not live_instance:
+        mark_instance_deleted(active_instance["instance_id"])
+        return None
+
+    created_at = datetime.fromisoformat(active_instance["created_at"])
+    now = datetime.now(timezone.utc)
+    runtime_seconds = max(0, int((now - created_at).total_seconds()))
+    active_instance["runtime_minutes"] = runtime_seconds // 60
+    active_instance["runtime_hours_display"] = round(runtime_seconds / 3600, 2)
+    active_instance["credits_consumed"] = get_charged_credits_for_instance(active_instance["instance_id"])
+    active_instance["url"] = live_instance.get("url")
+    active_instance["github_path"] = live_instance.get("github_path")
+    active_instance["template_id"] = live_instance.get("template_id")
+    active_instance["template_title"] = live_instance.get("template_title")
+    return active_instance
+
+
 def _can_manage_template(template: dict, user: Optional[dict]) -> bool:
     if not template or not user:
         return False
@@ -362,6 +387,7 @@ async def index(request: Request):
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
     images = list_images(enabled_only=True)
     notebook_templates = list_notebook_templates(enabled_only=True)
+    active_instance = _active_instance_context(user)
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -372,6 +398,7 @@ async def index(request: Request):
             "default_image": settings.DEFAULT_IMAGE,
             "instance_types_json": json.dumps(INSTANCE_TYPES),
             "user_json": json.dumps(user or {}),
+            "active_instance_json": json.dumps(active_instance or {}),
         },
     )
 
@@ -380,23 +407,7 @@ async def index(request: Request):
 async def profile_page(request: Request):
     """Render user profile and login page."""
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
-    active_instance = get_active_instance_for_user(user["id"]) if user else None
-    if active_instance:
-        live_instance = k8s_client.get_instance_by_id(active_instance["instance_id"])
-        if not live_instance:
-            mark_instance_deleted(active_instance["instance_id"])
-            active_instance = None
-        else:
-            created_at = datetime.fromisoformat(active_instance["created_at"])
-            now = datetime.now(timezone.utc)
-            runtime_seconds = max(0, int((now - created_at).total_seconds()))
-            active_instance["runtime_minutes"] = runtime_seconds // 60
-            active_instance["runtime_hours_display"] = round(runtime_seconds / 3600, 2)
-            active_instance["credits_consumed"] = get_charged_credits_for_instance(active_instance["instance_id"])
-            active_instance["url"] = live_instance.get("url")
-            active_instance["github_path"] = live_instance.get("github_path")
-            active_instance["template_id"] = live_instance.get("template_id")
-            active_instance["template_title"] = live_instance.get("template_title")
+    active_instance = _active_instance_context(user)
     return templates.TemplateResponse(
         request,
         "profile.html",

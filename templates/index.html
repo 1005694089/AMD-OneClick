@@ -57,7 +57,8 @@
     .template-title { display:-webkit-box; height:44px; overflow:hidden; line-clamp:2; -webkit-line-clamp:2; -webkit-box-orient:vertical; font-size:16px; line-height:22px; font-weight:850; color:#273049; }
     .template-desc { display:-webkit-box; height:40px; overflow:hidden; line-clamp:2; -webkit-line-clamp:2; -webkit-box-orient:vertical; color:#6c7283; line-height:20px; margin-top:8px; font-size:13px; }
     .template-meta { margin-top:14px; height:24px; display:flex; gap:6px; flex-wrap:nowrap; overflow:hidden; }
-    .template-actions { margin-top:auto; padding-top:16px; display:flex; gap:8px; align-items:center; }
+    .template-actions { margin-top:auto; padding-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:8px; align-items:center; }
+    .template-actions .ant-btn { width:100%; }
     .empty-gallery { padding:46px; text-align:center; background:#fff; border:1px dashed #d9e0ef; border-radius:18px; color:#747b8c; }
     @media (max-width: 1120px) { .template-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } .gallery-hero-inner { grid-template-columns:1fr; } .gallery-art { display:none; } }
     @media (max-width: 900px) { .gallery-bar { align-items:flex-start; flex-direction:column; } .template-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
@@ -75,6 +76,7 @@
     const images = {{ image_catalog_json | safe }};
     const notebookTemplates = {{ notebook_templates_json | safe }};
     const defaultImage = {{ default_image | tojson }};
+    const initialActiveInstance = {{ active_instance_json | safe }};
 
     function avatarNode(user) {
       if (!user || !user.email) return null;
@@ -106,8 +108,8 @@
       const [createForm] = Form.useForm();
       const [notebookLoading, setNotebookLoading] = React.useState(false);
       const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
-      const [readyUrl, setReadyUrl] = React.useState('');
-      const [readyTemplateId, setReadyTemplateId] = React.useState(null);
+      const [readyUrl, setReadyUrl] = React.useState(initialActiveInstance.url || '');
+      const [readyTemplateId, setReadyTemplateId] = React.useState(initialActiveInstance.template_id ? Number(initialActiveInstance.template_id) : null);
       const [createModalOpen, setCreateModalOpen] = React.useState(false);
       const [createLoading, setCreateLoading] = React.useState(false);
       const initialTab = new URLSearchParams(window.location.search).get('tab') === 'notebook' ? 'notebook' : 'gallery';
@@ -123,6 +125,7 @@
         return matchesSearch && matchesTag;
       });
       const hasNotebook = tpl => !!(tpl && tpl.repo_url && tpl.notebook_path);
+      const hasActiveInstance = !!(initialActiveInstance && initialActiveInstance.instance_id);
 
       function openCreateModal() {
         createForm.setFieldsValue({ image: defaultImage, branch: 'main', category: 'Workspace' });
@@ -218,8 +221,9 @@
               React.createElement('div', { className: 'template-meta' }, (tpl.tags || []).slice(0, 3).map(tag => React.createElement(Tag, { key: tag }, tag))),
               React.createElement('div', { className: 'template-actions' },
                 hasNotebook(tpl) && React.createElement(Button, { href: `/templates/${tpl.id}/preview`, target: '_blank' }, 'Preview'),
-                React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: launchingTemplateId && launchingTemplateId !== tpl.id, onClick: () => launchTemplate(tpl) }, 'Launch'),
-                readyTemplateId === tpl.id && readyUrl && React.createElement(Button, { href: readyUrl, target: '_blank' }, 'Open Notebook')
+                readyTemplateId === tpl.id && readyUrl
+                  ? React.createElement(Button, { type:'primary', href: readyUrl, target: '_blank' }, 'Open Notebook')
+                  : React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch')
               )
             ))
           )

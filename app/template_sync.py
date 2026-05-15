@@ -20,9 +20,9 @@ from .store import (
     list_notebook_templates,
     list_template_preview_sync_candidates,
     mark_template_preview_syncing,
-    replace_template_preview_assets,
     update_template_preview_failure,
     update_template_preview_success,
+    update_template_preview_success_with_assets,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,20 +134,17 @@ async def sync_template_preview(template_id: int, force: bool = False) -> dict:
             notebook = json.loads(notebook_bytes.decode("utf-8"))
             assets = []
             for asset_path in extract_markdown_asset_paths(notebook, template["notebook_path"]):
-                try:
-                    content, content_type, _ = await _fetch_bytes(
-                        client,
-                        _github_raw_url_candidates(template["repo_url"], template["branch"], asset_path),
-                        max_bytes=MAX_ASSET_BYTES,
-                    )
-                    assets.append({"asset_path": asset_path, "content_type": content_type, "content": content})
-                except Exception as e:
-                    logger.warning("Template %s asset sync failed for %s: %s", template_id, asset_path, e)
+                content, content_type, _ = await _fetch_bytes(
+                    client,
+                    _github_raw_url_candidates(template["repo_url"], template["branch"], asset_path),
+                    max_bytes=MAX_ASSET_BYTES,
+                )
+                assets.append({"asset_path": asset_path, "content_type": content_type, "content": content})
 
-        replace_template_preview_assets(template_id, assets)
-        cache = update_template_preview_success(
+        cache = update_template_preview_success_with_assets(
             template,
             json.dumps(notebook, ensure_ascii=False),
+            assets,
             _next_sync(REFRESH_INTERVAL_MINUTES),
         )
         logger.info("Template %s preview synced from %s with %s assets", template_id, source_url, len(assets))

@@ -600,6 +600,46 @@ def update_template_preview_success(template: dict, notebook_json: str, next_syn
         )
 
 
+def update_template_preview_success_with_assets(template: dict, notebook_json: str, assets: list[dict], next_sync_at: str) -> dict:
+    now = utc_now()
+    fingerprint = template_preview_fingerprint(template)
+    with engine.begin() as conn:
+        conn.execute(
+            update(template_preview_cache)
+            .where(template_preview_cache.c.template_id == template["id"])
+            .values(
+                repo_url=template["repo_url"],
+                branch=template["branch"],
+                notebook_path=template["notebook_path"],
+                source_fingerprint=fingerprint,
+                notebook_json=notebook_json,
+                status="ready",
+                error_message=None,
+                last_synced_at=now,
+                next_sync_at=next_sync_at,
+                updated_at=now,
+            )
+        )
+        conn.execute(template_preview_assets.delete().where(template_preview_assets.c.template_id == template["id"]))
+        for asset in assets:
+            conn.execute(
+                template_preview_assets.insert().values(
+                    template_id=template["id"],
+                    asset_path=asset["asset_path"],
+                    content_type=asset.get("content_type") or "application/octet-stream",
+                    content=asset["content"],
+                    status=asset.get("status") or "ready",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        return row_to_dict(
+            conn.execute(select(template_preview_cache).where(template_preview_cache.c.template_id == template["id"]))
+            .mappings()
+            .first()
+        )
+
+
 def update_template_preview_failure(template_id: int, error_message: str, next_sync_at: str) -> Optional[dict]:
     now = utc_now()
     with engine.begin() as conn:
