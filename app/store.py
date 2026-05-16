@@ -162,6 +162,20 @@ credit_ledger = Table(
     Column("created_at", String(64), nullable=False),
 )
 
+coupon_redemptions = Table(
+    "coupon_redemptions",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("coupon_id", String(255), nullable=False, unique=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
+    Column("external_user_id", String(255)),
+    Column("card_hours", Integer, nullable=False),
+    Column("credits", Integer, nullable=False),
+    Column("issued_at", String(64)),
+    Column("expires_at", String(64)),
+    Column("redeemed_at", String(64), nullable=False),
+)
+
 usage_charges = Table(
     "usage_charges",
     metadata,
@@ -202,8 +216,8 @@ def ensure_schema_columns(conn):
     if "owner_user_id" not in template_columns:
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN owner_user_id INTEGER"))
 
-    # Backward-compatible creation for databases initialized before preview caching.
-    metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets])
+    # Backward-compatible creation for databases initialized before these tables.
+    metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions])
 
 
 def ensure_default_image(conn):
@@ -325,6 +339,54 @@ def grant_user_credits(user_id: int, amount: int, reason: str = "manual admin gr
             )
         )
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
+def redeem_user_coupon(user_id: int, coupon: dict) -> dict:
+    coupon_id = str(coupon.get("coupon_id") or "").strip()
+    if not coupon_id:
+        raise ValueError("coupon_id is required")
+
+    card_hours = coupon.get("card_hours")
+    if not isinstance(card_hours, int) or card_hours <= 0:
+        raise ValueError("card_hours must be a positive integer")
+
+    now = utc_now()
+    with engine.begin() as conn:
+        user = conn.execute(select(users).where(users.c.id == user_id).with_for_update()).mappings().first()
+        if not user:
+            raise ValueError("user not found")
+
+        try:
+            conn.execute(
+                coupon_redemptions.insert().values(
+                    coupon_id=coupon_id,
+                    user_id=user_id,
+                    external_user_id=str(coupon.get("user_id") or ""),
+                    card_hours=card_hours,
+                    credits=card_hours,
+                    issued_at=str(coupon.get("issued_at") or ""),
+                    expires_at=str(coupon.get("expires_at") or ""),
+                    redeemed_at=now,
+                )
+            )
+        except IntegrityError:
+            raise ValueError("coupon has already been redeemed")
+
+        conn.execute(update(users).where(users.c.id == user_id).values(credits=users.c.credits + card_hours, updated_at=now))
+        conn.execute(
+            credit_ledger.insert().values(
+                user_id=user_id,
+                delta=card_hours,
+                reason=f"coupon redemption {coupon_id}",
+                instance_id=None,
+                created_at=now,
+            )
+        )
+        return {
+            "user": row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first()),
+            "credits_added": card_hours,
+            "coupon_id": coupon_id,
+        }
 
 
 def list_images(enabled_only: bool = False) -> list[dict]:

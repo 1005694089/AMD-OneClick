@@ -95,6 +95,7 @@ class Settings:
     PYPI_HOST_IP: str = "101.6.15.130"
 
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
+    COUPON_PRIVATE_KEY_PEM: Optional[str] = os.getenv("COUPON_PRIVATE_KEY_PEM")
 
 
 settings = Settings()

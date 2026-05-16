@@ -76,12 +76,15 @@
 
     function App() {
       const [templateForm] = Form.useForm();
+      const [redeemForm] = Form.useForm();
       const [editorTemplates, setEditorTemplates] = React.useState([]);
       const [editorImages, setEditorImages] = React.useState([]);
       const [editorLoading, setEditorLoading] = React.useState(false);
       const [templateModalOpen, setTemplateModalOpen] = React.useState(false);
       const [editingTemplate, setEditingTemplate] = React.useState(null);
       const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
+      const [redeemModalOpen, setRedeemModalOpen] = React.useState(false);
+      const [redeemLoading, setRedeemLoading] = React.useState(false);
       const isEditor = !!(user && user.is_editor);
 
       async function loadEditorTemplates() {
@@ -148,6 +151,27 @@
         } else {
           const data = await res.json().catch(() => ({}));
           message.error(data.detail || 'Delete failed');
+        }
+      }
+
+      async function redeemCredits(values) {
+        setRedeemLoading(true);
+        try {
+          const res = await fetch('/api/credits/redeem', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({coupon: values.coupon}),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Redeem failed');
+          message.success(`Redeemed ${data.credits_added || 0} credits`);
+          redeemForm.resetFields();
+          setRedeemModalOpen(false);
+          window.location.reload();
+        } catch (e) {
+          message.error(e.message || 'Redeem failed');
+        } finally {
+          setRedeemLoading(false);
         }
       }
 
@@ -264,7 +288,11 @@
               )
             ),
             React.createElement('div', {className:'profile-grid'},
-              React.createElement(Card, null, React.createElement(Statistic, {title:'Credits Available', value:user.credits}), React.createElement(Paragraph, {type:'secondary', style:{marginTop:16}}, 'Usage costs 1 credit per GPU per hour. Each account can keep one active instance.')),
+              React.createElement(Card, null,
+                React.createElement(Statistic, {title:'Credits Available', value:user.credits}),
+                React.createElement(Paragraph, {type:'secondary', style:{marginTop:16}}, 'Usage costs 1 credit per GPU per hour. Each account can keep one active instance.'),
+                React.createElement(Button, {type:'primary', onClick:()=>setRedeemModalOpen(true)}, 'Redeem Credits')
+              ),
               React.createElement(Card, {title:'Active Instance'}, activeInstance && activeInstance.instance_id ? React.createElement(React.Fragment, null,
                 React.createElement('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:18}},
                   React.createElement(Statistic, {title:'Running Time', value:activeInstance.runtime_hours_display || 0, suffix:'hours', precision:2}),
@@ -283,6 +311,12 @@
                   React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current notebook instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))
                 )
               ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
+            ),
+            React.createElement(Modal, {title:'Redeem Credits', open:redeemModalOpen, onCancel:()=>setRedeemModalOpen(false), footer:null, destroyOnClose:true},
+              React.createElement(Form, {form:redeemForm, layout:'vertical', onFinish:redeemCredits},
+                React.createElement(Form.Item, {name:'coupon', label:'Coupon Code', rules:[{required:true,message:'Coupon code is required'}]}, React.createElement(Input.TextArea, {autoSize:{minRows:4,maxRows:8}, placeholder:'Paste your encrypted coupon here'})),
+                React.createElement(Button, {type:'primary', htmlType:'submit', block:true, loading:redeemLoading}, 'Redeem')
+              )
             ),
             renderEditorTemplates()
           ) : React.createElement(React.Fragment, null,

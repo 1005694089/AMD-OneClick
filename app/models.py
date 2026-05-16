@@ -28,6 +28,11 @@ class CreditGrantRequest(BaseModel):
     reason: Optional[str] = "manual admin grant"
 
 
+class CouponRedeemRequest(BaseModel):
+    """Request model for redeeming encrypted credit coupons"""
+    coupon: str
+
+
 class NotebookTemplateRequest(BaseModel):
     """Request model for managing notebook templates"""
     title: str

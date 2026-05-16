@@ -149,6 +149,7 @@ stringData:
   MODELSCOPE_AUTH_URL: "https://modelscope.cn/oauth/authorize"
   MODELSCOPE_TOKEN_URL: "https://modelscope.cn/oauth/token"
   MODELSCOPE_USERINFO_URL: "https://modelscope.cn/api/v1/user"
+  COUPON_PRIVATE_KEY_PEM: "<replace-with-coupon-private-key-pem>"
 
 ---
 apiVersion: apps/v1
@@ -178,7 +179,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:admin-search-nopoll-20260515-1755
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:coupon-redemption-20260516-1450
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

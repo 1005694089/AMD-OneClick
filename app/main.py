@@ -32,6 +32,7 @@ from .models import (
     DestroyResponse,
     ImageRequest,
     CreditGrantRequest,
+    CouponRedeemRequest,
     NotebookTemplateRequest,
     TemplateLaunchRequest,
 )
@@ -59,6 +60,7 @@ from .store import (
     list_users,
     mark_instance_deleted,
     record_instance,
+    redeem_user_coupon,
     template_preview_fingerprint,
     upsert_notebook_template,
     update_image_sync_status,
@@ -377,6 +379,44 @@ def _request_with_retries(method: str, url: str, retries: int = 3, **kwargs) -> 
     raise last_error
 
 
+def _parse_coupon_datetime(value: str) -> datetime:
+    raw = str(value or "").strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _decode_credit_coupon(encrypted_coupon_b64: str) -> dict:
+    if not settings.COUPON_PRIVATE_KEY_PEM:
+        raise HTTPException(status_code=500, detail="Coupon redemption is not configured")
+    try:
+        from Crypto.Cipher import PKCS1_OAEP
+        from Crypto.PublicKey import RSA
+
+        encrypted = base64.b64decode(encrypted_coupon_b64.strip(), validate=True)
+        rsa_private_key = RSA.import_key(settings.COUPON_PRIVATE_KEY_PEM)
+        cipher_rsa = PKCS1_OAEP.new(rsa_private_key)
+        decrypted_json = cipher_rsa.decrypt(encrypted)
+        coupon = json.loads(decrypted_json.decode("utf-8"))
+
+        required = {"coupon_id", "user_id", "card_hours", "issued_at", "expires_at"}
+        missing = required - set(coupon)
+        if missing:
+            raise ValueError(f"missing fields: {', '.join(sorted(missing))}")
+        if not isinstance(coupon["card_hours"], int) or coupon["card_hours"] <= 0:
+            raise ValueError("invalid card_hours")
+        if datetime.utcnow() > _parse_coupon_datetime(coupon["expires_at"]):
+            raise ValueError("coupon expired")
+        return coupon
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid coupon: {e}")
+
+
 # =============================================================================
 # User Endpoints
 # =============================================================================
@@ -536,6 +576,15 @@ async def logout(request: Request):
 @app.get("/api/me")
 async def api_me(user: dict = Depends(current_user)):
     return user
+
+
+@app.post("/api/credits/redeem")
+async def redeem_credits(req: CouponRedeemRequest, user: dict = Depends(current_user)):
+    coupon = _decode_credit_coupon(req.coupon)
+    try:
+        return redeem_user_coupon(user["id"], coupon)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/api/notebook/request", response_model=NotebookStatus)
