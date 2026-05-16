@@ -294,14 +294,14 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
                 email=email,
                 name=name,
                 avatar_url=avatar_url,
-                credits=100,
+                credits=10,
                 created_at=now,
                 updated_at=now,
             )
         )
         user_id = result.inserted_primary_key[0]
         conn.execute(
-            credit_ledger.insert().values(user_id=user_id, delta=100, reason="signup_bonus", created_at=now)
+            credit_ledger.insert().values(user_id=user_id, delta=10, reason="signup_bonus", created_at=now)
         )
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
 

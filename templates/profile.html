@@ -86,6 +86,8 @@
       const [redeemModalOpen, setRedeemModalOpen] = React.useState(false);
       const [redeemLoading, setRedeemLoading] = React.useState(false);
       const isEditor = !!(user && user.is_editor);
+      const activeGpuCount = Number((activeInstance && activeInstance.gpu_count) || 1);
+      const creditsLow = !!(activeInstance && activeInstance.instance_id && Number(user.credits || 0) <= activeGpuCount * 2);
 
       async function loadEditorTemplates() {
         if (!user || !user.email) return;
@@ -164,12 +166,12 @@
           });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Redeem failed');
-          message.success(`Redeemed ${data.credits_added || 0} credits`);
+          message.success(`Successfully redeemed ${data.credits_added || 0} credits`, 3);
           redeemForm.resetFields();
           setRedeemModalOpen(false);
-          window.location.reload();
+          setTimeout(() => window.location.reload(), 3200);
         } catch (e) {
-          message.error(e.message || 'Redeem failed');
+          message.error(e.message || 'Redeem failed', 3);
         } finally {
           setRedeemLoading(false);
         }
@@ -291,9 +293,11 @@
               React.createElement(Card, null,
                 React.createElement(Statistic, {title:'Credits Available', value:user.credits}),
                 React.createElement(Paragraph, {type:'secondary', style:{marginTop:16}}, 'Usage costs 1 credit per GPU per hour. Each account can keep one active instance.'),
+                React.createElement(Paragraph, {type:'secondary'}, 'Need more credits? Visit ', React.createElement('a', {href:'https://developer.amd.com.cn/', target:'_blank', rel:'noreferrer'}, 'AMD Developer China'), ' to get a coupon, then redeem it here.'),
                 React.createElement(Button, {type:'primary', onClick:()=>setRedeemModalOpen(true)}, 'Redeem Credits')
               ),
               React.createElement(Card, {title:'Active Instance'}, activeInstance && activeInstance.instance_id ? React.createElement(React.Fragment, null,
+                creditsLow && React.createElement(Alert, {type:'warning', showIcon:true, style:{marginBottom:16}, message:'Credits are running low', description:'Your instance will be automatically deleted when credits are exhausted. Save your work and redeem more credits as soon as possible.'}),
                 React.createElement('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:18}},
                   React.createElement(Statistic, {title:'Running Time', value:activeInstance.runtime_hours_display || 0, suffix:'hours', precision:2}),
                   React.createElement(Statistic, {title:'Credits Consumed', value:activeInstance.credits_consumed || 0})
