@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Profile - AMD Radeon Cloud</title>
+  <title>Profile - Radeon Cloud</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/reset.css" />
   <script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
@@ -269,7 +269,7 @@
       return React.createElement(Layout, null,
         React.createElement(Header, {className:'app-header'},
           React.createElement('div', {className:'left-header'},
-            React.createElement('div', {className:'brand'}, React.createElement('img', {src:'https://amd-ai-academy.com/static/image.png'}), React.createElement('span', null, 'AMD Radeon Cloud')),
+            React.createElement('div', {className:'brand'}, React.createElement('img', {src:'https://amd-ai-academy.com/static/image.png'}), React.createElement('span', null, 'Radeon Cloud')),
             React.createElement(Menu, {mode:'horizontal', selectedKeys:[], items:[
               {key:'gallery',label:React.createElement('a',{href:'/'},'Gallery')},
               {key:'space',label:'Space',disabled:true},
@@ -325,7 +325,7 @@
             ),
             renderEditorTemplates()
           ) : React.createElement(React.Fragment, null,
-            React.createElement('section', {className:'profile-hero'}, React.createElement(Text, {style:{color:'#aaa7bc'}}, 'Account'), React.createElement(Title, {level:1, style:{color:'#fff', marginTop:8}}, 'Sign in to AMD Radeon Cloud'), React.createElement(Paragraph, {style:{color:'#c5c2cf', maxWidth:620}}, 'Use GitHub or ModelScope to claim credits and launch GPU notebooks.')),
+            React.createElement('section', {className:'profile-hero'}, React.createElement(Text, {style:{color:'#aaa7bc'}}, 'Account'), React.createElement(Title, {level:1, style:{color:'#fff', marginTop:8}}, 'Sign in to Radeon Cloud'), React.createElement(Paragraph, {style:{color:'#c5c2cf', maxWidth:620}}, 'Use GitHub or ModelScope to claim credits and launch GPU notebooks.')),
             React.createElement('div', {className:'profile-grid'},
               React.createElement(Card, {title:'GitHub'}, React.createElement(Paragraph, {type:'secondary'}, 'Recommended for GitHub-based developer workflows.'), githubEnabled ? React.createElement(Button, {type:'primary', href:'/auth/github/login'}, 'Continue with GitHub') : React.createElement(Alert, {type:'warning', message:'GitHub OAuth is not configured'})),
               React.createElement(Card, {title:'ModelScope'}, React.createElement(Paragraph, {type:'secondary'}, 'Use your ModelScope identity and avatar.'), modelscopeEnabled ? React.createElement(Button, {type:'primary', href:'/auth/modelscope/login'}, 'Continue with ModelScope') : React.createElement(Alert, {type:'warning', message:'ModelScope OAuth is not configured'}))
