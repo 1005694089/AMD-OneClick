@@ -87,7 +87,8 @@
       const [redeemLoading, setRedeemLoading] = React.useState(false);
       const isEditor = !!(user && user.is_editor);
       const activeGpuCount = Number((activeInstance && activeInstance.gpu_count) || 1);
-      const creditsLow = !!(activeInstance && activeInstance.instance_id && Number(user.credits || 0) <= activeGpuCount * 2);
+      const remainingRunHours = activeGpuCount > 0 ? Math.floor(Number(user.credits || 0) / activeGpuCount) : 0;
+      const creditsLow = !!(activeInstance && activeInstance.instance_id && remainingRunHours <= 6);
 
       async function loadEditorTemplates() {
         if (!user || !user.email) return;
@@ -297,7 +298,7 @@
                 React.createElement(Button, {type:'primary', onClick:()=>setRedeemModalOpen(true)}, 'Redeem Credits')
               ),
               React.createElement(Card, {title:'Active Instance'}, activeInstance && activeInstance.instance_id ? React.createElement(React.Fragment, null,
-                creditsLow && React.createElement(Alert, {type:'warning', showIcon:true, style:{marginBottom:16}, message:'Credits are running low', description:'Your instance will be automatically deleted when credits are exhausted. Save your work and redeem more credits as soon as possible.'}),
+                creditsLow && React.createElement(Alert, {type:'warning', showIcon:true, closable:true, style:{marginBottom:16}, message:`Credits are running low: about ${remainingRunHours} hour${remainingRunHours === 1 ? '' : 's'} remaining`, description:'Your instance will be automatically deleted when credits are exhausted. Save your work and redeem more credits as soon as possible.'}),
                 React.createElement('div', {style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16,marginBottom:18}},
                   React.createElement(Statistic, {title:'Running Time', value:activeInstance.runtime_hours_display || 0, suffix:'hours', precision:2}),
                   React.createElement(Statistic, {title:'Credits Consumed', value:activeInstance.credits_consumed || 0})
