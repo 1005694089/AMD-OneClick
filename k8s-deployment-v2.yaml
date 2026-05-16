@@ -179,7 +179,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:low-credit-alert-20260516-1528
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:admin-responsive-brand-20260516-1600
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

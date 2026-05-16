@@ -232,14 +232,14 @@
       return React.createElement(Layout, null,
         React.createElement(Header, { className: 'app-header' },
           React.createElement('div', { className: 'left-header' },
-            React.createElement('div', { className: 'brand' }, React.createElement('img', { src: 'https://amd-ai-academy.com/static/image.png' }), React.createElement('span', null, 'AMD Radeon Cloud')),
+            React.createElement('div', { className: 'brand' }, React.createElement('img', { src: 'https://amd-ai-academy.com/static/image.png' }), React.createElement('span', null, 'Radeon Cloud')),
             React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'space', label: 'Space', disabled: true }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 300 } })
           ), React.createElement(UserMenu)
         ),
         React.createElement('section', { className: activeTab === 'gallery' ? 'hero gallery-hero' : 'hero' },
           activeTab === 'gallery' ? React.createElement('div', { className: 'gallery-hero-inner' },
             React.createElement('div', null,
-              React.createElement('div', { className: 'gallery-eyebrow' }, 'AMD Radeon Cloud Gallery'),
+              React.createElement('div', { className: 'gallery-eyebrow' }, 'Radeon Cloud Gallery'),
               React.createElement('h1', null, 'Explore runnable GPU notebooks'),
               React.createElement('p', null, 'Choose a prepared notebook or workspace, then launch it on AMD GPUs.'),
               React.createElement('div', { className: 'gallery-search' },
@@ -252,7 +252,7 @@
               React.createElement('div', { className: 'art-card' }, React.createElement('strong', null, 'Skill Agent'), React.createElement('span', null, 'Agent · Notebook')),
               React.createElement('div', { className: 'art-card' }, React.createElement('strong', null, 'LLM Inference'), React.createElement('span', null, 'vLLM · AMD GPU'))
             )
-          ) : React.createElement(Text, { style: { color: '#aaa7bc' } }, currentUser && currentUser.email ? `Good day, ${currentUser.name || currentUser.email}` : 'Welcome to AMD Radeon Cloud'),
+          ) : React.createElement(Text, { style: { color: '#aaa7bc' } }, currentUser && currentUser.email ? `Good day, ${currentUser.name || currentUser.email}` : 'Welcome to Radeon Cloud'),
           activeTab !== 'gallery' && React.createElement(Title, { level: 1 }, 'Launch GPU Notebook'),
           activeTab !== 'gallery' && React.createElement(Paragraph, null, 'Start a blank OpenCode-ready Jupyter notebook on AMD GPUs. Choose an image and GPU count, then launch.')
         ),
