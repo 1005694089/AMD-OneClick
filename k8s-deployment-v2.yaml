@@ -125,12 +125,12 @@ data:
   IDLE_TIMEOUT_MINUTES: "10"
   MAX_LIFETIME_HOURS: "6"
   SERVICE_HOST: "36.151.243.69"
-  PUBLIC_BASE_URL: "https://radeon.oneclickamd.ai"
+  PUBLIC_BASE_URL: "https://radeon.anruicloud.com"
   NODE_PORT_BASE: "30000"
   NOTEBOOK_TOKEN: "amd-oneclick"
   NOTEBOOK_LABEL_PREFIX: "amd-oneclick-v2"
-  GITHUB_REDIRECT_URI: "https://radeon.oneclickamd.ai/auth/github/callback"
-  MODELSCOPE_REDIRECT_URI: "https://radeon.oneclickamd.ai/auth/modelscope/callback"
+  GITHUB_REDIRECT_URI: "https://radeon.anruicloud.com/auth/github/callback"
+  MODELSCOPE_REDIRECT_URI: "https://radeon.anruicloud.com/auth/modelscope/callback"
 
 ---
 apiVersion: v1

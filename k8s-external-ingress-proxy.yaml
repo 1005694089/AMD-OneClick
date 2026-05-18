@@ -1,5 +1,5 @@
 # External ingress proxy deployed on the default kubeconfig cluster (DO).
-# DNS should point radeon.oneclickamd.ai to the existing ingress controller IP:
+# DNS should point radeon.anruicloud.com to the existing ingress controller IP:
 # 134.199.132.159
 ---
 apiVersion: v1
@@ -99,10 +99,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - radeon.oneclickamd.ai
-      secretName: radeon-oneclickamd-ai-tls
+        - radeon.anruicloud.com
+      secretName: radeon-anruicloud-com-tls
   rules:
-    - host: radeon.oneclickamd.ai
+    - host: radeon.anruicloud.com
       http:
         paths:
           - path: /
