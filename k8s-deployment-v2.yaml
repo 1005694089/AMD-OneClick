@@ -179,7 +179,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:template-slug-fix-20260518-2102
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:preview-gh-proxy-first-20260518-2142
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

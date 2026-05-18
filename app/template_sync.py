@@ -49,8 +49,10 @@ def _github_raw_url_candidates(repo_url: str, branch: str, path: str) -> list[st
     org, repo = _github_repo_parts(repo_url)
     clean_path = quote(path.lstrip("/"), safe="/")
     clean_branch = quote(branch or "main", safe="")
+    raw_url = f"https://raw.githubusercontent.com/{org}/{repo}/{clean_branch}/{clean_path}"
     return [
-        f"https://raw.githubusercontent.com/{org}/{repo}/{clean_branch}/{clean_path}",
+        f"https://gh-proxy.org/{raw_url}",
+        raw_url,
         f"https://github.com/{org}/{repo}/raw/{clean_branch}/{clean_path}",
         f"http://github.com/{org}/{repo}/raw/{clean_branch}/{clean_path}",
     ]
