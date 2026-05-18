@@ -504,24 +504,15 @@ def upsert_notebook_template(
         raise ValueError("template notebook_path must point to an .ipynb file")
 
     with engine.begin() as conn:
-        values["slug"] = _unique_template_slug(conn, slug, template_id) if not upsert_on_slug_conflict else slug
+        # Avoid relying on catching IntegrityError inside the transaction. In
+        # PostgreSQL a failed insert aborts the transaction, so duplicate slugs
+        # must be handled before writing.
+        values["slug"] = _unique_template_slug(conn, slug, template_id)
         if template_id:
             conn.execute(update(notebook_templates).where(notebook_templates.c.id == template_id).values(**values))
             return _template_row_to_dict(conn.execute(select(notebook_templates).where(notebook_templates.c.id == template_id)).mappings().first())
-        try:
-            result = conn.execute(notebook_templates.insert().values(**values, created_at=now))
-            new_id = result.inserted_primary_key[0]
-        except IntegrityError:
-            existing = conn.execute(select(notebook_templates).where(notebook_templates.c.slug == slug)).mappings().first()
-            if not existing:
-                raise
-            if not upsert_on_slug_conflict:
-                values["slug"] = _unique_template_slug(conn, slug)
-                result = conn.execute(notebook_templates.insert().values(**values, created_at=now))
-                new_id = result.inserted_primary_key[0]
-                return _template_row_to_dict(conn.execute(select(notebook_templates).where(notebook_templates.c.id == new_id)).mappings().first())
-            conn.execute(update(notebook_templates).where(notebook_templates.c.id == existing["id"]).values(**values))
-            new_id = existing["id"]
+        result = conn.execute(notebook_templates.insert().values(**values, created_at=now))
+        new_id = result.inserted_primary_key[0]
         return _template_row_to_dict(conn.execute(select(notebook_templates).where(notebook_templates.c.id == new_id)).mappings().first())
 
 
