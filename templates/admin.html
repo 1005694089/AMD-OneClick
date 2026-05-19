@@ -46,8 +46,11 @@ function App(){
   const [form]=Form.useForm();
   const [templateForm]=Form.useForm();
   const [creditForm]=Form.useForm();
+  const [bulkDestroyForm]=Form.useForm();
   const [imageModalOpen,setImageModalOpen]=React.useState(false);
   const [templateModalOpen,setTemplateModalOpen]=React.useState(false);
+  const [bulkDestroyModalOpen,setBulkDestroyModalOpen]=React.useState(false);
+  const [bulkDestroyLoading,setBulkDestroyLoading]=React.useState(false);
   const [editingTemplate,setEditingTemplate]=React.useState(null);
   const [creditModalUser,setCreditModalUser]=React.useState(null);
 
@@ -90,6 +93,22 @@ function App(){
     }
   }
   async function deleteTemplate(id){ const r=await fetch(`/api/admin/templates/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Template deleted':'Delete failed'); load(); }
+  async function bulkDestroyInstances(values){
+    setBulkDestroyLoading(true);
+    try{
+      const res=await fetch('/api/admin/instances/bulk-destroy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({matcher:values.matcher})});
+      const data=await res.json().catch(()=>({detail:'Bulk destroy failed'}));
+      if(!res.ok) throw new Error(data.detail || 'Bulk destroy failed');
+      message[data.failed_count?'warning':'success'](`Destroyed ${data.destroyed_count || 0}/${data.matched_count || 0} matched instances`);
+      bulkDestroyForm.resetFields();
+      setBulkDestroyModalOpen(false);
+      load();
+    }catch(e){
+      message.error(e.message || 'Bulk destroy failed');
+    }finally{
+      setBulkDestroyLoading(false);
+    }
+  }
   async function grantCredits(values){
     if(!creditModalUser) return;
     const res=await fetch(`/api/admin/users/${creditModalUser.id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
@@ -156,7 +175,8 @@ function App(){
         React.createElement('div',null,React.createElement(Title,{level:2,style:{margin:0}},'Admin Console'),React.createElement(Text,{type:'secondary'},'Manage images and running instances')),
         React.createElement('div',{className:'toolbar-actions'},
           React.createElement(Button,{onClick:()=>openTemplateModal(null)},'Add Template'),
-          React.createElement(Button,{type:'primary',onClick:()=>setImageModalOpen(true)},'Add Image')
+          React.createElement(Button,{type:'primary',onClick:()=>setImageModalOpen(true)},'Add Image'),
+          React.createElement(Button,{danger:true,onClick:()=>setBulkDestroyModalOpen(true)},'Remove Instances')
         )
       ),
       React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
@@ -202,6 +222,13 @@ function App(){
           React.createElement(Form.Item,{name:'amount',label:'Amount',rules:[{required:true,message:'Amount is required'}]},React.createElement(InputNumber,{min:1,precision:0,style:{width:'100%'},placeholder:'1000'})),
           React.createElement(Form.Item,{name:'reason',label:'Reason'},React.createElement(Input,{placeholder:'manual admin grant'})),
           React.createElement(Button,{type:'primary',htmlType:'submit',block:true},'Grant')
+        )
+      ),
+      React.createElement(Modal,{title:'Remove Running Instances',open:bulkDestroyModalOpen,onCancel:()=>setBulkDestroyModalOpen(false),footer:null,destroyOnClose:true},
+        React.createElement(Form,{form:bulkDestroyForm,layout:'vertical',onFinish:bulkDestroyInstances},
+          React.createElement(Typography.Paragraph,{type:'danger'},'This will delete running notebook instances. Enter ALL to delete every instance, or enter a substring such as modelscope to delete instances whose email contains that text.'),
+          React.createElement(Form.Item,{name:'matcher',label:'Email matcher',rules:[{required:true,message:'Matcher is required'}]},React.createElement(Input,{placeholder:'modelscope or ALL'})),
+          React.createElement(Button,{danger:true,type:'primary',htmlType:'submit',block:true,loading:bulkDestroyLoading},'Remove Matched Instances')
         )
       )
     )

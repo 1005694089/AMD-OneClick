@@ -32,6 +32,7 @@ from .models import (
     DestroyResponse,
     ImageRequest,
     CreditGrantRequest,
+    InstanceBulkDestroyRequest,
     CouponRedeemRequest,
     NotebookTemplateRequest,
     TemplateLaunchRequest,
@@ -1422,6 +1423,47 @@ async def destroy_all_instances(username: str = Depends(verify_admin)):
     except Exception as e:
         logger.error(f"Error destroying all instances: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/instances/bulk-destroy")
+async def bulk_destroy_instances(req: InstanceBulkDestroyRequest, username: str = Depends(verify_admin)):
+    """Destroy running notebook instances whose email matches the input, or all instances for ALL."""
+    matcher = (req.matcher or "").strip()
+    if not matcher:
+        raise HTTPException(status_code=400, detail="matcher is required")
+
+    destroy_all = matcher == "ALL"
+    needle = matcher.lower()
+    instances = k8s_client.list_instances()
+    matched = [
+        inst for inst in instances
+        if destroy_all or needle in (inst.get("email") or "").lower()
+    ]
+    destroyed = []
+    failed = []
+    for inst in matched:
+        instance_id = inst.get("id")
+        if not instance_id:
+            continue
+        try:
+            if k8s_client.delete_instance_by_id(instance_id):
+                mark_instance_deleted(instance_id)
+                destroyed.append({"id": instance_id, "email": inst.get("email")})
+            else:
+                failed.append({"id": instance_id, "email": inst.get("email"), "reason": "not found"})
+        except Exception as e:
+            logger.error("Bulk destroy failed for %s: %s", instance_id, e)
+            failed.append({"id": instance_id, "email": inst.get("email"), "reason": str(e)})
+
+    return {
+        "success": not failed,
+        "matcher": matcher,
+        "matched_count": len(matched),
+        "destroyed_count": len(destroyed),
+        "failed_count": len(failed),
+        "destroyed": destroyed,
+        "failed": failed,
+    }
 
 
 @app.post("/api/admin/cleanup")

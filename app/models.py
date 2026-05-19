@@ -28,6 +28,11 @@ class CreditGrantRequest(BaseModel):
     reason: Optional[str] = "manual admin grant"
 
 
+class InstanceBulkDestroyRequest(BaseModel):
+    """Request model for bulk destroying instances by email matcher"""
+    matcher: str
+
+
 class CouponRedeemRequest(BaseModel):
     """Request model for redeeming encrypted credit coupons"""
     coupon: str
