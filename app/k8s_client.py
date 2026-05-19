@@ -57,6 +57,12 @@ class K8sClient:
                               instance_type: str = "jupyter",
                               github_info: Optional[dict] = None) -> str:
         """Build startup script based on instance type"""
+        model_link_script = f"""
+mkdir -p /app
+if [ -d {shlex.quote(settings.HF_CACHE_MOUNT_PATH)}/Qwen3-8B ] && [ ! -e /app/Qwen3-8B ]; then
+    ln -s {shlex.quote(settings.HF_CACHE_MOUNT_PATH)}/Qwen3-8B /app/Qwen3-8B
+fi
+"""
         if github_info:
             notebook_path = github_info["path"].lstrip("/")
             notebook_filename = notebook_path.split("/")[-1]
@@ -68,6 +74,7 @@ class K8sClient:
                 return f"""
 set -e
 export PATH="/root/.opencode/bin:$PATH"
+{model_link_script}
 mkdir -p /app/workspace
 rm -rf /app/workspace/repo
 
@@ -91,6 +98,7 @@ fi
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir=/app/workspace/repo
 """
             return f"""
+{model_link_script}
 mkdir -p /app/notebooks
 cd /app/notebooks
 
@@ -115,6 +123,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         if instance_type == "opencode":
             return f"""
 export PATH="/root/.opencode/bin:$PATH"
+{model_link_script}
 cd /app
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}'
 """
@@ -122,6 +131,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         # Default: jupyter
         return f"""
 export PATH="/root/.opencode/bin:$PATH"
+{model_link_script}
 cd /app
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}'
 """

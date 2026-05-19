@@ -179,7 +179,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:admin-bulk-remove-20260519-1105
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:qwen-symlink-startup-20260519-1115
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
