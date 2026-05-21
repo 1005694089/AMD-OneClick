@@ -3,6 +3,7 @@ Kubernetes client for managing notebook instances
 """
 import hashlib
 import logging
+import os
 import re
 import shlex
 import socket
@@ -32,10 +33,24 @@ class K8sClient:
             # Fall back to kubeconfig file
             config.load_kube_config()
             logger.info("Loaded kubeconfig file")
+
+        # kubernetes>=35 generated clients use the BearerToken auth name, while
+        # load_incluster_config may populate the older "authorization" key.
+        self._ensure_bearer_token_auth()
         
         self.core_v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
         self.namespace = settings.K8S_NAMESPACE
+
+    def _ensure_bearer_token_auth(self):
+        token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        if not os.path.exists(token_path):
+            return
+        token = open(token_path, encoding="utf-8").read().strip()
+        cfg = client.Configuration.get_default_copy()
+        cfg.api_key["BearerToken"] = token
+        cfg.api_key_prefix["BearerToken"] = "Bearer"
+        client.Configuration.set_default(cfg)
     
     def _generate_instance_id(self, email: str) -> str:
         """Generate a unique instance ID from email"""
