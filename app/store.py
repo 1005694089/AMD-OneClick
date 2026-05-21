@@ -317,6 +317,33 @@ def list_users() -> list[dict]:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
 
 
+def get_admin_daily_stats() -> dict:
+    def day_key(value: str) -> str:
+        return datetime.fromisoformat(value).date().isoformat()
+
+    with engine.begin() as conn:
+        user_rows = conn.execute(select(users.c.created_at)).all()
+        instance_rows = conn.execute(select(instance_records.c.created_at)).all()
+
+    user_counts: dict[str, int] = {}
+    instance_counts: dict[str, int] = {}
+    for (created_at,) in user_rows:
+        day = day_key(created_at)
+        user_counts[day] = user_counts.get(day, 0) + 1
+    for (created_at,) in instance_rows:
+        day = day_key(created_at)
+        instance_counts[day] = instance_counts.get(day, 0) + 1
+
+    days = sorted(set(user_counts) | set(instance_counts))
+    return {
+        "days": days,
+        "daily_users": [user_counts.get(day, 0) for day in days],
+        "daily_instances": [instance_counts.get(day, 0) for day in days],
+        "total_users": len(user_rows),
+        "total_instances": len(instance_rows),
+    }
+
+
 def grant_user_credits(user_id: int, amount: int, reason: str = "manual admin grant") -> Optional[dict]:
     if amount <= 0:
         raise ValueError("amount must be positive")

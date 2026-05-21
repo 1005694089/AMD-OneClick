@@ -46,6 +46,7 @@ from .store import (
     delete_image,
     delete_notebook_template,
     get_active_instance_for_user,
+    get_admin_daily_stats,
     get_charged_credits_for_instance,
     get_image_by_value,
     get_notebook_template,
@@ -1257,6 +1258,11 @@ async def list_instances(username: str = Depends(verify_admin)):
 @app.get("/api/admin/users")
 async def admin_list_users(username: str = Depends(verify_admin)):
     return {"users": list_users()}
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(username: str = Depends(verify_admin)):
+    return get_admin_daily_stats()
 
 
 @app.post("/api/admin/users/{user_id}/credits")

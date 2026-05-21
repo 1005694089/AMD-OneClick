@@ -9,6 +9,7 @@
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
   <style>
     body { margin:0; background:#f5f6fb; }
     .header { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:12px 28px; background:#fff; border-bottom:1px solid #edf0f5; }
@@ -22,6 +23,7 @@
     .ant-card { border-radius: 14px; }
     .ant-statistic-content { font-size: 24px; }
     .admin-metrics { display:flex; gap:32px; flex-wrap:wrap; }
+    .stats-chart { width:100%; height:320px; }
     .user-search { width:min(360px, 100%); }
     .form-row { display:grid; grid-template-columns: minmax(0,1fr) 220px; gap:16px; align-items:start; }
     .form-row.three { grid-template-columns: 180px minmax(0,1fr) 120px; }
@@ -41,6 +43,7 @@ function App(){
   const [instances,setInstances]=React.useState([]);
   const [users,setUsers]=React.useState([]);
   const [templates,setTemplates]=React.useState([]);
+  const [stats,setStats]=React.useState({days:[],daily_users:[],daily_instances:[],total_instances:0,total_users:0});
   const [loading,setLoading]=React.useState(false);
   const [userSearch,setUserSearch]=React.useState('');
   const [form]=Form.useForm();
@@ -57,19 +60,40 @@ function App(){
   async function load(){
     setLoading(true);
     try{
-      const [imgRes, instRes, userRes, tplRes] = await Promise.all([fetch('/api/admin/images'), fetch('/api/admin/instances'), fetch('/api/admin/users'), fetch('/api/admin/templates')]);
+      const [imgRes, instRes, userRes, tplRes, statsRes] = await Promise.all([fetch('/api/admin/images'), fetch('/api/admin/instances'), fetch('/api/admin/users'), fetch('/api/admin/templates'), fetch('/api/admin/stats')]);
       const imgData = await imgRes.json();
       const instData = await instRes.json();
       const userData = await userRes.json();
       const tplData = await tplRes.json();
+      const statsData = await statsRes.json();
       setImages(imgData.images||[]);
       setInstances(instData.instances||[]);
       setUsers(userData.users||[]);
       setTemplates(tplData.templates||[]);
+      setStats(statsData||{});
     }catch(e){ message.error('Failed to load admin data'); }
     setLoading(false);
   }
   React.useEffect(()=>{ load(); },[]);
+  React.useEffect(()=>{
+    const node=document.getElementById('adminDailyStatsChart');
+    if(!node || !window.echarts) return;
+    const chart=echarts.init(node);
+    chart.setOption({
+      tooltip:{trigger:'axis'},
+      legend:{top:0,data:['Instances Launched','Users Registered']},
+      grid:{top:48,left:42,right:24,bottom:42},
+      xAxis:{type:'category',boundaryGap:false,data:stats.days||[]},
+      yAxis:{type:'value',minInterval:1},
+      series:[
+        {name:'Instances Launched',type:'line',smooth:true,symbolSize:7,data:stats.daily_instances||[]},
+        {name:'Users Registered',type:'line',smooth:true,symbolSize:7,data:stats.daily_users||[]}
+      ]
+    });
+    const resize=()=>chart.resize();
+    window.addEventListener('resize',resize);
+    return()=>{window.removeEventListener('resize',resize); chart.dispose();};
+  },[stats]);
 
   async function addImage(values){
     const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...values, enabled:true})});
@@ -180,7 +204,8 @@ function App(){
         )
       ),
       React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
-        React.createElement(Card,null,React.createElement('div',{className:'admin-metrics'},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Templates',value:templates.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Instances',value:instances.length}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
+        React.createElement(Card,null,React.createElement('div',{className:'admin-metrics'},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Templates',value:templates.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Running Instances',value:instances.length}),React.createElement(Statistic,{title:'Total Instances',value:stats.total_instances||0}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
+        React.createElement(Card,{title:'Daily Activity'},React.createElement('div',{id:'adminDailyStatsChart',className:'stats-chart'})),
         React.createElement(Card,{title:'Users',extra:React.createElement(Input.Search,{className:'user-search',allowClear:true,placeholder:'Search email, name, provider, or ID',value:userSearch,onChange:e=>setUserSearch(e.target.value),onSearch:setUserSearch})},React.createElement(Table,{rowKey:'id',columns:userColumns,dataSource:filteredUsers,loading,pagination:{pageSize:10,showSizeChanger:true},scroll:{x:'max-content'},size:'middle'})),
         React.createElement(Card,{title:'Notebook Templates'},React.createElement(Table,{rowKey:'id',columns:templateColumns,dataSource:templates,loading,pagination:false,scroll:{x:1400},size:'middle'})),
         React.createElement(Card,{title:'Image Catalog'},React.createElement(Table,{rowKey:'id',columns:imageColumns,dataSource:images,loading,pagination:false,scroll:{x:1100},size:'middle'})),
