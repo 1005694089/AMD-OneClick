@@ -62,6 +62,7 @@ from .store import (
     list_users,
     mark_instance_deleted,
     record_instance,
+    record_instance_launch_event,
     redeem_user_coupon,
     template_preview_fingerprint,
     upsert_notebook_template,
@@ -627,6 +628,7 @@ async def request_notebook(req: NotebookRequest, user: dict = Depends(current_us
         record_instance(
             user["id"], email, instance["id"], image, instance_type, gpu_count, instance.get("node_port")
         )
+        record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count)
 
         if instance.get("url"):
             send_notebook_url_email(email, instance["url"])
@@ -901,6 +903,16 @@ async def launch_notebook_template(template_id: int, req: TemplateLaunchRequest,
             custom_instance_id=instance_id,
         )
         record_instance(user["id"], email, instance["id"], template["image"], "opencode", gpu_count, instance.get("node_port"))
+        record_instance_launch_event(
+            user["id"],
+            email,
+            instance["id"],
+            template["image"],
+            "opencode",
+            gpu_count,
+            template_id=template["id"],
+            template_title=template["title"],
+        )
         if instance.get("url"):
             send_notebook_url_email(email, instance["url"])
         return NotebookStatus(

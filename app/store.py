@@ -151,6 +151,21 @@ instance_records = Table(
     Column("deleted_at", String(64)),
 )
 
+instance_launch_events = Table(
+    "instance_launch_events",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
+    Column("email", String(255), nullable=False),
+    Column("instance_id", String(255), nullable=False),
+    Column("image", Text, nullable=False),
+    Column("instance_type", String(64), nullable=False),
+    Column("gpu_count", Integer, nullable=False),
+    Column("template_id", Integer),
+    Column("template_title", String(255)),
+    Column("created_at", String(64), nullable=False),
+)
+
 credit_ledger = Table(
     "credit_ledger",
     metadata,
@@ -217,7 +232,7 @@ def ensure_schema_columns(conn):
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN owner_user_id INTEGER"))
 
     # Backward-compatible creation for databases initialized before these tables.
-    metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions])
+    metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions, instance_launch_events])
 
 
 def ensure_default_image(conn):
@@ -323,24 +338,37 @@ def get_admin_daily_stats() -> dict:
 
     with engine.begin() as conn:
         user_rows = conn.execute(select(users.c.created_at)).all()
-        instance_rows = conn.execute(select(instance_records.c.created_at)).all()
+        active_user_rows = conn.execute(select(instance_records.c.created_at)).all()
+        launch_rows = conn.execute(select(instance_launch_events.c.created_at)).all()
 
     user_counts: dict[str, int] = {}
-    instance_counts: dict[str, int] = {}
+    active_user_counts: dict[str, int] = {}
+    launch_counts: dict[str, int] = {}
     for (created_at,) in user_rows:
         day = day_key(created_at)
         user_counts[day] = user_counts.get(day, 0) + 1
-    for (created_at,) in instance_rows:
+    for (created_at,) in active_user_rows:
         day = day_key(created_at)
-        instance_counts[day] = instance_counts.get(day, 0) + 1
+        active_user_counts[day] = active_user_counts.get(day, 0) + 1
+    for (created_at,) in launch_rows:
+        day = day_key(created_at)
+        launch_counts[day] = launch_counts.get(day, 0) + 1
 
-    days = sorted(set(user_counts) | set(instance_counts))
+    days = sorted(set(user_counts) | set(active_user_counts) | set(launch_counts))
+    tracking_started_at = min((created_at for (created_at,) in launch_rows), default=None)
     return {
         "days": days,
         "daily_users": [user_counts.get(day, 0) for day in days],
-        "daily_instances": [instance_counts.get(day, 0) for day in days],
+        "daily_instance_launches": [launch_counts.get(day, 0) for day in days],
+        "daily_active_users": [active_user_counts.get(day, 0) for day in days],
+        # Backward-compatible aliases for older frontend code.
+        "daily_instances": [launch_counts.get(day, 0) for day in days],
         "total_users": len(user_rows),
-        "total_instances": len(instance_rows),
+        "total_instance_launches": len(launch_rows),
+        "total_active_users": len(active_user_rows),
+        "total_instances": len(launch_rows),
+        "legacy_total_instance_records": len(active_user_rows),
+        "tracking_started_at": tracking_started_at,
     }
 
 
@@ -905,6 +933,32 @@ def record_instance(user_id: int, email: str, instance_id: str, image: str, inst
             conn.execute(update(instance_records).where(instance_records.c.id == existing["id"]).values(**values))
         else:
             conn.execute(instance_records.insert().values(**values, instance_id=instance_id, created_at=now))
+
+
+def record_instance_launch_event(
+    user_id: int,
+    email: str,
+    instance_id: str,
+    image: str,
+    instance_type: str,
+    gpu_count: int,
+    template_id: Optional[int] = None,
+    template_title: Optional[str] = None,
+):
+    with engine.begin() as conn:
+        conn.execute(
+            instance_launch_events.insert().values(
+                user_id=user_id,
+                email=email,
+                instance_id=instance_id,
+                image=image,
+                instance_type=instance_type,
+                gpu_count=gpu_count,
+                template_id=template_id,
+                template_title=template_title,
+                created_at=utc_now(),
+            )
+        )
 
 
 def mark_instance_deleted(instance_id: str):

@@ -43,7 +43,7 @@ function App(){
   const [instances,setInstances]=React.useState([]);
   const [users,setUsers]=React.useState([]);
   const [templates,setTemplates]=React.useState([]);
-  const [stats,setStats]=React.useState({days:[],daily_users:[],daily_instances:[],total_instances:0,total_users:0});
+  const [stats,setStats]=React.useState({days:[],daily_users:[],daily_instance_launches:[],daily_active_users:[],total_instance_launches:0,total_active_users:0,total_users:0});
   const [loading,setLoading]=React.useState(false);
   const [userSearch,setUserSearch]=React.useState('');
   const [form]=Form.useForm();
@@ -81,12 +81,13 @@ function App(){
     const chart=echarts.init(node);
     chart.setOption({
       tooltip:{trigger:'axis'},
-      legend:{top:0,data:['Instances Launched','Users Registered']},
+      legend:{top:0,data:['Instance Launches','Active Users','Users Registered']},
       grid:{top:48,left:42,right:24,bottom:42},
       xAxis:{type:'category',boundaryGap:false,data:stats.days||[]},
       yAxis:{type:'value',minInterval:1},
       series:[
-        {name:'Instances Launched',type:'line',smooth:true,symbolSize:7,data:stats.daily_instances||[]},
+        {name:'Instance Launches',type:'line',smooth:true,symbolSize:7,data:stats.daily_instance_launches||stats.daily_instances||[]},
+        {name:'Active Users',type:'line',smooth:true,symbolSize:7,data:stats.daily_active_users||[]},
         {name:'Users Registered',type:'line',smooth:true,symbolSize:7,data:stats.daily_users||[]}
       ]
     });
@@ -204,8 +205,8 @@ function App(){
         )
       ),
       React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
-        React.createElement(Card,null,React.createElement('div',{className:'admin-metrics'},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Templates',value:templates.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Running Instances',value:instances.length}),React.createElement(Statistic,{title:'Total Instances',value:stats.total_instances||0}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
-        React.createElement(Card,{title:'Daily Activity'},React.createElement('div',{id:'adminDailyStatsChart',className:'stats-chart'})),
+        React.createElement(Card,null,React.createElement('div',{className:'admin-metrics'},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Templates',value:templates.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Running Instances',value:instances.length}),React.createElement(Statistic,{title:'Total Launches',value:stats.total_instance_launches||0}),React.createElement(Statistic,{title:'Active Users',value:stats.total_active_users||0}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
+        React.createElement(Card,{title:'Daily Activity',extra:stats.tracking_started_at?React.createElement(Text,{type:'secondary'},`Launch tracking since ${dayjs(stats.tracking_started_at).format('YYYY-MM-DD HH:mm')}`):React.createElement(Text,{type:'secondary'},'Launch tracking starts after this update')},React.createElement('div',{id:'adminDailyStatsChart',className:'stats-chart'})),
         React.createElement(Card,{title:'Users',extra:React.createElement(Input.Search,{className:'user-search',allowClear:true,placeholder:'Search email, name, provider, or ID',value:userSearch,onChange:e=>setUserSearch(e.target.value),onSearch:setUserSearch})},React.createElement(Table,{rowKey:'id',columns:userColumns,dataSource:filteredUsers,loading,pagination:{pageSize:10,showSizeChanger:true},scroll:{x:'max-content'},size:'middle'})),
         React.createElement(Card,{title:'Notebook Templates'},React.createElement(Table,{rowKey:'id',columns:templateColumns,dataSource:templates,loading,pagination:false,scroll:{x:1400},size:'middle'})),
         React.createElement(Card,{title:'Image Catalog'},React.createElement(Table,{rowKey:'id',columns:imageColumns,dataSource:images,loading,pagination:false,scroll:{x:1100},size:'middle'})),
