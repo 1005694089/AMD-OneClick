@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 GPU_INSTANCE_CREATED_METRIC = "radeon_cloud_gpu_instance_created"
 USER_REGISTERED_METRIC = "radeon_cloud_user_registered"
+GPU_HOUR_CHARGED_METRIC = "radeon_cloud_gpu_hour_charged"
 
 
 def telemetry_configured() -> bool:
@@ -31,7 +32,7 @@ def _base_labels() -> dict[str, str]:
     }
 
 
-async def _post_metric(name: str, labels: dict[str, Any], value: float = 1) -> bool:
+async def _post_metric(name: str, labels: dict[str, Any], value: float = 1, timestamp: int | None = None) -> bool:
     if not telemetry_configured():
         return False
 
@@ -39,7 +40,7 @@ async def _post_metric(name: str, labels: dict[str, Any], value: float = 1) -> b
         "name": name,
         "value": value,
         "labels": {**_base_labels(), **{key: str(val) for key, val in labels.items() if val is not None}},
-        "timestamp": _timestamp(),
+        "timestamp": timestamp or _timestamp(),
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
@@ -92,3 +93,33 @@ async def report_gpu_instance_created_event(
             logger.info("Reported Radeon Cloud GPU instance creation event to AMD Telemetry")
     except Exception as exc:
         logger.warning("Failed to report GPU instance creation event to AMD Telemetry: %s", exc)
+
+
+async def report_gpu_hour_charged_event(
+    *,
+    instance_id: str,
+    billing_session_id: str,
+    billing_unit: int,
+    user_id: int,
+    gpu_count: int,
+    timestamp: int | None = None,
+) -> None:
+    try:
+        reported = await _post_metric(
+            GPU_HOUR_CHARGED_METRIC,
+            {
+                "event": "gpu_hour_charged",
+                "instance_id": instance_id,
+                "billing_session_id": billing_session_id,
+                "billing_unit": billing_unit,
+                "user_id": user_id,
+                "gpu_count": gpu_count,
+                "gpu_type": "amd",
+            },
+            value=float(gpu_count),
+            timestamp=timestamp,
+        )
+        if reported:
+            logger.info("Reported Radeon Cloud GPU hour charge event to AMD Telemetry")
+    except Exception as exc:
+        logger.warning("Failed to report GPU hour charge event to AMD Telemetry: %s", exc)

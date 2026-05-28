@@ -33,13 +33,24 @@ async def cleanup_job():
                     continue
                 billable_units = max(1, math.ceil(elapsed_seconds / 3600))
                 for unit in range(1, billable_units + 1):
+                    billing_session_id = record.get("billing_session_id") or record["instance_id"]
                     result = charge_usage_unit(
                         record["user_id"],
                         record["instance_id"],
-                        record.get("billing_session_id") or record["instance_id"],
+                        billing_session_id,
                         unit,
                         int(record["gpu_count"]),
                     )
+                    if result == "charged":
+                        from .telemetry import report_gpu_hour_charged_event
+
+                        await report_gpu_hour_charged_event(
+                            instance_id=record["instance_id"],
+                            billing_session_id=billing_session_id,
+                            billing_unit=unit,
+                            user_id=record["user_id"],
+                            gpu_count=int(record["gpu_count"]),
+                        )
                     if result == "insufficient":
                         if k8s_client.delete_instance_by_id(record["instance_id"]):
                             mark_instance_deleted(record["instance_id"])

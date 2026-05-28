@@ -184,7 +184,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:billing-session-admin-fix-20260528-2253
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:gpu-hour-telemetry-20260528-2328
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
