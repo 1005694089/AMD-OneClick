@@ -131,6 +131,10 @@ data:
   NOTEBOOK_LABEL_PREFIX: "amd-oneclick-v2"
   GITHUB_REDIRECT_URI: "https://radeon.anruicloud.com/auth/github/callback"
   MODELSCOPE_REDIRECT_URI: "https://radeon.anruicloud.com/auth/modelscope/callback"
+  TELEMETRY_API_URL: "http://36.150.116.200:30090/v1/metrics"
+  ONECLICK_TELEMETRY_ENABLED: "true"
+  ONECLICK_TELEMETRY_SOURCE: "amd_oneclick"
+  ONECLICK_TELEMETRY_PRODUCT: "radeon_cloud"
 
 ---
 apiVersion: v1
@@ -150,6 +154,7 @@ stringData:
   MODELSCOPE_TOKEN_URL: "https://modelscope.cn/oauth/token"
   MODELSCOPE_USERINFO_URL: "https://modelscope.cn/api/v1/user"
   COUPON_PRIVATE_KEY_PEM: "<replace-with-coupon-private-key-pem>"
+  METRICS_INGEST_API_KEY: "<replace-with-metrics-ingest-api-key>"
 
 ---
 apiVersion: apps/v1
@@ -179,7 +184,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:launch-events-dashboard-20260521-1058
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:billing-session-admin-fix-20260528-2253
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

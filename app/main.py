@@ -291,7 +291,10 @@ def _active_instance_context(user: Optional[dict]) -> Optional[dict]:
     runtime_seconds = max(0, int((now - created_at).total_seconds()))
     active_instance["runtime_minutes"] = runtime_seconds // 60
     active_instance["runtime_hours_display"] = round(runtime_seconds / 3600, 2)
-    active_instance["credits_consumed"] = get_charged_credits_for_instance(active_instance["instance_id"])
+    active_instance["credits_consumed"] = get_charged_credits_for_instance(
+        active_instance["instance_id"],
+        active_instance.get("billing_session_id"),
+    )
     active_instance["url"] = live_instance.get("url")
     active_instance["github_path"] = live_instance.get("github_path")
     active_instance["template_id"] = live_instance.get("template_id")
@@ -500,6 +503,10 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
     if not email:
         raise HTTPException(status_code=400, detail="GitHub account has no accessible email")
     user = get_or_create_user("github", str(profile["id"]), email, profile.get("name") or profile.get("login") or "", profile.get("avatar_url") or "")
+    if user.get("_created"):
+        from .telemetry import report_user_registered_event
+
+        await report_user_registered_event(user)
     request.session["user_id"] = user["id"]
     return RedirectResponse("/")
 
@@ -566,6 +573,10 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
     provider_id = str(profile.get("id") or profile.get("sub") or profile.get("username") or profile.get("email") or token_data.get("uid") or token[:12])
     email = profile.get("email") or f"{provider_id}@modelscope.local"
     user = get_or_create_user("modelscope", provider_id, email, profile.get("name") or profile.get("username") or provider_id, profile.get("avatar_url") or profile.get("avatar") or "")
+    if user.get("_created"):
+        from .telemetry import report_user_registered_event
+
+        await report_user_registered_event(user)
     request.session["user_id"] = user["id"]
     return RedirectResponse("/")
 
@@ -629,6 +640,14 @@ async def request_notebook(req: NotebookRequest, user: dict = Depends(current_us
             user["id"], email, instance["id"], image, instance_type, gpu_count, instance.get("node_port")
         )
         record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count)
+        from .telemetry import report_gpu_instance_created_event
+
+        await report_gpu_instance_created_event(
+            instance_id=instance["id"],
+            user_id=user["id"],
+            instance_type=instance_type,
+            gpu_count=gpu_count,
+        )
 
         if instance.get("url"):
             send_notebook_url_email(email, instance["url"])
@@ -912,6 +931,15 @@ async def launch_notebook_template(template_id: int, req: TemplateLaunchRequest,
             gpu_count,
             template_id=template["id"],
             template_title=template["title"],
+        )
+        from .telemetry import report_gpu_instance_created_event
+
+        await report_gpu_instance_created_event(
+            instance_id=instance["id"],
+            user_id=user["id"],
+            instance_type="opencode",
+            gpu_count=gpu_count,
+            template_id=template["id"],
         )
         if instance.get("url"):
             send_notebook_url_email(email, instance["url"])
@@ -1243,7 +1271,7 @@ async def list_instances(username: str = Depends(verify_admin)):
                 id=inst["id"],
                 email=inst["email"],
                 pod_name=inst["pod_name"],
-                url=inst.get("url", ""),
+                url=inst.get("url") or "",
                 status=inst["status"],
                 created_at=inst.get("created_at", ""),
                 last_activity=inst.get("last_activity"),

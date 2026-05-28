@@ -5,6 +5,7 @@ Uses PostgreSQL when DATABASE_URL is set; falls back to local SQLite for dev.
 """
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -148,6 +149,7 @@ instance_records = Table(
     Column("status", String(64), nullable=False, default="running"),
     Column("created_at", String(64), nullable=False),
     Column("last_charged_at", String(64), nullable=False),
+    Column("billing_session_id", String(255), nullable=False),
     Column("deleted_at", String(64)),
 )
 
@@ -197,11 +199,12 @@ usage_charges = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
     Column("instance_id", String(255), nullable=False),
+    Column("billing_session_id", String(255), nullable=False),
     Column("billing_unit", Integer, nullable=False),
     Column("gpu_count", Integer, nullable=False),
     Column("credits", Integer, nullable=False),
     Column("created_at", String(64), nullable=False),
-    UniqueConstraint("instance_id", "billing_unit", name="uq_usage_charge_instance_unit"),
+    UniqueConstraint("billing_session_id", "billing_unit", name="uq_usage_charge_session_unit"),
 )
 
 
@@ -226,6 +229,24 @@ def ensure_schema_columns(conn):
     user_columns = {col["name"] for col in inspector.get_columns("users")}
     if "is_editor" not in user_columns:
         conn.execute(text("ALTER TABLE users ADD COLUMN is_editor BOOLEAN NOT NULL DEFAULT FALSE"))
+
+    instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
+    if "billing_session_id" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN billing_session_id VARCHAR(255)"))
+        conn.execute(text("UPDATE instance_records SET billing_session_id = instance_id WHERE billing_session_id IS NULL"))
+
+    usage_columns = {col["name"] for col in inspector.get_columns("usage_charges")}
+    if "billing_session_id" not in usage_columns:
+        conn.execute(text("ALTER TABLE usage_charges ADD COLUMN billing_session_id VARCHAR(255)"))
+        conn.execute(text("UPDATE usage_charges SET billing_session_id = instance_id WHERE billing_session_id IS NULL"))
+
+    # New launches reuse the same Kubernetes instance_id, so billing idempotency must be scoped
+    # to a launch session instead of the stable instance id.
+    if conn.dialect.name == "postgresql":
+        conn.execute(text("ALTER TABLE usage_charges DROP CONSTRAINT IF EXISTS uq_usage_charge_instance_unit"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_charge_session_unit ON usage_charges (billing_session_id, billing_unit)"))
+    elif conn.dialect.name == "sqlite":
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_charge_session_unit ON usage_charges (billing_session_id, billing_unit)"))
 
     template_columns = {col["name"] for col in inspector.get_columns("notebook_templates")}
     if "owner_user_id" not in template_columns:
@@ -291,7 +312,9 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
                 .where(users.c.id == existing["id"])
                 .values(email=email, name=name, avatar_url=avatar_url, updated_at=now)
             )
-            return row_to_dict(conn.execute(select(users).where(users.c.id == existing["id"])).mappings().first())
+            user = row_to_dict(conn.execute(select(users).where(users.c.id == existing["id"])).mappings().first())
+            user["_created"] = False
+            return user
 
         by_email = conn.execute(select(users).where(users.c.email == email)).mappings().first()
         if by_email:
@@ -300,7 +323,9 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
                 .where(users.c.id == by_email["id"])
                 .values(provider=provider, provider_id=provider_id, name=name, avatar_url=avatar_url, updated_at=now)
             )
-            return row_to_dict(conn.execute(select(users).where(users.c.id == by_email["id"])).mappings().first())
+            user = row_to_dict(conn.execute(select(users).where(users.c.id == by_email["id"])).mappings().first())
+            user["_created"] = False
+            return user
 
         result = conn.execute(
             users.insert().values(
@@ -318,7 +343,9 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
         conn.execute(
             credit_ledger.insert().values(user_id=user_id, delta=10, reason="signup_bonus", created_at=now)
         )
-        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+        user = row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+        user["_created"] = True
+        return user
 
 
 def get_user(user_id: int) -> Optional[dict]:
@@ -914,6 +941,7 @@ def get_active_instance_for_user(user_id: int) -> Optional[dict]:
 
 def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int):
     now = utc_now()
+    billing_session_id = f"{instance_id}:{uuid.uuid4().hex[:12]}"
     with engine.begin() as conn:
         existing = conn.execute(
             select(instance_records).where(instance_records.c.instance_id == instance_id)
@@ -926,13 +954,15 @@ def record_instance(user_id: int, email: str, instance_id: str, image: str, inst
             gpu_count=gpu_count,
             node_port=node_port,
             status="running",
+            created_at=now,
             last_charged_at=now,
+            billing_session_id=billing_session_id,
             deleted_at=None,
         )
         if existing:
             conn.execute(update(instance_records).where(instance_records.c.id == existing["id"]).values(**values))
         else:
-            conn.execute(instance_records.insert().values(**values, instance_id=instance_id, created_at=now))
+            conn.execute(instance_records.insert().values(**values, instance_id=instance_id))
 
 
 def record_instance_launch_event(
@@ -979,20 +1009,23 @@ def charge_user(user_id: int, amount: int, reason: str, instance_id: str):
         )
 
 
-def get_charged_credits_for_instance(instance_id: str) -> int:
+def get_charged_credits_for_instance(instance_id: str, billing_session_id: Optional[str] = None) -> int:
     with engine.begin() as conn:
-        rows = conn.execute(select(usage_charges.c.credits).where(usage_charges.c.instance_id == instance_id)).all()
+        if billing_session_id:
+            rows = conn.execute(select(usage_charges.c.credits).where(usage_charges.c.billing_session_id == billing_session_id)).all()
+        else:
+            rows = conn.execute(select(usage_charges.c.credits).where(usage_charges.c.instance_id == instance_id)).all()
         return sum(int(r[0]) for r in rows)
 
 
-def charge_usage_unit(user_id: int, instance_id: str, billing_unit: int, gpu_count: int) -> str:
+def charge_usage_unit(user_id: int, instance_id: str, billing_session_id: str, billing_unit: int, gpu_count: int) -> str:
     """Idempotently charge one billing unit. Returns charged/existing/insufficient."""
     now = utc_now()
     credits = int(gpu_count)
     with engine.begin() as conn:
         existing = conn.execute(
             select(usage_charges.c.id).where(
-                usage_charges.c.instance_id == instance_id,
+                usage_charges.c.billing_session_id == billing_session_id,
                 usage_charges.c.billing_unit == billing_unit,
             )
         ).first()
@@ -1009,6 +1042,7 @@ def charge_usage_unit(user_id: int, instance_id: str, billing_unit: int, gpu_cou
             usage_charges.insert().values(
                 user_id=user_id,
                 instance_id=instance_id,
+                billing_session_id=billing_session_id,
                 billing_unit=billing_unit,
                 gpu_count=gpu_count,
                 credits=credits,

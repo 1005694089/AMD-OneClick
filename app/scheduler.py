@@ -36,6 +36,7 @@ async def cleanup_job():
                     result = charge_usage_unit(
                         record["user_id"],
                         record["instance_id"],
+                        record.get("billing_session_id") or record["instance_id"],
                         unit,
                         int(record["gpu_count"]),
                     )
@@ -90,7 +91,10 @@ def start_scheduler():
         replace_existing=True,
     )
     scheduler.start()
-    logger.info("Scheduler started; cleanup runs every 1 minute and template preview sync every 2 minutes")
+    logger.info(
+        "Scheduler started; cleanup runs every 1 minute, template preview sync every 2 minutes, telemetry events %s",
+        "enabled" if settings.ONECLICK_TELEMETRY_ENABLED else "disabled",
+    )
 
 
 def stop_scheduler():
