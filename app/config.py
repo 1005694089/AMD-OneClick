@@ -36,11 +36,6 @@ INSTANCE_TYPES = {
 class Settings:
     K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "default")
 
-    MANAGER_ROLE: str = os.getenv(
-        "MANAGER_ROLE",
-        "monolith" if os.getenv("RUN_SCHEDULER", "true").lower() in {"1", "true", "yes", "on"} else "web",
-    ).lower()
-
     DEFAULT_IMAGE: str = os.getenv(
         "DEFAULT_IMAGE",
         "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
@@ -51,10 +46,6 @@ class Settings:
         return [self.DEFAULT_IMAGE]
 
     DATABASE_PATH: str = os.getenv("DATABASE_PATH", "/data/amd-oneclick.db")
-    DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "10"))
-    DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "20"))
-    DB_POOL_RECYCLE_SECONDS: int = int(os.getenv("DB_POOL_RECYCLE_SECONDS", "1800"))
-    DB_STATEMENT_TIMEOUT_MS: int = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
     SESSION_SECRET: str = os.getenv("SESSION_SECRET", "change-me-for-production")
 
     GITHUB_CLIENT_ID: Optional[str] = os.getenv("GITHUB_CLIENT_ID")
@@ -105,15 +96,6 @@ class Settings:
 
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
     COUPON_PRIVATE_KEY_PEM: Optional[str] = os.getenv("COUPON_PRIVATE_KEY_PEM")
-
-    RUN_SCHEDULER: bool = MANAGER_ROLE in {"monolith", "worker"} and os.getenv("RUN_SCHEDULER", "true").lower() in {"1", "true", "yes", "on"}
-
-    OAUTH_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_CONNECT_TIMEOUT_SECONDS", "5"))
-    OAUTH_READ_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_READ_TIMEOUT_SECONDS", "15"))
-    PROXY_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("PROXY_CONNECT_TIMEOUT_SECONDS", "10"))
-    PROXY_READ_TIMEOUT_SECONDS: float = float(os.getenv("PROXY_READ_TIMEOUT_SECONDS", "3600"))
-    INSTANCE_SERVICE_CACHE_TTL_SECONDS: int = int(os.getenv("INSTANCE_SERVICE_CACHE_TTL_SECONDS", "30"))
-    SLOW_REQUEST_THRESHOLD_SECONDS: float = float(os.getenv("SLOW_REQUEST_THRESHOLD_SECONDS", "2"))
 
     TELEMETRY_API_URL: str = os.getenv("TELEMETRY_API_URL", "")
     METRICS_INGEST_API_KEY: str = os.getenv("METRICS_INGEST_API_KEY", "")

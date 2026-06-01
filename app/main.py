@@ -7,7 +7,6 @@ import logging
 import os
 import base64
 import asyncio
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -21,6 +20,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.middleware.sessions import SessionMiddleware
 import secrets
 import httpx
+import requests
 import websockets
 
 from .config import settings, INSTANCE_TYPES
@@ -77,8 +77,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_INSTANCE_SERVICE_CACHE: dict[str, tuple[str, float]] = {}
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -86,20 +84,11 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting AMD OneClick Notebook Manager")
     init_db()
-    app.state.proxy_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.PROXY_READ_TIMEOUT_SECONDS, connect=settings.PROXY_CONNECT_TIMEOUT_SECONDS),
-        follow_redirects=False,
-    )
-    if settings.RUN_SCHEDULER:
-        start_scheduler()
-    else:
-        logger.info("Background scheduler disabled for this manager process")
+    start_scheduler()
     yield
     # Shutdown
     logger.info("Shutting down AMD OneClick Notebook Manager")
-    if settings.RUN_SCHEDULER:
-        stop_scheduler()
-    await app.state.proxy_client.aclose()
+    stop_scheduler()
 
 
 app = FastAPI(
@@ -109,27 +98,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET)
-
-
-@app.middleware("http")
-async def log_slow_requests(request: Request, call_next):
-    start = time.monotonic()
-    status_code = 500
-    try:
-        response = await call_next(request)
-        status_code = response.status_code
-        return response
-    finally:
-        elapsed = time.monotonic() - start
-        if elapsed >= settings.SLOW_REQUEST_THRESHOLD_SECONDS:
-            logger.warning(
-                "Slow request method=%s path=%s status=%s duration=%.3fs role=%s",
-                request.method,
-                request.url.path,
-                status_code,
-                elapsed,
-                settings.MANAGER_ROLE,
-            )
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -375,21 +343,14 @@ def _validate_oauth_state(request: Request, provider: str, state: str):
 
 
 def _instance_service_base(instance_id: str) -> str:
-    cached = _INSTANCE_SERVICE_CACHE.get(instance_id)
-    now = time.monotonic()
-    if cached and cached[1] > now:
-        return cached[0]
     try:
         svc = k8s_client.core_v1.read_namespaced_service(
             name=f"{instance_id}-svc",
             namespace=k8s_client.namespace,
         )
     except Exception:
-        _INSTANCE_SERVICE_CACHE.pop(instance_id, None)
         raise HTTPException(status_code=404, detail="Instance service not found")
-    target = f"http://{svc.spec.cluster_ip}:{settings.NOTEBOOK_PORT}"
-    _INSTANCE_SERVICE_CACHE[instance_id] = (target, now + settings.INSTANCE_SERVICE_CACHE_TTL_SECONDS)
-    return target
+    return f"http://{svc.spec.cluster_ip}:{settings.NOTEBOOK_PORT}"
 
 
 def _proxy_headers(headers) -> dict:
@@ -409,15 +370,19 @@ def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
     return location
 
 
-def _append_internal_token(url: str) -> str:
-    separator = "&" if "?" in url else "?"
-    if "token=" in url.split("?", 1)[-1]:
-        return url
-    return f"{url}{separator}token={settings.NOTEBOOK_TOKEN}"
-
-
-def _oauth_timeout() -> httpx.Timeout:
-    return httpx.Timeout(settings.OAUTH_READ_TIMEOUT_SECONDS, connect=settings.OAUTH_CONNECT_TIMEOUT_SECONDS)
+def _request_with_retries(method: str, url: str, retries: int = 3, **kwargs) -> requests.Response:
+    last_error = None
+    timeout = kwargs.pop("timeout", 30)
+    for attempt in range(1, retries + 1):
+        try:
+            return requests.request(method, url, timeout=timeout, **kwargs)
+        except requests.RequestException as e:
+            last_error = e
+            logger.warning("HTTP %s %s failed on attempt %s/%s: %s", method, url, attempt, retries, e)
+            if attempt < retries:
+                import time
+                time.sleep(min(2 * attempt, 5))
+    raise last_error
 
 
 def _parse_coupon_datetime(value: str) -> datetime:
@@ -517,39 +482,23 @@ async def github_login(request: Request):
 @app.get("/auth/github/callback", name="github_callback")
 async def github_callback(request: Request, code: str = Query(...), state: str = Query("")):
     _validate_oauth_state(request, "github", state)
-    try:
-        async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
-            token_resp = await client.post(
-                "https://github.com/login/oauth/access_token",
-                headers={"Accept": "application/json"},
-                data={
-                    "client_id": settings.GITHUB_CLIENT_ID,
-                    "client_secret": settings.GITHUB_CLIENT_SECRET,
-                    "code": code,
-                    "redirect_uri": _oauth_redirect_uri(request, "github"),
-                },
-            )
-            token = token_resp.json().get("access_token")
-            if not token:
-                raise HTTPException(status_code=400, detail="GitHub OAuth token exchange failed")
-            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-            profile_resp, emails_resp = await asyncio.gather(
-                client.get("https://api.github.com/user", headers=headers),
-                client.get("https://api.github.com/user/emails", headers=headers),
-            )
-    except httpx.RequestError as e:
-        logger.error("GitHub OAuth request failed: %s", e)
-        raise HTTPException(status_code=502, detail="GitHub OAuth request failed")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("GitHub OAuth response handling failed: %s", e)
-        raise HTTPException(status_code=400, detail="GitHub OAuth token exchange failed")
+    token_resp = requests.post(
+        "https://github.com/login/oauth/access_token",
+        headers={"Accept": "application/json"},
+        data={
+            "client_id": settings.GITHUB_CLIENT_ID,
+            "client_secret": settings.GITHUB_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": _oauth_redirect_uri(request, "github"),
+        },
+        timeout=20,
+    )
     token = token_resp.json().get("access_token")
     if not token:
         raise HTTPException(status_code=400, detail="GitHub OAuth token exchange failed")
-    profile = profile_resp.json()
-    emails = emails_resp.json()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    profile = requests.get("https://api.github.com/user", headers=headers, timeout=20).json()
+    emails = requests.get("https://api.github.com/user/emails", headers=headers, timeout=20).json()
     email = profile.get("email") or next((e["email"] for e in emails if e.get("primary")), None)
     if not email:
         raise HTTPException(status_code=400, detail="GitHub account has no accessible email")
@@ -582,35 +531,33 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
     if expected_state and state and not secrets.compare_digest(expected_state, state):
         logger.warning("ModelScope OAuth state mismatch: expected=%s got=%s; continuing because ModelScope may not echo state", expected_state, state)
     try:
-        async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
-            token_resp = await client.post(
-                settings.MODELSCOPE_TOKEN_URL,
-                data={
-                    "grant_type": "authorization_code",
-                    "client_id": settings.MODELSCOPE_CLIENT_ID,
-                    "client_secret": settings.MODELSCOPE_CLIENT_SECRET,
-                    "code": code,
-                    "redirect_uri": _oauth_redirect_uri(request, "modelscope"),
-                },
-            )
-            try:
-                token_data = token_resp.json()
-            except Exception:
-                logger.error("ModelScope token response is not JSON: status=%s body=%s", token_resp.status_code, token_resp.text[:500])
-                raise HTTPException(status_code=400, detail="ModelScope OAuth token exchange failed")
-            token = token_data.get("access_token")
-            if not token:
-                raise HTTPException(status_code=400, detail="ModelScope OAuth token exchange failed")
-            try:
-                profile_resp = await client.get(settings.MODELSCOPE_USERINFO_URL, headers={"Authorization": f"Bearer {token}"})
-            except httpx.RequestError as e:
-                logger.warning("ModelScope userinfo request failed: %s", e)
-                profile_resp = None
-    except httpx.RequestError as e:
+        token_resp = requests.post(
+            settings.MODELSCOPE_TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": settings.MODELSCOPE_CLIENT_ID,
+                "client_secret": settings.MODELSCOPE_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": _oauth_redirect_uri(request, "modelscope"),
+            },
+            timeout=20,
+        )
+    except requests.RequestException as e:
         logger.error("ModelScope OAuth token request failed: %s", e)
         raise HTTPException(status_code=502, detail="ModelScope OAuth token request failed")
-    except HTTPException:
-        raise
+    try:
+        token_data = token_resp.json()
+    except Exception:
+        logger.error("ModelScope token response is not JSON: status=%s body=%s", token_resp.status_code, token_resp.text[:500])
+        raise HTTPException(status_code=400, detail="ModelScope OAuth token exchange failed")
+    token = token_data.get("access_token")
+    if not token:
+        raise HTTPException(status_code=400, detail="ModelScope OAuth token exchange failed")
+    try:
+        profile_resp = requests.get(settings.MODELSCOPE_USERINFO_URL, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+    except requests.RequestException as e:
+        logger.warning("ModelScope userinfo request failed: %s", e)
+        profile_resp = None
     try:
         profile = profile_resp.json() if profile_resp else {}
     except Exception:
@@ -1235,29 +1182,20 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
     target_url = f"{target_base}/instances/{instance_id}/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
-    target_url = _append_internal_token(target_url)
 
     body = await request.body()
-    try:
-        upstream = await request.app.state.proxy_client.request(
+    timeout = httpx.Timeout(3600.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        upstream = await client.request(
             request.method,
             target_url,
             headers=_proxy_headers(request.headers),
             content=body,
         )
-    except httpx.ConnectTimeout:
-        logger.warning("Instance proxy connect timeout instance=%s path=%s target=%s", instance_id, path, target_url)
-        return Response("Instance upstream connection timed out", status_code=504)
-    except httpx.ReadTimeout:
-        logger.warning("Instance proxy read timeout instance=%s path=%s target=%s", instance_id, path, target_url)
-        return Response("Instance upstream read timed out", status_code=504)
-    except httpx.RequestError as e:
-        logger.warning("Instance proxy upstream error instance=%s path=%s target=%s error=%s", instance_id, path, target_url, e)
-        return Response("Instance upstream unavailable", status_code=502)
 
     response_headers = {
         k: v for k, v in upstream.headers.items()
-        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length", "server", "date", "set-cookie"}
+        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length", "set-cookie"}
     }
     if "location" in response_headers:
         response_headers["location"] = _rewrite_location(response_headers["location"], instance_id, target_base)
@@ -1270,32 +1208,18 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
 @app.websocket("/instances/{instance_id}/{path:path}")
 async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path: str):
     """Proxy WebSocket traffic for Jupyter terminals/kernels under /instances/<id>/."""
-    requested_subprotocols = [
-        part.strip()
-        for part in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
-        if part.strip()
-    ]
-    await websocket.accept(subprotocol=requested_subprotocols[0] if requested_subprotocols else None)
+    await websocket.accept()
     try:
         target_base = _instance_service_base(instance_id).replace("http://", "ws://")
         target_url = f"{target_base}/instances/{instance_id}/{path}"
         if websocket.url.query:
             target_url += f"?{websocket.url.query}"
-        target_url = _append_internal_token(target_url)
 
         headers = []
         if websocket.headers.get("cookie"):
             headers.append(("cookie", websocket.headers["cookie"]))
-        for header in ("origin", "user-agent"):
-            if websocket.headers.get(header):
-                headers.append((header, websocket.headers[header]))
 
-        async with websockets.connect(
-            target_url,
-            additional_headers=headers,
-            subprotocols=requested_subprotocols or None,
-            open_timeout=10,
-        ) as upstream:
+        async with websockets.connect(target_url, additional_headers=headers, open_timeout=10) as upstream:
             async def client_to_upstream():
                 while True:
                     msg = await websocket.receive()
