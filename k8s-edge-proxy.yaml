@@ -25,6 +25,8 @@ data:
       listen 80;
       server_name _;
 
+      client_header_buffer_size 16k;
+      large_client_header_buffers 8 64k;
       client_max_body_size 0;
       client_body_timeout 3600s;
       send_timeout 3600s;
@@ -60,6 +62,8 @@ data:
       listen 443 ssl;
       server_name _;
 
+      client_header_buffer_size 16k;
+      large_client_header_buffers 8 64k;
       ssl_certificate /etc/nginx/tls/tls.crt;
       ssl_certificate_key /etc/nginx/tls/tls.key;
       ssl_protocols TLSv1.2 TLSv1.3;
