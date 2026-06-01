@@ -409,6 +409,13 @@ def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
     return location
 
 
+def _append_internal_token(url: str) -> str:
+    separator = "&" if "?" in url else "?"
+    if "token=" in url.split("?", 1)[-1]:
+        return url
+    return f"{url}{separator}token={settings.NOTEBOOK_TOKEN}"
+
+
 def _oauth_timeout() -> httpx.Timeout:
     return httpx.Timeout(settings.OAUTH_READ_TIMEOUT_SECONDS, connect=settings.OAUTH_CONNECT_TIMEOUT_SECONDS)
 
@@ -1228,6 +1235,7 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
     target_url = f"{target_base}/instances/{instance_id}/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
+    target_url = _append_internal_token(target_url)
 
     body = await request.body()
     try:
@@ -1273,6 +1281,7 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
         target_url = f"{target_base}/instances/{instance_id}/{path}"
         if websocket.url.query:
             target_url += f"?{websocket.url.query}"
+        target_url = _append_internal_token(target_url)
 
         headers = []
         if websocket.headers.get("cookie"):
