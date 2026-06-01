@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import text
 
 from .config import settings
 
@@ -15,9 +16,40 @@ logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
+CLEANUP_JOB_LOCK_ID = 42001001
+TEMPLATE_SYNC_JOB_LOCK_ID = 42001002
+
+
+def _try_advisory_lock(conn, lock_id: int) -> bool:
+    if conn.dialect.name != "postgresql":
+        return True
+    return bool(conn.execute(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id}).scalar())
+
+
+def _release_advisory_lock(conn, lock_id: int):
+    if conn.dialect.name == "postgresql":
+        conn.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+
+
+async def _run_with_advisory_lock(name: str, lock_id: int, job):
+    from .store import engine
+
+    with engine.connect() as conn:
+        if not _try_advisory_lock(conn, lock_id):
+            logger.info("%s skipped; another worker holds the lock", name)
+            return
+        try:
+            await job()
+        finally:
+            _release_advisory_lock(conn, lock_id)
+
 
 async def cleanup_job():
     """Periodic job to cleanup idle and expired instances"""
+    await _run_with_advisory_lock("cleanup_job", CLEANUP_JOB_LOCK_ID, _cleanup_job_impl)
+
+
+async def _cleanup_job_impl():
     from .k8s_client import k8s_client
     from .store import charge_usage_unit, list_active_instances, mark_instance_deleted, update_instance_charge_time
     
@@ -72,6 +104,10 @@ async def cleanup_job():
 
 async def template_preview_sync_job():
     """Periodic job to refresh notebook template preview caches."""
+    await _run_with_advisory_lock("template_preview_sync_job", TEMPLATE_SYNC_JOB_LOCK_ID, _template_preview_sync_job_impl)
+
+
+async def _template_preview_sync_job_impl():
     from .template_sync import sync_due_template_previews
 
     logger.info("Running template preview sync job...")

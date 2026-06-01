@@ -2,17 +2,17 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: amd-oneclick-manager-v3-web
+  name: amd-oneclick-manager-v3-worker
   namespace: default
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
-      app: amd-oneclick-manager-v3-web
+      app: amd-oneclick-manager-v3-worker
   template:
     metadata:
       labels:
-        app: amd-oneclick-manager-v3-web
+        app: amd-oneclick-manager-v3-worker
     spec:
       serviceAccountName: amd-oneclick-manager-v2
       affinity:
@@ -25,14 +25,6 @@ spec:
                     values:
                       - wx-ms-w7900d-0027
                       - wx-ms-w7900d-0044
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app: amd-oneclick-manager-v3-web
-                topologyKey: kubernetes.io/hostname
       dnsPolicy: None
       dnsConfig:
         nameservers:
@@ -57,13 +49,13 @@ spec:
                 name: amd-oneclick-postgres
           env:
             - name: MANAGER_ROLE
-              value: "web"
+              value: "worker"
           resources:
             limits:
-              cpu: "2"
+              cpu: "1"
               memory: "1Gi"
             requests:
-              cpu: "500m"
+              cpu: "250m"
               memory: "256Mi"
           livenessProbe:
             httpGet:
@@ -77,17 +69,3 @@ spec:
               port: 8000
             initialDelaySeconds: 20
             periodSeconds: 10
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: amd-oneclick-manager-v3-web
-  namespace: default
-spec:
-  selector:
-    app: amd-oneclick-manager-v3-web
-  type: NodePort
-  ports:
-    - port: 80
-      targetPort: 8000
-      nodePort: 30089

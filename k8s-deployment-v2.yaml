@@ -123,6 +123,7 @@ data:
   HF_CACHE_MOUNT_PATH: "/root/.cache/huggingface"
   HF_HUB_DISABLE_XET: "1"
   IDLE_TIMEOUT_MINUTES: "10"
+  MANAGER_ROLE: "web"
   MAX_LIFETIME_HOURS: "6"
   SERVICE_HOST: "36.151.243.69"
   PUBLIC_BASE_URL: "https://radeon.anruicloud.com"
@@ -184,7 +185,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:gpu-hour-telemetry-20260528-2328
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:manager-v3-hardened-20260601-2150
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

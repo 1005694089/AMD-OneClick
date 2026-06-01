@@ -16,8 +16,8 @@ data:
       '' close;
     }
 
-    upstream amd_oneclick_manager_v2 {
-      server 10.233.11.198:80;
+    upstream amd_oneclick_manager {
+      server 10.233.217.68:80;
       keepalive 64;
     }
 
@@ -52,7 +52,7 @@ data:
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
 
-        proxy_pass http://amd_oneclick_manager_v2;
+        proxy_pass http://amd_oneclick_manager;
       }
     }
 
@@ -93,7 +93,7 @@ data:
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
 
-        proxy_pass http://amd_oneclick_manager_v2;
+        proxy_pass http://amd_oneclick_manager;
       }
     }
 ---

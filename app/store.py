@@ -45,7 +45,21 @@ if DATABASE_URL.startswith("sqlite:///"):
     db_path = DATABASE_URL.removeprefix("sqlite:///")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+engine_kwargs = {
+    "future": True,
+    "pool_pre_ping": True,
+}
+if not DATABASE_URL.startswith("sqlite"):
+    engine_kwargs.update(
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_recycle=settings.DB_POOL_RECYCLE_SECONDS,
+        connect_args={
+            "options": f"-c statement_timeout={settings.DB_STATEMENT_TIMEOUT_MS}",
+        },
+    )
+
+engine = create_engine(DATABASE_URL, **engine_kwargs)
 metadata = MetaData()
 
 users = Table(
