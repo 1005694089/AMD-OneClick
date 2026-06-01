@@ -17,7 +17,7 @@ data:
     }
 
     upstream amd_oneclick_manager {
-      server 10.233.217.68:80;
+      server 10.233.11.198:80;
       keepalive 64;
     }
 
