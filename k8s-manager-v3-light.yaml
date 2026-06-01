@@ -89,7 +89,7 @@ spec:
       dnsPolicy: ClusterFirst
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:manager-v3-workshop-db-20260602-0020
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:manager-v3-workshop-db-20260602-0030
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

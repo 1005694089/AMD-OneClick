@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -304,7 +304,20 @@ def _template_accessible_to_user(template_id: int, user: Optional[dict]) -> Opti
     return None
 
 
-def _active_instance_context(user: Optional[dict]) -> Optional[dict]:
+def _request_public_origin(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
+
+
+def _instance_public_url(request: Request, instance_id: str, notebook_path: Optional[str] = None) -> str:
+    path = f"/instances/{instance_id}/lab"
+    if notebook_path:
+        path += f"/tree/{quote(notebook_path.lstrip('/'), safe='/')}"
+    return f"{_request_public_origin(request)}{path}?token={settings.NOTEBOOK_TOKEN}"
+
+
+def _active_instance_context(user: Optional[dict], request: Optional[Request] = None) -> Optional[dict]:
     if not user:
         return None
     active_instance = get_active_instance_for_user(user["id"])
@@ -325,7 +338,10 @@ def _active_instance_context(user: Optional[dict]) -> Optional[dict]:
         active_instance["instance_id"],
         active_instance.get("billing_session_id"),
     )
-    active_instance["url"] = live_instance.get("url")
+    active_instance["url"] = (
+        _instance_public_url(request, live_instance["id"], live_instance.get("github_path"))
+        if request else live_instance.get("url")
+    )
     active_instance["github_path"] = live_instance.get("github_path")
     active_instance["template_id"] = live_instance.get("template_id")
     active_instance["template_title"] = live_instance.get("template_title")
@@ -467,7 +483,7 @@ async def index(request: Request):
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
     images = list_images(enabled_only=True)
     notebook_templates = list_notebook_templates(enabled_only=True)
-    active_instance = _active_instance_context(user)
+    active_instance = _active_instance_context(user, request)
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -488,7 +504,7 @@ async def index(request: Request):
 async def profile_page(request: Request):
     """Render user profile and login page."""
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
-    active_instance = _active_instance_context(user)
+    active_instance = _active_instance_context(user, request)
     return templates.TemplateResponse(
         request,
         "profile.html",
@@ -668,7 +684,7 @@ async def redeem_credits(req: CouponRedeemRequest, user: dict = Depends(current_
 
 
 @app.post("/api/notebook/request", response_model=NotebookStatus)
-async def request_notebook(req: NotebookRequest, user: dict = Depends(current_user)):
+async def request_notebook(request: Request, req: NotebookRequest, user: dict = Depends(current_user)):
     """Request a notebook instance"""
     email = user["email"].lower()
     image = req.image or settings.DEFAULT_IMAGE
@@ -715,13 +731,14 @@ async def request_notebook(req: NotebookRequest, user: dict = Depends(current_us
             gpu_count=gpu_count,
         )
 
-        if instance.get("url"):
-            send_notebook_url_email(email, instance["url"])
+        public_url = _instance_public_url(request, instance["id"])
+        if public_url:
+            send_notebook_url_email(email, public_url)
 
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your instance...",
-            url=instance.get("url"),
+            url=public_url,
             email=email
         )
 
@@ -775,7 +792,7 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
         return NotebookStatus(
             status=status or "unknown",
             message=status_messages.get(status, "Checking status..."),
-            url=instance.get("url"),
+            url=_instance_public_url(request, instance["id"], instance.get("github_path")),
             email=email
         )
         
@@ -955,7 +972,7 @@ async def preview_notebook_template_asset(request: Request, template_id: int, as
 
 
 @app.post("/api/templates/{template_id}/launch", response_model=NotebookStatus)
-async def launch_notebook_template(template_id: int, req: TemplateLaunchRequest, user: dict = Depends(current_user)):
+async def launch_notebook_template(template_id: int, request: Request, req: TemplateLaunchRequest, user: dict = Depends(current_user)):
     template = _template_accessible_to_user(template_id, user)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -1007,12 +1024,13 @@ async def launch_notebook_template(template_id: int, req: TemplateLaunchRequest,
             gpu_count=gpu_count,
             template_id=template["id"],
         )
-        if instance.get("url"):
-            send_notebook_url_email(email, instance["url"])
+        public_url = _instance_public_url(request, instance["id"], github_info.get("path") if github_info else None)
+        if public_url:
+            send_notebook_url_email(email, public_url)
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your notebook template...",
-            url=instance.get("url"),
+            url=public_url,
             email=email,
             instance_id=instance["id"],
         )
