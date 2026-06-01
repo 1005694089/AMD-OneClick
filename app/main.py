@@ -1249,17 +1249,25 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
 
     response_headers = {
         k: v for k, v in upstream.headers.items()
-        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length", "server", "date"}
+        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length", "server", "date", "set-cookie"}
     }
     if "location" in response_headers:
         response_headers["location"] = _rewrite_location(response_headers["location"], instance_id, target_base)
-    return Response(content=upstream.content, status_code=upstream.status_code, headers=response_headers)
+    response = Response(content=upstream.content, status_code=upstream.status_code, headers=response_headers)
+    for cookie in upstream.headers.get_list("set-cookie"):
+        response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
+    return response
 
 
 @app.websocket("/instances/{instance_id}/{path:path}")
 async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path: str):
     """Proxy WebSocket traffic for Jupyter terminals/kernels under /instances/<id>/."""
-    await websocket.accept()
+    requested_subprotocols = [
+        part.strip()
+        for part in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
+        if part.strip()
+    ]
+    await websocket.accept(subprotocol=requested_subprotocols[0] if requested_subprotocols else None)
     try:
         target_base = _instance_service_base(instance_id).replace("http://", "ws://")
         target_url = f"{target_base}/instances/{instance_id}/{path}"
@@ -1269,8 +1277,16 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
         headers = []
         if websocket.headers.get("cookie"):
             headers.append(("cookie", websocket.headers["cookie"]))
+        for header in ("origin", "user-agent"):
+            if websocket.headers.get(header):
+                headers.append((header, websocket.headers[header]))
 
-        async with websockets.connect(target_url, additional_headers=headers, open_timeout=10) as upstream:
+        async with websockets.connect(
+            target_url,
+            additional_headers=headers,
+            subprotocols=requested_subprotocols or None,
+            open_timeout=10,
+        ) as upstream:
             async def client_to_upstream():
                 while True:
                     msg = await websocket.receive()
