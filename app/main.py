@@ -84,11 +84,15 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting AMD OneClick Notebook Manager")
     init_db()
-    start_scheduler()
+    if settings.RUN_SCHEDULER:
+        start_scheduler()
+    else:
+        logger.info("Background scheduler disabled for this manager process")
     yield
     # Shutdown
     logger.info("Shutting down AMD OneClick Notebook Manager")
-    stop_scheduler()
+    if settings.RUN_SCHEDULER:
+        stop_scheduler()
 
 
 app = FastAPI(

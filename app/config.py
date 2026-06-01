@@ -97,6 +97,8 @@ class Settings:
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
     COUPON_PRIVATE_KEY_PEM: Optional[str] = os.getenv("COUPON_PRIVATE_KEY_PEM")
 
+    RUN_SCHEDULER: bool = os.getenv("RUN_SCHEDULER", "true").lower() in {"1", "true", "yes", "on"}
+
     TELEMETRY_API_URL: str = os.getenv("TELEMETRY_API_URL", "")
     METRICS_INGEST_API_KEY: str = os.getenv("METRICS_INGEST_API_KEY", "")
     ONECLICK_TELEMETRY_ENABLED: bool = os.getenv("ONECLICK_TELEMETRY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
