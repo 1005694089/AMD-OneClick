@@ -2,6 +2,59 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: amd-oneclick-workshop-postgres
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amd-oneclick-workshop-postgres
+  template:
+    metadata:
+      labels:
+        app: amd-oneclick-workshop-postgres
+    spec:
+      nodeName: wx-ms-w7900d-0005
+      containers:
+        - name: postgres
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: amd-oneclick-workshop-postgres
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: pgdata
+          hostPath:
+            path: /var/lib/amd-oneclick-workshop-postgres
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amd-oneclick-workshop-postgres
+  namespace: default
+spec:
+  selector:
+    app: amd-oneclick-workshop-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: amd-oneclick-manager-v3-light
   namespace: default
 spec:
@@ -33,17 +86,10 @@ spec:
                   matchLabels:
                     app: amd-oneclick-manager-v3-light
                 topologyKey: kubernetes.io/hostname
-      dnsPolicy: None
-      dnsConfig:
-        nameservers:
-          - 8.8.8.8
-          - 8.8.4.4
-        options:
-          - name: ndots
-            value: "5"
+      dnsPolicy: ClusterFirst
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:manager-v3-light-20260601-2335
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:manager-v3-workshop-db-20260602-0020
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
@@ -53,9 +99,12 @@ spec:
                 name: amd-oneclick-config-v2
             - secretRef:
                 name: amd-oneclick-secrets-v2
-            - secretRef:
-                name: amd-oneclick-postgres
           env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: amd-oneclick-workshop-postgres
+                  key: DATABASE_URL
             - name: RUN_SCHEDULER
               value: "false"
             - name: OAUTH_CONNECT_TIMEOUT_SECONDS
@@ -64,6 +113,8 @@ spec:
               value: "15"
             - name: SLOW_REQUEST_THRESHOLD_SECONDS
               value: "2"
+            - name: NOTEBOOK_LABEL_PREFIX
+              value: "amd-oneclick-v3-workshop"
             - name: WORKSHOP_LOGIN_ENABLED
               value: "true"
             - name: WORKSHOP_USER_COUNT

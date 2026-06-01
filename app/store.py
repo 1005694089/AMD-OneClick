@@ -353,6 +353,16 @@ def get_user(user_id: int) -> Optional[dict]:
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
 
 
+def ensure_user_min_credits(user_id: int, minimum_credits: int) -> Optional[dict]:
+    with engine.begin() as conn:
+        user = conn.execute(select(users).where(users.c.id == user_id)).mappings().first()
+        if not user:
+            return None
+        if int(user["credits"]) < minimum_credits:
+            conn.execute(update(users).where(users.c.id == user_id).values(credits=minimum_credits, updated_at=utc_now()))
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
 def list_users() -> list[dict]:
     stmt = select(users).order_by(users.c.id.desc())
     with engine.begin() as conn:

@@ -55,6 +55,7 @@ from .store import (
     get_template_preview_asset,
     get_template_preview_cache,
     get_user,
+    ensure_user_min_credits,
     grant_user_credits,
     ensure_template_preview_cache,
     init_db,
@@ -144,9 +145,6 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 def current_user(request: Request) -> dict:
-    workshop_user = _workshop_session_user(request)
-    if workshop_user:
-        return workshop_user
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Login required")
@@ -158,43 +156,10 @@ def current_user(request: Request) -> dict:
 
 
 def session_user(request: Request) -> Optional[dict]:
-    workshop_user = _workshop_session_user(request)
-    if workshop_user:
-        return workshop_user
     user_id = request.session.get("user_id")
     if not user_id:
         return None
     return get_user(int(user_id))
-
-
-def _workshop_account(index: int) -> dict:
-    return {
-        "id": -index,
-        "email": f"workshop{index}@amd.com",
-        "name": f"WORKSHOP{index}",
-        "provider": "workshop",
-        "provider_id": f"workshop{index}",
-        "avatar_url": "",
-        "credits": settings.WORKSHOP_CREDITS,
-        "is_editor": False,
-        "is_workshop": True,
-    }
-
-
-def _workshop_session_user(request: Request) -> Optional[dict]:
-    index = request.session.get("workshop_user_index")
-    if not index:
-        return None
-    try:
-        index = int(index)
-    except (TypeError, ValueError):
-        request.session.pop("workshop_user_index", None)
-        return None
-    if not settings.WORKSHOP_LOGIN_ENABLED or index < 1 or index > settings.WORKSHOP_USER_COUNT:
-        request.session.pop("workshop_user_index", None)
-        return None
-    return _workshop_account(index)
-
 
 def _workshop_index_from_email(email: str) -> Optional[int]:
     raw = (email or "").strip().lower()
@@ -514,6 +479,7 @@ async def index(request: Request):
             "instance_types_json": json.dumps(INSTANCE_TYPES),
             "user_json": json.dumps(user or {}),
             "active_instance_json": json.dumps(active_instance or {}),
+            "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
         },
     )
 
@@ -680,9 +646,11 @@ async def workshop_login(request: Request):
     password = str(payload.get("password", ""))
     if not index or not secrets.compare_digest(password, f"amdyes{index}"):
         raise HTTPException(status_code=401, detail="Invalid workshop credentials")
+    user = get_or_create_user("workshop", f"workshop{index}", f"workshop{index}@amd.com", f"WORKSHOP{index}", "")
+    user = ensure_user_min_credits(user["id"], settings.WORKSHOP_CREDITS) or user
     request.session.clear()
-    request.session["workshop_user_index"] = index
-    return {"user": _workshop_account(index)}
+    request.session["user_id"] = user["id"]
+    return {"user": user}
 
 
 @app.get("/api/me")
