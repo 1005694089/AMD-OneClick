@@ -77,6 +77,7 @@
     const notebookTemplates = {{ notebook_templates_json | safe }};
     const defaultImage = {{ default_image | tojson }};
     const initialActiveInstance = {{ active_instance_json | safe }};
+    const showWorkshopLogin = new URLSearchParams(window.location.search).get('v') === 'workshop';
 
     function avatarNode(user) {
       if (!user || !user.email) return null;
@@ -90,6 +91,7 @@
           { key: 'github', label: React.createElement('a', { href: '/auth/github/login' }, 'Login with GitHub') },
           { key: 'modelscope', label: React.createElement('a', { href: '/auth/modelscope/login' }, 'Login with ModelScope') },
         ];
+        if (showWorkshopLogin) items.unshift({ key: 'workshop', label: React.createElement('span', { onClick: () => window.dispatchEvent(new Event('open-workshop-login')) }, 'Workshop Login') });
         return React.createElement(Dropdown, { menu: { items }, placement: 'bottomRight', trigger: ['click'] }, React.createElement(Button, { shape: 'round' }, 'Login'));
       }
       const items = [
@@ -112,6 +114,9 @@
       const [readyTemplateId, setReadyTemplateId] = React.useState(initialActiveInstance.template_id ? Number(initialActiveInstance.template_id) : null);
       const [createModalOpen, setCreateModalOpen] = React.useState(false);
       const [createLoading, setCreateLoading] = React.useState(false);
+      const [workshopLoginOpen, setWorkshopLoginOpen] = React.useState(false);
+      const [workshopLoginLoading, setWorkshopLoginLoading] = React.useState(false);
+      const [workshopForm] = Form.useForm();
       const initialTab = new URLSearchParams(window.location.search).get('tab') === 'notebook' ? 'notebook' : 'gallery';
       const [activeTab, setActiveTab] = React.useState(initialTab);
       const [gallerySearch, setGallerySearch] = React.useState('');
@@ -126,6 +131,25 @@
       });
       const hasNotebook = tpl => !!(tpl && tpl.repo_url && tpl.notebook_path);
       const hasActiveInstance = !!(initialActiveInstance && initialActiveInstance.instance_id);
+      React.useEffect(() => {
+        const open = () => setWorkshopLoginOpen(true);
+        window.addEventListener('open-workshop-login', open);
+        return () => window.removeEventListener('open-workshop-login', open);
+      }, []);
+
+      async function loginWorkshop(values) {
+        setWorkshopLoginLoading(true);
+        try {
+          const res = await fetch('/auth/workshop/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(values) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Workshop login failed');
+          window.location.href = '/?v=workshop';
+        } catch (err) {
+          message.error(err.message || 'Workshop login failed');
+        } finally {
+          setWorkshopLoginLoading(false);
+        }
+      }
 
       function openCreateModal() {
         createForm.setFieldsValue({ image: defaultImage, branch: 'main', category: 'Workspace' });
@@ -281,6 +305,13 @@
               React.createElement(Button, { type:'primary', href:'/auth/github/login' }, 'Login with GitHub'),
               React.createElement(Button, { href:'/auth/modelscope/login' }, 'Login with ModelScope')
             )
+          )
+        ),
+        React.createElement(Modal, { title:'Workshop Login', open:workshopLoginOpen, onCancel:()=>setWorkshopLoginOpen(false), footer:null, destroyOnClose:true },
+          React.createElement(Form, { form:workshopForm, layout:'vertical', onFinish:loginWorkshop },
+            React.createElement(Form.Item, { name:'email', label:'Email', rules:[{required:true,message:'Email is required'}] }, React.createElement(Input, { placeholder:'WORKSHOP1@amd.com' })),
+            React.createElement(Form.Item, { name:'password', label:'Password', rules:[{required:true,message:'Password is required'}] }, React.createElement(Input.Password, { placeholder:'amdyes1' })),
+            React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:workshopLoginLoading }, 'Login')
           )
         )
       );

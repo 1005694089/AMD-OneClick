@@ -43,7 +43,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:manager-v3-light-20260601-2320
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:manager-v3-light-20260601-2335
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
@@ -64,6 +64,12 @@ spec:
               value: "15"
             - name: SLOW_REQUEST_THRESHOLD_SECONDS
               value: "2"
+            - name: WORKSHOP_LOGIN_ENABLED
+              value: "true"
+            - name: WORKSHOP_USER_COUNT
+              value: "150"
+            - name: WORKSHOP_CREDITS
+              value: "10000"
           resources:
             limits:
               cpu: "2"

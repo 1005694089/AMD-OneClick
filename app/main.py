@@ -144,6 +144,9 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 def current_user(request: Request) -> dict:
+    workshop_user = _workshop_session_user(request)
+    if workshop_user:
+        return workshop_user
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Login required")
@@ -155,10 +158,53 @@ def current_user(request: Request) -> dict:
 
 
 def session_user(request: Request) -> Optional[dict]:
+    workshop_user = _workshop_session_user(request)
+    if workshop_user:
+        return workshop_user
     user_id = request.session.get("user_id")
     if not user_id:
         return None
     return get_user(int(user_id))
+
+
+def _workshop_account(index: int) -> dict:
+    return {
+        "id": -index,
+        "email": f"workshop{index}@amd.com",
+        "name": f"WORKSHOP{index}",
+        "provider": "workshop",
+        "provider_id": f"workshop{index}",
+        "avatar_url": "",
+        "credits": settings.WORKSHOP_CREDITS,
+        "is_editor": False,
+        "is_workshop": True,
+    }
+
+
+def _workshop_session_user(request: Request) -> Optional[dict]:
+    index = request.session.get("workshop_user_index")
+    if not index:
+        return None
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        request.session.pop("workshop_user_index", None)
+        return None
+    if not settings.WORKSHOP_LOGIN_ENABLED or index < 1 or index > settings.WORKSHOP_USER_COUNT:
+        request.session.pop("workshop_user_index", None)
+        return None
+    return _workshop_account(index)
+
+
+def _workshop_index_from_email(email: str) -> Optional[int]:
+    raw = (email or "").strip().lower()
+    if not raw.endswith("@amd.com") or not raw.startswith("workshop"):
+        return None
+    number = raw.removeprefix("workshop").removesuffix("@amd.com")
+    if not number.isdigit():
+        return None
+    index = int(number)
+    return index if 1 <= index <= settings.WORKSHOP_USER_COUNT else None
 
 
 def current_editor(user: dict = Depends(current_user)) -> dict:
@@ -623,6 +669,20 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
 async def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/")
+
+
+@app.post("/auth/workshop/login")
+async def workshop_login(request: Request):
+    if not settings.WORKSHOP_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Workshop login is not enabled")
+    payload = await request.json()
+    index = _workshop_index_from_email(payload.get("email", ""))
+    password = str(payload.get("password", ""))
+    if not index or not secrets.compare_digest(password, f"amdyes{index}"):
+        raise HTTPException(status_code=401, detail="Invalid workshop credentials")
+    request.session.clear()
+    request.session["workshop_user_index"] = index
+    return {"user": _workshop_account(index)}
 
 
 @app.get("/api/me")
