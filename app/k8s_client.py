@@ -19,6 +19,36 @@ from .config import settings, INSTANCE_TYPES
 
 logger = logging.getLogger(__name__)
 
+RESOURCE_PROFILES = {
+    "standard": {
+        "label": "16 CPU / 64Gi memory",
+        "cpu_request": "8",
+        "cpu_limit": "16",
+        "memory_request": "32Gi",
+        "memory_limit": "64Gi",
+    },
+    "large": {
+        "label": "32 CPU / 128Gi memory",
+        "cpu_request": "16",
+        "cpu_limit": "32",
+        "memory_request": "64Gi",
+        "memory_limit": "128Gi",
+    },
+    "xlarge": {
+        "label": "64 CPU / 256Gi memory",
+        "cpu_request": "32",
+        "cpu_limit": "64",
+        "memory_request": "128Gi",
+        "memory_limit": "256Gi",
+    },
+}
+
+AUTO_RESOURCE_PROFILE_BY_GPU = {
+    1: "standard",
+    2: "large",
+    4: "xlarge",
+}
+
 
 class K8sClient:
     """Kubernetes client for notebook management"""
@@ -68,14 +98,32 @@ class K8sClient:
     def _jupyter_base_url(self, instance_id: str) -> str:
         return f"/instances/{instance_id}/"
 
+    def _workspace_host_path(self, instance_id: str) -> str:
+        safe_id = re.sub(r"[^a-zA-Z0-9_.-]", "-", instance_id)
+        return f"{settings.WORKSPACE_HOST_ROOT.rstrip('/')}/{safe_id}"
+
+    def _resolve_resource_profile(self, gpu_count: int, resource_profile: Optional[str] = None) -> tuple[str, dict]:
+        profile = (resource_profile or "auto").strip().lower()
+        if profile == "auto":
+            profile = AUTO_RESOURCE_PROFILE_BY_GPU.get(gpu_count, "standard")
+        if profile not in RESOURCE_PROFILES:
+            allowed = ", ".join(["auto", *RESOURCE_PROFILES.keys()])
+            raise ValueError(f"Invalid resource profile '{resource_profile}'. Allowed values: {allowed}")
+        return profile, RESOURCE_PROFILES[profile]
+
     def _build_startup_script(self, instance_id: str,
                               instance_type: str = "jupyter",
                               github_info: Optional[dict] = None) -> str:
         """Build startup script based on instance type"""
+        workspace = shlex.quote(settings.WORKSPACE_MOUNT_PATH)
         model_link_script = f"""
 mkdir -p /app
+mkdir -p {workspace}
 if [ -d {shlex.quote(settings.HF_CACHE_MOUNT_PATH)}/Qwen3-8B ] && [ ! -e /app/Qwen3-8B ]; then
     ln -s {shlex.quote(settings.HF_CACHE_MOUNT_PATH)}/Qwen3-8B /app/Qwen3-8B
+fi
+if [ -d {shlex.quote(settings.HF_CACHE_MOUNT_PATH)}/Qwen3-8B ] && [ ! -e {workspace}/Qwen3-8B ]; then
+    ln -s {shlex.quote(settings.HF_CACHE_MOUNT_PATH)}/Qwen3-8B {workspace}/Qwen3-8B
 fi
 """
         if github_info:
@@ -90,79 +138,93 @@ fi
 set -e
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
-mkdir -p /app/workspace
-rm -rf /app/workspace/repo
+mkdir -p {workspace}
 
-echo "Cloning {repo_url}..."
-for i in 1 2 3; do
-    rm -rf /app/workspace/repo
-    if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} /app/workspace/repo; then
-        echo "Repository cloned"
-        break
-    fi
-    echo "Git clone attempt $i failed, retrying..."
-    sleep $((i * 3))
-done
+if [ ! -e {workspace}/repo ]; then
+    echo "Cloning {repo_url}..."
+    for i in 1 2 3; do
+        rm -rf {workspace}/.repo-tmp
+        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {workspace}/.repo-tmp; then
+            mv {workspace}/.repo-tmp {workspace}/repo
+            echo "Repository cloned"
+            break
+        fi
+        echo "Git clone attempt $i failed, retrying..."
+        sleep $((i * 3))
+    done
+else
+    echo "Using existing persistent workspace at {settings.WORKSPACE_MOUNT_PATH}/repo"
+fi
 
-cd /app/workspace/repo
+cd {workspace}/repo
 if [ ! -f {notebook_path_q} ]; then
     echo "Notebook not found: {notebook_path}"
     find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
 fi
 
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir=/app/workspace/repo
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/repo
 """
             return f"""
 {model_link_script}
-mkdir -p /app/notebooks
-cd /app/notebooks
+mkdir -p {workspace}/notebooks
+cd {workspace}/notebooks
 
-echo "Downloading {notebook_filename}..."
-for i in 1 2 3; do
-    if curl -fsSL --connect-timeout 30 --max-time 120 -o {shlex.quote(notebook_filename)} {shlex.quote(github_info["raw_url"])}; then
-        echo "Downloaded: {notebook_filename}"
-        break
-    else
-        echo "Attempt $i failed, retrying..."
-        sleep 2
-    fi
-done
+if [ ! -f {shlex.quote(notebook_filename)} ]; then
+    echo "Downloading {notebook_filename}..."
+    for i in 1 2 3; do
+        if curl -fsSL --connect-timeout 30 --max-time 120 -o {shlex.quote(notebook_filename)} {shlex.quote(github_info["raw_url"])}; then
+            echo "Downloaded: {notebook_filename}"
+            break
+        else
+            echo "Attempt $i failed, retrying..."
+            sleep 2
+        fi
+    done
+else
+    echo "Using existing persistent notebook {notebook_filename}"
+fi
 
 if [ ! -f {shlex.quote(notebook_filename)} ]; then
     echo "Warning: Failed to download notebook, starting with empty directory"
 fi
 
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir=/app/notebooks
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/notebooks
 """
 
         if instance_type == "opencode":
             return f"""
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
-cd /app
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}'
+cd {workspace}
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
 """
 
         # Default: jupyter
         return f"""
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
-cd /app
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}'
+cd {workspace}
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
 """
 
     def _get_pod_manifest(self, email: str, instance_id: str, image: str,
                           instance_type: str = "jupyter",
                           gpu_count: int = 1,
-                          github_info: Optional[dict] = None) -> dict:
+                          github_info: Optional[dict] = None,
+                          resource_profile: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
+        profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
 
         annotations = {
             "amd-oneclick/email": email,
             "amd-oneclick/created-at": datetime.now(timezone.utc).isoformat(),
             "amd-oneclick/instance-type": instance_type,
             "amd-oneclick/path-proxy": "true",
+            "amd-oneclick/resource-profile": profile_name,
+            "amd-oneclick/cpu-limit": resources["cpu_limit"],
+            "amd-oneclick/memory-limit": resources["memory_limit"],
+            "amd-oneclick/workspace-host-path": self._workspace_host_path(instance_id),
         }
 
         if github_info:
@@ -226,13 +288,13 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         ],
                         "resources": {
                             "limits": {
-                                "cpu": settings.CPU_LIMIT,
-                                "memory": settings.MEMORY_LIMIT,
+                                "cpu": resources["cpu_limit"],
+                                "memory": resources["memory_limit"],
                                 "amd.com/gpu": str(gpu_count)
                             },
                             "requests": {
-                                "cpu": settings.CPU_REQUEST,
-                                "memory": settings.MEMORY_REQUEST,
+                                "cpu": resources["cpu_request"],
+                                "memory": resources["memory_request"],
                                 "amd.com/gpu": str(gpu_count)
                             }
                         },
@@ -240,13 +302,15 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                             {"name": "SHELL", "value": "/bin/bash"},
                             {"name": "USER_EMAIL", "value": email},
                             {"name": "INSTANCE_TYPE", "value": instance_type},
+                            {"name": "WORKSPACE_DIR", "value": settings.WORKSPACE_MOUNT_PATH},
                             {"name": "HF_HOME", "value": settings.HF_CACHE_MOUNT_PATH},
                             {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
                             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET}
                         ],
                         "volumeMounts": [
                             {"name": "shm", "mountPath": "/dev/shm"},
-                            {"name": "hf-cache", "mountPath": settings.HF_CACHE_MOUNT_PATH}
+                            {"name": "hf-cache", "mountPath": settings.HF_CACHE_MOUNT_PATH},
+                            {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH}
                         ]
                     }
                 ],
@@ -262,6 +326,13 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         "name": "hf-cache",
                         "hostPath": {
                             "path": settings.HF_CACHE_HOST_PATH,
+                            "type": "DirectoryOrCreate"
+                        }
+                    },
+                    {
+                        "name": "workspace",
+                        "hostPath": {
+                            "path": self._workspace_host_path(instance_id),
                             "type": "DirectoryOrCreate"
                         }
                     }
@@ -485,7 +556,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         instance_type: str = "jupyter",
                         gpu_count: int = 1,
                         github_info: Optional[dict] = None,
-                        custom_instance_id: Optional[str] = None) -> dict:
+                        custom_instance_id: Optional[str] = None,
+                        resource_profile: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -501,6 +573,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             instance_type=instance_type,
             gpu_count=gpu_count,
             github_info=github_info,
+            resource_profile=resource_profile,
         )
         for attempt in range(1, 7):
             try:
@@ -551,6 +624,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             "image": image,
             "instance_type": instance_type,
             "gpu_count": gpu_count,
+            "resource_profile": self._resolve_resource_profile(gpu_count, resource_profile)[0],
             "status": "pending",
             "created_at": datetime.now(timezone.utc),
             "node_port": node_port,
@@ -598,6 +672,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                 "instance_type": instance_type,
                 "gpu_count": gpu_count,
+                "resource_profile": pod.metadata.annotations.get("amd-oneclick/resource-profile"),
+                "cpu_limit": pod.metadata.annotations.get("amd-oneclick/cpu-limit"),
+                "memory_limit": pod.metadata.annotations.get("amd-oneclick/memory-limit"),
                 "github_org": pod.metadata.annotations.get("amd-oneclick/github-org"),
                 "github_repo": pod.metadata.annotations.get("amd-oneclick/github-repo"),
                 "github_path": github_path,

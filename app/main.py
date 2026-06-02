@@ -38,7 +38,7 @@ from .models import (
     NotebookTemplateRequest,
     TemplateLaunchRequest,
 )
-from .k8s_client import k8s_client
+from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
 from .template_sync import sync_template_preview
@@ -317,6 +317,14 @@ def _instance_public_url(request: Request, instance_id: str, notebook_path: Opti
     return f"{_request_public_origin(request)}{path}?token={settings.NOTEBOOK_TOKEN}"
 
 
+def _validate_resource_profile(profile: Optional[str]) -> str:
+    value = (profile or "auto").strip().lower()
+    if value == "auto" or value in RESOURCE_PROFILES:
+        return value
+    allowed = ", ".join(["auto", *RESOURCE_PROFILES.keys()])
+    raise HTTPException(status_code=400, detail=f"Invalid resource profile. Allowed values: {allowed}")
+
+
 def _active_instance_context(user: Optional[dict], request: Optional[Request] = None) -> Optional[dict]:
     if not user:
         return None
@@ -496,6 +504,8 @@ async def index(request: Request):
             "user_json": json.dumps(user or {}),
             "active_instance_json": json.dumps(active_instance or {}),
             "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
+            "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
+            "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
         },
     )
 
@@ -690,6 +700,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     image = req.image or settings.DEFAULT_IMAGE
     instance_type = req.instance_type or "jupyter"
     gpu_count = req.gpu_count or 1
+    resource_profile = _validate_resource_profile(req.resource_profile)
 
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
@@ -717,6 +728,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             instance_type=instance_type,
             gpu_count=gpu_count,
             custom_instance_id=instance_id,
+            resource_profile=resource_profile,
         )
         record_instance(
             user["id"], email, instance["id"], image, instance_type, gpu_count, instance.get("node_port")
@@ -1003,6 +1015,7 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             gpu_count=gpu_count,
             github_info=github_info,
             custom_instance_id=instance_id,
+            resource_profile="auto",
         )
         record_instance(user["id"], email, instance["id"], template["image"], "opencode", gpu_count, instance.get("node_port"))
         record_instance_launch_event(

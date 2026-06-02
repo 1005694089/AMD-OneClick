@@ -78,6 +78,8 @@
     const defaultImage = {{ default_image | tojson }};
     const initialActiveInstance = {{ active_instance_json | safe }};
     const showWorkshopLogin = {{ workshop_login_enabled | tojson }};
+    const resourceProfiles = {{ resource_profiles_json | safe }};
+    const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
 
     function avatarNode(user) {
       if (!user || !user.email) return null;
@@ -107,6 +109,8 @@
 
     function App() {
       const [form] = Form.useForm();
+      const watchedGpuCount = Form.useWatch('gpu_count', form) || 1;
+      const watchedResourceProfile = Form.useWatch('resource_profile', form) || 'auto';
       const [createForm] = Form.useForm();
       const [notebookLoading, setNotebookLoading] = React.useState(false);
       const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
@@ -122,6 +126,10 @@
       const [gallerySearch, setGallerySearch] = React.useState('');
       const [activeTag, setActiveTag] = React.useState('All');
       const imageOptions = (images || []).map(img => ({ label: React.createElement('span', { className: 'image-option-label', title: img.image }, img.name ? `${img.name} (${img.image.split('/').pop()})` : img.image.split('/').pop()), value: img.image }));
+      const resourceProfileOptions = [
+        { value: 'auto', label: 'Auto (recommended by GPU count)' },
+        ...Object.entries(resourceProfiles || {}).map(([value, profile]) => ({ value, label: profile.label || value }))
+      ];
       const galleryTags = ['All', ...Array.from(new Set((notebookTemplates || []).flatMap(tpl => [tpl.category, ...(tpl.tags || [])].filter(Boolean))))].slice(0, 12);
       const filteredTemplates = (notebookTemplates || []).filter(tpl => {
         const text = `${tpl.title || ''} ${tpl.description || ''} ${tpl.category || ''} ${(tpl.tags || []).join(' ')}`.toLowerCase();
@@ -180,7 +188,7 @@
         const values = await form.validateFields();
         setNotebookLoading(true); setReadyUrl(''); setReadyTemplateId(null);
         try {
-          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, instance_type: 'opencode' }) });
+          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode' }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           pollStatus(data.url, { type: 'notebook' }); message.success('Instance requested');
@@ -218,11 +226,16 @@
         }, 3000);
       }
       function renderNotebookLaunch() {
+        const selectedGpuCount = watchedGpuCount || 1;
+        const selectedProfile = watchedResourceProfile || 'auto';
+        const recommendedProfile = autoResourceProfileByGpu[String(selectedGpuCount)] || autoResourceProfileByGpu[selectedGpuCount] || 'standard';
+        const recommendedResource = resourceProfiles && resourceProfiles[recommendedProfile] ? resourceProfiles[recommendedProfile].label : recommendedProfile;
         return React.createElement(Card, { className: 'launch-card', title: 'Notebook', extra: React.createElement(Text, { type: 'secondary' }, 'Default: OpenCode') },
-          React.createElement(Form, { form, layout: 'vertical', initialValues: { image: defaultImage, gpu_count: 1 } },
+          React.createElement(Form, { form, layout: 'vertical', initialValues: { image: defaultImage, gpu_count: 1, resource_profile: 'auto' } },
             React.createElement(Form.Item, { label: 'Account' }, React.createElement(Select, { disabled: true, value: currentUser && currentUser.email ? currentUser.email : 'Login required', options: [{ value: currentUser && currentUser.email ? currentUser.email : 'Login required', label: currentUser && currentUser.email ? currentUser.email : 'Login required' }] })),
             React.createElement(Form.Item, { label: 'Container Image', name: 'image', rules: [{ required: true }] }, React.createElement(Select, { options: imageOptions, className: 'fixed-select', popupMatchSelectWidth: true, style: { width: '100%' }, listHeight: 360 })),
             React.createElement(Form.Item, { label: 'GPU Count', name: 'gpu_count', rules: [{ required: true }] }, React.createElement(Select, { options: [{ value: 1, label: '1 GPU / 1 credit per hour' }, { value: 2, label: '2 GPUs / 2 credits per hour' }, { value: 4, label: '4 GPUs / 4 credits per hour' }] })),
+            React.createElement(Form.Item, { label: 'CPU / Memory', name: 'resource_profile', extra: selectedProfile === 'auto' ? `Auto currently uses ${recommendedResource}` : 'Use a larger profile if your workload was OOMKilled.' }, React.createElement(Select, { options: resourceProfileOptions })),
             React.createElement(Button, { type: 'primary', size: 'large', block: true, loading: notebookLoading, onClick: launch }, 'Launch Notebook')
           ), readyUrl && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Button, { href: readyUrl, target: '_blank', block: true }, 'Open Notebook'))
         );
