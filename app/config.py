@@ -98,6 +98,11 @@ class Settings:
 
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
     COUPON_PRIVATE_KEY_PEM: Optional[str] = os.getenv("COUPON_PRIVATE_KEY_PEM")
+    COUPON_REDEEM_ENABLED: bool = os.getenv("COUPON_REDEEM_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    COUPON_REDEEM_DISABLED_MESSAGE: str = os.getenv(
+        "COUPON_REDEEM_DISABLED_MESSAGE",
+        "System maintenance is in progress. Credit redemption is temporarily unavailable. Please contact the administrator if you need credits.",
+    )
 
     RUN_SCHEDULER: bool = os.getenv("RUN_SCHEDULER", "true").lower() in {"1", "true", "yes", "on"}
     OAUTH_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_CONNECT_TIMEOUT_SECONDS", "5"))

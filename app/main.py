@@ -523,6 +523,8 @@ async def profile_page(request: Request):
             "active_instance": active_instance,
             "github_enabled": bool(settings.GITHUB_CLIENT_ID),
             "modelscope_enabled": bool(settings.MODELSCOPE_CLIENT_ID),
+            "coupon_redeem_enabled": settings.COUPON_REDEEM_ENABLED,
+            "coupon_redeem_disabled_message": settings.COUPON_REDEEM_DISABLED_MESSAGE,
         },
     )
 
@@ -686,6 +688,8 @@ async def api_me(user: dict = Depends(current_user)):
 
 @app.post("/api/credits/redeem")
 async def redeem_credits(req: CouponRedeemRequest, user: dict = Depends(current_user)):
+    if not settings.COUPON_REDEEM_ENABLED:
+        raise HTTPException(status_code=503, detail=settings.COUPON_REDEEM_DISABLED_MESSAGE)
     coupon = _decode_credit_coupon(req.coupon)
     try:
         return redeem_user_coupon(user["id"], coupon)

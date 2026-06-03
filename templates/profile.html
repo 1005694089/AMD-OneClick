@@ -34,6 +34,8 @@
     const activeInstance = {{ (active_instance or {}) | tojson }};
     const githubEnabled = {{ github_enabled | tojson }};
     const modelscopeEnabled = {{ modelscope_enabled | tojson }};
+    const couponRedeemEnabled = {{ coupon_redeem_enabled | tojson }};
+    const couponRedeemDisabledMessage = {{ coupon_redeem_disabled_message | tojson }};
 
     function avatarNode(u, size=48) {
       if (!u || !u.email) return React.createElement(Avatar, { size, style:{ background:'linear-gradient(135deg,#8ea7ff,#b865ff)' } }, '?');
@@ -158,6 +160,10 @@
       }
 
       async function redeemCredits(values) {
+        if (!couponRedeemEnabled) {
+          message.warning(couponRedeemDisabledMessage, 5);
+          return;
+        }
         setRedeemLoading(true);
         try {
           const res = await fetch('/api/credits/redeem', {
@@ -294,8 +300,10 @@
               React.createElement(Card, null,
                 React.createElement(Statistic, {title:'Credits Available', value:user.credits}),
                 React.createElement(Paragraph, {type:'secondary', style:{marginTop:16}}, 'Usage costs 1 credit per GPU per hour. Each account can keep one active instance.'),
-                React.createElement(Paragraph, {type:'secondary'}, 'Need more credits? Visit ', React.createElement('a', {href:'https://developer.amd.com.cn/', target:'_blank', rel:'noreferrer'}, 'AMD Developer China'), ' to get a coupon, then redeem it here.'),
-                React.createElement(Button, {type:'primary', onClick:()=>setRedeemModalOpen(true)}, 'Redeem Credits')
+                couponRedeemEnabled
+                  ? React.createElement(Paragraph, {type:'secondary'}, 'Need more credits? Visit ', React.createElement('a', {href:'https://developer.amd.com.cn/', target:'_blank', rel:'noreferrer'}, 'AMD Developer China'), ' to get a coupon, then redeem it here.')
+                  : React.createElement(Alert, {type:'warning', showIcon:true, style:{marginTop:16}, message:'Credit redemption temporarily unavailable', description:couponRedeemDisabledMessage}),
+                React.createElement(Button, {type:'primary', disabled:!couponRedeemEnabled, onClick:()=>setRedeemModalOpen(true)}, 'Redeem Credits')
               ),
               React.createElement(Card, {title:'Active Instance'}, activeInstance && activeInstance.instance_id ? React.createElement(React.Fragment, null,
                 creditsLow && React.createElement(Alert, {type:'warning', showIcon:true, closable:true, style:{marginBottom:16}, message:`Credits are running low: about ${remainingRunHours} hour${remainingRunHours === 1 ? '' : 's'} remaining`, description:'Your instance will be automatically deleted when credits are exhausted. Save your work and redeem more credits as soon as possible.'}),
@@ -319,8 +327,9 @@
             ),
             React.createElement(Modal, {title:'Redeem Credits', open:redeemModalOpen, onCancel:()=>setRedeemModalOpen(false), footer:null, destroyOnClose:true},
               React.createElement(Form, {form:redeemForm, layout:'vertical', onFinish:redeemCredits},
+                !couponRedeemEnabled && React.createElement(Alert, {type:'warning', showIcon:true, style:{marginBottom:16}, message:'Credit redemption temporarily unavailable', description:couponRedeemDisabledMessage}),
                 React.createElement(Form.Item, {name:'coupon', label:'Coupon Code', rules:[{required:true,message:'Coupon code is required'}]}, React.createElement(Input.TextArea, {autoSize:{minRows:4,maxRows:8}, placeholder:'Paste your encrypted coupon here'})),
-                React.createElement(Button, {type:'primary', htmlType:'submit', block:true, loading:redeemLoading}, 'Redeem')
+                React.createElement(Button, {type:'primary', htmlType:'submit', block:true, disabled:!couponRedeemEnabled, loading:redeemLoading}, 'Redeem')
               )
             ),
             renderEditorTemplates()
