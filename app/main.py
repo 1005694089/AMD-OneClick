@@ -529,6 +529,21 @@ async def profile_page(request: Request):
     )
 
 
+@app.get("/user-guide", response_class=HTMLResponse)
+async def user_guide_page(request: Request):
+    """Render the public developer user guide."""
+    user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
+    return templates.TemplateResponse(
+        request,
+        "user_guide.html",
+        {
+            "user": user,
+            "github_enabled": bool(settings.GITHUB_CLIENT_ID),
+            "modelscope_enabled": bool(settings.MODELSCOPE_CLIENT_ID),
+        },
+    )
+
+
 @app.get("/auth/github/login")
 async def github_login(request: Request):
     if not settings.GITHUB_CLIENT_ID:
