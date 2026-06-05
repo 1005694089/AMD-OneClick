@@ -110,6 +110,155 @@ class K8sClient:
         safe_id = self._safe_storage_segment(instance_id)
         return f"{prefix}/{safe_id}" if prefix else safe_id
 
+    def _network_disk_dynamic_enabled(self) -> bool:
+        return bool(
+            settings.NETWORK_DISK_ENABLED
+            and settings.NETWORK_DISK_NFS_SERVER.strip()
+            and settings.NETWORK_DISK_SERVER_NODE_NAME.strip()
+        )
+
+    def _network_disk_claim_name(self, instance_id: str) -> str:
+        prefix = self._safe_storage_segment(settings.NETWORK_DISK_PVC_PREFIX).lower()
+        safe_id = self._safe_storage_segment(instance_id).lower()
+        return f"{prefix}-{safe_id}"[:63].rstrip("-")
+
+    def _network_disk_nfs_path(self, instance_id: str) -> str:
+        prefix = "/" + settings.NETWORK_DISK_NFS_PATH_PREFIX.strip("/")
+        return f"{prefix}/{self._safe_storage_segment(instance_id)}"
+
+    def _ensure_network_disk(self, instance_id: str) -> Optional[str]:
+        if not self._network_disk_dynamic_enabled():
+            return None
+
+        claim_name = self._network_disk_claim_name(instance_id)
+        nfs_path = self._network_disk_nfs_path(instance_id)
+        self._provision_network_disk_image(instance_id)
+        self._ensure_network_disk_pv_pvc(claim_name, nfs_path)
+        return claim_name
+
+    def _provision_network_disk_image(self, instance_id: str):
+        safe_id = self._safe_storage_segment(instance_id)
+        pod_name = f"netdisk-prov-{safe_id.lower()}"[:63].rstrip("-")
+        image_path = f"{settings.NETWORK_DISK_IMAGE_HOST_ROOT.rstrip('/')}/{safe_id}.img"
+        mount_path = f"{settings.NETWORK_DISK_EXPORT_HOST_ROOT.rstrip('/')}{self._network_disk_nfs_path(instance_id)}"
+        size_gi = int(settings.NETWORK_DISK_SIZE_GI)
+        command = f"""
+set -eux
+nsenter -t 1 -m -- /bin/bash -lc {shlex.quote(f'''
+set -eux
+img={shlex.quote(image_path)}
+mnt={shlex.quote(mount_path)}
+mkdir -p {shlex.quote(settings.NETWORK_DISK_IMAGE_HOST_ROOT)} "$mnt"
+if [ ! -f "$img" ]; then
+  truncate -s {size_gi}G "$img"
+  mkfs.ext4 -F "$img"
+fi
+if ! mountpoint -q "$mnt"; then
+  mount -o loop "$img" "$mnt"
+fi
+df -h "$mnt"
+findmnt "$mnt"
+''')}
+"""
+        body = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name, "namespace": self.namespace, "labels": {"app": "oneclick-network-disk-provisioner", "instance-id": safe_id}},
+            "spec": {
+                "nodeName": settings.NETWORK_DISK_SERVER_NODE_NAME,
+                "hostPID": True,
+                "restartPolicy": "Never",
+                "containers": [
+                    {
+                        "name": "provision",
+                        "image": "docker.m.daocloud.io/library/ubuntu:24.04",
+                        "securityContext": {"privileged": True},
+                        "command": ["/bin/bash", "-lc"],
+                        "args": [command],
+                        "resources": {
+                            "requests": {"cpu": "50m", "memory": "64Mi"},
+                            "limits": {"cpu": "1", "memory": "512Mi"},
+                        },
+                        "volumeMounts": [{"name": "host", "mountPath": "/host"}],
+                    }
+                ],
+                "volumes": [{"name": "host", "hostPath": {"path": "/", "type": "Directory"}}],
+            },
+        }
+        try:
+            self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace)
+            for _ in range(30):
+                try:
+                    self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                    time.sleep(1)
+                except ApiException as e:
+                    if e.status == 404:
+                        break
+                    raise
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
+        last_phase = ""
+        for _ in range(120):
+            pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+            last_phase = pod.status.phase
+            if last_phase == "Succeeded":
+                return
+            if last_phase == "Failed":
+                raise RuntimeError(f"network disk provisioner {pod_name} failed")
+            time.sleep(1)
+        raise RuntimeError(f"network disk provisioner {pod_name} timed out in phase {last_phase}")
+
+    def _ensure_network_disk_pv_pvc(self, claim_name: str, nfs_path: str):
+        size = f"{int(settings.NETWORK_DISK_SIZE_GI)}Gi"
+        pv_body = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {"name": claim_name, "labels": {"app": "oneclick-network-disk", "claim": claim_name}},
+            "spec": {
+                "capacity": {"storage": size},
+                "accessModes": ["ReadWriteMany"],
+                "persistentVolumeReclaimPolicy": "Retain",
+                "storageClassName": "",
+                "nfs": {"server": settings.NETWORK_DISK_NFS_SERVER.strip(), "path": nfs_path},
+            },
+        }
+        pvc_body = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": claim_name, "namespace": self.namespace, "labels": {"app": "oneclick-network-disk"}},
+            "spec": {
+                "accessModes": ["ReadWriteMany"],
+                "resources": {"requests": {"storage": size}},
+                "volumeName": claim_name,
+                "storageClassName": "",
+            },
+        }
+        try:
+            self.core_v1.read_persistent_volume(name=claim_name)
+        except ApiException as e:
+            if e.status == 404:
+                self.core_v1.create_persistent_volume(body=pv_body)
+            else:
+                raise
+
+        try:
+            self.core_v1.read_namespaced_persistent_volume_claim(name=claim_name, namespace=self.namespace)
+        except ApiException as e:
+            if e.status == 404:
+                self.core_v1.create_namespaced_persistent_volume_claim(namespace=self.namespace, body=pvc_body)
+            else:
+                raise
+
+        for _ in range(60):
+            pvc = self.core_v1.read_namespaced_persistent_volume_claim(name=claim_name, namespace=self.namespace)
+            if pvc.status.phase == "Bound":
+                return
+            time.sleep(1)
+        raise RuntimeError(f"network disk PVC {claim_name} did not bind")
+
     def _resolve_resource_profile(self, gpu_count: int, resource_profile: Optional[str] = None) -> tuple[str, dict]:
         profile = (resource_profile or "auto").strip().lower()
         if profile == "auto":
@@ -219,7 +368,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                           instance_type: str = "jupyter",
                           gpu_count: int = 1,
                           github_info: Optional[dict] = None,
-                          resource_profile: Optional[str] = None) -> dict:
+                          resource_profile: Optional[str] = None,
+                          network_disk_claim_name: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -234,11 +384,14 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             "amd-oneclick/memory-limit": resources["memory_limit"],
             "amd-oneclick/workspace-host-path": self._workspace_host_path(instance_id),
         }
-        network_disk_enabled = bool(settings.NETWORK_DISK_ENABLED and settings.NETWORK_DISK_PVC_NAME.strip())
-        network_disk_sub_path = self._network_disk_sub_path(instance_id) if network_disk_enabled else ""
+        network_disk_pvc_name = network_disk_claim_name or settings.NETWORK_DISK_PVC_NAME.strip()
+        network_disk_enabled = bool(settings.NETWORK_DISK_ENABLED and network_disk_pvc_name)
+        use_static_network_disk_subpath = bool(network_disk_enabled and not network_disk_claim_name)
+        network_disk_sub_path = self._network_disk_sub_path(instance_id) if use_static_network_disk_subpath else ""
         if network_disk_enabled:
-            annotations["amd-oneclick/network-disk-pvc"] = settings.NETWORK_DISK_PVC_NAME.strip()
-            annotations["amd-oneclick/network-disk-sub-path"] = network_disk_sub_path
+            annotations["amd-oneclick/network-disk-pvc"] = network_disk_pvc_name
+            if network_disk_sub_path:
+                annotations["amd-oneclick/network-disk-sub-path"] = network_disk_sub_path
 
         if github_info:
             annotations["amd-oneclick/github-org"] = github_info.get("org", "")
@@ -290,15 +443,17 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
         ]
         if network_disk_enabled:
-            volume_mounts.append({
+            network_disk_mount = {
                 "name": "network-disk",
                 "mountPath": settings.NETWORK_DISK_MOUNT_PATH,
-                "subPath": network_disk_sub_path,
-            })
+            }
+            if network_disk_sub_path:
+                network_disk_mount["subPath"] = network_disk_sub_path
+            volume_mounts.append(network_disk_mount)
             volumes.append({
                 "name": "network-disk",
                 "persistentVolumeClaim": {
-                    "claimName": settings.NETWORK_DISK_PVC_NAME.strip()
+                    "claimName": network_disk_pvc_name
                 }
             })
             env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
@@ -596,6 +751,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         if existing:
             return existing
 
+        network_disk_claim_name = self._ensure_network_disk(instance_id)
         node_port = self._allocate_node_port()
 
         pod_manifest = self._get_pod_manifest(
@@ -604,6 +760,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             gpu_count=gpu_count,
             github_info=github_info,
             resource_profile=resource_profile,
+            network_disk_claim_name=network_disk_claim_name,
         )
         for attempt in range(1, 7):
             try:

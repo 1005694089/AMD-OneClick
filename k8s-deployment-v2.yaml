@@ -22,6 +22,33 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: amd-oneclick-manager-v2-network-disk
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: amd-oneclick-manager-v2-network-disk
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: amd-oneclick-manager-v2-network-disk
+subjects:
+  - kind: ServiceAccount
+    name: amd-oneclick-manager-v2
+    namespace: default
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -128,6 +155,13 @@ data:
   NETWORK_DISK_PVC_NAME: "oneclick-network-disk-test"
   NETWORK_DISK_MOUNT_PATH: "/network-workspace"
   NETWORK_DISK_SUBPATH_PREFIX: "instances"
+  NETWORK_DISK_SIZE_GI: "20"
+  NETWORK_DISK_PVC_PREFIX: "oneclick-network-disk"
+  NETWORK_DISK_NFS_SERVER: "10.233.211.13"
+  NETWORK_DISK_NFS_PATH_PREFIX: "/instances"
+  NETWORK_DISK_SERVER_NODE_NAME: "wx-ms-w7900d-0005"
+  NETWORK_DISK_IMAGE_HOST_ROOT: "/workspace/oneclick-network-disk/images"
+  NETWORK_DISK_EXPORT_HOST_ROOT: "/workspace/oneclick-network-disk/export"
   IDLE_TIMEOUT_MINUTES: "10"
   MAX_LIFETIME_HOURS: "6"
   SERVICE_HOST: "36.151.243.69"
@@ -192,7 +226,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-network-disk-exp-20260605-1635
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-network-disk-quota-20260605-1715
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

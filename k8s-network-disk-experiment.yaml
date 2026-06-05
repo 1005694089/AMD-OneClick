@@ -22,7 +22,7 @@ spec:
       nodeName: wx-ms-w7900d-0005
       containers:
         - name: nfs
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/nfs-server-alpine:12
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/nfs-server-alpine:12-crossmnt
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
@@ -39,6 +39,7 @@ spec:
           volumeMounts:
             - name: export
               mountPath: /exports
+              mountPropagation: HostToContainer
           resources:
             requests:
               cpu: 100m
@@ -51,6 +52,61 @@ spec:
           hostPath:
             path: /workspace/oneclick-network-disk/export
             type: DirectoryOrCreate
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: oneclick-nfs-client-installer
+  namespace: default
+  labels:
+    app: oneclick-nfs-client-installer
+spec:
+  selector:
+    matchLabels:
+      app: oneclick-nfs-client-installer
+  template:
+    metadata:
+      labels:
+        app: oneclick-nfs-client-installer
+    spec:
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: install
+          image: docker.m.daocloud.io/library/ubuntu:24.04
+          securityContext:
+            privileged: true
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -eux
+              chroot /host /bin/bash -lc 'if command -v mount.nfs >/dev/null 2>&1; then echo nfs-common-already-installed; else apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-common; fi; command -v mount.nfs; mount.nfs -V || true'
+              sleep infinity
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -lc
+                - chroot /host /bin/bash -lc 'command -v mount.nfs >/dev/null 2>&1'
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: host
+              mountPath: /host
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+            type: Directory
 ---
 apiVersion: v1
 kind: Service
@@ -100,3 +156,32 @@ spec:
   nfs:
     server: 10.233.211.13
     path: /
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: oneclick-network-disk-quota-test
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  nfs:
+    server: 10.233.211.13
+    path: /instances/u-quota-test
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oneclick-network-disk-quota-test
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  volumeName: oneclick-network-disk-quota-test
+  storageClassName: ""
