@@ -188,7 +188,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-redeem-shutdown-20260603-2338
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-admin-template-pagination-20260605-1545
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
