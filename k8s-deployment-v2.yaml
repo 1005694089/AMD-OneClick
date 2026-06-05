@@ -124,6 +124,10 @@ data:
   HF_HUB_DISABLE_XET: "1"
   WORKSPACE_HOST_ROOT: "/workspace/amd-oneclick"
   WORKSPACE_MOUNT_PATH: "/workspace"
+  NETWORK_DISK_ENABLED: "false"
+  NETWORK_DISK_PVC_NAME: "oneclick-network-disk-test"
+  NETWORK_DISK_MOUNT_PATH: "/network-workspace"
+  NETWORK_DISK_SUBPATH_PREFIX: "instances"
   IDLE_TIMEOUT_MINUTES: "10"
   MAX_LIFETIME_HOURS: "6"
   SERVICE_HOST: "36.151.243.69"
@@ -188,7 +192,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-admin-template-pagination-20260605-1545
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-network-disk-exp-20260605-1635
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

@@ -102,6 +102,14 @@ class K8sClient:
         safe_id = re.sub(r"[^a-zA-Z0-9_.-]", "-", instance_id)
         return f"{settings.WORKSPACE_HOST_ROOT.rstrip('/')}/{safe_id}"
 
+    def _safe_storage_segment(self, value: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_.-]", "-", value).strip("-") or "default"
+
+    def _network_disk_sub_path(self, instance_id: str) -> str:
+        prefix = settings.NETWORK_DISK_SUBPATH_PREFIX.strip("/")
+        safe_id = self._safe_storage_segment(instance_id)
+        return f"{prefix}/{safe_id}" if prefix else safe_id
+
     def _resolve_resource_profile(self, gpu_count: int, resource_profile: Optional[str] = None) -> tuple[str, dict]:
         profile = (resource_profile or "auto").strip().lower()
         if profile == "auto":
@@ -226,6 +234,11 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             "amd-oneclick/memory-limit": resources["memory_limit"],
             "amd-oneclick/workspace-host-path": self._workspace_host_path(instance_id),
         }
+        network_disk_enabled = bool(settings.NETWORK_DISK_ENABLED and settings.NETWORK_DISK_PVC_NAME.strip())
+        network_disk_sub_path = self._network_disk_sub_path(instance_id) if network_disk_enabled else ""
+        if network_disk_enabled:
+            annotations["amd-oneclick/network-disk-pvc"] = settings.NETWORK_DISK_PVC_NAME.strip()
+            annotations["amd-oneclick/network-disk-sub-path"] = network_disk_sub_path
 
         if github_info:
             annotations["amd-oneclick/github-org"] = github_info.get("org", "")
@@ -238,6 +251,57 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/template-title"] = github_info.get("template_title", "")
 
         startup_script = self._build_startup_script(instance_id, instance_type, github_info)
+
+        volume_mounts = [
+            {"name": "shm", "mountPath": "/dev/shm"},
+            {"name": "hf-cache", "mountPath": settings.HF_CACHE_MOUNT_PATH},
+            {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH},
+        ]
+        volumes = [
+            {
+                "name": "shm",
+                "emptyDir": {
+                    "medium": "Memory",
+                    "sizeLimit": "64Gi"
+                }
+            },
+            {
+                "name": "hf-cache",
+                "hostPath": {
+                    "path": settings.HF_CACHE_HOST_PATH,
+                    "type": "DirectoryOrCreate"
+                }
+            },
+            {
+                "name": "workspace",
+                "hostPath": {
+                    "path": self._workspace_host_path(instance_id),
+                    "type": "DirectoryOrCreate"
+                }
+            },
+        ]
+        env = [
+            {"name": "SHELL", "value": "/bin/bash"},
+            {"name": "USER_EMAIL", "value": email},
+            {"name": "INSTANCE_TYPE", "value": instance_type},
+            {"name": "WORKSPACE_DIR", "value": settings.WORKSPACE_MOUNT_PATH},
+            {"name": "HF_HOME", "value": settings.HF_CACHE_MOUNT_PATH},
+            {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
+            {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
+        ]
+        if network_disk_enabled:
+            volume_mounts.append({
+                "name": "network-disk",
+                "mountPath": settings.NETWORK_DISK_MOUNT_PATH,
+                "subPath": network_disk_sub_path,
+            })
+            volumes.append({
+                "name": "network-disk",
+                "persistentVolumeClaim": {
+                    "claimName": settings.NETWORK_DISK_PVC_NAME.strip()
+                }
+            })
+            env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
 
         return {
             "apiVersion": "v1",
@@ -298,45 +362,11 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                                 "amd.com/gpu": str(gpu_count)
                             }
                         },
-                        "env": [
-                            {"name": "SHELL", "value": "/bin/bash"},
-                            {"name": "USER_EMAIL", "value": email},
-                            {"name": "INSTANCE_TYPE", "value": instance_type},
-                            {"name": "WORKSPACE_DIR", "value": settings.WORKSPACE_MOUNT_PATH},
-                            {"name": "HF_HOME", "value": settings.HF_CACHE_MOUNT_PATH},
-                            {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
-                            {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET}
-                        ],
-                        "volumeMounts": [
-                            {"name": "shm", "mountPath": "/dev/shm"},
-                            {"name": "hf-cache", "mountPath": settings.HF_CACHE_MOUNT_PATH},
-                            {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH}
-                        ]
+                        "env": env,
+                        "volumeMounts": volume_mounts
                     }
                 ],
-                "volumes": [
-                    {
-                        "name": "shm",
-                        "emptyDir": {
-                            "medium": "Memory",
-                            "sizeLimit": "64Gi"
-                        }
-                    },
-                    {
-                        "name": "hf-cache",
-                        "hostPath": {
-                            "path": settings.HF_CACHE_HOST_PATH,
-                            "type": "DirectoryOrCreate"
-                        }
-                    },
-                    {
-                        "name": "workspace",
-                        "hostPath": {
-                            "path": self._workspace_host_path(instance_id),
-                            "type": "DirectoryOrCreate"
-                        }
-                    }
-                ],
+                "volumes": volumes,
                 "restartPolicy": "Always"
             }
         }
