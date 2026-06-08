@@ -146,6 +146,7 @@ instance_records = Table(
     Column("instance_type", String(64), nullable=False),
     Column("gpu_count", Integer, nullable=False),
     Column("node_port", Integer),
+    Column("opencode_node_port", Integer),
     Column("status", String(64), nullable=False, default="running"),
     Column("created_at", String(64), nullable=False),
     Column("last_charged_at", String(64), nullable=False),
@@ -207,6 +208,30 @@ usage_charges = Table(
     UniqueConstraint("billing_session_id", "billing_unit", name="uq_usage_charge_session_unit"),
 )
 
+# Per-user custom images. This is deliberately separate from the global `images`
+# catalog so a user's custom image never appears in other users' launch dropdowns.
+# It also doubles as the build queue consumed by the R9700 build-agent.
+custom_images = Table(
+    "custom_images",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False, index=True),
+    Column("name", String(64), nullable=False),
+    Column("image", Text, nullable=False),
+    Column("dockerfile", Text, nullable=False),
+    Column("build_status", String(32), nullable=False, default="pending"),
+    Column("build_log", Text),
+    Column("claimed_by", String(128)),
+    Column("claimed_at", String(64)),
+    Column("created_at", String(64), nullable=False),
+    Column("updated_at", String(64), nullable=False),
+    UniqueConstraint("user_id", "name", name="uq_custom_image_user_name"),
+)
+
+# Build queue states that count against a user's quota and block re-use of a name.
+CUSTOM_IMAGE_ACTIVE_STATUSES = ("pending", "building", "ready")
+CUSTOM_IMAGE_LOG_MAX_CHARS = 60000
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -234,6 +259,8 @@ def ensure_schema_columns(conn):
     if "billing_session_id" not in instance_columns:
         conn.execute(text("ALTER TABLE instance_records ADD COLUMN billing_session_id VARCHAR(255)"))
         conn.execute(text("UPDATE instance_records SET billing_session_id = instance_id WHERE billing_session_id IS NULL"))
+    if "opencode_node_port" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN opencode_node_port INTEGER"))
 
     usage_columns = {col["name"] for col in inspector.get_columns("usage_charges")}
     if "billing_session_id" not in usage_columns:
@@ -253,7 +280,7 @@ def ensure_schema_columns(conn):
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN owner_user_id INTEGER"))
 
     # Backward-compatible creation for databases initialized before these tables.
-    metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions, instance_launch_events])
+    metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions, instance_launch_events, custom_images])
 
 
 def ensure_default_image(conn):
@@ -933,6 +960,184 @@ def get_image_by_value(image: str) -> Optional[dict]:
         )
 
 
+# =============================================================================
+# Custom images (per-user) + build queue
+# =============================================================================
+
+def list_custom_images(user_id: int) -> list[dict]:
+    stmt = select(custom_images).where(custom_images.c.user_id == user_id).order_by(custom_images.c.id.desc())
+    with engine.begin() as conn:
+        return [dict(r) for r in conn.execute(stmt).mappings().all()]
+
+
+def get_custom_image(image_id: int, user_id: Optional[int] = None) -> Optional[dict]:
+    stmt = select(custom_images).where(custom_images.c.id == image_id)
+    if user_id is not None:
+        stmt = stmt.where(custom_images.c.user_id == user_id)
+    with engine.begin() as conn:
+        return row_to_dict(conn.execute(stmt).mappings().first())
+
+
+def count_active_custom_images(user_id: int) -> int:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(custom_images.c.id).where(
+                custom_images.c.user_id == user_id,
+                custom_images.c.build_status.in_(CUSTOM_IMAGE_ACTIVE_STATUSES),
+            )
+        ).all()
+        return len(rows)
+
+
+def create_custom_image(user_id: int, name: str, image: str, dockerfile: str, max_per_user: int) -> dict:
+    """Enqueue a custom image build. Enforces the per-user cap and unique name.
+
+    Raises ValueError on cap exceeded or duplicate name.
+    """
+    name = name.strip()
+    image = image.strip()
+    now = utc_now()
+    with engine.begin() as conn:
+        active = conn.execute(
+            select(custom_images.c.id).where(
+                custom_images.c.user_id == user_id,
+                custom_images.c.build_status.in_(CUSTOM_IMAGE_ACTIVE_STATUSES),
+            )
+        ).all()
+        if len(active) >= max_per_user:
+            raise ValueError(f"You can have at most {max_per_user} custom images. Delete one first.")
+        existing = conn.execute(
+            select(custom_images.c.id).where(
+                custom_images.c.user_id == user_id,
+                custom_images.c.name == name,
+            )
+        ).first()
+        if existing:
+            raise ValueError(f"You already have a custom image named '{name}'.")
+        try:
+            result = conn.execute(
+                custom_images.insert().values(
+                    user_id=user_id,
+                    name=name,
+                    image=image,
+                    dockerfile=dockerfile,
+                    build_status="pending",
+                    build_log="",
+                    claimed_by=None,
+                    claimed_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        except IntegrityError:
+            raise ValueError(f"You already have a custom image named '{name}'.")
+        new_id = result.inserted_primary_key[0]
+        return row_to_dict(conn.execute(select(custom_images).where(custom_images.c.id == new_id)).mappings().first())
+
+
+def claim_next_build(agent_id: str) -> Optional[dict]:
+    """Atomically lease the oldest pending build for the agent."""
+    now = utc_now()
+    with engine.begin() as conn:
+        pending = conn.execute(
+            select(custom_images)
+            .where(custom_images.c.build_status == "pending")
+            .order_by(custom_images.c.id)
+            .limit(1)
+        ).mappings().first()
+        if not pending:
+            return None
+        conn.execute(
+            update(custom_images)
+            .where(custom_images.c.id == pending["id"], custom_images.c.build_status == "pending")
+            .values(build_status="building", claimed_by=agent_id, claimed_at=now, updated_at=now)
+        )
+        return row_to_dict(conn.execute(select(custom_images).where(custom_images.c.id == pending["id"])).mappings().first())
+
+
+def append_custom_image_log(image_id: int, chunk: str) -> None:
+    if not chunk:
+        return
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(select(custom_images.c.build_log).where(custom_images.c.id == image_id)).first()
+        if not current:
+            return
+        combined = (current[0] or "") + chunk
+        if len(combined) > CUSTOM_IMAGE_LOG_MAX_CHARS:
+            combined = combined[-CUSTOM_IMAGE_LOG_MAX_CHARS:]
+        conn.execute(
+            update(custom_images).where(custom_images.c.id == image_id).values(build_log=combined, updated_at=now)
+        )
+
+
+def update_custom_image_status(image_id: int, status: Optional[str] = None, image: Optional[str] = None) -> Optional[dict]:
+    now = utc_now()
+    values = {"updated_at": now}
+    if status is not None:
+        values["build_status"] = status
+    if image is not None:
+        values["image"] = image
+    with engine.begin() as conn:
+        current = conn.execute(select(custom_images.c.id).where(custom_images.c.id == image_id)).first()
+        if not current:
+            return None
+        conn.execute(update(custom_images).where(custom_images.c.id == image_id).values(**values))
+        return row_to_dict(conn.execute(select(custom_images).where(custom_images.c.id == image_id)).mappings().first())
+
+
+def delete_custom_image(image_id: int, user_id: int) -> Optional[dict]:
+    """Delete a user's custom image; returns the deleted row (for cleanup) or None."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(custom_images).where(custom_images.c.id == image_id, custom_images.c.user_id == user_id)
+        ).mappings().first()
+        if not row:
+            return None
+        conn.execute(custom_images.delete().where(custom_images.c.id == image_id, custom_images.c.user_id == user_id))
+        return dict(row)
+
+
+def get_ready_custom_image_by_value(user_id: int, image: str) -> Optional[dict]:
+    """Resolve a user-owned, build-ready custom image by its full image string."""
+    with engine.begin() as conn:
+        return row_to_dict(
+            conn.execute(
+                select(custom_images).where(
+                    custom_images.c.user_id == user_id,
+                    custom_images.c.image == image,
+                    custom_images.c.build_status == "ready",
+                )
+            ).mappings().first()
+        )
+
+
+def reap_stale_builds(timeout_seconds: int) -> int:
+    """Fail builds whose lease is older than timeout_seconds. Returns count reaped."""
+    now = datetime.now(timezone.utc)
+    reaped = 0
+    with engine.begin() as conn:
+        building = conn.execute(
+            select(custom_images.c.id, custom_images.c.claimed_at).where(custom_images.c.build_status == "building")
+        ).all()
+        for row in building:
+            claimed_at = row[1]
+            stale = True
+            if claimed_at:
+                try:
+                    stale = (now - datetime.fromisoformat(claimed_at)).total_seconds() > timeout_seconds
+                except ValueError:
+                    stale = True
+            if stale:
+                conn.execute(
+                    update(custom_images)
+                    .where(custom_images.c.id == row[0])
+                    .values(build_status="failed", updated_at=utc_now())
+                )
+                reaped += 1
+    return reaped
+
+
 def get_active_instance_for_user(user_id: int) -> Optional[dict]:
     with engine.begin() as conn:
         return row_to_dict(
@@ -949,7 +1154,7 @@ def get_active_instance_for_user(user_id: int) -> Optional[dict]:
         )
 
 
-def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int):
+def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None):
     now = utc_now()
     billing_session_id = f"{instance_id}:{uuid.uuid4().hex[:12]}"
     with engine.begin() as conn:
@@ -963,6 +1168,7 @@ def record_instance(user_id: int, email: str, instance_id: str, image: str, inst
             instance_type=instance_type,
             gpu_count=gpu_count,
             node_port=node_port,
+            opencode_node_port=opencode_node_port,
             status="running",
             created_at=now,
             last_charged_at=now,

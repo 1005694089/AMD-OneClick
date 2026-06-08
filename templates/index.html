@@ -57,8 +57,9 @@
     .template-title { display:-webkit-box; height:44px; overflow:hidden; line-clamp:2; -webkit-line-clamp:2; -webkit-box-orient:vertical; font-size:16px; line-height:22px; font-weight:850; color:#273049; }
     .template-desc { display:-webkit-box; height:40px; overflow:hidden; line-clamp:2; -webkit-line-clamp:2; -webkit-box-orient:vertical; color:#6c7283; line-height:20px; margin-top:8px; font-size:13px; }
     .template-meta { margin-top:14px; height:24px; display:flex; gap:6px; flex-wrap:nowrap; overflow:hidden; }
-    .template-actions { margin-top:auto; padding-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:8px; align-items:center; }
-    .template-actions .ant-btn { width:100%; }
+    .template-actions { margin-top:auto; padding-top:16px; display:flex; flex-wrap:wrap; gap:8px; justify-content:center; align-items:center; }
+    .template-actions .ant-btn { min-width:0; flex:0 1 auto; }
+    .template-actions .ant-btn > span { overflow:hidden; text-overflow:ellipsis; }
     .empty-gallery { padding:46px; text-align:center; background:#fff; border:1px dashed #d9e0ef; border-radius:18px; color:#747b8c; }
     @media (max-width: 1120px) { .template-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } .gallery-hero-inner { grid-template-columns:1fr; } .gallery-art { display:none; } }
     @media (max-width: 900px) { .gallery-bar { align-items:flex-start; flex-direction:column; } .template-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
@@ -77,9 +78,31 @@
     const notebookTemplates = {{ notebook_templates_json | safe }};
     const defaultImage = {{ default_image | tojson }};
     const initialActiveInstance = {{ active_instance_json | safe }};
+    const initialCustomImages = {{ custom_images_json | safe }};
     const showWorkshopLogin = {{ workshop_login_enabled | tojson }};
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
+
+    const JUPYTER_LOGO = 'https://cdn.jsdelivr.net/npm/simple-icons@13/icons/jupyter.svg';
+    const OPENCODE_LOGO = 'https://opencode.ai/favicon.svg';
+    const HERMES_LOGO = 'https://hermes-agent.nousresearch.com/favicon.ico';
+    // Render a brand logo with a small, always-visible one-word label next to it.
+    // If the logo fails to load, the label alone still identifies the button.
+    function brandContent(src, alt, label) {
+      return React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+        React.createElement('img', { src, alt, style: { height: 18, width: 18, objectFit: 'contain', display: 'block' }, onError: (e) => { e.target.style.display = 'none'; } }),
+        React.createElement('span', { style: { fontSize: 12, lineHeight: 1 } }, label)
+      );
+    }
+    // Disabled Hermes button — placeholder for a future experimental feature.
+    function hermesButton(opts) {
+      return React.createElement(Button, Object.assign({ disabled: true, title: 'Hermes - experimental, coming soon' }, opts || {}),
+        React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+          brandContent(HERMES_LOGO, 'Hermes', 'Hermes'),
+          React.createElement('span', { style: { fontSize: 10, opacity: 0.6 } }, 'soon')
+        )
+      );
+    }
 
     function avatarNode(user) {
       if (!user || !user.email) return null;
@@ -115,7 +138,11 @@
       const [notebookLoading, setNotebookLoading] = React.useState(false);
       const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
       const [readyUrl, setReadyUrl] = React.useState(initialActiveInstance.url || '');
+      const [readyOpencodeUrl, setReadyOpencodeUrl] = React.useState(initialActiveInstance.opencode_url || '');
       const [readyTemplateId, setReadyTemplateId] = React.useState(initialActiveInstance.template_id ? Number(initialActiveInstance.template_id) : null);
+      const [customImages, setCustomImages] = React.useState(initialCustomImages || []);
+      // null = checking, true = active pod ready, false = still starting/pulling image
+      const [instanceReady, setInstanceReady] = React.useState(initialActiveInstance && initialActiveInstance.instance_id ? null : true);
       const [createModalOpen, setCreateModalOpen] = React.useState(false);
       const [createLoading, setCreateLoading] = React.useState(false);
       const [workshopLoginOpen, setWorkshopLoginOpen] = React.useState(false);
@@ -126,6 +153,10 @@
       const [gallerySearch, setGallerySearch] = React.useState('');
       const [activeTag, setActiveTag] = React.useState('All');
       const imageOptions = (images || []).map(img => ({ label: React.createElement('span', { className: 'image-option-label', title: img.image }, img.name ? `${img.name} (${img.image.split('/').pop()})` : img.image.split('/').pop()), value: img.image }));
+      const templateImageOptions = [
+        ...imageOptions,
+        ...((customImages || []).filter(ci => ci.build_status === 'ready').map(ci => ({ value: ci.image, label: React.createElement('span', { className: 'image-option-label', title: ci.image }, `${ci.name} (custom)`) })))
+      ];
       const resourceProfileOptions = [
         { value: 'auto', label: 'Auto (recommended by GPU count)' },
         ...Object.entries(resourceProfiles || {}).map(([value, profile]) => ({ value, label: profile.label || value }))
@@ -143,6 +174,25 @@
         const open = () => setWorkshopLoginOpen(true);
         window.addEventListener('open-workshop-login', open);
         return () => window.removeEventListener('open-workshop-login', open);
+      }, []);
+
+      // If there is an active instance on load, poll whether its pod is actually ready
+      // (the image may still be pulling onto the node), so we don't surface a dead link.
+      React.useEffect(() => {
+        if (!initialActiveInstance || !initialActiveInstance.instance_id) return;
+        let cancelled = false; let timer = null;
+        async function check() {
+          try {
+            const res = await fetch('/api/notebook/status');
+            const data = await res.json();
+            if (cancelled) return;
+            if (data.status === 'ready') { setInstanceReady(true); if (timer) clearInterval(timer); }
+            else { setInstanceReady(false); }
+          } catch (e) {}
+        }
+        check();
+        timer = setInterval(check, 5000);
+        return () => { cancelled = true; if (timer) clearInterval(timer); };
       }, []);
 
       async function loginWorkshop(values) {
@@ -186,7 +236,7 @@
       async function launch() {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const values = await form.validateFields();
-        setNotebookLoading(true); setReadyUrl(''); setReadyTemplateId(null);
+        setNotebookLoading(true); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
         try {
           const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode' }) });
           const data = await res.json();
@@ -197,12 +247,24 @@
       async function launchTemplate(tpl) {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const gpuCount = form.getFieldValue('gpu_count') || 1;
-        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyTemplateId(null);
+        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
         try {
           const res = await fetch(`/api/templates/${tpl.id}/launch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gpu_count: gpuCount }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           pollStatus(data.url, { type: 'template', templateId: tpl.id }); message.success(`Launching ${tpl.title}`);
+        } catch (err) { setLaunchingTemplateId(null); message.error(err.message); }
+      }
+      async function launchCustomImage(ci) {
+        if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
+        if (hasActiveInstance) { message.warning('Only one active instance is allowed. Open or destroy it from Profile.'); return; }
+        const gpuCount = form.getFieldValue('gpu_count') || 1;
+        setLaunchingTemplateId(`custom-${ci.id}`); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
+        try {
+          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: ci.image, gpu_count: gpuCount, resource_profile: 'auto', instance_type: 'opencode' }) });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Launch failed');
+          pollStatus(data.url, { type: 'template', templateId: `custom-${ci.id}` }); message.success(`Launching ${ci.name}`);
         } catch (err) { setLaunchingTemplateId(null); message.error(err.message); }
       }
       function finishPolling(target) {
@@ -211,6 +273,7 @@
       }
       function pollStatus(initialUrl, target) {
         let url = initialUrl || '';
+        let opencodeUrl = '';
         let attempts = 0;
         const timer = setInterval(async () => {
           attempts += 1;
@@ -218,7 +281,8 @@
             const res = await fetch('/api/notebook/status');
             const data = await res.json();
             if (data.url) url = data.url;
-            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setReadyUrl(url); if (target && target.templateId) setReadyTemplateId(target.templateId); message.success('Notebook is ready'); }
+            if (data.opencode_url) opencodeUrl = data.opencode_url;
+            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setReadyUrl(url); setReadyOpencodeUrl(opencodeUrl); if (target && target.templateId) setReadyTemplateId(target.templateId); message.success('Notebook is ready'); }
             if (data.status === 'failed') { clearInterval(timer); finishPolling(target); message.error('Instance failed'); }
             if (data.status === 'not_found') { clearInterval(timer); finishPolling(target); message.error(data.message || 'Instance not found'); }
             if (attempts >= 240) { clearInterval(timer); finishPolling(target); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
@@ -237,11 +301,94 @@
             React.createElement(Form.Item, { label: 'GPU Count', name: 'gpu_count', rules: [{ required: true }] }, React.createElement(Select, { options: [{ value: 1, label: '1 GPU / 1 credit per hour' }, { value: 2, label: '2 GPUs / 2 credits per hour' }, { value: 4, label: '4 GPUs / 4 credits per hour' }] })),
             React.createElement(Form.Item, { label: 'CPU / Memory', name: 'resource_profile', extra: selectedProfile === 'auto' ? `Auto currently uses ${recommendedResource}` : 'Use a larger profile if your workload was OOMKilled.' }, React.createElement(Select, { options: resourceProfileOptions })),
             React.createElement(Button, { type: 'primary', size: 'large', block: true, loading: notebookLoading, onClick: launch }, 'Launch Notebook')
-          ), readyUrl && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Button, { href: readyUrl, target: '_blank', block: true }, 'Open Notebook'))
+          ), readyUrl && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Space, { style: { width: '100%' }, direction: 'vertical' },
+            React.createElement(Button, { href: readyUrl, target: '_blank', block: true, title: 'Open Notebook (Jupyter)' }, brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')),
+            readyOpencodeUrl && React.createElement(Button, { type: 'primary', ghost: true, href: readyOpencodeUrl, target: '_blank', block: true, title: 'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
+            hermesButton({ block: true })
+          ))
+        );
+      }
+      function renderCustomImages() {
+        if (!currentUser || !currentUser.email) return null;
+        const customImageValues = new Set((customImages || []).map(ci => ci.image));
+        const customTemplates = (notebookTemplates || []).filter(t => currentUser.id && t.owner_user_id === currentUser.id && customImageValues.has(t.image));
+        if ((customImages || []).length === 0 && customTemplates.length === 0) return null;
+        const statusColor = { ready: 'green', building: 'blue', pending: 'gold', failed: 'red' };
+        const activeTemplateId = (initialActiveInstance && initialActiveInstance.template_id) ? Number(initialActiveInstance.template_id) : null;
+        const aTemplateJustLaunched = (typeof readyTemplateId === 'number');
+
+        function openActions(nbUrl, ocUrl, ready) {
+          return React.createElement(React.Fragment, null,
+            React.createElement(Button, { title: ready ? 'Open Notebook (Jupyter)' : 'Workspace is starting...', disabled: !ready, href: ready && nbUrl ? nbUrl : undefined, target: '_blank' }, ready ? brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter') : 'Starting\u2026'),
+            ocUrl && React.createElement(Button, { type: 'primary', ghost: true, title: ready ? 'Open in OpenCode' : 'Workspace is starting...', disabled: !ready, href: ready ? ocUrl : undefined, target: '_blank' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
+            ready && hermesButton({})
+          );
+        }
+
+        const imageCards = (customImages || []).map(ci => {
+          const launchKey = `custom-${ci.id}`;
+          const justLaunched = readyTemplateId === launchKey && !!readyUrl;
+          // Only "active" when this image was launched directly (not via a template that
+          // happens to use the same image).
+          const activeIsThis = !!(initialActiveInstance && initialActiveInstance.instance_id && initialActiveInstance.image === ci.image && !activeTemplateId && !aTemplateJustLaunched);
+          const isActive = justLaunched || activeIsThis;
+          const nbUrl = justLaunched ? readyUrl : (activeIsThis ? initialActiveInstance.url : '');
+          const ocUrl = justLaunched ? readyOpencodeUrl : (activeIsThis ? initialActiveInstance.opencode_url : '');
+          const ready = justLaunched ? true : (activeIsThis ? (instanceReady === true) : false);
+          let actions;
+          if (ci.build_status !== 'ready') {
+            actions = React.createElement(Button, { disabled: true }, ci.build_status === 'failed' ? 'Build failed' : 'Building...');
+          } else if (isActive) {
+            actions = openActions(nbUrl, ocUrl, ready);
+          } else {
+            actions = React.createElement(Button, { type: 'primary', loading: launchingTemplateId === launchKey, disabled: (launchingTemplateId && launchingTemplateId !== launchKey) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchCustomImage(ci) }, 'Launch');
+          }
+          return React.createElement(Card, { key: `ci-${ci.id}`, className: 'template-card' },
+            React.createElement('div', { className: 'template-cover', style: { background: 'linear-gradient(135deg,#ffe9d6,#ffd6ec)' } },
+              React.createElement(Text, { style: { color: '#b5532d', fontWeight: 800 } }, 'Custom Image')
+            ),
+            React.createElement('span', { className: 'template-title' }, ci.name),
+            React.createElement('div', { className: 'template-desc' }, ci.image.split('/').pop()),
+            React.createElement('div', { className: 'template-meta' }, React.createElement(Tag, { color: isActive && !ready ? 'gold' : (statusColor[ci.build_status] || 'default') }, isActive && !ready ? 'starting' : ci.build_status)),
+            React.createElement('div', { className: 'template-actions' }, actions)
+          );
+        });
+
+        const templateCards = customTemplates.map(tpl => {
+          const justLaunched = readyTemplateId === tpl.id && !!readyUrl;
+          const activeIsThis = activeTemplateId === tpl.id;
+          const isActive = justLaunched || activeIsThis;
+          const nbUrl = justLaunched ? readyUrl : (activeIsThis ? initialActiveInstance.url : '');
+          const ocUrl = justLaunched ? readyOpencodeUrl : (activeIsThis ? initialActiveInstance.opencode_url : '');
+          const ready = justLaunched ? true : (activeIsThis ? (instanceReady === true) : false);
+          let actions;
+          if (isActive) {
+            actions = openActions(nbUrl, ocUrl, ready);
+          } else {
+            actions = React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch');
+          }
+          return React.createElement(Card, { key: `ct-${tpl.id}`, className: 'template-card' },
+            React.createElement('div', { className: 'template-cover', style: { background: 'linear-gradient(135deg,#e7e0ff,#d6ecff)' } },
+              React.createElement(Text, { style: { color: '#5b46c9', fontWeight: 800 } }, 'Custom Template')
+            ),
+            React.createElement('span', { className: 'template-title' }, tpl.title),
+            React.createElement('div', { className: 'template-desc' }, tpl.description || `${tpl.image.split('/').pop()} workspace`),
+            React.createElement('div', { className: 'template-meta' }, isActive && !ready ? React.createElement(Tag, { color: 'gold' }, 'starting') : (tpl.tags || []).slice(0, 3).map(tag => React.createElement(Tag, { key: tag }, tag))),
+            React.createElement('div', { className: 'template-actions' }, actions)
+          );
+        });
+
+        return React.createElement('div', { style: { marginBottom: 22 } },
+          React.createElement('div', { className: 'gallery-bar' },
+            React.createElement(Title, { level: 4, style: { margin: 0 } }, 'My Custom Workspaces'),
+            React.createElement(Button, { size: 'small', href: '/profile' }, 'Manage')
+          ),
+          React.createElement('div', { className: 'template-grid' }, [...imageCards, ...templateCards])
         );
       }
       function renderGallery() {
         return React.createElement(React.Fragment, null,
+          renderCustomImages(),
           React.createElement('div', { className: 'gallery-bar' },
             React.createElement('div', { className: 'tag-rail' },
               galleryTags.map(tag => React.createElement('button', { key: tag, className: `tag-pill ${activeTag === tag ? 'active' : ''}`, onClick: () => setActiveTag(tag) }, tag))
@@ -259,8 +406,10 @@
               React.createElement('div', { className: 'template-actions' },
                 hasNotebook(tpl) && React.createElement(Button, { href: `/templates/${tpl.id}/preview`, target: '_blank' }, 'Preview'),
                 readyTemplateId === tpl.id && readyUrl
-                  ? React.createElement(Button, { type:'primary', href: readyUrl, target: '_blank' }, 'Open Notebook')
-                  : React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch')
+                  ? React.createElement(Button, { type:'primary', ghost: true, href: readyUrl, target: '_blank', title: 'Open Notebook (Jupyter)' }, brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter'))
+                  : React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch'),
+                readyTemplateId === tpl.id && readyOpencodeUrl && React.createElement(Button, { type: 'primary', ghost: true, href: readyOpencodeUrl, target: '_blank', title: 'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
+                readyTemplateId === tpl.id && readyUrl && hermesButton({})
               )
             ))
           )
@@ -304,7 +453,7 @@
               React.createElement(Form.Item, { name:'category', label:'Category', style:{width:180} }, React.createElement(Input, { placeholder:'Workspace' })),
               React.createElement(Form.Item, { name:'tags', label:'Tags', style:{flex:1} }, React.createElement(Input, { placeholder:'workspace, opencode' }))
             ),
-            React.createElement(Form.Item, { name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}] }, React.createElement(Select, { options:imageOptions, className:'fixed-select', popupMatchSelectWidth:true, listHeight:360 })),
+            React.createElement(Form.Item, { name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}] }, React.createElement(Select, { options:templateImageOptions, className:'fixed-select', popupMatchSelectWidth:true, listHeight:360 })),
             React.createElement(Form.Item, { name:'repo_url', label:'GitHub Repo URL' }, React.createElement(Input, { placeholder:'Optional. Leave empty for an image-only workspace.' })),
             React.createElement(Space, { style:{width:'100%'}, size:16 },
               React.createElement(Form.Item, { name:'branch', label:'Branch', style:{width:180} }, React.createElement(Input, { placeholder:'main' })),

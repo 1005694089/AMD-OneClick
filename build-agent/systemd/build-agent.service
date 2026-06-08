@@ -1,0 +1,31 @@
+[Unit]
+Description=AMD OneClick custom image build-agent (polls manager, builds, pushes to ACR)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated low-privilege user. With rootless Docker/Podman this user is NOT in the
+# host `docker` group (which would be root-equivalent). See setup.sh.
+User=buildagent
+Group=buildagent
+EnvironmentFile=/etc/amd-oneclick-build-agent.env
+ExecStart=/usr/bin/python3 /opt/amd-oneclick/build-agent/agent.py
+Restart=always
+RestartSec=5
+
+# --- Hardening ---
+# ProtectHome hides /home so a compromised agent cannot read 7900_cluster_config.
+# Registry credentials therefore must live outside $HOME via DOCKER_CONFIG (set in the
+# EnvironmentFile, e.g. /etc/amd-oneclick/docker), which we expose via ReadWritePaths.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+ReadWritePaths=/etc/amd-oneclick/docker /run/user
+
+[Install]
+WantedBy=multi-user.target

@@ -10,7 +10,7 @@ import socket
 import time
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -73,13 +73,19 @@ class K8sClient:
         self.namespace = settings.K8S_NAMESPACE
 
     def _ensure_bearer_token_auth(self):
+        cfg = client.Configuration.get_default_copy()
+        if cfg.api_key.get("BearerToken"):
+            return
+        if cfg.api_key.get("authorization"):
+            cfg.api_key["BearerToken"] = cfg.api_key["authorization"]
+            client.Configuration.set_default(cfg)
+            return
+
         token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
         if not os.path.exists(token_path):
             return
         token = open(token_path, encoding="utf-8").read().strip()
-        cfg = client.Configuration.get_default_copy()
-        cfg.api_key["BearerToken"] = token
-        cfg.api_key_prefix["BearerToken"] = "Bearer"
+        cfg.api_key["BearerToken"] = f"bearer {token}"
         client.Configuration.set_default(cfg)
     
     def _generate_instance_id(self, email: str) -> str:
@@ -268,6 +274,27 @@ findmnt "$mnt"
             raise ValueError(f"Invalid resource profile '{resource_profile}'. Allowed values: {allowed}")
         return profile, RESOURCE_PROFILES[profile]
 
+    def _service_launch_snippet(self, instance_id: str, notebook_dir: str) -> str:
+        """Launch Jupyter Lab and OpenCode web side by side.
+
+        Security model: both services are on NodePorts whose URLs are only returned
+        to the authenticated instance owner. This matches the existing Jupyter trust
+        model (shared NOTEBOOK_TOKEN visible in every URL). OpenCode web runs without
+        HTTP basic auth because Chrome blocks embedded credentials in URLs loaded from
+        web pages. errexit is disabled so a failed optional service can never
+        crash-loop the pod; `wait` keeps the container alive while Jupyter runs.
+        """
+        base_url = self._jupyter_base_url(instance_id)
+        return (
+            "set +e\n"
+            f"jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root "
+            f"--ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{base_url}' "
+            f"--notebook-dir={notebook_dir} &\n"
+            f"opencode web --port {settings.OPENCODE_WEB_PORT} --hostname 0.0.0.0 "
+            ">/tmp/opencode-web.log 2>&1 &\n"
+            "wait\n"
+        )
+
     def _build_startup_script(self, instance_id: str,
                               instance_type: str = "jupyter",
                               github_info: Optional[dict] = None) -> str:
@@ -319,8 +346,7 @@ if [ ! -f {notebook_path_q} ]; then
     find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
 fi
 
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/repo
-"""
+{self._service_launch_snippet(instance_id, f"{workspace}/repo")}"""
             return f"""
 {model_link_script}
 mkdir -p {workspace}/notebooks
@@ -345,31 +371,30 @@ if [ ! -f {shlex.quote(notebook_filename)} ]; then
     echo "Warning: Failed to download notebook, starting with empty directory"
 fi
 
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/notebooks
-"""
+{self._service_launch_snippet(instance_id, f"{workspace}/notebooks")}"""
 
         if instance_type == "opencode":
             return f"""
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 cd {workspace}
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
-"""
+{self._service_launch_snippet(instance_id, workspace)}"""
 
         # Default: jupyter
         return f"""
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 cd {workspace}
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
-"""
+{self._service_launch_snippet(instance_id, workspace)}"""
 
     def _get_pod_manifest(self, email: str, instance_id: str, image: str,
                           instance_type: str = "jupyter",
                           gpu_count: int = 1,
                           github_info: Optional[dict] = None,
                           resource_profile: Optional[str] = None,
-                          network_disk_claim_name: Optional[str] = None) -> dict:
+                          network_disk_claim_name: Optional[str] = None,
+                          template_id: Optional[str] = None,
+                          template_title: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -402,6 +427,14 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/github-repo-url"] = github_info.get("repo_url", "")
             annotations["amd-oneclick/template-id"] = github_info.get("template_id", "")
             annotations["amd-oneclick/template-title"] = github_info.get("template_title", "")
+
+        # Tag the instance with its source template even for image-only templates (no
+        # github_info), so the active instance is attributable to the template rather
+        # than just its underlying image.
+        if template_id:
+            annotations["amd-oneclick/template-id"] = str(template_id)
+        if template_title:
+            annotations["amd-oneclick/template-title"] = template_title
 
         startup_script = self._build_startup_script(instance_id, instance_type, github_info)
 
@@ -458,6 +491,12 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             })
             env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
 
+        # Only attach a registry pull secret for images from the custom registry, and only
+        # when one is configured. Other images keep relying on node-level credentials.
+        image_pull_secrets = []
+        if settings.CUSTOM_IMAGE_PULL_SECRET_NAME and image.startswith(settings.CUSTOM_IMAGE_REGISTRY):
+            image_pull_secrets = [{"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME}]
+
         return {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -471,6 +510,10 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "securityContext": {
                     "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
                 },
+                # Notebook pods don't call the K8s API; dropping the token reduces blast
+                # radius if a user (root in their pod) tries to reach the apiserver.
+                "automountServiceAccountToken": False,
+                "imagePullSecrets": image_pull_secrets,
                 "dnsPolicy": "None",
                 "dnsConfig": {
                     "nameservers": ["8.8.8.8", "8.8.4.4"],
@@ -503,6 +546,10 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                             {
                                 "containerPort": settings.NOTEBOOK_PORT,
                                 "name": "jupyter"
+                            },
+                            {
+                                "containerPort": settings.OPENCODE_WEB_PORT,
+                                "name": "opencode"
                             }
                         ],
                         "resources": {
@@ -526,8 +573,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             }
         }
     
-    def _get_service_manifest(self, email: str, instance_id: str, node_port: int) -> dict:
-        """Generate Service manifest"""
+    def _get_service_manifest(self, email: str, instance_id: str, node_port: int, opencode_node_port: int) -> dict:
+        """Generate Service manifest exposing both Jupyter and OpenCode web."""
         labels = self._get_labels(email, instance_id)
         
         return {
@@ -547,15 +594,19 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         "port": settings.NOTEBOOK_PORT,
                         "targetPort": settings.NOTEBOOK_PORT,
                         "nodePort": node_port
+                    },
+                    {
+                        "name": "opencode",
+                        "port": settings.OPENCODE_WEB_PORT,
+                        "targetPort": settings.OPENCODE_WEB_PORT,
+                        "nodePort": opencode_node_port
                     }
                 ]
             }
         }
     
-    def _allocate_node_port(self) -> int:
-        """Allocate an available NodePort"""
+    def _used_node_ports(self) -> set:
         used_ports = set()
-        
         try:
             services = self.core_v1.list_namespaced_service(namespace=self.namespace)
             for svc in services.items:
@@ -564,13 +615,25 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                         used_ports.add(port.node_port)
         except ApiException as e:
             logger.warning(f"Error listing services: {e}")
-        
-        # Find available port starting from base
+        return used_ports
+
+    def _allocate_node_port(self) -> int:
+        """Allocate a single available NodePort."""
+        used_ports = self._used_node_ports()
         port = settings.NODE_PORT_BASE
         while port in used_ports and port < 32767:
             port += 1
-        
         return port
+
+    def _allocate_node_port_pair(self) -> tuple:
+        """Allocate two distinct available NodePorts (jupyter + opencode)."""
+        used_ports = self._used_node_ports()
+        port = settings.NODE_PORT_BASE
+        while port < 32766:
+            if port not in used_ports and (port + 1) not in used_ports:
+                return port, port + 1
+            port += 1
+        raise RuntimeError("Unable to allocate a free NodePort pair for service")
 
     def _prepull_name(self, image_id: int) -> str:
         return f"image-prepull-catalog-{image_id}"
@@ -686,6 +749,67 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         except ApiException as e:
             if e.status != 404:
                 raise
+
+    def _custom_prepull_name(self, custom_image_id: int) -> str:
+        return f"image-prepull-custom-{custom_image_id}"
+
+    def sync_custom_image_to_nodes(self, custom_image_id: int, image: str) -> None:
+        """Prepull a user's custom image onto every node (best-effort).
+
+        Uses a distinct DaemonSet name from the catalog prepull and attaches the
+        custom registry pull secret when configured.
+        """
+        image = image.strip()
+        if not image:
+            return
+        name = self._custom_prepull_name(custom_image_id)
+        labels = {"app": "amd-oneclick-custom-prepull", "custom-image-id": str(custom_image_id)}
+
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(name=name, namespace=self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        pod_spec = {
+            "tolerations": [{"operator": "Exists"}],
+            "containers": [
+                {
+                    "name": "pull",
+                    "image": image,
+                    "imagePullPolicy": "Always",
+                    "command": [
+                        "sh",
+                        "-c",
+                        "echo image ready on $(hostname); while true; do sleep 86400; done",
+                    ],
+                    "resources": {
+                        "requests": {"cpu": "10m", "memory": "16Mi"},
+                        "limits": {"cpu": "100m", "memory": "64Mi"},
+                    },
+                }
+            ],
+        }
+        if settings.CUSTOM_IMAGE_PULL_SECRET_NAME:
+            pod_spec["imagePullSecrets"] = [{"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME}]
+
+        body = {
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": {"name": name, "namespace": self.namespace, "labels": labels},
+            "spec": {
+                "selector": {"matchLabels": labels},
+                "template": {"metadata": {"labels": labels}, "spec": pod_spec},
+            },
+        }
+        self.apps_v1.create_namespaced_daemon_set(namespace=self.namespace, body=body)
+
+    def delete_custom_image_sync(self, custom_image_id: int):
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(name=self._custom_prepull_name(custom_image_id), namespace=self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
     
     def get_instance_by_email(self, email: str) -> Optional[dict]:
         """Get existing notebook instance for an email"""
@@ -703,9 +827,10 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     name=f"{instance_id}-svc",
                     namespace=self.namespace
                 )
-                node_port = svc.spec.ports[0].node_port if svc.spec.ports else None
+                node_port, opencode_node_port = self._extract_node_ports(svc)
             except ApiException:
                 node_port = None
+                opencode_node_port = None
             
             return {
                 "id": instance_id,
@@ -716,7 +841,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "status": pod.status.phase.lower(),
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
-                "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None
+                "opencode_node_port": opencode_node_port,
+                "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
+                "opencode_url": self._build_opencode_url(opencode_node_port),
             }
         except ApiException as e:
             if e.status == 404:
@@ -736,13 +863,51 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             encoded_path = quote(notebook_path.lstrip("/"), safe="/")
             return f"http://{settings.SERVICE_HOST}:{node_port}/lab/tree/{encoded_path}?token={settings.NOTEBOOK_TOKEN}"
         return base_url
+
+    def _opencode_host(self) -> str:
+        """Host for direct OpenCode NodePort access.
+
+        Must be the host users actually reach the cluster on (the hostname in
+        PUBLIC_BASE_URL, e.g. 36.150.116.200), NOT SERVICE_HOST (36.151.243.69),
+        which is only used for the path-proxied Jupyter URLs and is not routable
+        for direct NodePort access from the browser.
+        """
+        if settings.PUBLIC_BASE_URL:
+            host = urlparse(settings.PUBLIC_BASE_URL).hostname
+            if host:
+                return host
+        return settings.SERVICE_HOST
+
+    def _build_opencode_url(self, opencode_node_port: Optional[int]) -> Optional[str]:
+        """Build the OpenCode web URL for the instance owner.
+
+        No credentials are embedded because Chrome blocks http://user:pass@host/ URLs
+        loaded from web pages. The URL is only returned to the authenticated owner,
+        matching the existing Jupyter trust model (shared token in query string).
+        """
+        if not opencode_node_port:
+            return None
+        return f"http://{self._opencode_host()}:{opencode_node_port}/"
+
+    def _extract_node_ports(self, svc) -> tuple:
+        """Return (jupyter_node_port, opencode_node_port) from a Service object."""
+        jupyter_port = None
+        opencode_port = None
+        for port in (svc.spec.ports or []):
+            if port.name == "opencode":
+                opencode_port = port.node_port
+            elif port.name == "jupyter" or jupyter_port is None:
+                jupyter_port = port.node_port
+        return jupyter_port, opencode_port
     
     def create_instance(self, email: str, image: Optional[str] = None,
                         instance_type: str = "jupyter",
                         gpu_count: int = 1,
                         github_info: Optional[dict] = None,
                         custom_instance_id: Optional[str] = None,
-                        resource_profile: Optional[str] = None) -> dict:
+                        resource_profile: Optional[str] = None,
+                        template_id: Optional[str] = None,
+                        template_title: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -752,7 +917,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             return existing
 
         network_disk_claim_name = self._ensure_network_disk(instance_id)
-        node_port = self._allocate_node_port()
+        node_port, opencode_node_port = self._allocate_node_port_pair()
 
         pod_manifest = self._get_pod_manifest(
             email, instance_id, image,
@@ -761,6 +926,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             github_info=github_info,
             resource_profile=resource_profile,
             network_disk_claim_name=network_disk_claim_name,
+            template_id=template_id,
+            template_title=template_title,
         )
         for attempt in range(1, 7):
             try:
@@ -780,19 +947,20 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
 
         service_created = False
         for _ in range(20):
-            svc_manifest = self._get_service_manifest(email, instance_id, node_port)
+            svc_manifest = self._get_service_manifest(email, instance_id, node_port, opencode_node_port)
             try:
                 self.core_v1.create_namespaced_service(
                     namespace=self.namespace,
                     body=svc_manifest
                 )
-                logger.info(f"Created service {instance_id}-svc with NodePort {node_port}")
+                logger.info(f"Created service {instance_id}-svc with NodePorts {node_port}/{opencode_node_port}")
                 service_created = True
                 break
             except ApiException as e:
                 if e.status == 422:
-                    logger.warning(f"NodePort {node_port} rejected by API server, retrying next port: {e}")
-                    node_port += 1
+                    logger.warning(f"NodePort pair {node_port}/{opencode_node_port} rejected by API server, retrying next pair: {e}")
+                    node_port += 2
+                    opencode_node_port = node_port + 1
                     continue
                 logger.error(f"Failed to create service: {e}")
                 self.delete_instance_by_id(instance_id)
@@ -815,7 +983,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             "status": "pending",
             "created_at": datetime.now(timezone.utc),
             "node_port": node_port,
+            "opencode_node_port": opencode_node_port,
             "url": self._build_url(node_port, notebook_path, instance_id, use_path_proxy=True),
+            "opencode_url": self._build_opencode_url(opencode_node_port),
             "github_info": github_info
         }
     
@@ -834,9 +1004,10 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     name=f"{instance_id}-svc",
                     namespace=self.namespace
                 )
-                node_port = svc.spec.ports[0].node_port if svc.spec.ports else None
+                node_port, opencode_node_port = self._extract_node_ports(svc)
             except ApiException:
                 node_port = None
+                opencode_node_port = None
 
             email = pod.metadata.annotations.get("amd-oneclick/email", "unknown")
             github_path = pod.metadata.annotations.get("amd-oneclick/github-path")
@@ -856,7 +1027,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "status": pod.status.phase.lower(),
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
+                "opencode_node_port": opencode_node_port,
                 "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
+                "opencode_url": self._build_opencode_url(opencode_node_port),
                 "instance_type": instance_type,
                 "gpu_count": gpu_count,
                 "resource_profile": pod.metadata.annotations.get("amd-oneclick/resource-profile"),
