@@ -175,7 +175,7 @@ data:
   ONECLICK_TELEMETRY_ENABLED: "true"
   ONECLICK_TELEMETRY_SOURCE: "amd_oneclick"
   ONECLICK_TELEMETRY_PRODUCT: "radeon_cloud"
-  COUPON_REDEEM_ENABLED: "false"
+  COUPON_REDEEM_ENABLED: "true"
   COUPON_REDEEM_DISABLED_MESSAGE: "System maintenance is in progress. Credit redemption is temporarily unavailable. Please contact the administrator if you need credits."
 
 ---
