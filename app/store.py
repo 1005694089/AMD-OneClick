@@ -409,6 +409,36 @@ def get_admin_daily_stats() -> dict:
     }
 
 
+def get_coupon_adp_user_daily_stats() -> list[dict]:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(coupon_redemptions.c.external_user_id, coupon_redemptions.c.redeemed_at)
+            .where(coupon_redemptions.c.external_user_id.is_not(None))
+            .order_by(coupon_redemptions.c.redeemed_at)
+        ).all()
+
+    first_seen: dict[str, str] = {}
+    for external_user_id, redeemed_at in rows:
+        user_id = str(external_user_id or "").strip()
+        if not user_id:
+            continue
+        day = datetime.fromisoformat(str(redeemed_at)).date().isoformat()
+        if user_id not in first_seen or day < first_seen[user_id]:
+            first_seen[user_id] = day
+
+    daily_counts: dict[str, int] = {}
+    for day in first_seen.values():
+        daily_counts[day] = daily_counts.get(day, 0) + 1
+
+    cumulative = 0
+    result = []
+    for day in sorted(daily_counts):
+        new_unique = daily_counts[day]
+        cumulative += new_unique
+        result.append({"day": day, "new_unique_adp_user_ids": new_unique, "cumulative_unique_adp_user_ids": cumulative})
+    return result
+
+
 def grant_user_credits(user_id: int, amount: int, reason: str = "manual admin grant") -> Optional[dict]:
     if amount <= 0:
         raise ValueError("amount must be positive")
