@@ -226,7 +226,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-coupon-adp-telemetry-20260610-1818
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-coupon-adp-telemetry-20260610-1810
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
