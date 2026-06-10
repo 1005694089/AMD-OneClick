@@ -34,8 +34,24 @@
     const activeInstance = {{ (active_instance or {}) | tojson }};
     const githubEnabled = {{ github_enabled | tojson }};
     const modelscopeEnabled = {{ modelscope_enabled | tojson }};
+    const ssoEnabled = {{ sso_enabled | tojson }};
+    const ssoBindEntryUrl = {{ sso_bind_entry_url | tojson }};
+    const ssoBindReturnQueryKey = {{ sso_bind_return_query_key | tojson }};
     const couponRedeemEnabled = {{ coupon_redeem_enabled | tojson }};
     const couponRedeemDisabledMessage = {{ coupon_redeem_disabled_message | tojson }};
+
+    function buildBindRedirectUrl() {
+      const url = new URL(window.location.href);
+      url.searchParams.set(ssoBindReturnQueryKey || 'bind', '1');
+      return `${ssoBindEntryUrl}${encodeURIComponent(url.toString())}`;
+    }
+
+    async function confirmBindAccount() {
+      const res = await fetch('/api/account/bind', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Bind account failed');
+      return data;
+    }
 
     function avatarNode(u, size=48) {
       if (!u || !u.email) return React.createElement(Avatar, { size, style:{ background:'linear-gradient(135deg,#8ea7ff,#b865ff)' } }, '?');
@@ -45,6 +61,9 @@
 
     function UserMenu() {
       if (!user || !user.email) {
+        if (ssoEnabled) {
+          return React.createElement(Button, {shape:'round', href:`${ssoBindEntryUrl}${encodeURIComponent(window.location.href)}`}, 'Login');
+        }
         const items = [
           githubEnabled ? { key:'github', label:React.createElement('a', {href:'/auth/github/login'}, 'Login with GitHub') } : null,
           modelscopeEnabled ? { key:'modelscope', label:React.createElement('a', {href:'/auth/modelscope/login'}, 'Login with ModelScope') } : null,
@@ -53,8 +72,7 @@
       }
       const items = [
         { key:'profile', label:React.createElement('a', {href:'/profile'}, 'Profile') },
-        { key:'github', label:React.createElement('a', {href:'/auth/github/login'}, 'Switch to GitHub') },
-        { key:'modelscope', label:React.createElement('a', {href:'/auth/modelscope/login'}, 'Switch to ModelScope') },
+        ...(user.needs_bind ? [{ key:'bind', label:React.createElement('a', {href:buildBindRedirectUrl()}, 'Bind Account') }] : []),
         { type:'divider' },
         { key:'logout', label:React.createElement('a', {href:'/auth/logout'}, 'Logout') },
       ];
@@ -108,6 +126,30 @@
       }
 
       React.useEffect(() => { loadEditorTemplates(); }, [user && user.email]);
+
+      React.useEffect(() => {
+        const marker = new URLSearchParams(window.location.search).get(ssoBindReturnQueryKey || 'bind');
+        if (!user || !user.needs_bind || marker !== '1') return;
+        const displayName = user.sso_nickname || user.sso_username || user.sso_sub || 'current SSO user';
+        Modal.confirm({
+          title: 'Bind developer account',
+          content: `Confirm binding to ${displayName}?`,
+          okText: 'Bind',
+          cancelText: 'Cancel',
+          onOk: async () => {
+            try {
+              await confirmBindAccount();
+              message.success('Account binding completed');
+              const cleanUrl = new URL(window.location.href);
+              cleanUrl.searchParams.delete(ssoBindReturnQueryKey || 'bind');
+              window.history.replaceState({}, '', cleanUrl.toString());
+              setTimeout(() => window.location.reload(), 400);
+            } catch (err) {
+              message.error(err.message || 'Bind account failed');
+            }
+          }
+        });
+      }, []);
 
       function openTemplateModal(record) {
         setEditingTemplate(record || null);
@@ -301,7 +343,7 @@
                 React.createElement(Statistic, {title:'Credits Available', value:user.credits}),
                 React.createElement(Paragraph, {type:'secondary', style:{marginTop:16}}, 'Usage costs 1 credit per GPU per hour. Each account can keep one active instance.'),
                 couponRedeemEnabled
-                  ? React.createElement(Paragraph, {type:'secondary'}, 'Need more credits? Visit ', React.createElement('a', {href:'https://developer.amd.com.cn/', target:'_blank', rel:'noreferrer'}, 'AMD Developer China'), ' to get a coupon, then redeem it here.')
+                  ? React.createElement(Paragraph, {type:'secondary'}, 'Need more credits? Visit ', React.createElement('a', {href:'https://aideveloperportal.anruicloud.com/', target:'_blank', rel:'noreferrer'}, 'AMD Developer China'), ' to get a coupon, then redeem it here.')
                   : React.createElement(Alert, {type:'warning', showIcon:true, style:{marginTop:16}, message:'Credit redemption temporarily unavailable', description:couponRedeemDisabledMessage}),
                 React.createElement(Button, {type:'primary', disabled:!couponRedeemEnabled, onClick:()=>setRedeemModalOpen(true)}, 'Redeem Credits')
               ),

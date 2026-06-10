@@ -78,8 +78,24 @@
     const defaultImage = {{ default_image | tojson }};
     const initialActiveInstance = {{ active_instance_json | safe }};
     const showWorkshopLogin = {{ workshop_login_enabled | tojson }};
+    const ssoEnabled = {{ sso_enabled | tojson }};
+    const ssoBindEntryUrl = {{ sso_bind_entry_url | tojson }};
+    const ssoBindReturnQueryKey = {{ sso_bind_return_query_key | tojson }};
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
+
+    function buildBindRedirectUrl() {
+      const url = new URL(window.location.href);
+      url.searchParams.set(ssoBindReturnQueryKey || 'bind', '1');
+      return `${ssoBindEntryUrl}${encodeURIComponent(url.toString())}`;
+    }
+
+    async function confirmBindAccount() {
+      const res = await fetch('/api/account/bind', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Bind account failed');
+      return data;
+    }
 
     function avatarNode(user) {
       if (!user || !user.email) return null;
@@ -89,6 +105,9 @@
 
     function UserMenu() {
       if (!currentUser || !currentUser.email) {
+        if (ssoEnabled) {
+          return React.createElement(Button, { shape: 'round', href: `${ssoBindEntryUrl}${encodeURIComponent(window.location.href)}` }, 'Login');
+        }
         const items = [
           { key: 'github', label: React.createElement('a', { href: '/auth/github/login' }, 'Login with GitHub') },
           { key: 'modelscope', label: React.createElement('a', { href: '/auth/modelscope/login' }, 'Login with ModelScope') },
@@ -100,8 +119,7 @@
         { key: 'user', disabled: true, label: React.createElement('div', null, React.createElement('strong', null, currentUser.email), React.createElement('br'), React.createElement(Text, { type: 'secondary' }, `${currentUser.provider} · ${currentUser.credits} credits`)) },
         { type: 'divider' },
         { key: 'profile', label: React.createElement('a', { href: '/profile' }, 'Profile') },
-        { key: 'github', label: React.createElement('a', { href: '/auth/github/login' }, 'Switch to GitHub') },
-        { key: 'modelscope', label: React.createElement('a', { href: '/auth/modelscope/login' }, 'Switch to ModelScope') },
+        ...(currentUser.needs_bind ? [{ key: 'bind', label: React.createElement('a', { href: buildBindRedirectUrl() }, 'Bind Account') }] : []),
         { key: 'logout', label: React.createElement('a', { href: '/auth/logout' }, 'Logout') },
       ];
       return React.createElement(Dropdown, { menu: { items }, placement: 'bottomRight', trigger: ['click'] }, React.createElement(Button, { type: 'text' }, React.createElement(Space, null, avatarNode(currentUser), React.createElement('span', { className: 'avatar-name' }, currentUser.name || currentUser.email))));
@@ -143,6 +161,30 @@
         const open = () => setWorkshopLoginOpen(true);
         window.addEventListener('open-workshop-login', open);
         return () => window.removeEventListener('open-workshop-login', open);
+      }, []);
+
+      React.useEffect(() => {
+        const marker = new URLSearchParams(window.location.search).get(ssoBindReturnQueryKey || 'bind');
+        if (!currentUser || !currentUser.needs_bind || marker !== '1') return;
+        const displayName = currentUser.sso_nickname || currentUser.sso_username || currentUser.sso_sub || 'current SSO user';
+        Modal.confirm({
+          title: 'Bind developer account',
+          content: `Confirm binding to ${displayName}?`,
+          okText: 'Bind',
+          cancelText: 'Cancel',
+          onOk: async () => {
+            try {
+              await confirmBindAccount();
+              message.success('Account binding completed');
+              const cleanUrl = new URL(window.location.href);
+              cleanUrl.searchParams.delete(ssoBindReturnQueryKey || 'bind');
+              window.history.replaceState({}, '', cleanUrl.toString());
+              setTimeout(() => window.location.reload(), 400);
+            } catch (err) {
+              message.error(err.message || 'Bind account failed');
+            }
+          }
+        });
       }, []);
 
       async function loginWorkshop(values) {

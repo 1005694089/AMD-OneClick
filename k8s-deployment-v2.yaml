@@ -177,7 +177,22 @@ data:
   ONECLICK_TELEMETRY_PRODUCT: "radeon_cloud"
   COUPON_REDEEM_ENABLED: "true"
   COUPON_REDEEM_DISABLED_MESSAGE: "System maintenance is in progress. Credit redemption is temporarily unavailable. Please contact the administrator if you need credits."
-
+  SSO_ENABLED: "true"
+  SSO_ISSUER: "AMD.aideveloperportal"
+  SSO_AUDIENCE: "WebApi"
+  SSO_ALGORITHM: "RS256"
+  SSO_ACCESS_COOKIE_NAME: "sso_access_token"
+  SSO_REFRESH_COOKIE_NAME: "sso_refresh_token"
+  SSO_REFRESH_THRESHOLD_SECONDS: "300"
+  SSO_REFRESH_URL: "https://aideveloperportal.anruicloud.com/apitest/api/auth/refresh"
+  SSO_LOGOUT_URL: "https://aideveloperportal.anruicloud.com/apitest/api/auth/logout"
+  SSO_BIND_ENTRY_URL: "https://aideveloperportal.anruicloud.com/login?returnUrl="
+  SSO_BIND_RETURN_QUERY_KEY: "bind"
+  SSO_AUTO_CREATE_USER: "true"
+  SSO_DEFAULT_USER_DOMAIN: "developer.local"
+  REDIS_TOKEN_VERSION_KEY_PREFIX: "auth:user"
+  SSO_CLAIM_NAME_URI: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"
+  SSO_CLAIM_EMAIL_URI: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"
 ---
 apiVersion: v1
 kind: Secret
@@ -196,6 +211,8 @@ stringData:
   MODELSCOPE_TOKEN_URL: "https://modelscope.cn/oauth/token"
   MODELSCOPE_USERINFO_URL: "https://modelscope.cn/api/v1/user"
   COUPON_PRIVATE_KEY_PEM: "<replace-with-coupon-private-key-pem>"
+  SSO_PUBLIC_KEY_PEM: "<replace-with-sso-public-key-pem>"
+  REDIS_URL: "<replace-with-redis-url>"
   METRICS_INGEST_API_KEY: "<replace-with-metrics-ingest-api-key>"
 
 ---

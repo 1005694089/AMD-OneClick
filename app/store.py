@@ -55,6 +55,8 @@ users = Table(
     Column("provider", String(64), nullable=False),
     Column("provider_id", String(255), nullable=False),
     Column("email", String(255), nullable=False, unique=True),
+    Column("developer_user_id", String(255), unique=True),
+    Column("is_bound", Boolean, nullable=False, default=False),
     Column("name", String(255)),
     Column("avatar_url", Text),
     Column("credits", Integer, nullable=False, default=100),
@@ -229,6 +231,15 @@ def ensure_schema_columns(conn):
     user_columns = {col["name"] for col in inspector.get_columns("users")}
     if "is_editor" not in user_columns:
         conn.execute(text("ALTER TABLE users ADD COLUMN is_editor BOOLEAN NOT NULL DEFAULT FALSE"))
+    if "developer_user_id" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN developer_user_id VARCHAR(255)"))
+    if "is_bound" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN is_bound BOOLEAN NOT NULL DEFAULT FALSE"))
+
+    if conn.dialect.name == "postgresql":
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_developer_user_id ON users (developer_user_id) WHERE developer_user_id IS NOT NULL"))
+    elif conn.dialect.name == "sqlite":
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_developer_user_id ON users (developer_user_id)"))
 
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
     if "billing_session_id" not in instance_columns:
@@ -350,6 +361,97 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
 
 def get_user(user_id: int) -> Optional[dict]:
     with engine.begin() as conn:
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return None
+    with engine.begin() as conn:
+        return row_to_dict(conn.execute(select(users).where(users.c.email == normalized)).mappings().first())
+
+
+def get_user_by_developer_user_id(developer_user_id: str) -> Optional[dict]:
+    key = (developer_user_id or "").strip()
+    if not key:
+        return None
+    with engine.begin() as conn:
+        return row_to_dict(conn.execute(select(users).where(users.c.developer_user_id == key)).mappings().first())
+
+
+def bind_user_developer_user_id(user_id: int, developer_user_id: str) -> Optional[dict]:
+    key = (developer_user_id or "").strip()
+    if not key:
+        raise ValueError("developer_user_id is required")
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(select(users).where(users.c.id == user_id).with_for_update()).mappings().first()
+        if not current:
+            return None
+        existing = conn.execute(select(users).where(users.c.developer_user_id == key, users.c.id != user_id)).mappings().first()
+        if existing:
+            raise ValueError("developer_user_id is already bound to another user")
+        conn.execute(
+            update(users)
+            .where(users.c.id == user_id)
+            .values(developer_user_id=key, is_bound=True, updated_at=now)
+        )
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
+def get_or_create_sso_user(developer_user_id: str, email: str, username: str = "", nickname: str = "") -> dict:
+    now = utc_now()
+    key = (developer_user_id or "").strip()
+    normalized_email = (email or "").strip().lower()
+    if not key:
+        raise ValueError("developer_user_id is required")
+    if not normalized_email:
+        raise ValueError("email is required")
+
+    with engine.begin() as conn:
+        by_developer = conn.execute(select(users).where(users.c.developer_user_id == key)).mappings().first()
+        if by_developer:
+            conn.execute(
+                update(users)
+                .where(users.c.id == by_developer["id"])
+                .values(
+                    email=normalized_email,
+                    name=(nickname or username or by_developer.get("name") or "").strip(),
+                    provider="developer",
+                    provider_id=key,
+                    is_bound=True,
+                    updated_at=now,
+                )
+            )
+            return row_to_dict(conn.execute(select(users).where(users.c.id == by_developer["id"])).mappings().first())
+
+        by_email = conn.execute(select(users).where(users.c.email == normalized_email)).mappings().first()
+        if by_email:
+            # Keep backward-compatible data; explicit binding is handled by UI flow.
+            user = row_to_dict(by_email)
+            user["needs_bind"] = not bool(by_email.get("developer_user_id"))
+            user["pending_developer_user_id"] = key
+            return user
+
+        result = conn.execute(
+            users.insert().values(
+                provider="developer",
+                provider_id=key,
+                email=normalized_email,
+                developer_user_id=key,
+                is_bound=True,
+                name=(nickname or username or normalized_email.split("@")[0]).strip(),
+                avatar_url="",
+                credits=10,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        user_id = result.inserted_primary_key[0]
+        conn.execute(
+            credit_ledger.insert().values(user_id=user_id, delta=10, reason="signup_bonus", created_at=now)
+        )
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
 
 

@@ -24,7 +24,7 @@ import httpx
 import requests
 import websockets
 
-from .config import settings, INSTANCE_TYPES
+from .config import settings, INSTANCE_TYPES, validate_settings
 from .models import (
     NotebookRequest, 
     NotebookStatus, 
@@ -43,6 +43,7 @@ from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
 from .template_sync import sync_template_preview
 from .store import (
+    bind_user_developer_user_id,
     clear_template_preview_cache,
     delete_image,
     delete_notebook_template,
@@ -71,6 +72,7 @@ from .store import (
     update_image_sync_status,
     upsert_image,
 )
+from .sso_auth import developer_logout, resolve_current_user, resolve_websocket_user_from_cookie_header
 
 # Configure logging
 logging.basicConfig(
@@ -85,6 +87,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     logger.info("Starting AMD OneClick Notebook Manager")
+    validate_settings()
     init_db()
     if settings.RUN_SCHEDULER:
         start_scheduler()
@@ -103,7 +106,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
-app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET)
+if not settings.SSO_ENABLED:
+    app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET)
 
 
 @app.middleware("http")
@@ -144,7 +148,13 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials.username
 
 
-def current_user(request: Request) -> dict:
+async def current_user(request: Request, response: Response) -> dict:
+    if settings.SSO_ENABLED:
+        user = await resolve_current_user(request, response, required=True)
+        if not user:
+            raise HTTPException(status_code=401, detail="Login required")
+        return user
+
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Login required")
@@ -155,7 +165,10 @@ def current_user(request: Request) -> dict:
     return user
 
 
-def session_user(request: Request) -> Optional[dict]:
+async def session_user(request: Request, response: Response) -> Optional[dict]:
+    if settings.SSO_ENABLED:
+        return await resolve_current_user(request, response, required=False)
+
     user_id = request.session.get("user_id")
     if not user_id:
         return None
@@ -486,9 +499,8 @@ def _decode_credit_coupon(encrypted_coupon_b64: str) -> dict:
 # =============================================================================
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def index(request: Request, user: Optional[dict] = Depends(session_user)):
     """Render the main request page"""
-    user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
     images = list_images(enabled_only=True)
     notebook_templates = list_notebook_templates(enabled_only=True)
     active_instance = _active_instance_context(user, request)
@@ -503,7 +515,10 @@ async def index(request: Request):
             "instance_types_json": json.dumps(INSTANCE_TYPES),
             "user_json": json.dumps(user or {}),
             "active_instance_json": json.dumps(active_instance or {}),
-            "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
+            "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED and not settings.SSO_ENABLED,
+            "sso_enabled": settings.SSO_ENABLED,
+            "sso_bind_entry_url": settings.SSO_BIND_ENTRY_URL,
+            "sso_bind_return_query_key": settings.SSO_BIND_RETURN_QUERY_KEY,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
         },
@@ -511,9 +526,8 @@ async def index(request: Request):
 
 
 @app.get("/profile", response_class=HTMLResponse)
-async def profile_page(request: Request):
+async def profile_page(request: Request, user: Optional[dict] = Depends(session_user)):
     """Render user profile and login page."""
-    user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
     active_instance = _active_instance_context(user, request)
     return templates.TemplateResponse(
         request,
@@ -523,6 +537,9 @@ async def profile_page(request: Request):
             "active_instance": active_instance,
             "github_enabled": bool(settings.GITHUB_CLIENT_ID),
             "modelscope_enabled": bool(settings.MODELSCOPE_CLIENT_ID),
+            "sso_enabled": settings.SSO_ENABLED,
+            "sso_bind_entry_url": settings.SSO_BIND_ENTRY_URL,
+            "sso_bind_return_query_key": settings.SSO_BIND_RETURN_QUERY_KEY,
             "coupon_redeem_enabled": settings.COUPON_REDEEM_ENABLED,
             "coupon_redeem_disabled_message": settings.COUPON_REDEEM_DISABLED_MESSAGE,
         },
@@ -531,6 +548,8 @@ async def profile_page(request: Request):
 
 @app.get("/auth/github/login")
 async def github_login(request: Request):
+    if settings.SSO_ENABLED:
+        raise HTTPException(status_code=404, detail="Local login is disabled")
     if not settings.GITHUB_CLIENT_ID:
         raise HTTPException(status_code=500, detail="GitHub OAuth is not configured")
     params = {
@@ -544,6 +563,8 @@ async def github_login(request: Request):
 
 @app.get("/auth/github/callback", name="github_callback")
 async def github_callback(request: Request, code: str = Query(...), state: str = Query("")):
+    if settings.SSO_ENABLED:
+        raise HTTPException(status_code=404, detail="Local login is disabled")
     _validate_oauth_state(request, "github", state)
     try:
         async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
@@ -589,6 +610,8 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
 
 @app.get("/auth/modelscope/login")
 async def modelscope_login(request: Request):
+    if settings.SSO_ENABLED:
+        raise HTTPException(status_code=404, detail="login is disabled")
     if not settings.MODELSCOPE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="ModelScope OAuth is not configured")
     params = {
@@ -603,6 +626,8 @@ async def modelscope_login(request: Request):
 
 @app.get("/auth/modelscope/callback", name="modelscope_callback")
 async def modelscope_callback(request: Request, code: str = Query(...), state: str = Query("")):
+    if settings.SSO_ENABLED:
+        raise HTTPException(status_code=404, detail="login is disabled")
     expected_state = request.session.pop("modelscope_oauth_state", None)
     if expected_state and state and not secrets.compare_digest(expected_state, state):
         logger.warning("ModelScope OAuth state mismatch: expected=%s got=%s; continuing because ModelScope may not echo state", expected_state, state)
@@ -661,12 +686,18 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
 
 @app.get("/auth/logout")
 async def logout(request: Request):
+    if settings.SSO_ENABLED:
+        response = RedirectResponse("/")
+        await developer_logout(request, response)
+        return response
     request.session.clear()
     return RedirectResponse("/")
 
 
 @app.post("/auth/workshop/login")
 async def workshop_login(request: Request):
+    if settings.SSO_ENABLED:
+        raise HTTPException(status_code=404, detail="login is disabled")
     if not settings.WORKSHOP_LOGIN_ENABLED:
         raise HTTPException(status_code=404, detail="Workshop login is not enabled")
     payload = await request.json()
@@ -684,6 +715,20 @@ async def workshop_login(request: Request):
 @app.get("/api/me")
 async def api_me(user: dict = Depends(current_user)):
     return user
+
+
+@app.post("/api/account/bind")
+async def bind_account(user: dict = Depends(current_user)):
+    pending_developer_user_id = str(user.get("pending_developer_user_id") or "").strip()
+    if not pending_developer_user_id:
+        raise HTTPException(status_code=400, detail="No pending developer account to bind")
+    try:
+        updated = bind_user_developer_user_id(int(user["id"]), pending_developer_user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user": updated, "bound": True}
 
 
 @app.post("/api/credits/redeem")
@@ -764,14 +809,8 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
 
 
 @app.get("/api/notebook/status", response_model=NotebookStatus)
-async def check_status(request: Request, email: Optional[str] = Query(None, description="User email")):
+async def check_status(request: Request, email: Optional[str] = Query(None, description="User email"), user: dict = Depends(current_user)):
     """Check the status of a notebook instance"""
-    user_id = request.session.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Login required")
-    user = get_user(int(user_id))
-    if not user:
-        raise HTTPException(status_code=401, detail="Login required")
     email = user["email"].lower()
     
     try:
@@ -1277,8 +1316,12 @@ async def check_github_status(instance_id: str = Query(...)):
 # =============================================================================
 
 @app.api_route("/instances/{instance_id}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
-async def proxy_instance_http(instance_id: str, path: str, request: Request):
+async def proxy_instance_http(instance_id: str, path: str, request: Request, user: dict = Depends(current_user)):
     """Proxy HTTP traffic to a Jupyter instance using its path-based base_url."""
+    active = get_active_instance_for_user(int(user["id"]))
+    if not active or active.get("instance_id") != instance_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     target_base = _instance_service_base(instance_id)
     target_url = f"{target_base}/instances/{instance_id}/{path}"
     if request.url.query:
@@ -1309,6 +1352,17 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
 @app.websocket("/instances/{instance_id}/{path:path}")
 async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path: str):
     """Proxy WebSocket traffic for Jupyter terminals/kernels under /instances/<id>/."""
+    cookie_header = websocket.headers.get("cookie", "")
+    user = resolve_websocket_user_from_cookie_header(cookie_header)
+    if not user:
+        await websocket.close(code=4401)
+        return
+
+    active = get_active_instance_for_user(int(user["id"]))
+    if not active or active.get("instance_id") != instance_id:
+        await websocket.close(code=4403)
+        return
+
     await websocket.accept()
     try:
         target_base = _instance_service_base(instance_id).replace("http://", "ws://")

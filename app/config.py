@@ -47,6 +47,31 @@ class Settings:
 
     DATABASE_PATH: str = os.getenv("DATABASE_PATH", "/data/amd-oneclick.db")
     SESSION_SECRET: str = os.getenv("SESSION_SECRET", "change-me-for-production")
+    SSO_ENABLED: bool = os.getenv("SSO_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    SSO_PUBLIC_KEY_PEM: Optional[str] = os.getenv("SSO_PUBLIC_KEY_PEM")
+    SSO_ISSUER: str = os.getenv("SSO_ISSUER", "")
+    SSO_AUDIENCE: str = os.getenv("SSO_AUDIENCE", "")
+    SSO_ALGORITHM: str = os.getenv("SSO_ALGORITHM", "RS256")
+    SSO_ACCESS_COOKIE_NAME: str = os.getenv("SSO_ACCESS_COOKIE_NAME", "sso_access_token")
+    SSO_REFRESH_COOKIE_NAME: str = os.getenv("SSO_REFRESH_COOKIE_NAME", "sso_refresh_token")
+    SSO_REFRESH_THRESHOLD_SECONDS: int = int(os.getenv("SSO_REFRESH_THRESHOLD_SECONDS", "300"))
+    SSO_REFRESH_URL: str = os.getenv("SSO_REFRESH_URL", "/apitest/api/auth/refresh")
+    SSO_LOGOUT_URL: str = os.getenv("SSO_LOGOUT_URL", "/apitest/api/auth/logout")
+    SSO_BIND_ENTRY_URL: str = os.getenv("SSO_BIND_ENTRY_URL", "https://aideveloperportal.anruicloud.com/login?returnUrl=")
+    SSO_BIND_RETURN_QUERY_KEY: str = os.getenv("SSO_BIND_RETURN_QUERY_KEY", "bind")
+    SSO_AUTO_CREATE_USER: bool = os.getenv("SSO_AUTO_CREATE_USER", "true").lower() in {"1", "true", "yes", "on"}
+    SSO_DEFAULT_USER_DOMAIN: str = os.getenv("SSO_DEFAULT_USER_DOMAIN", "developer.local")
+    SSO_CLAIM_NAME_URI: str = os.getenv(
+        "SSO_CLAIM_NAME_URI",
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
+    )
+    SSO_CLAIM_EMAIL_URI: str = os.getenv(
+        "SSO_CLAIM_EMAIL_URI",
+        "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+    )
+
+    REDIS_URL: str = os.getenv("REDIS_URL", "")
+    REDIS_TOKEN_VERSION_KEY_PREFIX: str = os.getenv("REDIS_TOKEN_VERSION_KEY_PREFIX", "auth:user")
 
     GITHUB_CLIENT_ID: Optional[str] = os.getenv("GITHUB_CLIENT_ID")
     GITHUB_CLIENT_SECRET: Optional[str] = os.getenv("GITHUB_CLIENT_SECRET")
@@ -131,3 +156,17 @@ class Settings:
 
 
 settings = Settings()
+
+
+def validate_settings() -> None:
+    if not settings.SSO_ENABLED:
+        return
+    missing = []
+    if not settings.SSO_PUBLIC_KEY_PEM:
+        missing.append("SSO_PUBLIC_KEY_PEM")
+    if not settings.SSO_ISSUER:
+        missing.append("SSO_ISSUER")
+    if not settings.SSO_AUDIENCE:
+        missing.append("SSO_AUDIENCE")
+    if missing:
+        raise RuntimeError(f"SSO is enabled but missing required env vars: {', '.join(missing)}")
