@@ -6,7 +6,7 @@ Uses PostgreSQL when DATABASE_URL is set; falls back to local SQLite for dev.
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -430,12 +430,20 @@ def get_coupon_adp_user_daily_stats() -> list[dict]:
     for day in first_seen.values():
         daily_counts[day] = daily_counts.get(day, 0) + 1
 
+    if not daily_counts:
+        return []
+
+    start_day = datetime.fromisoformat(min(daily_counts)).date()
+    end_day = datetime.now(timezone.utc).date()
+    current_day = start_day
     cumulative = 0
     result = []
-    for day in sorted(daily_counts):
-        new_unique = daily_counts[day]
+    while current_day <= end_day:
+        day = current_day.isoformat()
+        new_unique = daily_counts.get(day, 0)
         cumulative += new_unique
         result.append({"day": day, "new_unique_adp_user_ids": new_unique, "cumulative_unique_adp_user_ids": cumulative})
+        current_day = current_day + timedelta(days=1)
     return result
 
 
