@@ -85,14 +85,6 @@ async def template_preview_sync_job():
         logger.error(f"Template preview sync job failed: {e}")
 
 
-async def telemetry_daily_rollup_job():
-    """Report derived daily telemetry rollups."""
-    from .telemetry import report_coupon_adp_user_daily_metrics
-
-    logger.info("Running telemetry daily rollup job...")
-    await report_coupon_adp_user_daily_metrics()
-
-
 def start_scheduler():
     """Start the background scheduler"""
     scheduler.add_job(
@@ -108,14 +100,6 @@ def start_scheduler():
         id="template_preview_sync_job",
         name="Sync notebook template preview cache",
         replace_existing=True,
-    )
-    scheduler.add_job(
-        telemetry_daily_rollup_job,
-        trigger=IntervalTrigger(hours=1),
-        id="telemetry_daily_rollup_job",
-        name="Report daily telemetry rollups",
-        replace_existing=True,
-        next_run_time=datetime.now(timezone.utc),
     )
     scheduler.start()
     logger.info(
