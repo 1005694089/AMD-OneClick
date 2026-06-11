@@ -156,6 +156,41 @@ class K8sClient:
                 return condition.status == "True"
         return False
 
+    def _node_name_affinity(self, node_names: list[str]) -> Optional[dict]:
+        node_names = list(dict.fromkeys(name for name in node_names if name))
+        if not node_names:
+            return None
+        node_selector_terms = [
+            {
+                "matchFields": [
+                    {"key": "metadata.name", "operator": "In", "values": [node_name]}
+                ]
+            }
+            for node_name in node_names
+        ]
+        return {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": node_selector_terms
+                }
+            }
+        }
+
+    def _healthy_schedulable_node_names(self) -> list[str]:
+        try:
+            nodes = self.core_v1.list_node(_request_timeout=settings.K8S_READ_TIMEOUT_SECONDS).items
+        except Exception as e:
+            logger.warning("Unable to list nodes for prepull affinity; scheduling prepull normally: %s", e)
+            return []
+        return [node.metadata.name for node in nodes if self._node_is_ready_for_scheduling(node)]
+
+    def _prepull_node_affinity(self) -> Optional[dict]:
+        node_names = self._healthy_schedulable_node_names()
+        if not node_names:
+            return None
+        logger.info("Restricting image prepull to %s healthy schedulable nodes", len(node_names))
+        return self._node_name_affinity(node_names)
+
     def _cached_image_node_names(self, image: str) -> list[str]:
         if not settings.IMAGE_CACHE_NODE_AFFINITY_ENABLED or not image:
             return []
@@ -180,23 +215,7 @@ class K8sClient:
         if not node_names:
             return None
         logger.info("Restricting notebook image %s to %s cached nodes", image, len(node_names))
-        # Kubernetes node field selectors accept exactly one value per
-        # metadata.name In/NotIn requirement, so OR one term per cached node.
-        node_selector_terms = [
-            {
-                "matchFields": [
-                    {"key": "metadata.name", "operator": "In", "values": [node_name]}
-                ]
-            }
-            for node_name in node_names
-        ]
-        return {
-            "nodeAffinity": {
-                "requiredDuringSchedulingIgnoredDuringExecution": {
-                    "nodeSelectorTerms": node_selector_terms
-                }
-            }
-        }
+        return self._node_name_affinity(node_names)
 
     def _network_disk_sub_path(self, instance_id: str) -> str:
         prefix = settings.NETWORK_DISK_SUBPATH_PREFIX.strip("/")
@@ -962,6 +981,9 @@ done
         image_pull_secrets = self._image_pull_secrets(image)
         if image_pull_secrets:
             body["spec"]["template"]["spec"]["imagePullSecrets"] = image_pull_secrets
+        prepull_affinity = self._prepull_node_affinity()
+        if prepull_affinity:
+            body["spec"]["template"]["spec"]["affinity"] = prepull_affinity
         self.apps_v1.create_namespaced_daemon_set(namespace=self.namespace, body=body)
         return self.get_image_sync_status(image_id)
 
@@ -1065,6 +1087,9 @@ done
         image_pull_secrets = self._image_pull_secrets(image)
         if image_pull_secrets:
             pod_spec["imagePullSecrets"] = image_pull_secrets
+        prepull_affinity = self._prepull_node_affinity()
+        if prepull_affinity:
+            pod_spec["affinity"] = prepull_affinity
 
         body = {
             "apiVersion": "apps/v1",
