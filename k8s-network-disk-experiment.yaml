@@ -4,6 +4,9 @@ kind: Namespace
 metadata:
   name: amd-oneclick-network-disk
 ---
+# Prerequisite: create the acr-enterprise-pull docker-registry Secret in this
+# namespace too. imagePullSecrets are namespaced; the default namespace Secret
+# cannot be used by this NFS pod.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,9 +23,11 @@ spec:
         app: oneclick-nfs-server
     spec:
       nodeName: wx-ms-w7900d-0005
+      imagePullSecrets:
+        - name: acr-enterprise-pull
       containers:
         - name: nfs
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/nfs-server-alpine:12-crossmnt
+          image: radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/nfs-server-alpine:12-crossmnt
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true

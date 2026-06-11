@@ -13,12 +13,18 @@ metadata:
   name: amd-oneclick-manager
   namespace: default
 rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "update", "patch", "delete", "list"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -43,7 +49,12 @@ metadata:
   namespace: default
 data:
   K8S_NAMESPACE: "default"
-  DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+  DEFAULT_IMAGE: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+  ENTERPRISE_REGISTRY_HOST: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com"
+  ADMIN_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin"
+  CUSTOM_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/cloud_user"
+  CUSTOM_IMAGE_PULL_SECRET_NAME: "acr-enterprise-pull"
+  IMAGE_PULL_SECRET_REGISTRY_HOSTS: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com"
   CPU_LIMIT: "16"
   MEMORY_LIMIT: "64Gi"
   GPU_LIMIT: "1"
@@ -82,9 +93,11 @@ spec:
         app: amd-oneclick-manager
     spec:
       serviceAccountName: amd-oneclick-manager
+      imagePullSecrets:
+        - name: acr-enterprise-pull
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:latest
+          image: radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick:v2-acr-oss-dark-20260611
           imagePullPolicy: Always
           workingDir: /app
           ports:

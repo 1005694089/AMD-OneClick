@@ -54,9 +54,15 @@ ENV PATH="/root/.opencode/bin:/root/.hermes/bin:${PATH}"
 class Settings:
     K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "default")
 
+    ENTERPRISE_REGISTRY_HOST: str = os.getenv(
+        "ENTERPRISE_REGISTRY_HOST",
+        "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com",
+    ).rstrip("/")
+    ADMIN_IMAGE_REGISTRY: str = os.getenv("ADMIN_IMAGE_REGISTRY", f"{ENTERPRISE_REGISTRY_HOST}/admin").rstrip("/")
+
     DEFAULT_IMAGE: str = os.getenv(
         "DEFAULT_IMAGE",
-        "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+        f"{ADMIN_IMAGE_REGISTRY}/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
     )
 
     @property
@@ -64,6 +70,10 @@ class Settings:
         return [self.DEFAULT_IMAGE]
 
     DATABASE_PATH: str = os.getenv("DATABASE_PATH", "/data/amd-oneclick.db")
+    DATABASE_POOL_SIZE: int = int(os.getenv("DATABASE_POOL_SIZE", "10"))
+    DATABASE_MAX_OVERFLOW: int = int(os.getenv("DATABASE_MAX_OVERFLOW", "10"))
+    DATABASE_POOL_TIMEOUT_SECONDS: int = int(os.getenv("DATABASE_POOL_TIMEOUT_SECONDS", "30"))
+    DATABASE_POOL_RECYCLE_SECONDS: int = int(os.getenv("DATABASE_POOL_RECYCLE_SECONDS", "1800"))
     SESSION_SECRET: str = os.getenv("SESSION_SECRET", "change-me-for-production")
 
     GITHUB_CLIENT_ID: Optional[str] = os.getenv("GITHUB_CLIENT_ID")
@@ -120,6 +130,8 @@ class Settings:
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     NODE_PORT_BASE: int = int(os.getenv("NODE_PORT_BASE", "30000"))
+    POD_CREATE_RETRY_ATTEMPTS: int = int(os.getenv("POD_CREATE_RETRY_ATTEMPTS", "30"))
+    POD_CREATE_RETRY_DELAY_SECONDS: int = int(os.getenv("POD_CREATE_RETRY_DELAY_SECONDS", "5"))
 
     PYPI_MIRROR: str = "https://pypi.tuna.tsinghua.edu.cn/simple"
     PYPI_HOST: str = "pypi.tuna.tsinghua.edu.cn"
@@ -156,14 +168,19 @@ class Settings:
     # Custom user image builds (built off-cluster by the R9700 build-agent, pushed to ACR).
     CUSTOM_IMAGE_REGISTRY: str = os.getenv(
         "CUSTOM_IMAGE_REGISTRY",
-        "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud-user",
-    )
+        f"{ENTERPRISE_REGISTRY_HOST}/cloud_user",
+    ).rstrip("/")
     CUSTOM_IMAGE_MAX_PER_USER: int = int(os.getenv("CUSTOM_IMAGE_MAX_PER_USER", "2"))
     CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS", "1800"))
     CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES: int = int(os.getenv("CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES", "65536"))
-    # Optional registry pull secret referenced by notebook + prepull pods for the custom
-    # registry. Empty means "assume nodes can already pull" (no imagePullSecrets injected).
-    CUSTOM_IMAGE_PULL_SECRET_NAME: str = os.getenv("CUSTOM_IMAGE_PULL_SECRET_NAME", "")
+    # Registry pull secret referenced by manager, notebook, and prepull pods for the
+    # enterprise ACR host. Empty means "assume nodes can already pull".
+    CUSTOM_IMAGE_PULL_SECRET_NAME: str = os.getenv("CUSTOM_IMAGE_PULL_SECRET_NAME", "acr-enterprise-pull")
+    IMAGE_PULL_SECRET_REGISTRY_HOSTS: list = [
+        host.strip().strip("/")
+        for host in os.getenv("IMAGE_PULL_SECRET_REGISTRY_HOSTS", ENTERPRISE_REGISTRY_HOST).split(",")
+        if host.strip()
+    ]
     # Name of the dockerconfigjson secret the R9700 agent uses to push (referenced for docs).
     ACR_PUSH_SECRET_NAME: str = os.getenv("ACR_PUSH_SECRET_NAME", "acr-push-secret")
 
@@ -176,6 +193,34 @@ class Settings:
     CUSTOM_IMAGE_BUILD_LEASE_TIMEOUT_SECONDS: int = int(
         os.getenv("CUSTOM_IMAGE_BUILD_LEASE_TIMEOUT_SECONDS", "3600")
     )
+
+    OSS_ENABLED: bool = os.getenv("OSS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    OSS_BUCKET: str = os.getenv("OSS_BUCKET", "").strip()
+    OSS_ENDPOINT: str = os.getenv("OSS_ENDPOINT", "oss-cn-shanghai-internal.aliyuncs.com").strip()
+    OSS_REGION: str = os.getenv("OSS_REGION", "cn-shanghai").strip()
+    OSS_BACKUP_PREFIX: str = os.getenv("OSS_BACKUP_PREFIX", "cloud_user").strip().strip("/")
+    OSS_INSTANCE_QUOTA_GB: int = int(os.getenv("OSS_INSTANCE_QUOTA_GB", "10"))
+    OSS_BACKUP_INTERVAL_MINUTES: int = int(os.getenv("OSS_BACKUP_INTERVAL_MINUTES", "10"))
+    OSS_IDLE_EXPIRY_DAYS: int = int(os.getenv("OSS_IDLE_EXPIRY_DAYS", "15"))
+    OSS_IDLE_REAPER_DRY_RUN: bool = os.getenv("OSS_IDLE_REAPER_DRY_RUN", "true").lower() in {"1", "true", "yes", "on"}
+    OSS_STS_ROLE_ARN: str = os.getenv("OSS_STS_ROLE_ARN", "").strip()
+    OSS_STS_DURATION_SECONDS: int = int(os.getenv("OSS_STS_DURATION_SECONDS", "7200"))
+    OSS_STS_REFRESH_INTERVAL_MINUTES: int = int(os.getenv("OSS_STS_REFRESH_INTERVAL_MINUTES", "45"))
+    OSS_RAM_ACCESS_KEY_ID: str = os.getenv("OSS_RAM_ACCESS_KEY_ID", "").strip()
+    OSS_RAM_ACCESS_KEY_SECRET: str = os.getenv("OSS_RAM_ACCESS_KEY_SECRET", "").strip()
+    OSSUTIL_IMAGE: str = os.getenv("OSSUTIL_IMAGE", f"{ADMIN_IMAGE_REGISTRY}/ossutil:1.7.19")
+    OSS_TERMINATION_GRACE_PERIOD_SECONDS: int = int(os.getenv("OSS_TERMINATION_GRACE_PERIOD_SECONDS", "45"))
+    OSS_SECRET_DELETE_WAIT_SECONDS: int = int(
+        os.getenv("OSS_SECRET_DELETE_WAIT_SECONDS", str(OSS_TERMINATION_GRACE_PERIOD_SECONDS + 30))
+    )
+    OSS_EXCLUDES: list = [
+        item.strip()
+        for item in os.getenv(
+            "OSS_EXCLUDES",
+            ".git,.cache,__pycache__,node_modules,.venv,venv,env,datasets,*.pt,*.pth,*.safetensors,*.bin,*.gguf",
+        ).split(",")
+        if item.strip()
+    ]
 
 
 settings = Settings()

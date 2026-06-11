@@ -15,9 +15,11 @@ spec:
         app: amd-oneclick-workshop-postgres
     spec:
       nodeName: wx-ms-w7900d-0005
+      imagePullSecrets:
+        - name: acr-enterprise-pull
       containers:
         - name: postgres
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/postgres:16-alpine
+          image: radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/postgres:16-alpine
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5432
@@ -68,6 +70,8 @@ spec:
         app: amd-oneclick-manager-v3-light
     spec:
       serviceAccountName: amd-oneclick-manager-v2
+      imagePullSecrets:
+        - name: acr-enterprise-pull
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -96,7 +100,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:manager-v3-workshop-db-20260602-0030
+          image: radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick:v2-acr-oss-dark-20260611
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
@@ -134,6 +138,92 @@ spec:
               memory: "1Gi"
             requests:
               cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: amd-oneclick-workshop-postgres
+  namespace: default
+type: Opaque
+stringData:
+  POSTGRES_DB: "amd_oneclick"
+  POSTGRES_USER: "amd_oneclick"
+  POSTGRES_PASSWORD: "<replace-with-workshop-postgres-password>"
+  DATABASE_URL: "postgresql+psycopg2://amd_oneclick:<replace-with-workshop-postgres-password>@amd-oneclick-workshop-postgres:5432/amd_oneclick"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amd-oneclick-manager-v3-scheduler
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amd-oneclick-manager-v3-scheduler
+  template:
+    metadata:
+      labels:
+        app: amd-oneclick-manager-v3-scheduler
+    spec:
+      serviceAccountName: amd-oneclick-manager-v2
+      imagePullSecrets:
+        - name: acr-enterprise-pull
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 8.8.4.4
+        options:
+          - name: ndots
+            value: "5"
+      containers:
+        - name: manager
+          image: radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick:v2-acr-oss-dark-20260611
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: amd-oneclick-config-v2
+            - secretRef:
+                name: amd-oneclick-secrets-v2
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: amd-oneclick-workshop-postgres
+                  key: DATABASE_URL
+            - name: RUN_SCHEDULER
+              value: "true"
+            - name: NOTEBOOK_LABEL_PREFIX
+              value: "amd-oneclick-v3-workshop"
+            - name: WORKSHOP_LOGIN_ENABLED
+              value: "true"
+            - name: WORKSHOP_USER_COUNT
+              value: "150"
+            - name: WORKSHOP_CREDITS
+              value: "10000"
+          resources:
+            limits:
+              cpu: "1"
+              memory: "768Mi"
+            requests:
+              cpu: "250m"
               memory: "256Mi"
           livenessProbe:
             httpGet:

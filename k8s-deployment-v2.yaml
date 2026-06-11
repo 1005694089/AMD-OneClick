@@ -25,6 +25,9 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "update", "patch", "delete", "list"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -94,9 +97,11 @@ spec:
         app: amd-oneclick-postgres
     spec:
       nodeName: wx-ms-w7900d-0005
+      imagePullSecrets:
+        - name: acr-enterprise-pull
       containers:
         - name: postgres
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/postgres:16-alpine
+          image: radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/postgres:16-alpine
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5432
@@ -140,7 +145,12 @@ metadata:
   namespace: default
 data:
   K8S_NAMESPACE: "default"
-  DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+  DEFAULT_IMAGE: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+  ENTERPRISE_REGISTRY_HOST: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com"
+  ADMIN_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin"
+  CUSTOM_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/cloud_user"
+  CUSTOM_IMAGE_PULL_SECRET_NAME: "acr-enterprise-pull"
+  IMAGE_PULL_SECRET_REGISTRY_HOSTS: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com"
   CPU_LIMIT: "16"
   MEMORY_LIMIT: "64Gi"
   GPU_LIMIT: "1"
@@ -169,6 +179,12 @@ data:
   NODE_PORT_BASE: "30000"
   NOTEBOOK_TOKEN: "amd-oneclick"
   NOTEBOOK_LABEL_PREFIX: "amd-oneclick-v2"
+  POD_CREATE_RETRY_ATTEMPTS: "30"
+  POD_CREATE_RETRY_DELAY_SECONDS: "5"
+  DATABASE_POOL_SIZE: "10"
+  DATABASE_MAX_OVERFLOW: "10"
+  DATABASE_POOL_TIMEOUT_SECONDS: "30"
+  DATABASE_POOL_RECYCLE_SECONDS: "1800"
   GITHUB_REDIRECT_URI: "https://radeon.anruicloud.com/auth/github/callback"
   MODELSCOPE_REDIRECT_URI: "https://radeon.anruicloud.com/auth/modelscope/callback"
   TELEMETRY_API_URL: "http://36.150.116.200:30090/v1/metrics"
@@ -177,6 +193,21 @@ data:
   ONECLICK_TELEMETRY_PRODUCT: "radeon_cloud"
   COUPON_REDEEM_ENABLED: "true"
   COUPON_REDEEM_DISABLED_MESSAGE: "System maintenance is in progress. Credit redemption is temporarily unavailable. Please contact the administrator if you need credits."
+  OSS_ENABLED: "false"
+  OSS_BUCKET: "cri-kw9uiu28ixf3otvo-registry"
+  OSS_ENDPOINT: "oss-cn-shanghai-internal.aliyuncs.com"
+  OSS_REGION: "cn-shanghai"
+  OSS_BACKUP_PREFIX: "cloud_user"
+  OSS_INSTANCE_QUOTA_GB: "10"
+  OSS_BACKUP_INTERVAL_MINUTES: "10"
+  OSS_IDLE_EXPIRY_DAYS: "15"
+  OSS_IDLE_REAPER_DRY_RUN: "true"
+  OSS_STS_ROLE_ARN: "<replace-with-oss-sts-role-arn>"
+  OSS_STS_DURATION_SECONDS: "7200"
+  OSS_STS_REFRESH_INTERVAL_MINUTES: "45"
+  OSSUTIL_IMAGE: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/ossutil:1.7.19"
+  OSS_TERMINATION_GRACE_PERIOD_SECONDS: "45"
+  OSS_EXCLUDES: ".git,.cache,__pycache__,node_modules,.venv,venv,env,datasets,*.pt,*.pth,*.safetensors,*.bin,*.gguf"
 
 ---
 apiVersion: v1
@@ -197,6 +228,8 @@ stringData:
   MODELSCOPE_USERINFO_URL: "https://modelscope.cn/api/v1/user"
   COUPON_PRIVATE_KEY_PEM: "<replace-with-coupon-private-key-pem>"
   METRICS_INGEST_API_KEY: "<replace-with-metrics-ingest-api-key>"
+  OSS_RAM_ACCESS_KEY_ID: "<replace-with-oss-ram-access-key-id>"
+  OSS_RAM_ACCESS_KEY_SECRET: "<replace-with-oss-ram-access-key-secret>"
 
 ---
 apiVersion: apps/v1
@@ -216,6 +249,8 @@ spec:
     spec:
       nodeName: wx-ms-w7900d-0005
       serviceAccountName: amd-oneclick-manager-v2
+      imagePullSecrets:
+        - name: acr-enterprise-pull
       dnsPolicy: None
       dnsConfig:
         nameservers:
@@ -226,7 +261,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-network-disk-quota-20260605-1715
+          image: radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick:v2-acr-oss-dark-20260611
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

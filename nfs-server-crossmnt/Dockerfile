@@ -1,2 +1,2 @@
-FROM crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/nfs-server-alpine:12
+FROM radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/nfs-server-alpine:12
 RUN sed -i "s/no_subtree_check/no_subtree_check,crossmnt/g" /etc/exports

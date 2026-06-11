@@ -19,6 +19,6 @@ Includes ROCm 7.2.1, PyTorch 2.9, vLLM 0.16.0, Python 3.12, Ubuntu 24.04.
 ## Build & Push
 
 ```bash
-docker build -t crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416 .
-docker push crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416
+docker build -t radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416 .
+docker push radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416
 ```

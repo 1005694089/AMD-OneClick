@@ -27,7 +27,7 @@
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Descriptions, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Select, Space, Statistic, Table, Tag, Typography, Alert, message } = antd;
+    const { Avatar, Button, Card, Descriptions, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Progress, Select, Space, Statistic, Table, Tag, Typography, Alert, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const user = {{ (user or {}) | tojson }};
@@ -38,7 +38,7 @@
     const couponRedeemDisabledMessage = {{ coupon_redeem_disabled_message | tojson }};
     const DEFAULT_DOCKERFILE = [
       '# Start from the AMD ROCm base (recommended) or any public image.',
-      'FROM crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416',
+      'FROM radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416',
       '',
       '# Add your packages. Jupyter, OpenCode and Hermes are appended automatically.',
       'RUN pip install --no-cache-dir transformers datasets',
@@ -121,6 +121,7 @@
       const [buildModalOpen, setBuildModalOpen] = React.useState(false);
       const [buildLoading, setBuildLoading] = React.useState(false);
       const [logModal, setLogModal] = React.useState({ open: false, title: '', log: '' });
+      const [backupStatus, setBackupStatus] = React.useState(null);
       const [buildForm] = Form.useForm();
       // null = still checking, true = pod ready, false = pod still starting/pulling image
       const [instanceReady, setInstanceReady] = React.useState(null);
@@ -162,6 +163,21 @@
       }
 
       React.useEffect(() => { loadCustomImages(); }, [user && user.email]);
+
+      React.useEffect(() => {
+        if (!user || !user.email) return;
+        let cancelled = false;
+        async function loadBackupStatus() {
+          try {
+            const res = await fetch('/api/oss/status');
+            const data = await res.json().catch(() => ({}));
+            if (!cancelled && res.ok) setBackupStatus(data);
+          } catch (e) {}
+        }
+        loadBackupStatus();
+        const timer = setInterval(loadBackupStatus, 60000);
+        return () => { cancelled = true; clearInterval(timer); };
+      }, [user && user.email]);
 
       // Auto-refresh while any build is in progress.
       React.useEffect(() => {
@@ -361,6 +377,33 @@
         }, 3000);
       }
 
+      function formatBytes(bytes) {
+        const value = Number(bytes || 0);
+        if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+        if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+        return `${Math.round(value / 1024)} KB`;
+      }
+
+      function renderBackupStatus() {
+        if (!backupStatus || !backupStatus.enabled) return null;
+        if (backupStatus.error) {
+          return React.createElement(Card, {title:'Workspace Backup'},
+            React.createElement(Alert, {type:'warning', showIcon:true, message:'Backup status unavailable', description:backupStatus.error})
+          );
+        }
+        const used = Number(backupStatus.used_bytes || 0);
+        const quota = Number(backupStatus.quota_bytes || 0);
+        const pct = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0;
+        return React.createElement(Card, {title:'Workspace Backup'},
+          React.createElement(Progress, {percent:pct, status:pct >= 100 ? 'exception' : 'active'}),
+          React.createElement(Descriptions, {column:1, size:'small', style:{marginTop:12}, items:[
+            {key:'used', label:'Used', children:`${formatBytes(used)} / ${formatBytes(quota)}`},
+            {key:'objects', label:'Objects', children:backupStatus.object_count || 0},
+            {key:'last', label:'Last Backup', children:backupStatus.last_backup_at ? dayjs(backupStatus.last_backup_at).format('YYYY-MM-DD HH:mm') : 'Pending'},
+          ]})
+        );
+      }
+
       const templateColumns = [
         {title:'Title',dataIndex:'title',width:220,render:(v,r)=>React.createElement('div',null,React.createElement('strong',null,v),React.createElement('br'),React.createElement(Text,{type:'secondary'},r.category || 'Uncategorized'))},
         {title:'Image',dataIndex:'image',width:280,render:v=>React.createElement(Text,{code:true,copyable:true,style:{display:'block',maxWidth:260,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},title:v},v)},
@@ -493,7 +536,8 @@
                   instanceReady === true && hermesButton({}),
                   React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current notebook instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))
                 )
-              ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
+              ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'})),
+              renderBackupStatus()
             ),
             React.createElement(Modal, {title:'Redeem Credits', open:redeemModalOpen, onCancel:()=>setRedeemModalOpen(false), footer:null, destroyOnClose:true},
               React.createElement(Form, {form:redeemForm, layout:'vertical', onFinish:redeemCredits},

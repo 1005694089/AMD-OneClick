@@ -30,7 +30,8 @@ import sys
 import time
 
 
-DEFAULT_IMAGE = "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+DEFAULT_IMAGE = "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+DEFAULT_IMAGE_PULL_SECRET = "acr-enterprise-pull"
 DEFAULT_CACHE_HOST_PATH = "/var/lib/amd-oneclick/hf-cache"
 DEFAULT_CACHE_MOUNT_PATH = "/root/.cache/huggingface"
 
@@ -60,6 +61,11 @@ def safe_name(model: str) -> str:
 def build_manifest(args) -> str:
     name = safe_name(args.model)
     hf_endpoint_line = f"export HF_ENDPOINT={args.hf_endpoint}" if args.hf_endpoint else ""
+    image_pull_secret = ""
+    if args.image_pull_secret:
+        image_pull_secret = f"""
+      imagePullSecrets:
+        - name: {args.image_pull_secret}"""
     return f"""
 apiVersion: apps/v1
 kind: DaemonSet
@@ -85,6 +91,7 @@ spec:
     spec:
       tolerations:
         - operator: Exists
+{image_pull_secret}
       containers:
         - name: sync
           image: {args.image}
@@ -128,6 +135,17 @@ def kubectl_base(kubeconfig):
     return cmd
 
 
+def require_image_pull_secret(cmd, namespace: str, secret_name: str):
+    if not secret_name:
+        return
+    proc = run(cmd + ["get", "secret", secret_name, "-n", namespace], check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"image pull secret {secret_name!r} was not found in namespace {namespace!r}. "
+            "Create it there or pass --image-pull-secret ''."
+        )
+
+
 def wait_ready(args, name):
     cmd = kubectl_base(args.kubeconfig)
     deadline = time.time() + args.timeout_minutes * 60
@@ -153,6 +171,7 @@ def main():
     parser.add_argument("--kubeconfig", default="/home/hfang/AMD-OneClick/cluster.yaml")
     parser.add_argument("--namespace", default="default")
     parser.add_argument("--image", default=DEFAULT_IMAGE)
+    parser.add_argument("--image-pull-secret", default=DEFAULT_IMAGE_PULL_SECRET)
     parser.add_argument("--cache-host-path", default=DEFAULT_CACHE_HOST_PATH)
     parser.add_argument("--cache-mount-path", default=DEFAULT_CACHE_MOUNT_PATH)
     parser.add_argument("--disable-xet", default="1")
@@ -176,6 +195,8 @@ def main():
     if args.delete:
         run(cmd + ["delete", "ds", name, "-n", args.namespace, "--ignore-not-found"], check=False)
         return
+
+    require_image_pull_secret(cmd, args.namespace, args.image_pull_secret)
 
     if not args.yes:
         print(f"Will create/update DaemonSet {name} to sync {args.model} into {args.cache_host_path}")

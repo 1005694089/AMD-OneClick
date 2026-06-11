@@ -174,6 +174,10 @@ def session_user(request: Request) -> Optional[dict]:
         return None
     return get_user(int(user_id))
 
+
+async def _run_blocking(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
+
 def _workshop_index_from_email(email: str) -> Optional[int]:
     raw = (email or "").strip().lower()
     if not raw.endswith("@amd.com") or not raw.startswith("workshop"):
@@ -560,7 +564,7 @@ async def index(request: Request):
         for t in list_notebook_templates(enabled_only=False, owner_user_id=user["id"]):
             if t["id"] not in existing_ids:
                 notebook_templates.append(t)
-    active_instance = _active_instance_context(user, request)
+    active_instance = await _run_blocking(_active_instance_context, user, request) if user else None
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -586,7 +590,7 @@ async def index(request: Request):
 async def profile_page(request: Request):
     """Render user profile and login page."""
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
-    active_instance = _active_instance_context(user, request)
+    active_instance = await _run_blocking(_active_instance_context, user, request) if user else None
     return templates.TemplateResponse(
         request,
         "profile.html",
@@ -758,6 +762,13 @@ async def api_me(user: dict = Depends(current_user)):
     return user
 
 
+@app.get("/api/oss/status")
+async def oss_status(user: dict = Depends(current_user)):
+    from .oss import get_user_backup_status
+
+    return await _run_blocking(get_user_backup_status, int(user["id"]))
+
+
 @app.post("/api/credits/redeem")
 async def redeem_credits(req: CouponRedeemRequest, user: dict = Depends(current_user)):
     if not settings.COUPON_REDEEM_ENABLED:
@@ -790,7 +801,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
 
     active = get_active_instance_for_user(user["id"])
     if active:
-        if k8s_client.get_instance_by_id(active["instance_id"]):
+        if await _run_blocking(k8s_client.get_instance_by_id, active["instance_id"]):
             raise HTTPException(status_code=400, detail="Each user can only have one active instance")
         mark_instance_deleted(active["instance_id"])
 
@@ -799,26 +810,31 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
 
     try:
         instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
-        instance = k8s_client.create_instance(
-            email, image,
+        instance = await _run_blocking(
+            k8s_client.create_instance,
+            email,
+            image,
             instance_type=instance_type,
             gpu_count=gpu_count,
             custom_instance_id=instance_id,
             resource_profile=resource_profile,
+            user_id=user["id"],
         )
-        record_instance(
-            user["id"], email, instance["id"], image, instance_type, gpu_count,
+        actual_gpu_count = int(instance.get("gpu_count") or gpu_count)
+        record_result = record_instance(
+            user["id"], email, instance["id"], instance.get("image") or image, instance.get("instance_type") or instance_type, actual_gpu_count,
             instance.get("node_port"), instance.get("opencode_node_port"),
         )
-        record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count)
-        from .telemetry import report_gpu_instance_created_event
+        if record_result.get("new_session", True):
+            record_instance_launch_event(user["id"], email, instance["id"], instance.get("image") or image, instance.get("instance_type") or instance_type, actual_gpu_count)
+            from .telemetry import report_gpu_instance_created_event
 
-        await report_gpu_instance_created_event(
-            instance_id=instance["id"],
-            user_id=user["id"],
-            instance_type=instance_type,
-            gpu_count=gpu_count,
-        )
+            await report_gpu_instance_created_event(
+                instance_id=instance["id"],
+                user_id=user["id"],
+                instance_type=instance_type,
+                gpu_count=actual_gpu_count,
+            )
 
         public_url = _instance_public_url(request, instance["id"])
         if public_url:
@@ -856,7 +872,7 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
                 message="No notebook instance found for this user",
                 email=email
             )
-        instance = k8s_client.get_instance_by_id(active["instance_id"])
+        instance = await _run_blocking(k8s_client.get_instance_by_id, active["instance_id"])
         
         if not instance:
             mark_instance_deleted(active["instance_id"])
@@ -866,7 +882,7 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
                 email=email
             )
         
-        status = k8s_client.get_pod_status(email, instance_id=active["instance_id"])
+        status = await _run_blocking(k8s_client.get_pod_status, email, instance_id=active["instance_id"])
         
         status_messages = {
             "ready": "Your notebook is ready!",
@@ -905,7 +921,7 @@ async def destroy_current_notebook(user: dict = Depends(current_user)):
 
     instance_id = active["instance_id"]
     try:
-        deleted = k8s_client.delete_instance_by_id(instance_id)
+        deleted = await _run_blocking(k8s_client.delete_instance_by_id, instance_id)
         mark_instance_deleted(instance_id)
         return DestroyResponse(
             success=True,
@@ -970,7 +986,7 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
     if not record:
         raise HTTPException(status_code=404, detail="Custom image not found")
     try:
-        k8s_client.delete_custom_image_sync(image_id)
+        await _run_blocking(k8s_client.delete_custom_image_sync, image_id)
     except Exception as e:
         logger.warning("Failed to delete custom prepull DaemonSet for image %s: %s", image_id, e)
     return {"success": True}
@@ -1007,7 +1023,7 @@ async def report_build_result(image_id: int, req: BuildResultRequest, _agent: bo
     update_custom_image_status(image_id, status=status)
     if status == "ready":
         try:
-            k8s_client.sync_custom_image_to_nodes(image_id, record["image"])
+            await _run_blocking(k8s_client.sync_custom_image_to_nodes, image_id, record["image"])
         except Exception as e:
             logger.warning("Failed to start custom prepull for image %s: %s", image_id, e)
     return {"ok": True}
@@ -1172,7 +1188,7 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
 
     active = get_active_instance_for_user(user["id"])
     if active:
-        if k8s_client.get_instance_by_id(active["instance_id"]):
+        if await _run_blocking(k8s_client.get_instance_by_id, active["instance_id"]):
             raise HTTPException(status_code=400, detail="Each user can only have one active instance")
         mark_instance_deleted(active["instance_id"])
 
@@ -1183,7 +1199,8 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
     try:
         github_info = _template_github_info(template) if template.get("repo_url") and template.get("notebook_path") else None
         instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
-        instance = k8s_client.create_instance(
+        instance = await _run_blocking(
+            k8s_client.create_instance,
             email,
             template["image"],
             instance_type="opencode",
@@ -1193,30 +1210,33 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             resource_profile="auto",
             template_id=str(template["id"]),
             template_title=template["title"],
+            user_id=user["id"],
         )
-        record_instance(
-            user["id"], email, instance["id"], template["image"], "opencode", gpu_count,
+        actual_gpu_count = int(instance.get("gpu_count") or gpu_count)
+        record_result = record_instance(
+            user["id"], email, instance["id"], instance.get("image") or template["image"], instance.get("instance_type") or "opencode", actual_gpu_count,
             instance.get("node_port"), instance.get("opencode_node_port"),
         )
-        record_instance_launch_event(
-            user["id"],
-            email,
-            instance["id"],
-            template["image"],
-            "opencode",
-            gpu_count,
-            template_id=template["id"],
-            template_title=template["title"],
-        )
-        from .telemetry import report_gpu_instance_created_event
+        if record_result.get("new_session", True):
+            record_instance_launch_event(
+                user["id"],
+                email,
+                instance["id"],
+                instance.get("image") or template["image"],
+                instance.get("instance_type") or "opencode",
+                actual_gpu_count,
+                template_id=template["id"],
+                template_title=template["title"],
+            )
+            from .telemetry import report_gpu_instance_created_event
 
-        await report_gpu_instance_created_event(
-            instance_id=instance["id"],
-            user_id=user["id"],
-            instance_type="opencode",
-            gpu_count=gpu_count,
-            template_id=template["id"],
-        )
+            await report_gpu_instance_created_event(
+                instance_id=instance["id"],
+                user_id=user["id"],
+                instance_type="opencode",
+                gpu_count=actual_gpu_count,
+                template_id=template["id"],
+            )
         public_url = _instance_public_url(request, instance["id"], github_info.get("path") if github_info else None)
         if public_url:
             send_notebook_url_email(email, public_url)
@@ -1303,9 +1323,9 @@ async def github_notebook(
     # Check if user already has an instance for this notebook (via cookie)
     if instance_id == generated_instance_id:
         # Check if instance exists and is ready
-        existing = k8s_client.get_instance_by_id(generated_instance_id)
+        existing = await _run_blocking(k8s_client.get_instance_by_id, generated_instance_id)
         if existing:
-            status = k8s_client.get_pod_status("", instance_id=generated_instance_id)
+            status = await _run_blocking(k8s_client.get_pod_status, "", instance_id=generated_instance_id)
             if status == "ready":
                 # Redirect directly to notebook
                 return RedirectResponse(url=existing["url"], status_code=302)
@@ -1362,7 +1382,7 @@ async def create_github_notebook(
     instance_id = _generate_github_instance_id(org, repo, path, user_session)
     
     # Check if instance already exists for THIS user
-    existing = k8s_client.get_instance_by_id(instance_id)
+    existing = await _run_blocking(k8s_client.get_instance_by_id, instance_id)
     if existing:
         response.set_cookie(
             key="amd_oneclick_gh_instance",
@@ -1381,7 +1401,8 @@ async def create_github_notebook(
         # Use a placeholder email for GitHub notebooks
         email = f"github-{instance_id}@oneclick.local"
         
-        instance = k8s_client.create_instance(
+        instance = await _run_blocking(
+            k8s_client.create_instance,
             email=email,
             image=settings.DEFAULT_IMAGE,
             github_info=github_info,
@@ -1412,7 +1433,7 @@ async def create_github_notebook(
 async def check_github_status(instance_id: str = Query(...)):
     """Check the status of a GitHub notebook instance"""
     try:
-        instance = k8s_client.get_instance_by_id(instance_id)
+        instance = await _run_blocking(k8s_client.get_instance_by_id, instance_id)
         
         if not instance:
             return NotebookStatus(
@@ -1421,7 +1442,7 @@ async def check_github_status(instance_id: str = Query(...)):
                 instance_id=instance_id
             )
         
-        status = k8s_client.get_pod_status("", instance_id=instance_id)
+        status = await _run_blocking(k8s_client.get_pod_status, "", instance_id=instance_id)
         
         # Normalize status for frontend - 'ready' means 'running' and ready to use
         if status == "ready":
@@ -1456,7 +1477,7 @@ async def check_github_status(instance_id: str = Query(...)):
 @app.api_route("/instances/{instance_id}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_instance_http(instance_id: str, path: str, request: Request):
     """Proxy HTTP traffic to a Jupyter instance using its path-based base_url."""
-    target_base = _instance_service_base(instance_id)
+    target_base = await _run_blocking(_instance_service_base, instance_id)
     target_url = f"{target_base}/instances/{instance_id}/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
@@ -1488,7 +1509,7 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
     """Proxy WebSocket traffic for Jupyter terminals/kernels under /instances/<id>/."""
     await websocket.accept()
     try:
-        target_base = _instance_service_base(instance_id).replace("http://", "ws://")
+        target_base = (await _run_blocking(_instance_service_base, instance_id)).replace("http://", "ws://")
         target_url = f"{target_base}/instances/{instance_id}/{path}"
         if websocket.url.query:
             target_url += f"?{websocket.url.query}"
@@ -1545,7 +1566,7 @@ async def admin_page(request: Request, username: str = Depends(verify_admin)):
 async def list_instances(username: str = Depends(verify_admin)):
     """List all notebook instances"""
     try:
-        instances = k8s_client.list_instances()
+        instances = await _run_blocking(k8s_client.list_instances)
         
         items = [
             NotebookListItem(
@@ -1642,7 +1663,7 @@ async def admin_sync_template_preview(template_id: int, username: str = Depends(
 @app.get("/api/admin/images")
 async def admin_list_images(username: str = Depends(verify_admin)):
     for image in list_images(enabled_only=False):
-        sync = k8s_client.get_image_sync_status(image["id"])
+        sync = await _run_blocking(k8s_client.get_image_sync_status, image["id"])
         if (
             image.get("sync_status") != sync["status"]
             or image.get("desired_count") != sync["desired_count"]
@@ -1663,7 +1684,7 @@ async def admin_list_images(username: str = Depends(verify_admin)):
 @app.post("/api/admin/images")
 async def admin_create_image(req: ImageRequest, username: str = Depends(verify_admin)):
     image = upsert_image(req.name, req.image, req.description or "", req.enabled)
-    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    sync = await _run_blocking(k8s_client.sync_image_to_nodes, image["id"], image["image"])
     return update_image_sync_status(
         image["id"],
         sync["status"],
@@ -1679,7 +1700,7 @@ async def admin_update_image(image_id: int, req: ImageRequest, username: str = D
     image = upsert_image(req.name, req.image, req.description or "", req.enabled, image_id=image_id)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
-    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    sync = await _run_blocking(k8s_client.sync_image_to_nodes, image["id"], image["image"])
     return update_image_sync_status(
         image["id"],
         sync["status"],
@@ -1695,7 +1716,7 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
     image = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
-    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    sync = await _run_blocking(k8s_client.sync_image_to_nodes, image["id"], image["image"])
     return update_image_sync_status(
         image["id"],
         sync["status"],
@@ -1708,7 +1729,7 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
 
 @app.delete("/api/admin/images/{image_id}")
 async def admin_delete_image(image_id: int, username: str = Depends(verify_admin)):
-    k8s_client.delete_image_sync(image_id)
+    await _run_blocking(k8s_client.delete_image_sync, image_id)
     if not delete_image(image_id):
         raise HTTPException(status_code=404, detail="Image not found")
     return {"success": True}
@@ -1718,7 +1739,7 @@ async def admin_delete_image(image_id: int, username: str = Depends(verify_admin
 async def destroy_instance(instance_id: str, username: str = Depends(verify_admin)):
     """Destroy a specific notebook instance by ID"""
     try:
-        success = k8s_client.delete_instance_by_id(instance_id)
+        success = await _run_blocking(k8s_client.delete_instance_by_id, instance_id)
         if success:
             mark_instance_deleted(instance_id)
         
@@ -1737,14 +1758,28 @@ async def destroy_instance(instance_id: str, username: str = Depends(verify_admi
 async def destroy_all_instances(username: str = Depends(verify_admin)):
     """Destroy all notebook instances"""
     try:
-        count = k8s_client.delete_all_instances()
-        for inst in k8s_client.list_instances():
-            mark_instance_deleted(inst["id"])
-        
+        def delete_snapshot():
+            destroyed = []
+            failed = []
+            for inst in k8s_client.list_instances():
+                instance_id = inst.get("id")
+                if not instance_id:
+                    continue
+                try:
+                    if k8s_client.delete_instance_by_id(instance_id):
+                        mark_instance_deleted(instance_id)
+                        destroyed.append(inst)
+                    else:
+                        failed.append({"id": instance_id, "email": inst.get("email"), "reason": "not found"})
+                except Exception as e:
+                    failed.append({"id": instance_id, "email": inst.get("email"), "reason": str(e)})
+            return destroyed, failed
+
+        destroyed, failed = await _run_blocking(delete_snapshot)
         return DestroyResponse(
-            success=True,
-            message=f"Destroyed {count} instances",
-            destroyed_count=count
+            success=not failed,
+            message=f"Destroyed {len(destroyed)} instances" + (f"; {len(failed)} failed" if failed else ""),
+            destroyed_count=len(destroyed)
         )
         
     except Exception as e:
@@ -1761,7 +1796,7 @@ async def bulk_destroy_instances(req: InstanceBulkDestroyRequest, username: str 
 
     destroy_all = matcher == "ALL"
     needle = matcher.lower()
-    instances = k8s_client.list_instances()
+    instances = await _run_blocking(k8s_client.list_instances)
     matched = [
         inst for inst in instances
         if destroy_all or needle in (inst.get("email") or "").lower()
@@ -1773,7 +1808,7 @@ async def bulk_destroy_instances(req: InstanceBulkDestroyRequest, username: str 
         if not instance_id:
             continue
         try:
-            if k8s_client.delete_instance_by_id(instance_id):
+            if await _run_blocking(k8s_client.delete_instance_by_id, instance_id):
                 mark_instance_deleted(instance_id)
                 destroyed.append({"id": instance_id, "email": inst.get("email")})
             else:
@@ -1797,7 +1832,7 @@ async def bulk_destroy_instances(req: InstanceBulkDestroyRequest, username: str 
 async def trigger_cleanup(username: str = Depends(verify_admin)):
     """Manually trigger cleanup of idle instances"""
     try:
-        cleaned = k8s_client.cleanup_idle_instances()
+        cleaned = await _run_blocking(k8s_client.cleanup_idle_instances, mark_instance_deleted)
         
         return {
             "success": True,

@@ -11,7 +11,8 @@ import textwrap
 import time
 from pathlib import Path
 
-DEFAULT_IMAGE = "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+DEFAULT_IMAGE = "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+DEFAULT_IMAGE_PULL_SECRET = "acr-enterprise-pull"
 DEFAULT_MODEL = "qwen/Qwen3-8B"
 DEFAULT_HF_ENDPOINT = "http://134.199.133.77"
 
@@ -82,6 +83,16 @@ class StressTest:
     def kubectl(self, *args, input_text=None, check=True, timeout=None):
         return run(self.kubectl_base + list(args), input_text=input_text, check=check, timeout=timeout)
 
+    def require_image_pull_secret(self):
+        if not self.args.image_pull_secret:
+            return
+        proc = self.kubectl("get", "secret", self.args.image_pull_secret, "-n", self.args.namespace, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"image pull secret {self.args.image_pull_secret!r} was not found in namespace {self.args.namespace!r}. "
+                "Create it there or pass --image-pull-secret ''."
+            )
+
     def confirm(self):
         if self.args.yes:
             return
@@ -96,6 +107,11 @@ class StressTest:
         return f"stress-{self.run_id}-{i:04d}@oneclick.local"
 
     def deploy_netmon(self):
+        image_pull_secret = ""
+        if self.args.image_pull_secret:
+            image_pull_secret = f"""
+      imagePullSecrets:
+        - name: {self.args.image_pull_secret}"""
         yaml = f"""
 apiVersion: apps/v1
 kind: DaemonSet
@@ -119,6 +135,7 @@ spec:
       hostNetwork: true
       tolerations:
         - operator: Exists
+{image_pull_secret}
       containers:
         - name: netmon
           image: {self.args.image}
@@ -142,6 +159,11 @@ spec:
         self.kubectl("apply", "-f", "-", input_text=yaml)
 
     def pod_yaml(self, i):
+        image_pull_secret = ""
+        if self.args.image_pull_secret:
+            image_pull_secret = f"""
+  imagePullSecrets:
+    - name: {self.args.image_pull_secret}"""
         local_dir = f"/tmp/hf-download/{self.args.model.replace('/', '__')}"
         shell = f"""
 set -o pipefail
@@ -194,6 +216,7 @@ spec:
     - key: amd.com/gpu
       operator: Exists
       effect: NoSchedule
+{image_pull_secret}
   containers:
     - name: worker
       image: {self.args.image}
@@ -400,6 +423,7 @@ spec:
 
     def run(self):
         self.confirm(); print(f"Run ID: {self.run_id}", flush=True)
+        self.require_image_pull_secret()
         try:
             self.deploy_netmon(); self.create_pods(); self.wait()
         finally:
@@ -414,6 +438,7 @@ def main():
     p.add_argument("--launch-interval", type=float, default=2.0)
     p.add_argument("--gpu", type=int, default=1)
     p.add_argument("--image", default=DEFAULT_IMAGE)
+    p.add_argument("--image-pull-secret", default=DEFAULT_IMAGE_PULL_SECRET)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--hf-endpoint", default=DEFAULT_HF_ENDPOINT)
     p.add_argument("--hf-workers", type=int, default=2)

@@ -7,7 +7,9 @@ import os
 import re
 import shlex
 import socket
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote, urlparse
@@ -71,6 +73,7 @@ class K8sClient:
         self.core_v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
         self.namespace = settings.K8S_NAMESPACE
+        self._node_port_lock = threading.Lock()
 
     def _ensure_bearer_token_auth(self):
         cfg = client.Configuration.get_default_copy()
@@ -110,6 +113,29 @@ class K8sClient:
 
     def _safe_storage_segment(self, value: str) -> str:
         return re.sub(r"[^a-zA-Z0-9_.-]", "-", value).strip("-") or "default"
+
+    def _image_requires_pull_secret(self, image: Optional[str]) -> bool:
+        if not image:
+            return False
+        prefixes = {
+            settings.DEFAULT_IMAGE,
+            settings.ADMIN_IMAGE_REGISTRY,
+            settings.CUSTOM_IMAGE_REGISTRY,
+            settings.OSSUTIL_IMAGE,
+            *settings.IMAGE_PULL_SECRET_REGISTRY_HOSTS,
+        }
+        for prefix in prefixes:
+            prefix = (prefix or "").strip().rstrip("/")
+            if prefix and (image == prefix or image.startswith(f"{prefix}/")):
+                return True
+        return False
+
+    def _image_pull_secrets(self, *images: Optional[str]) -> list:
+        if not settings.CUSTOM_IMAGE_PULL_SECRET_NAME:
+            return []
+        if any(self._image_requires_pull_secret(image) for image in images):
+            return [{"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME}]
+        return []
 
     def _network_disk_sub_path(self, instance_id: str) -> str:
         prefix = settings.NETWORK_DISK_SUBPATH_PREFIX.strip("/")
@@ -387,6 +413,125 @@ export PATH="/root/.opencode/bin:$PATH"
 cd {workspace}
 {self._service_launch_snippet(instance_id, workspace)}"""
 
+    def _oss_remote_uri(self, user_id: int) -> str:
+        prefix = settings.OSS_BACKUP_PREFIX.strip("/")
+        return f"oss://{settings.OSS_BUCKET}/{prefix}/{int(user_id)}/workspace/"
+
+    def _oss_exclude_args(self) -> str:
+        return "set -- " + " ".join(shlex.quote(f"--exclude={pattern}") for pattern in settings.OSS_EXCLUDES)
+
+    def _oss_credential_shell(self) -> str:
+        endpoint = shlex.quote(settings.OSS_ENDPOINT)
+        return f"""
+export OSS_ENDPOINT={endpoint}
+resolve_ossutil() {{
+  if command -v ossutil >/dev/null 2>&1; then echo ossutil; return 0; fi
+  if command -v ossutil64 >/dev/null 2>&1; then echo ossutil64; return 0; fi
+  echo "ossutil binary not found" >&2
+  return 1
+}}
+read_creds() {{
+  OSS_AK_ID="$(cat /etc/oss-creds/access_key_id 2>/dev/null || true)"
+  OSS_AK_SECRET="$(cat /etc/oss-creds/access_key_secret 2>/dev/null || true)"
+  OSS_STS_TOKEN="$(cat /etc/oss-creds/security_token 2>/dev/null || true)"
+  if [ -z "$OSS_AK_ID" ] || [ -z "$OSS_AK_SECRET" ] || [ -z "$OSS_STS_TOKEN" ]; then
+    echo "OSS STS credentials are missing" >&2
+    return 1
+  fi
+}}
+ossutil_with_creds() {{
+  read_creds || return 1
+  OSSUTIL_BIN="$(resolve_ossutil)" || return 1
+  "$OSSUTIL_BIN" -e "$OSS_ENDPOINT" -i "$OSS_AK_ID" -k "$OSS_AK_SECRET" -t "$OSS_STS_TOKEN" "$@"
+}}
+"""
+
+    def _oss_restore_script(self, user_id: int) -> str:
+        remote = shlex.quote(self._oss_remote_uri(user_id))
+        workspace = shlex.quote(settings.WORKSPACE_MOUNT_PATH)
+        return f"""
+set -u
+{self._oss_credential_shell()}
+WORKSPACE={workspace}
+REMOTE={remote}
+mkdir -p "$WORKSPACE"
+rm -f "$WORKSPACE/.oss-restore-ok"
+if ! ossutil_with_creds ls "$REMOTE" > /tmp/oss-list.txt 2> /tmp/oss-list.err; then
+  echo "OSS restore failed: unable to list $REMOTE" >&2
+  cat /tmp/oss-list.err >&2 || true
+  exit 1
+fi
+if grep -Eq 'Object Number is: 0|Object Number is 0' /tmp/oss-list.txt || ! grep -q "oss://" /tmp/oss-list.txt; then
+  echo "OSS restore skipped: no prior backup at $REMOTE"
+  date -Iseconds > "$WORKSPACE/.oss-restore-ok"
+  exit 0
+fi
+if ossutil_with_creds sync --delete "$REMOTE" "$WORKSPACE/"; then
+  date -Iseconds > "$WORKSPACE/.oss-restore-ok"
+else
+  echo "OSS restore failed" >&2
+  exit 1
+fi
+exit 0
+"""
+
+    def _oss_backup_script(self, user_id: int) -> str:
+        remote = shlex.quote(self._oss_remote_uri(user_id))
+        workspace = shlex.quote(settings.WORKSPACE_MOUNT_PATH)
+        interval_seconds = max(60, int(settings.OSS_BACKUP_INTERVAL_MINUTES) * 60)
+        quota_bytes = int(settings.OSS_INSTANCE_QUOTA_GB) * 1024 * 1024 * 1024
+        exclude_set_args = self._oss_exclude_args()
+        return f"""
+set -u
+{self._oss_credential_shell()}
+WORKSPACE={workspace}
+REMOTE={remote}
+INTERVAL_SECONDS={interval_seconds}
+QUOTA_BYTES={quota_bytes}
+{exclude_set_args}
+backup_once() {{
+  if [ ! -f "$WORKSPACE/.oss-restore-ok" ]; then
+    echo "OSS backup skipped: restore sentinel missing"
+    return 0
+  fi
+  mkdir -p "$WORKSPACE"
+  (
+    if command -v flock >/dev/null 2>&1; then flock -n 9 || exit 0; fi
+    LOCAL_BYTES="$(du -sb "$@" "$WORKSPACE" 2>/dev/null | awk '{{print $1}}' || true)"
+    if [ -n "$LOCAL_BYTES" ] && [ "$LOCAL_BYTES" -gt "$QUOTA_BYTES" ]; then
+      printf 'Workspace backup skipped: %s bytes exceeds %s byte quota.\\n' "$LOCAL_BYTES" "$QUOTA_BYTES" > "$WORKSPACE/.oss-backup-warning"
+      exit 0
+    fi
+    if ossutil_with_creds sync --delete "$@" "$WORKSPACE/" "$REMOTE"; then
+      date -Iseconds > "$WORKSPACE/.oss-last-backup-at"
+      rm -f "$WORKSPACE/.oss-backup-warning"
+      ossutil_with_creds du "$REMOTE" > "$WORKSPACE/.oss-remote-du" 2>/tmp/oss-du.err || true
+    else
+      echo "OSS backup failed" >&2
+      exit 1
+    fi
+  ) 9>/tmp/oss-backup.lock
+}}
+finish_backup() {{
+  echo "OSS final backup requested"
+  backup_once || echo "OSS final backup failed" >&2
+  exit 0
+}}
+trap finish_backup TERM INT
+while true; do
+  backup_once || true
+  slept=0
+  while [ "$slept" -lt "$INTERVAL_SECONDS" ]; do
+    if [ -f "$WORKSPACE/.oss-backup-now" ]; then
+      rm -f "$WORKSPACE/.oss-backup-now"
+      break
+    fi
+    sleep 15
+    slept=$((slept + 15))
+  done
+done
+"""
+
     def _get_pod_manifest(self, email: str, instance_id: str, image: str,
                           instance_type: str = "jupyter",
                           gpu_count: int = 1,
@@ -394,7 +539,10 @@ cd {workspace}
                           resource_profile: Optional[str] = None,
                           network_disk_claim_name: Optional[str] = None,
                           template_id: Optional[str] = None,
-                          template_title: Optional[str] = None) -> dict:
+                          template_title: Optional[str] = None,
+                          user_id: Optional[int] = None,
+                          oss_secret_name: Optional[str] = None,
+                          oss_launch_id: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -409,6 +557,12 @@ cd {workspace}
             "amd-oneclick/memory-limit": resources["memory_limit"],
             "amd-oneclick/workspace-host-path": self._workspace_host_path(instance_id),
         }
+        if user_id is not None:
+            annotations["amd-oneclick/user-id"] = str(int(user_id))
+        if oss_secret_name:
+            annotations["amd-oneclick/oss-sts-secret"] = oss_secret_name
+        if oss_launch_id:
+            annotations["amd-oneclick/oss-launch-id"] = oss_launch_id
         network_disk_pvc_name = network_disk_claim_name or settings.NETWORK_DISK_PVC_NAME.strip()
         network_disk_enabled = bool(settings.NETWORK_DISK_ENABLED and network_disk_pvc_name)
         use_static_network_disk_subpath = bool(network_disk_enabled and not network_disk_claim_name)
@@ -491,11 +645,121 @@ cd {workspace}
             })
             env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
 
-        # Only attach a registry pull secret for images from the custom registry, and only
-        # when one is configured. Other images keep relying on node-level credentials.
-        image_pull_secrets = []
-        if settings.CUSTOM_IMAGE_PULL_SECRET_NAME and image.startswith(settings.CUSTOM_IMAGE_REGISTRY):
-            image_pull_secrets = [{"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME}]
+        oss_pod_enabled = bool(settings.OSS_ENABLED and user_id and oss_secret_name and settings.OSS_BUCKET)
+        init_containers = []
+        sidecars = []
+        pod_images = [image]
+        if oss_pod_enabled:
+            pod_images.append(settings.OSSUTIL_IMAGE)
+            volumes.append({
+                "name": "oss-creds",
+                "secret": {
+                    "secretName": oss_secret_name,
+                    "optional": False,
+                },
+            })
+            oss_volume_mounts = [
+                {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH},
+                {"name": "oss-creds", "mountPath": "/etc/oss-creds", "readOnly": True},
+            ]
+            init_containers.append({
+                "name": "restore-workspace",
+                "image": settings.OSSUTIL_IMAGE,
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["/bin/sh", "-lc"],
+                "args": [self._oss_restore_script(int(user_id))],
+                "volumeMounts": oss_volume_mounts,
+                "resources": {
+                    "requests": {"cpu": "50m", "memory": "64Mi"},
+                    "limits": {"cpu": "1", "memory": "512Mi"},
+                },
+            })
+            sidecars.append({
+                "name": "workspace-backup",
+                "image": settings.OSSUTIL_IMAGE,
+                "imagePullPolicy": "IfNotPresent",
+                "restartPolicy": "Always",
+                "command": ["/bin/sh", "-lc"],
+                "args": [self._oss_backup_script(int(user_id))],
+                "volumeMounts": oss_volume_mounts,
+                "resources": {
+                    "requests": {"cpu": "50m", "memory": "64Mi"},
+                    "limits": {"cpu": "1", "memory": "512Mi"},
+                },
+            })
+
+        image_pull_secrets = self._image_pull_secrets(*pod_images)
+
+        spec = {
+            "securityContext": {
+                "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
+            },
+            # Notebook pods don't call the K8s API; dropping the token reduces blast
+            # radius if a user (root in their pod) tries to reach the apiserver.
+            "automountServiceAccountToken": False,
+            "dnsPolicy": "None",
+            "dnsConfig": {
+                "nameservers": ["8.8.8.8", "8.8.4.4"],
+                "searches": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
+                "options": [
+                    {"name": "ndots", "value": "5"}
+                ]
+            },
+            "hostAliases": [
+                {
+                    "ip": "36.151.243.83",
+                    "hostnames": ["github.com"]
+                }
+            ],
+            "tolerations": [
+                {
+                    "key": "amd.com/gpu",
+                    "operator": "Exists",
+                    "effect": "NoSchedule"
+                }
+            ],
+            "containers": [
+                {
+                    "name": "notebook",
+                    "image": image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["/bin/bash", "-c"],
+                    "args": [startup_script],
+                    "ports": [
+                        {
+                            "containerPort": settings.NOTEBOOK_PORT,
+                            "name": "jupyter"
+                        },
+                        {
+                            "containerPort": settings.OPENCODE_WEB_PORT,
+                            "name": "opencode"
+                        }
+                    ],
+                    "resources": {
+                        "limits": {
+                            "cpu": resources["cpu_limit"],
+                            "memory": resources["memory_limit"],
+                            "amd.com/gpu": str(gpu_count)
+                        },
+                        "requests": {
+                            "cpu": resources["cpu_request"],
+                            "memory": resources["memory_request"],
+                            "amd.com/gpu": str(gpu_count)
+                        }
+                    },
+                    "env": env,
+                    "volumeMounts": volume_mounts
+                },
+            ],
+            "volumes": volumes,
+            "restartPolicy": "Always",
+        }
+        if image_pull_secrets:
+            spec["imagePullSecrets"] = image_pull_secrets
+        init_containers.extend(sidecars)
+        if init_containers:
+            spec["initContainers"] = init_containers
+            spec["terminationGracePeriodSeconds"] = settings.OSS_TERMINATION_GRACE_PERIOD_SECONDS
 
         return {
             "apiVersion": "v1",
@@ -506,71 +770,7 @@ cd {workspace}
                 "labels": labels,
                 "annotations": annotations
             },
-            "spec": {
-                "securityContext": {
-                    "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
-                },
-                # Notebook pods don't call the K8s API; dropping the token reduces blast
-                # radius if a user (root in their pod) tries to reach the apiserver.
-                "automountServiceAccountToken": False,
-                "imagePullSecrets": image_pull_secrets,
-                "dnsPolicy": "None",
-                "dnsConfig": {
-                    "nameservers": ["8.8.8.8", "8.8.4.4"],
-                    "searches": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
-                    "options": [
-                        {"name": "ndots", "value": "5"}
-                    ]
-                },
-                "hostAliases": [
-                    {
-                        "ip": "36.151.243.83",
-                        "hostnames": ["github.com"]
-                    }
-                ],
-                "tolerations": [
-                    {
-                        "key": "amd.com/gpu",
-                        "operator": "Exists",
-                        "effect": "NoSchedule"
-                    }
-                ],
-                "containers": [
-                    {
-                        "name": "notebook",
-                        "image": image,
-                        "imagePullPolicy": "IfNotPresent",
-                        "command": ["/bin/bash", "-c"],
-                        "args": [startup_script],
-                        "ports": [
-                            {
-                                "containerPort": settings.NOTEBOOK_PORT,
-                                "name": "jupyter"
-                            },
-                            {
-                                "containerPort": settings.OPENCODE_WEB_PORT,
-                                "name": "opencode"
-                            }
-                        ],
-                        "resources": {
-                            "limits": {
-                                "cpu": resources["cpu_limit"],
-                                "memory": resources["memory_limit"],
-                                "amd.com/gpu": str(gpu_count)
-                            },
-                            "requests": {
-                                "cpu": resources["cpu_request"],
-                                "memory": resources["memory_request"],
-                                "amd.com/gpu": str(gpu_count)
-                            }
-                        },
-                        "env": env,
-                        "volumeMounts": volume_mounts
-                    }
-                ],
-                "volumes": volumes,
-                "restartPolicy": "Always"
-            }
+            "spec": spec
         }
     
     def _get_service_manifest(self, email: str, instance_id: str, node_port: int, opencode_node_port: int) -> dict:
@@ -625,9 +825,11 @@ cd {workspace}
             port += 1
         return port
 
-    def _allocate_node_port_pair(self) -> tuple:
+    def _allocate_node_port_pair(self, extra_used_ports: Optional[set] = None) -> tuple:
         """Allocate two distinct available NodePorts (jupyter + opencode)."""
         used_ports = self._used_node_ports()
+        if extra_used_ports:
+            used_ports.update(extra_used_ports)
         port = settings.NODE_PORT_BASE
         while port < 32766:
             if port not in used_ports and (port + 1) not in used_ports:
@@ -693,6 +895,9 @@ cd {workspace}
                 },
             },
         }
+        image_pull_secrets = self._image_pull_secrets(image)
+        if image_pull_secrets:
+            body["spec"]["template"]["spec"]["imagePullSecrets"] = image_pull_secrets
         self.apps_v1.create_namespaced_daemon_set(namespace=self.namespace, body=body)
         return self.get_image_sync_status(image_id)
 
@@ -790,8 +995,9 @@ cd {workspace}
                 }
             ],
         }
-        if settings.CUSTOM_IMAGE_PULL_SECRET_NAME:
-            pod_spec["imagePullSecrets"] = [{"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME}]
+        image_pull_secrets = self._image_pull_secrets(image)
+        if image_pull_secrets:
+            pod_spec["imagePullSecrets"] = image_pull_secrets
 
         body = {
             "apiVersion": "apps/v1",
@@ -899,6 +1105,17 @@ cd {workspace}
             elif port.name == "jupyter" or jupyter_port is None:
                 jupyter_port = port.node_port
         return jupyter_port, opencode_port
+
+    def _wait_for_existing_instance(self, instance_id: str, timeout_seconds: int = 45) -> Optional[dict]:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            instance = self.get_instance_by_id(instance_id)
+            if not instance:
+                return None
+            if instance.get("node_port"):
+                return instance
+            time.sleep(1)
+        return None
     
     def create_instance(self, email: str, image: Optional[str] = None,
                         instance_type: str = "jupyter",
@@ -907,67 +1124,112 @@ cd {workspace}
                         custom_instance_id: Optional[str] = None,
                         resource_profile: Optional[str] = None,
                         template_id: Optional[str] = None,
-                        template_title: Optional[str] = None) -> dict:
+                        template_title: Optional[str] = None,
+                        user_id: Optional[int] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
 
-        existing = self.get_instance_by_id(instance_id)
+        existing = self._wait_for_existing_instance(instance_id, timeout_seconds=3)
         if existing:
             return existing
 
-        network_disk_claim_name = self._ensure_network_disk(instance_id)
-        node_port, opencode_node_port = self._allocate_node_port_pair()
-
-        pod_manifest = self._get_pod_manifest(
-            email, instance_id, image,
-            instance_type=instance_type,
-            gpu_count=gpu_count,
-            github_info=github_info,
-            resource_profile=resource_profile,
-            network_disk_claim_name=network_disk_claim_name,
-            template_id=template_id,
-            template_title=template_title,
-        )
-        for attempt in range(1, 7):
-            try:
-                self.core_v1.create_namespaced_pod(
-                    namespace=self.namespace,
-                    body=pod_manifest
-                )
-                logger.info(f"Created pod {instance_id} for {email} (type={instance_type})")
-                break
-            except ApiException as e:
-                if e.status == 409 and attempt < 6:
-                    logger.warning("Pod %s still exists while creating; waiting for deletion before retry %s", instance_id, attempt)
-                    time.sleep(5)
-                    continue
-                logger.error(f"Failed to create pod: {e}")
-                raise
-
+        oss_secret_name = None
+        oss_launch_id = None
+        pod_created = False
         service_created = False
-        for _ in range(20):
-            svc_manifest = self._get_service_manifest(email, instance_id, node_port, opencode_node_port)
-            try:
-                self.core_v1.create_namespaced_service(
-                    namespace=self.namespace,
-                    body=svc_manifest
-                )
-                logger.info(f"Created service {instance_id}-svc with NodePorts {node_port}/{opencode_node_port}")
-                service_created = True
-                break
-            except ApiException as e:
-                if e.status == 422:
-                    logger.warning(f"NodePort pair {node_port}/{opencode_node_port} rejected by API server, retrying next pair: {e}")
-                    node_port += 2
-                    opencode_node_port = node_port + 1
-                    continue
-                logger.error(f"Failed to create service: {e}")
+        try:
+            if user_id and settings.OSS_ENABLED:
+                from .oss import ensure_instance_secret, oss_instance_enabled, sts_secret_name
+
+                if oss_instance_enabled(user_id):
+                    oss_launch_id = uuid.uuid4().hex[:12]
+                    oss_secret_name = sts_secret_name(instance_id, oss_launch_id)
+                    ensure_instance_secret(
+                        self.core_v1,
+                        self.namespace,
+                        instance_id,
+                        int(user_id),
+                        secret_name=oss_secret_name,
+                        launch_id=oss_launch_id,
+                    )
+                else:
+                    raise RuntimeError("OSS is enabled but OSS/STS runtime configuration is incomplete")
+
+            network_disk_claim_name = self._ensure_network_disk(instance_id)
+
+            pod_manifest = self._get_pod_manifest(
+                email, instance_id, image,
+                instance_type=instance_type,
+                gpu_count=gpu_count,
+                github_info=github_info,
+                resource_profile=resource_profile,
+                network_disk_claim_name=network_disk_claim_name,
+                template_id=template_id,
+                template_title=template_title,
+                user_id=user_id,
+                oss_secret_name=oss_secret_name,
+                oss_launch_id=oss_launch_id,
+            )
+            pod_retry_attempts = max(1, settings.POD_CREATE_RETRY_ATTEMPTS)
+            for attempt in range(1, pod_retry_attempts + 1):
+                try:
+                    self.core_v1.create_namespaced_pod(
+                        namespace=self.namespace,
+                        body=pod_manifest
+                    )
+                    pod_created = True
+                    logger.info(f"Created pod {instance_id} for {email} (type={instance_type})")
+                    break
+                except ApiException as e:
+                    if e.status == 409:
+                        existing = self._wait_for_existing_instance(instance_id)
+                        if existing:
+                            if oss_secret_name:
+                                self._delete_oss_secret(instance_id, secret_name=oss_secret_name)
+                            return existing
+                    if e.status == 409 and attempt < pod_retry_attempts:
+                        logger.warning("Pod %s still exists while creating; waiting for deletion before retry %s", instance_id, attempt)
+                        time.sleep(max(1, settings.POD_CREATE_RETRY_DELAY_SECONDS))
+                        continue
+                    logger.error(f"Failed to create pod: {e}")
+                    raise
+
+            node_port = None
+            opencode_node_port = None
+            rejected_ports = set()
+            with self._node_port_lock:
+                for _ in range(20):
+                    node_port, opencode_node_port = self._allocate_node_port_pair(rejected_ports)
+                    svc_manifest = self._get_service_manifest(email, instance_id, node_port, opencode_node_port)
+                    try:
+                        self.core_v1.create_namespaced_service(
+                            namespace=self.namespace,
+                            body=svc_manifest
+                        )
+                        logger.info(f"Created service {instance_id}-svc with NodePorts {node_port}/{opencode_node_port}")
+                        service_created = True
+                        break
+                    except ApiException as e:
+                        if e.status == 422:
+                            logger.warning(f"NodePort pair {node_port}/{opencode_node_port} rejected by API server, re-listing ports: {e}")
+                            rejected_ports.update({node_port, opencode_node_port})
+                            continue
+                        logger.error(f"Failed to create service: {e}")
+                        raise
+            if not service_created:
+                raise RuntimeError("Unable to allocate NodePort for service")
+        except Exception:
+            if pod_created:
                 self.delete_instance_by_id(instance_id)
-                raise
-        if not service_created:
-            self.delete_instance_by_id(instance_id)
-            raise RuntimeError("Unable to allocate NodePort for service")
+            elif oss_secret_name:
+                try:
+                    from .oss import delete_instance_secret
+
+                    delete_instance_secret(self.core_v1, self.namespace, instance_id, secret_name=oss_secret_name)
+                except Exception as secret_error:
+                    logger.warning("Failed to clean up OSS STS Secret for %s after launch failure: %s", instance_id, secret_error)
+            raise
 
         notebook_path = github_info.get("path") if github_info else None
 
@@ -988,7 +1250,7 @@ cd {workspace}
             "opencode_url": self._build_opencode_url(opencode_node_port),
             "github_info": github_info
         }
-    
+
     def get_instance_by_id(self, instance_id: str) -> Optional[dict]:
         """Get existing notebook instance by instance ID"""
         try:
@@ -1040,6 +1302,8 @@ cd {workspace}
                 "github_path": github_path,
                 "template_id": pod.metadata.annotations.get("amd-oneclick/template-id"),
                 "template_title": pod.metadata.annotations.get("amd-oneclick/template-title"),
+                "user_id": pod.metadata.annotations.get("amd-oneclick/user-id"),
+                "oss_secret_name": pod.metadata.annotations.get("amd-oneclick/oss-sts-secret"),
             }
         except ApiException as e:
             if e.status == 404:
@@ -1048,8 +1312,11 @@ cd {workspace}
     
     def delete_instance_by_id(self, instance_id: str) -> bool:
         """Delete a notebook instance by instance ID"""
-        deleted = False
-        
+        pod_delete_succeeded = False
+        pod_delete_requested = False
+        pod_already_gone = False
+        oss_secret_name = None
+
         # Delete Service
         try:
             self.core_v1.delete_namespaced_service(
@@ -1057,24 +1324,72 @@ cd {workspace}
                 namespace=self.namespace
             )
             logger.info(f"Deleted service {instance_id}-svc")
-            deleted = True
         except ApiException as e:
             if e.status != 404:
                 logger.warning(f"Error deleting service: {e}")
-        
-        # Delete Pod
+
         try:
-            self.core_v1.delete_namespaced_pod(
-                name=instance_id,
-                namespace=self.namespace
-            )
-            logger.info(f"Deleted pod {instance_id}")
-            deleted = True
+            pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+            annotations = pod.metadata.annotations or {}
+            oss_secret_name = annotations.get("amd-oneclick/oss-sts-secret")
         except ApiException as e:
-            if e.status != 404:
-                logger.warning(f"Error deleting pod: {e}")
+            if e.status == 404:
+                pod_already_gone = True
+                pod_delete_succeeded = True
+            else:
+                logger.warning(f"Error reading pod before delete: {e}")
+                return False
+
+        # Delete Pod
+        if not pod_already_gone:
+            try:
+                self.core_v1.delete_namespaced_pod(
+                    name=instance_id,
+                    namespace=self.namespace
+                )
+                logger.info(f"Deleted pod {instance_id}")
+                pod_delete_succeeded = True
+                pod_delete_requested = True
+            except ApiException as e:
+                if e.status == 404:
+                    pod_already_gone = True
+                    pod_delete_succeeded = True
+                else:
+                    logger.warning(f"Error deleting pod: {e}")
+                    return False
+
+        if pod_delete_requested:
+            threading.Thread(
+                target=self._delete_oss_secret_after_pod_gone,
+                args=(instance_id, oss_secret_name),
+                daemon=True,
+            ).start()
+        elif pod_already_gone:
+            self._delete_oss_secret(instance_id)
         
-        return deleted
+        return pod_delete_succeeded
+
+    def _delete_oss_secret(self, instance_id: str, secret_name: Optional[str] = None):
+        try:
+            from .oss import delete_instance_secret
+
+            delete_instance_secret(self.core_v1, self.namespace, instance_id, secret_name=secret_name)
+        except Exception as e:
+            logger.warning("Error deleting OSS STS Secret for %s: %s", instance_id, e)
+
+    def _delete_oss_secret_after_pod_gone(self, instance_id: str, secret_name: Optional[str]):
+        deadline = time.time() + max(1, settings.OSS_SECRET_DELETE_WAIT_SECONDS)
+        while time.time() < deadline:
+            try:
+                self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+                time.sleep(2)
+            except ApiException as e:
+                if e.status == 404:
+                    self._delete_oss_secret(instance_id, secret_name=secret_name)
+                    return
+                logger.warning("Error waiting for pod %s to terminate before OSS Secret cleanup: %s", instance_id, e)
+                break
+        logger.warning("Deferring OSS STS Secret cleanup for %s; pod still exists or status is unknown", instance_id)
     
     def delete_instance(self, email: str) -> bool:
         """Delete a notebook instance"""
@@ -1141,6 +1456,8 @@ cd {workspace}
                     "github_org": github_org,
                     "github_repo": github_repo,
                     "github_path": github_path,
+                    "user_id": pod.metadata.annotations.get("amd-oneclick/user-id"),
+                    "oss_secret_name": pod.metadata.annotations.get("amd-oneclick/oss-sts-secret"),
                 })
         except ApiException as e:
             logger.error(f"Error listing pods: {e}")
@@ -1153,7 +1470,7 @@ cd {workspace}
         deleted_count = 0
         
         for instance in instances:
-            if self.delete_instance(instance["email"]):
+            if self.delete_instance_by_id(instance["id"]):
                 deleted_count += 1
         
         return deleted_count
@@ -1214,15 +1531,17 @@ cd {workspace}
             logger.debug(f"Jupyter health check failed: {e}")
             return False
     
-    def check_pod_activity(self, email: str) -> Optional[datetime]:
+    def check_pod_activity(self, email: str, instance_id: Optional[str] = None) -> Optional[datetime]:
         """Check last activity of a pod by examining logs"""
-        instance_id = self._generate_instance_id(email)
+        if not instance_id:
+            instance_id = self._generate_instance_id(email)
         
         try:
             # Get recent logs
             logs = self.core_v1.read_namespaced_pod_log(
                 name=instance_id,
                 namespace=self.namespace,
+                container="notebook",
                 tail_lines=10,
                 timestamps=True
             )
@@ -1240,10 +1559,12 @@ cd {workspace}
                         pass
             
             return None
-        except ApiException:
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning("Unable to read notebook logs for idle check on %s: %s", instance_id, e)
             return None
     
-    def cleanup_idle_instances(self) -> list:
+    def cleanup_idle_instances(self, on_deleted=None) -> list:
         """Cleanup idle and expired instances"""
         cleaned = []
         instances = self.list_instances()
@@ -1266,7 +1587,7 @@ cd {workspace}
                 reason = f"exceeded max lifetime ({max_lifetime}h)"
 
             elif instance["status"] == "running" and idle_timeout > 0:
-                last_activity = self.check_pod_activity(instance["email"])
+                last_activity = self.check_pod_activity(instance["email"], instance_id=instance["id"])
                 if last_activity:
                     idle_minutes = (now - last_activity).total_seconds() / 60
                     if idle_minutes >= idle_timeout:
@@ -1274,9 +1595,12 @@ cd {workspace}
                         reason = f"idle for {int(idle_minutes)} minutes (limit {idle_timeout}m)"
 
             if should_delete:
-                if self.delete_instance(instance["email"]):
+                if self.delete_instance_by_id(instance["id"]):
+                    if on_deleted:
+                        on_deleted(instance["id"])
                     cleaned.append({
                         "email": instance["email"],
+                        "id": instance["id"],
                         "reason": reason
                     })
                     logger.info(f"Cleaned up instance for {instance['email']}: {reason}")

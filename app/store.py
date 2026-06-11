@@ -45,7 +45,15 @@ if DATABASE_URL.startswith("sqlite:///"):
     db_path = DATABASE_URL.removeprefix("sqlite:///")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+engine_kwargs = {"future": True, "pool_pre_ping": True}
+if not DATABASE_URL.startswith("sqlite"):
+    engine_kwargs.update(
+        pool_size=settings.DATABASE_POOL_SIZE,
+        max_overflow=settings.DATABASE_MAX_OVERFLOW,
+        pool_timeout=settings.DATABASE_POOL_TIMEOUT_SECONDS,
+        pool_recycle=settings.DATABASE_POOL_RECYCLE_SECONDS,
+    )
+engine = create_engine(DATABASE_URL, **engine_kwargs)
 metadata = MetaData()
 
 users = Table(
@@ -241,6 +249,41 @@ def row_to_dict(row) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def _sqlite_usage_has_legacy_instance_unit_unique(conn) -> bool:
+    indexes = conn.execute(text("PRAGMA index_list('usage_charges')")).mappings().all()
+    for index in indexes:
+        if not index.get("unique"):
+            continue
+        index_name = index["name"]
+        columns = [
+            row["name"]
+            for row in conn.execute(text(f"PRAGMA index_info('{index_name}')")).mappings().all()
+        ]
+        if columns == ["instance_id", "billing_unit"]:
+            return True
+    return False
+
+
+def _rebuild_sqlite_usage_charges(conn):
+    conn.execute(text("ALTER TABLE usage_charges RENAME TO usage_charges_legacy"))
+    metadata.create_all(bind=conn, tables=[usage_charges])
+    conn.execute(
+        text(
+            """
+            INSERT INTO usage_charges (
+                id, user_id, instance_id, billing_session_id, billing_unit,
+                gpu_count, credits, created_at
+            )
+            SELECT
+                id, user_id, instance_id, billing_session_id, billing_unit,
+                gpu_count, credits, created_at
+            FROM usage_charges_legacy
+            """
+        )
+    )
+    conn.execute(text("DROP TABLE usage_charges_legacy"))
+
+
 def init_db():
     metadata.create_all(engine)
     with engine.begin() as conn:
@@ -273,6 +316,8 @@ def ensure_schema_columns(conn):
         conn.execute(text("ALTER TABLE usage_charges DROP CONSTRAINT IF EXISTS uq_usage_charge_instance_unit"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_charge_session_unit ON usage_charges (billing_session_id, billing_unit)"))
     elif conn.dialect.name == "sqlite":
+        if _sqlite_usage_has_legacy_instance_unit_unique(conn):
+            _rebuild_sqlite_usage_charges(conn)
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_charge_session_unit ON usage_charges (billing_session_id, billing_unit)"))
 
     template_columns = {col["name"] for col in inspector.get_columns("notebook_templates")}
@@ -1154,31 +1199,89 @@ def get_active_instance_for_user(user_id: int) -> Optional[dict]:
         )
 
 
-def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None):
+def _record_instance_once(conn, user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None) -> dict:
     now = utc_now()
     billing_session_id = f"{instance_id}:{uuid.uuid4().hex[:12]}"
-    with engine.begin() as conn:
-        existing = conn.execute(
-            select(instance_records).where(instance_records.c.instance_id == instance_id)
-        ).mappings().first()
-        values = dict(
-            user_id=user_id,
-            email=email,
-            image=image,
-            instance_type=instance_type,
-            gpu_count=gpu_count,
-            node_port=node_port,
-            opencode_node_port=opencode_node_port,
-            status="running",
-            created_at=now,
-            last_charged_at=now,
-            billing_session_id=billing_session_id,
-            deleted_at=None,
+    existing = conn.execute(
+        select(instance_records).where(instance_records.c.instance_id == instance_id).with_for_update()
+    ).mappings().first()
+
+    if existing and existing["status"] == "running" and not existing["deleted_at"]:
+        conn.execute(
+            update(instance_records)
+            .where(instance_records.c.id == existing["id"])
+            .values(
+                node_port=node_port,
+                opencode_node_port=opencode_node_port,
+            )
         )
-        if existing:
-            conn.execute(update(instance_records).where(instance_records.c.id == existing["id"]).values(**values))
-        else:
-            conn.execute(instance_records.insert().values(**values, instance_id=instance_id))
+        return {
+            "id": existing["id"],
+            "billing_session_id": existing["billing_session_id"],
+            "new_session": False,
+            "created": False,
+        }
+
+    values = dict(
+        user_id=user_id,
+        email=email,
+        image=image,
+        instance_type=instance_type,
+        gpu_count=gpu_count,
+        node_port=node_port,
+        opencode_node_port=opencode_node_port,
+        status="running",
+        created_at=now,
+        last_charged_at=now,
+        billing_session_id=billing_session_id,
+        deleted_at=None,
+    )
+    if existing:
+        result = conn.execute(
+            update(instance_records)
+            .where(
+                instance_records.c.id == existing["id"],
+                instance_records.c.status != "running",
+            )
+            .values(**values)
+        )
+        if result.rowcount == 0:
+            current = conn.execute(
+                select(instance_records).where(instance_records.c.id == existing["id"])
+            ).mappings().first()
+            if current and current["status"] == "running" and not current["deleted_at"]:
+                return {
+                    "id": current["id"],
+                    "billing_session_id": current["billing_session_id"],
+                    "new_session": False,
+                    "created": False,
+                }
+            raise RuntimeError(f"Unable to record launch for {instance_id}; instance row changed concurrently")
+        return {
+            "id": existing["id"],
+            "billing_session_id": billing_session_id,
+            "new_session": True,
+            "created": False,
+        }
+
+    result = conn.execute(instance_records.insert().values(**values, instance_id=instance_id))
+    return {
+        "id": result.inserted_primary_key[0] if result.inserted_primary_key else None,
+        "billing_session_id": billing_session_id,
+        "new_session": True,
+        "created": True,
+    }
+
+
+def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None) -> dict:
+    try:
+        with engine.begin() as conn:
+            return _record_instance_once(conn, user_id, email, instance_id, image, instance_type, gpu_count, node_port, opencode_node_port)
+    except IntegrityError:
+        # Another launch request may have inserted the reusable instance_id between
+        # our read and insert. Re-read under lock and treat the live row as canonical.
+        with engine.begin() as conn:
+            return _record_instance_once(conn, user_id, email, instance_id, image, instance_type, gpu_count, node_port, opencode_node_port)
 
 
 def record_instance_launch_event(
@@ -1239,33 +1342,62 @@ def charge_usage_unit(user_id: int, instance_id: str, billing_session_id: str, b
     now = utc_now()
     credits = int(gpu_count)
     with engine.begin() as conn:
-        existing = conn.execute(
-            select(usage_charges.c.id).where(
-                usage_charges.c.billing_session_id == billing_session_id,
-                usage_charges.c.billing_unit == billing_unit,
-            )
+        def duplicate_charge_exists() -> bool:
+            duplicate = conn.execute(
+                select(usage_charges.c.id).where(
+                    usage_charges.c.billing_session_id == billing_session_id,
+                    usage_charges.c.billing_unit == billing_unit,
+                )
+            ).first()
+            return duplicate is not None
+
+        if duplicate_charge_exists():
+            return "existing"
+
+        active_instance = conn.execute(
+            select(instance_records.c.id).where(
+                instance_records.c.instance_id == instance_id,
+                instance_records.c.billing_session_id == billing_session_id,
+                instance_records.c.deleted_at.is_(None),
+                instance_records.c.status == "running",
+            ).with_for_update()
         ).first()
-        if existing:
+        if not active_instance:
+            return "inactive"
+
+        if duplicate_charge_exists():
             return "existing"
 
         user = conn.execute(select(users).where(users.c.id == user_id).with_for_update()).mappings().first()
         if not user:
             raise ValueError(f"User {user_id} not found")
-        if int(user["credits"]) < credits:
-            return "insufficient"
 
-        conn.execute(
-            usage_charges.insert().values(
-                user_id=user_id,
-                instance_id=instance_id,
-                billing_session_id=billing_session_id,
-                billing_unit=billing_unit,
-                gpu_count=gpu_count,
-                credits=credits,
-                created_at=now,
-            )
-        )
-        conn.execute(update(users).where(users.c.id == user_id).values(credits=users.c.credits - credits, updated_at=now))
+        try:
+            with conn.begin_nested():
+                credit_update = conn.execute(
+                    update(users)
+                    .where(users.c.id == user_id, users.c.credits >= credits)
+                    .values(credits=users.c.credits - credits, updated_at=now)
+                )
+                if credit_update.rowcount == 0:
+                    if duplicate_charge_exists():
+                        return "existing"
+                    return "insufficient"
+                conn.execute(
+                    usage_charges.insert().values(
+                        user_id=user_id,
+                        instance_id=instance_id,
+                        billing_session_id=billing_session_id,
+                        billing_unit=billing_unit,
+                        gpu_count=gpu_count,
+                        credits=credits,
+                        created_at=now,
+                    )
+                )
+        except IntegrityError:
+            if duplicate_charge_exists():
+                return "existing"
+            raise
         conn.execute(
             credit_ledger.insert().values(
                 user_id=user_id,
@@ -1291,3 +1423,32 @@ def list_active_instances() -> list[dict]:
     )
     with engine.begin() as conn:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
+
+
+def users_idle_since(cutoff_iso: str) -> list[dict]:
+    """Users with no running instance and last instance activity at or before cutoff."""
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(
+                instance_records.c.user_id,
+                instance_records.c.deleted_at,
+                instance_records.c.last_charged_at,
+                instance_records.c.status,
+            )
+        ).mappings().all()
+
+    active_users = set()
+    latest_activity: dict[int, str] = {}
+    for row in rows:
+        user_id = int(row["user_id"])
+        if row["status"] == "running" and not row["deleted_at"]:
+            active_users.add(user_id)
+        activity = row["deleted_at"] or row["last_charged_at"]
+        if activity and (user_id not in latest_activity or activity > latest_activity[user_id]):
+            latest_activity[user_id] = activity
+
+    return [
+        {"user_id": user_id, "idle_since": idle_since}
+        for user_id, idle_since in latest_activity.items()
+        if user_id not in active_users and idle_since <= cutoff_iso
+    ]

@@ -68,7 +68,7 @@ Provisioning done. Remaining MANUAL steps (require ACR credentials you control):
 
   1) Log in to the ACR push account into the agent's DOCKER_CONFIG (NOT \$HOME):
        sudo -u ${AGENT_USER} env DOCKER_CONFIG=${DOCKER_CONFIG_DIR} \\
-         docker login crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com
+         docker login radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com
 
   2) (Recommended) Set up rootless Docker or Podman for ${AGENT_USER} so a build
      escape is not host-root, then uncomment DOCKER_HOST in ${ENV_FILE}.
