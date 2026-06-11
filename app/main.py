@@ -501,9 +501,21 @@ def _instance_service_base(instance_id: str) -> str:
         svc = k8s_client.core_v1.read_namespaced_service(
             name=f"{instance_id}-svc",
             namespace=k8s_client.namespace,
+            _request_timeout=settings.K8S_READ_TIMEOUT_SECONDS,
         )
     except Exception:
         raise HTTPException(status_code=404, detail="Instance service not found")
+    try:
+        endpoints = k8s_client.core_v1.read_namespaced_endpoints(
+            name=f"{instance_id}-svc",
+            namespace=k8s_client.namespace,
+            _request_timeout=settings.K8S_READ_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        endpoints = None
+    has_endpoint = any(subset.addresses for subset in (endpoints.subsets or [])) if endpoints else False
+    if not has_endpoint:
+        raise HTTPException(status_code=503, detail="Instance is still starting")
     return f"http://{svc.spec.cluster_ip}:{settings.NOTEBOOK_PORT}"
 
 
@@ -1519,12 +1531,19 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
     body = await request.body()
     timeout = httpx.Timeout(3600.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        upstream = await client.request(
-            request.method,
-            target_url,
-            headers=_proxy_headers(request.headers),
-            content=body,
-        )
+        try:
+            upstream = await client.request(
+                request.method,
+                target_url,
+                headers=_proxy_headers(request.headers),
+                content=body,
+            )
+        except httpx.RequestError as e:
+            logger.warning("Instance proxy upstream unavailable instance=%s path=%s error=%s", instance_id, path, e)
+            raise HTTPException(
+                status_code=503,
+                detail="Instance is still starting. Please retry in a few seconds.",
+            ) from e
 
     response_headers = {
         k: v for k, v in upstream.headers.items()

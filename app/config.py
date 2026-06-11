@@ -62,7 +62,7 @@ class Settings:
 
     DEFAULT_IMAGE: str = os.getenv(
         "DEFAULT_IMAGE",
-        f"{ADMIN_IMAGE_REGISTRY}/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+        "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
     )
 
     @property
@@ -149,6 +149,8 @@ class Settings:
     OAUTH_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_CONNECT_TIMEOUT_SECONDS", "5"))
     OAUTH_READ_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_READ_TIMEOUT_SECONDS", "15"))
     SLOW_REQUEST_THRESHOLD_SECONDS: float = float(os.getenv("SLOW_REQUEST_THRESHOLD_SECONDS", "2"))
+    IMAGE_CACHE_NODE_AFFINITY_ENABLED: bool = os.getenv("IMAGE_CACHE_NODE_AFFINITY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    K8S_READ_TIMEOUT_SECONDS: float = float(os.getenv("K8S_READ_TIMEOUT_SECONDS", "5"))
     WORKSHOP_LOGIN_ENABLED: bool = os.getenv("WORKSHOP_LOGIN_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     WORKSHOP_USER_COUNT: int = int(os.getenv("WORKSHOP_USER_COUNT", "150"))
     WORKSHOP_CREDITS: int = int(os.getenv("WORKSHOP_CREDITS", "10000"))

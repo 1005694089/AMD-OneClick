@@ -137,6 +137,52 @@ class K8sClient:
             return [{"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME}]
         return []
 
+    def _node_is_ready_for_scheduling(self, node) -> bool:
+        if getattr(node.spec, "unschedulable", False):
+            return False
+        for condition in node.status.conditions or []:
+            if condition.type == "Ready":
+                return condition.status == "True"
+        return False
+
+    def _cached_image_node_names(self, image: str) -> list[str]:
+        if not settings.IMAGE_CACHE_NODE_AFFINITY_ENABLED or not image:
+            return []
+        try:
+            nodes = self.core_v1.list_node(_request_timeout=settings.K8S_READ_TIMEOUT_SECONDS).items
+        except Exception as e:
+            logger.warning("Unable to list nodes for image-cache affinity; scheduling normally: %s", e)
+            return []
+
+        node_names = []
+        for node in nodes:
+            if not self._node_is_ready_for_scheduling(node):
+                continue
+            for cached_image in node.status.images or []:
+                if image in (cached_image.names or []):
+                    node_names.append(node.metadata.name)
+                    break
+        return node_names
+
+    def _image_cache_node_affinity(self, image: str) -> Optional[dict]:
+        node_names = self._cached_image_node_names(image)
+        if not node_names:
+            return None
+        logger.info("Restricting notebook image %s to %s cached nodes", image, len(node_names))
+        return {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchFields": [
+                                {"key": "metadata.name", "operator": "In", "values": node_names}
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+
     def _network_disk_sub_path(self, instance_id: str) -> str:
         prefix = settings.NETWORK_DISK_SUBPATH_PREFIX.strip("/")
         safe_id = self._safe_storage_segment(instance_id)
@@ -756,6 +802,9 @@ done
         }
         if image_pull_secrets:
             spec["imagePullSecrets"] = image_pull_secrets
+        image_affinity = self._image_cache_node_affinity(image)
+        if image_affinity:
+            spec["affinity"] = image_affinity
         init_containers.extend(sidecars)
         if init_containers:
             spec["initContainers"] = init_containers
