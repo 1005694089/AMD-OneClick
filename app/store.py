@@ -373,26 +373,37 @@ def ensure_default_blank_template(conn):
                 .where(notebook_templates.c.id == exists.id)
                 .values(image=settings.DEFAULT_IMAGE, updated_at=now)
             )
-        return
-    conn.execute(
-        notebook_templates.insert().values(
-            title="Blank OpenCode Workspace",
-            slug="blank-opencode-workspace",
-            description="Start an empty JupyterLab workspace with OpenCode and your selected AMD GPU image.",
-            category="Workspace",
-            tags="workspace,opencode",
-            image=settings.DEFAULT_IMAGE,
-            repo_url="",
-            branch="main",
-            notebook_path="",
-            cover_url="",
-            enabled=True,
-            sort_order=-100,
-            owner_user_id=None,
-            created_at=now,
-            updated_at=now,
+    else:
+        conn.execute(
+            notebook_templates.insert().values(
+                title="Blank OpenCode Workspace",
+                slug="blank-opencode-workspace",
+                description="Start an empty JupyterLab workspace with OpenCode and your selected AMD GPU image.",
+                category="Workspace",
+                tags="workspace,opencode",
+                image=settings.DEFAULT_IMAGE,
+                repo_url="",
+                branch="main",
+                notebook_path="",
+                cover_url="",
+                enabled=True,
+                sort_order=-100,
+                owner_user_id=None,
+                created_at=now,
+                updated_at=now,
+            )
         )
-    )
+
+    blank_notebook = conn.execute(
+        select(notebook_templates.c.id, notebook_templates.c.image)
+        .where(notebook_templates.c.slug == "notebook")
+    ).first()
+    if blank_notebook and blank_notebook.image != settings.DEFAULT_IMAGE:
+        conn.execute(
+            update(notebook_templates)
+            .where(notebook_templates.c.id == blank_notebook.id)
+            .values(image=settings.DEFAULT_IMAGE, updated_at=now)
+        )
 
 
 def get_or_create_user(provider: str, provider_id: str, email: str, name: str = "", avatar_url: str = "") -> dict:
