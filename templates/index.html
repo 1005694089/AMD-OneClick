@@ -4,14 +4,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Radeon Cloud</title>
-  <link rel="stylesheet" href="/static/vendor/antd-reset.css" />
-  <script src="/static/vendor/react.production.min.js"></script>
-  <script src="/static/vendor/react-dom.production.min.js"></script>
-  <script src="/static/vendor/dayjs.min.js"></script>
-  <script src="/static/vendor/antd.min.js"></script>
+  <link rel="stylesheet" href="/static/vendor/antd-reset.css?v={{ static_asset_version }}" />
+  <link rel="preload" href="/static/vendor/react.production.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="/static/vendor/dayjs.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="/static/vendor/antd.min.js?v={{ static_asset_version }}" as="script" />
   <style>
     body { margin: 0; background: #f5f6fb; }
     #root { min-height: 100vh; }
+    .boot-shell { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; background:#f5f6fb; color:#20263a; }
+    .boot-brand { display:flex; align-items:center; gap:12px; font-size:20px; font-weight:800; }
+    .boot-brand img { width:40px; height:40px; object-fit:contain; }
+    .boot-line { width:160px; height:3px; overflow:hidden; border-radius:999px; background:#d9deea; position:relative; }
+    .boot-line:after { content:""; position:absolute; inset:0; width:42%; border-radius:999px; background:#20263a; animation:bootSlide 1.15s ease-in-out infinite; }
+    @keyframes bootSlide { 0% { transform:translateX(-120%); } 100% { transform:translateX(260%); } }
     .app-header { height: 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; background: #fff; border-bottom: 1px solid #edf0f5; position: sticky; top: 0; z-index: 20; }
     .left-header { display: flex; align-items: center; gap: 32px; }
     .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; font-size: 20px; }
@@ -68,7 +74,16 @@
   </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root">
+    <div class="boot-shell">
+      <div class="boot-brand"><img src="/static/vendor/amd-logo.png?v={{ static_asset_version }}" alt="AMD" /><span>Radeon Cloud</span></div>
+      <div class="boot-line"></div>
+    </div>
+  </div>
+  <script src="/static/vendor/react.production.min.js?v={{ static_asset_version }}"></script>
+  <script src="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}"></script>
+  <script src="/static/vendor/dayjs.min.js?v={{ static_asset_version }}"></script>
+  <script src="/static/vendor/antd.min.js?v={{ static_asset_version }}"></script>
   <script>
     const { Avatar, Button, Card, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Select, Space, Tag, Typography, message } = antd;
     const { Header, Content } = Layout;
@@ -83,9 +98,9 @@
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
 
-    const JUPYTER_LOGO = '/static/vendor/jupyter.svg';
-    const OPENCODE_LOGO = '/static/vendor/opencode.svg';
-    const HERMES_LOGO = '/static/vendor/hermes.ico';
+    const JUPYTER_LOGO = '/static/vendor/jupyter.svg?v={{ static_asset_version }}';
+    const OPENCODE_LOGO = '/static/vendor/opencode.svg?v={{ static_asset_version }}';
+    const HERMES_LOGO = '/static/vendor/hermes.ico?v={{ static_asset_version }}';
     // Render a brand logo with a small, always-visible one-word label next to it.
     // If the logo fails to load, the label alone still identifies the button.
     function brandContent(src, alt, label) {
@@ -418,7 +433,7 @@
       return React.createElement(Layout, null,
         React.createElement(Header, { className: 'app-header' },
           React.createElement('div', { className: 'left-header' },
-            React.createElement('div', { className: 'brand' }, React.createElement('img', { src: '/static/vendor/amd-logo.png' }), React.createElement('span', null, 'Radeon Cloud')),
+            React.createElement('div', { className: 'brand' }, React.createElement('img', { src: '/static/vendor/amd-logo.png?v={{ static_asset_version }}' }), React.createElement('span', null, 'Radeon Cloud')),
             React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'space', label: 'Space', disabled: true }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 300 } })
           ), React.createElement(UserMenu)
         ),

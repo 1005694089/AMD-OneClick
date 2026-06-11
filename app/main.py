@@ -94,6 +94,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class CacheControlStaticFiles(StaticFiles):
+    """Serve static assets with browser cache headers."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            if path.startswith("vendor/"):
+                response.headers.setdefault("Cache-Control", "public, max-age=604800, stale-while-revalidate=86400")
+            else:
+                response.headers.setdefault("Cache-Control", "public, max-age=3600")
+        return response
+
+
+def _static_asset_version() -> str:
+    explicit = os.getenv("STATIC_ASSET_VERSION")
+    if explicit:
+        return explicit
+    latest_mtime = 0
+    for root in ("static", "templates"):
+        if not os.path.isdir(root):
+            continue
+        for current_dir, _, file_names in os.walk(root):
+            for file_name in file_names:
+                file_path = os.path.join(current_dir, file_name)
+                try:
+                    latest_mtime = max(latest_mtime, int(os.path.getmtime(file_path)))
+                except OSError:
+                    continue
+    return str(latest_mtime or int(time.time()))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
@@ -135,10 +166,11 @@ async def log_slow_requests(request: Request, call_next):
             logger.warning("Slow request method=%s path=%s status=%s duration=%.3fs", request.method, request.url.path, status_code, elapsed)
 
 # Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", CacheControlStaticFiles(directory="static"), name="static")
 
 # Templates
 templates = Jinja2Templates(directory="templates")
+templates.env.globals["static_asset_version"] = _static_asset_version()
 
 # HTTP Basic Auth for admin
 security = HTTPBasic()

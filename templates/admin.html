@@ -4,14 +4,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Admin - Radeon Cloud</title>
-  <link rel="stylesheet" href="/static/vendor/antd-reset.css" />
-  <script src="/static/vendor/react.production.min.js"></script>
-  <script src="/static/vendor/react-dom.production.min.js"></script>
-  <script src="/static/vendor/dayjs.min.js"></script>
-  <script src="/static/vendor/antd.min.js"></script>
-<script src="/static/vendor/echarts.min.js"></script>
+  <link rel="stylesheet" href="/static/vendor/antd-reset.css?v={{ static_asset_version }}" />
+  <link rel="preload" href="/static/vendor/react.production.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="/static/vendor/dayjs.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="/static/vendor/antd.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="/static/vendor/echarts.min.js?v={{ static_asset_version }}" as="script" />
   <style>
     body { margin:0; background:#f5f6fb; }
+    .boot-shell { min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; background:#f5f6fb; color:#20263a; }
+    .boot-brand { display:flex; align-items:center; gap:12px; font-size:20px; font-weight:800; }
+    .boot-brand img { width:40px; height:40px; object-fit:contain; }
+    .boot-line { width:160px; height:3px; overflow:hidden; border-radius:999px; background:#d9deea; position:relative; }
+    .boot-line:after { content:""; position:absolute; inset:0; width:42%; border-radius:999px; background:#20263a; animation:bootSlide 1.15s ease-in-out infinite; }
+    @keyframes bootSlide { 0% { transform:translateX(-120%); } 100% { transform:translateX(260%); } }
     .header { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:12px 28px; background:#fff; border-bottom:1px solid #edf0f5; }
     .brand { display:flex; align-items:center; gap:12px; font-size:20px; font-weight:800; min-width:0; }
     .brand img { width:40px; height:40px; object-fit:contain; flex:0 0 40px; }
@@ -32,7 +38,17 @@
   </style>
 </head>
 <body>
-<div id="root"></div>
+<div id="root">
+  <div class="boot-shell">
+    <div class="boot-brand"><img src="/static/vendor/amd-logo.png?v={{ static_asset_version }}" alt="AMD" /><span>Radeon Cloud Admin</span></div>
+    <div class="boot-line"></div>
+  </div>
+</div>
+  <script src="/static/vendor/react.production.min.js?v={{ static_asset_version }}"></script>
+  <script src="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}"></script>
+  <script src="/static/vendor/dayjs.min.js?v={{ static_asset_version }}"></script>
+  <script src="/static/vendor/antd.min.js?v={{ static_asset_version }}"></script>
+<script src="/static/vendor/echarts.min.js?v={{ static_asset_version }}"></script>
 <script>
 const { Button, Card, Form, Input, InputNumber, Layout, Menu, Modal, Select, Space, Statistic, Table, Tag, Typography, Popconfirm, message } = antd;
 const { Header, Content } = Layout;
@@ -192,7 +208,7 @@ function App(){
 
   return React.createElement(Layout,null,
     React.createElement(Header,{className:'header'},
-      React.createElement('div',{className:'brand'},React.createElement('img',{src:'/static/vendor/amd-logo.png'}),React.createElement('span',null,'Radeon Cloud Admin')),
+      React.createElement('div',{className:'brand'},React.createElement('img',{src:'/static/vendor/amd-logo.png?v={{ static_asset_version }}'}),React.createElement('span',null,'Radeon Cloud Admin')),
       React.createElement('div',{className:'header-actions'},React.createElement(Button,{href:'/'},'Notebook'),React.createElement(Button,{onClick:load},'Refresh'))
     ),
     React.createElement(Content,{className:'content'},
