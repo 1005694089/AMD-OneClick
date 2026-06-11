@@ -172,6 +172,10 @@ class Settings:
         "CUSTOM_IMAGE_REGISTRY",
         f"{ENTERPRISE_REGISTRY_HOST}/cloud_user",
     ).rstrip("/")
+    # Optional full repository for custom images when the push credential is
+    # scoped to an existing ACR repo. Tags are generated as user-<id>-<name>.
+    CUSTOM_IMAGE_REPOSITORY: str = os.getenv("CUSTOM_IMAGE_REPOSITORY", "").rstrip("/")
+
     CUSTOM_IMAGE_MAX_PER_USER: int = int(os.getenv("CUSTOM_IMAGE_MAX_PER_USER", "2"))
     CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS", "1800"))
     CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES: int = int(os.getenv("CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES", "65536"))

@@ -991,6 +991,12 @@ async def list_my_custom_images(user: dict = Depends(current_user)):
     }
 
 
+def _custom_image_tag(user_id: int, name: str) -> str:
+    if settings.CUSTOM_IMAGE_REPOSITORY:
+        return f"{settings.CUSTOM_IMAGE_REPOSITORY}:user-{user_id}-{name}"
+    return f"{settings.CUSTOM_IMAGE_REGISTRY}/user-{user_id}:{name}"
+
+
 @app.post("/api/custom-images/build")
 async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(current_user)):
     name = (req.name or "").strip().lower()
@@ -1008,7 +1014,7 @@ async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(
             detail=f"Dockerfile exceeds {settings.CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES} bytes",
         )
 
-    image_tag = f"{settings.CUSTOM_IMAGE_REGISTRY}/user-{user['id']}:{name}"
+    image_tag = _custom_image_tag(user["id"], name)
     try:
         record = create_custom_image(
             user["id"], name, image_tag, dockerfile, settings.CUSTOM_IMAGE_MAX_PER_USER

@@ -80,6 +80,7 @@ data:
   ENTERPRISE_REGISTRY_HOST: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com"
   ADMIN_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin"
   CUSTOM_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/cloud_user"
+  CUSTOM_IMAGE_REPOSITORY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick"
   CUSTOM_IMAGE_PULL_SECRET_NAME: "acr-enterprise-pull"
   IMAGE_PULL_SECRET_REGISTRY_HOSTS: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com"
   CPU_LIMIT: "16"

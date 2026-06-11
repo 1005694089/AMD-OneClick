@@ -121,12 +121,13 @@ class K8sClient:
             settings.DEFAULT_IMAGE,
             settings.ADMIN_IMAGE_REGISTRY,
             settings.CUSTOM_IMAGE_REGISTRY,
+            settings.CUSTOM_IMAGE_REPOSITORY,
             settings.OSSUTIL_IMAGE,
             *settings.IMAGE_PULL_SECRET_REGISTRY_HOSTS,
         }
         for prefix in prefixes:
             prefix = (prefix or "").strip().rstrip("/")
-            if prefix and (image == prefix or image.startswith(f"{prefix}/")):
+            if prefix and (image == prefix or image.startswith(f"{prefix}/") or image.startswith(f"{prefix}:")):
                 return True
         return False
 
