@@ -333,6 +333,20 @@ def ensure_default_image(conn):
     exists = conn.execute(select(images.c.id).where(images.c.image == settings.DEFAULT_IMAGE)).first()
     if exists:
         return
+    existing_named = conn.execute(select(images.c.id).where(images.c.name == "AMD OneClick Base")).first()
+    if existing_named:
+        conn.execute(
+            update(images)
+            .where(images.c.id == existing_named.id)
+            .values(
+                image=settings.DEFAULT_IMAGE,
+                description="Default ROCm Jupyter/OpenCode image",
+                enabled=True,
+                sync_status="ready",
+                updated_at=now,
+            )
+        )
+        return
     conn.execute(
         images.insert().values(
             name="AMD OneClick Base",
@@ -348,8 +362,17 @@ def ensure_default_image(conn):
 
 def ensure_default_blank_template(conn):
     now = utc_now()
-    exists = conn.execute(select(notebook_templates.c.id).where(notebook_templates.c.slug == "blank-opencode-workspace")).first()
+    exists = conn.execute(
+        select(notebook_templates.c.id, notebook_templates.c.image)
+        .where(notebook_templates.c.slug == "blank-opencode-workspace")
+    ).first()
     if exists:
+        if exists.image != settings.DEFAULT_IMAGE:
+            conn.execute(
+                update(notebook_templates)
+                .where(notebook_templates.c.id == exists.id)
+                .values(image=settings.DEFAULT_IMAGE, updated_at=now)
+            )
         return
     conn.execute(
         notebook_templates.insert().values(
