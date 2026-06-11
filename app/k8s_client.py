@@ -138,9 +138,19 @@ class K8sClient:
             return [{"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME}]
         return []
 
+    def _prepull_tolerations(self) -> list[dict]:
+        return [
+            {"key": "amd.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+        ]
+
     def _node_is_ready_for_scheduling(self, node) -> bool:
         if getattr(node.spec, "unschedulable", False):
             return False
+        for taint in getattr(node.spec, "taints", None) or []:
+            if taint.key == "amd.com/gpu":
+                continue
+            if taint.effect in {"NoSchedule", "NoExecute"}:
+                return False
         for condition in node.status.conditions or []:
             if condition.type == "Ready":
                 return condition.status == "True"
@@ -928,7 +938,7 @@ done
                 "template": {
                     "metadata": {"labels": labels},
                     "spec": {
-                        "tolerations": [{"operator": "Exists"}],
+                        "tolerations": self._prepull_tolerations(),
                         "containers": [
                             {
                                 "name": "pull",
@@ -973,11 +983,14 @@ done
                     continue
                 if not any(ref.uid == ds_uid for ref in (pod.metadata.owner_references or [])):
                     continue
+                containers = pod.spec.containers or []
+                if not containers or containers[0].image != image:
+                    continue
                 statuses = pod.status.container_statuses or []
                 if not statuses:
                     continue
                 status = statuses[0]
-                if status.image == image and status.image_id:
+                if status.ready and status.image_id:
                     pulled_nodes.add(pod.spec.node_name)
 
             ready = len(pulled_nodes)
@@ -1031,7 +1044,7 @@ done
                 raise
 
         pod_spec = {
-            "tolerations": [{"operator": "Exists"}],
+            "tolerations": self._prepull_tolerations(),
             "containers": [
                 {
                     "name": "pull",
