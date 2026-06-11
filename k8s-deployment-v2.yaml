@@ -23,6 +23,9 @@ rules:
     resources: ["services"]
     verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
@@ -48,6 +51,33 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: amd-oneclick-manager-v2-network-disk
+subjects:
+  - kind: ServiceAccount
+    name: amd-oneclick-manager-v2
+    namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: amd-oneclick-manager-v2-nodeport-reader
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: amd-oneclick-manager-v2-nodeport-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: amd-oneclick-manager-v2-nodeport-reader
 subjects:
   - kind: ServiceAccount
     name: amd-oneclick-manager-v2
@@ -145,7 +175,7 @@ metadata:
   namespace: default
 data:
   K8S_NAMESPACE: "default"
-  DEFAULT_IMAGE: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+  DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
   ENTERPRISE_REGISTRY_HOST: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com"
   ADMIN_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin"
   CUSTOM_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/cloud_user"
@@ -178,6 +208,8 @@ data:
   PUBLIC_BASE_URL: "https://radeon.anruicloud.com"
   NODE_PORT_BASE: "30000"
   NOTEBOOK_TOKEN: "amd-oneclick"
+  IMAGE_CACHE_NODE_AFFINITY_ENABLED: "true"
+  K8S_READ_TIMEOUT_SECONDS: "5"
   NOTEBOOK_LABEL_PREFIX: "amd-oneclick-v2"
   POD_CREATE_RETRY_ATTEMPTS: "30"
   POD_CREATE_RETRY_DELAY_SECONDS: "5"
