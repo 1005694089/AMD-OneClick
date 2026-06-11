@@ -166,20 +166,24 @@ class K8sClient:
         return node_names
 
     def _image_cache_node_affinity(self, image: str) -> Optional[dict]:
-        node_names = self._cached_image_node_names(image)
+        node_names = list(dict.fromkeys(name for name in self._cached_image_node_names(image) if name))
         if not node_names:
             return None
         logger.info("Restricting notebook image %s to %s cached nodes", image, len(node_names))
+        # Kubernetes node field selectors accept exactly one value per
+        # metadata.name In/NotIn requirement, so OR one term per cached node.
+        node_selector_terms = [
+            {
+                "matchFields": [
+                    {"key": "metadata.name", "operator": "In", "values": [node_name]}
+                ]
+            }
+            for node_name in node_names
+        ]
         return {
             "nodeAffinity": {
                 "requiredDuringSchedulingIgnoredDuringExecution": {
-                    "nodeSelectorTerms": [
-                        {
-                            "matchFields": [
-                                {"key": "metadata.name", "operator": "In", "values": node_names}
-                            ]
-                        }
-                    ]
+                    "nodeSelectorTerms": node_selector_terms
                 }
             }
         }
