@@ -4,11 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Radeon Cloud</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/reset.css" />
-  <script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
+  <link rel="stylesheet" href="/static/vendor/antd-reset.css" />
+  <script src="/static/vendor/react.production.min.js"></script>
+  <script src="/static/vendor/react-dom.production.min.js"></script>
+  <script src="/static/vendor/dayjs.min.js"></script>
+  <script src="/static/vendor/antd.min.js"></script>
   <style>
     body { margin: 0; background: #f5f6fb; }
     #root { min-height: 100vh; }
@@ -83,9 +83,9 @@
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
 
-    const JUPYTER_LOGO = 'https://cdn.jsdelivr.net/npm/simple-icons@13/icons/jupyter.svg';
-    const OPENCODE_LOGO = 'https://opencode.ai/favicon.svg';
-    const HERMES_LOGO = 'https://hermes-agent.nousresearch.com/favicon.ico';
+    const JUPYTER_LOGO = '/static/vendor/jupyter.svg';
+    const OPENCODE_LOGO = '/static/vendor/opencode.svg';
+    const HERMES_LOGO = '/static/vendor/hermes.ico';
     // Render a brand logo with a small, always-visible one-word label next to it.
     // If the logo fails to load, the label alone still identifies the button.
     function brandContent(src, alt, label) {
@@ -418,7 +418,7 @@
       return React.createElement(Layout, null,
         React.createElement(Header, { className: 'app-header' },
           React.createElement('div', { className: 'left-header' },
-            React.createElement('div', { className: 'brand' }, React.createElement('img', { src: 'https://amd-ai-academy.com/static/image.png' }), React.createElement('span', null, 'Radeon Cloud')),
+            React.createElement('div', { className: 'brand' }, React.createElement('img', { src: '/static/vendor/amd-logo.png' }), React.createElement('span', null, 'Radeon Cloud')),
             React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'space', label: 'Space', disabled: true }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 300 } })
           ), React.createElement(UserMenu)
         ),

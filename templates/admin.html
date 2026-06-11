@@ -4,12 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Admin - Radeon Cloud</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/reset.css" />
-  <script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
+  <link rel="stylesheet" href="/static/vendor/antd-reset.css" />
+  <script src="/static/vendor/react.production.min.js"></script>
+  <script src="/static/vendor/react-dom.production.min.js"></script>
+  <script src="/static/vendor/dayjs.min.js"></script>
+  <script src="/static/vendor/antd.min.js"></script>
+<script src="/static/vendor/echarts.min.js"></script>
   <style>
     body { margin:0; background:#f5f6fb; }
     .header { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:12px 28px; background:#fff; border-bottom:1px solid #edf0f5; }
@@ -192,7 +192,7 @@ function App(){
 
   return React.createElement(Layout,null,
     React.createElement(Header,{className:'header'},
-      React.createElement('div',{className:'brand'},React.createElement('img',{src:'https://amd-ai-academy.com/static/image.png'}),React.createElement('span',null,'Radeon Cloud Admin')),
+      React.createElement('div',{className:'brand'},React.createElement('img',{src:'/static/vendor/amd-logo.png'}),React.createElement('span',null,'Radeon Cloud Admin')),
       React.createElement('div',{className:'header-actions'},React.createElement(Button,{href:'/'},'Notebook'),React.createElement(Button,{onClick:load},'Refresh'))
     ),
     React.createElement(Content,{className:'content'},
