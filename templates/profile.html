@@ -50,6 +50,9 @@
     const activeInstance = {{ (active_instance or {}) | tojson }};
     const githubEnabled = {{ github_enabled | tojson }};
     const modelscopeEnabled = {{ modelscope_enabled | tojson }};
+    const ssoEnabled = {{ sso_enabled | tojson }};
+    const ssoBindEntryUrl = {{ sso_bind_entry_url | tojson }};
+    const ssoBindReturnQueryKey = {{ sso_bind_return_query_key | tojson }};
     const couponRedeemEnabled = {{ coupon_redeem_enabled | tojson }};
     const couponRedeemDisabledMessage = {{ coupon_redeem_disabled_message | tojson }};
     const DEFAULT_DOCKERFILE = [
@@ -81,6 +84,20 @@
       );
     }
 
+
+    function buildBindRedirectUrl() {
+      const url = new URL(window.location.href);
+      url.searchParams.set(ssoBindReturnQueryKey || 'bind', '1');
+      return `${ssoBindEntryUrl}${encodeURIComponent(url.toString())}`;
+    }
+
+    async function confirmBindAccount() {
+      const res = await fetch('/api/account/bind', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Bind account failed');
+      return data;
+    }
+
     function avatarNode(u, size=48) {
       if (!u || !u.email) return React.createElement(Avatar, { size, style:{ background:'linear-gradient(135deg,#8ea7ff,#b865ff)' } }, '?');
       if (u.avatar_url) return React.createElement(Avatar, { src:u.avatar_url, size });
@@ -89,6 +106,9 @@
 
     function UserMenu() {
       if (!user || !user.email) {
+        if (ssoEnabled) {
+          return React.createElement(Button, {shape:'round', href:`${ssoBindEntryUrl}${encodeURIComponent(window.location.href)}`}, 'Login');
+        }
         const items = [
           githubEnabled ? { key:'github', label:React.createElement('a', {href:'/auth/github/login'}, 'Login with GitHub') } : null,
           modelscopeEnabled ? { key:'modelscope', label:React.createElement('a', {href:'/auth/modelscope/login'}, 'Login with ModelScope') } : null,
@@ -97,8 +117,11 @@
       }
       const items = [
         { key:'profile', label:React.createElement('a', {href:'/profile'}, 'Profile') },
-        { key:'github', label:React.createElement('a', {href:'/auth/github/login'}, 'Switch to GitHub') },
-        { key:'modelscope', label:React.createElement('a', {href:'/auth/modelscope/login'}, 'Switch to ModelScope') },
+        ...(user.needs_bind ? [{ key:'bind', label:React.createElement('a', {href:buildBindRedirectUrl()}, 'Bind Account') }] : []),
+        ...(ssoEnabled ? [] : [
+          { key:'github', label:React.createElement('a', {href:'/auth/github/login'}, 'Switch to GitHub') },
+          { key:'modelscope', label:React.createElement('a', {href:'/auth/modelscope/login'}, 'Switch to ModelScope') },
+        ]),
         { type:'divider' },
         { key:'logout', label:React.createElement('a', {href:'/auth/logout'}, 'Logout') },
       ];
