@@ -66,7 +66,7 @@ class Settings:
 
     DEFAULT_IMAGE: str = os.getenv(
         "DEFAULT_IMAGE",
-        "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+        f"{ENTERPRISE_REGISTRY_HOST}/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416",
     )
 
     @property

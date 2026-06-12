@@ -76,7 +76,7 @@ metadata:
   namespace: default
 data:
   K8S_NAMESPACE: "default"
-  DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+  DEFAULT_IMAGE: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
   ENTERPRISE_REGISTRY_HOST: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com"
   ADMIN_IMAGE_REGISTRY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin"
   ADMIN_IMAGE_UPLOAD_REPOSITORY: "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com/admin/radeon-admin-upload"
