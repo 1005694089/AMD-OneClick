@@ -4,6 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Preview Syncing - Radeon Cloud</title>
+  <script>window.__APP_BASE_PATH__ = {{ app_base_path | tojson }};</script>
+  <script src="{{ public_path('/static/app-path.js') }}"></script>
   <style>
     body { margin:0; min-height:100vh; display:grid; place-items:center; background:#f7f8fc; color:#1f2430; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     .card { width:min(720px, calc(100vw - 40px)); background:#fff; border:1px solid #e7eaf2; border-radius:24px; padding:34px; box-shadow:0 24px 60px rgba(30,34,60,.12); }
@@ -27,7 +29,7 @@
     <div class="actions">
       <button class="btn" id="refreshBtn">Refresh</button>
       <button class="btn secondary" id="retryBtn" style="display:none">Retry Sync</button>
-      <a class="btn secondary" href="/">Back to Gallery</a>
+      <a class="btn secondary" href="{{ public_path('/') }}">Back to Gallery</a>
     </div>
   </main>
   <script>
@@ -52,7 +54,7 @@
       retry.onclick = async () => {
         retry.disabled = true;
         retry.textContent = 'Retrying...';
-        const res = await fetch(`/api/profile/templates/${template.id}/sync-preview`, { method:'POST' });
+        const res = await fetch(appUrl(`/api/profile/templates/${template.id}/sync-preview`), { method:'POST' });
         retry.textContent = res.ok ? 'Sync Queued' : 'Retry Failed';
         setTimeout(() => window.location.reload(), 1600);
       };

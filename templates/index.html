@@ -130,7 +130,7 @@
     }
 
     async function confirmBindAccount() {
-      const res = await fetch('/api/account/bind', { method: 'POST' });
+      const res = await fetch(appUrl('/api/account/bind'), { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || 'Bind account failed');
       return data;
@@ -148,8 +148,8 @@
           return React.createElement(Button, { shape: 'round', href: `${ssoBindEntryUrl}${encodeURIComponent(window.location.href)}` }, 'Login');
         }
         const items = [
-          { key: 'github', label: React.createElement('a', { href: '/auth/github/login' }, 'Login with GitHub') },
-          { key: 'modelscope', label: React.createElement('a', { href: '/auth/modelscope/login' }, 'Login with ModelScope') },
+          { key: 'github', label: React.createElement('a', { href: appUrl('/auth/github/login') }, 'Login with GitHub') },
+          { key: 'modelscope', label: React.createElement('a', { href: appUrl('/auth/modelscope/login') }, 'Login with ModelScope') },
         ];
         if (showWorkshopLogin) items.unshift({ key: 'workshop', label: React.createElement('span', { onClick: () => window.dispatchEvent(new Event('open-workshop-login')) }, 'Workshop Login') });
         return React.createElement(Dropdown, { menu: { items }, placement: 'bottomRight', trigger: ['click'] }, React.createElement(Button, { shape: 'round' }, 'Login'));
@@ -157,7 +157,7 @@
       const items = [
         { key: 'user', disabled: true, label: React.createElement('div', null, React.createElement('strong', null, currentUser.email), React.createElement('br'), React.createElement(Text, { type: 'secondary' }, `${currentUser.provider} · ${currentUser.credits} credits`)) },
         { type: 'divider' },
-        { key: 'profile', label: React.createElement('a', { href: '/profile' }, 'Profile') },
+        { key: 'profile', label: React.createElement('a', { href: appUrl('/profile') }, 'Profile') },
         ...(currentUser.needs_bind ? [{ key: 'bind', label: React.createElement('a', { href: buildBindRedirectUrl() }, 'Bind Account') }] : []),
         ...(ssoEnabled ? [] : [
           { key: 'github', label: React.createElement('a', { href: '/auth/github/login' }, 'Switch to GitHub') },
@@ -236,10 +236,10 @@
       async function loginWorkshop(values) {
         setWorkshopLoginLoading(true);
         try {
-          const res = await fetch('/auth/workshop/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(values) });
+          const res = await fetch(appUrl('/auth/workshop/login'), { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(values) });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Workshop login failed');
-          window.location.href = '/';
+          window.location.href = appUrl('/');
         } catch (err) {
           message.error(err.message || 'Workshop login failed');
         } finally {
@@ -257,7 +257,7 @@
         setCreateLoading(true);
         try {
           const payload = { ...values, tags: values.tags || '', enabled: !!currentUser.is_editor, sort_order: 0 };
-          const res = await fetch('/api/profile/templates', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+          const res = await fetch(appUrl('/api/profile/templates'), { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Template create failed');
           message.success('Template created');
@@ -276,7 +276,7 @@
         const values = await form.validateFields();
         setNotebookLoading(true); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
         try {
-          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode' }) });
+          const res = await fetch(appUrl('/api/notebook/request'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode' }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           pollStatus(data.url, { type: 'notebook' }); message.success('Instance requested');
@@ -287,7 +287,7 @@
         const gpuCount = form.getFieldValue('gpu_count') || 1;
         setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
         try {
-          const res = await fetch(`/api/templates/${tpl.id}/launch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gpu_count: gpuCount }) });
+          const res = await fetch(appUrl(`/api/templates/${tpl.id}/launch`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gpu_count: gpuCount }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           pollStatus(data.url, { type: 'template', templateId: tpl.id }); message.success(`Launching ${tpl.title}`);
@@ -316,7 +316,7 @@
         const timer = setInterval(async () => {
           attempts += 1;
           try {
-            const res = await fetch('/api/notebook/status');
+            const res = await fetch(appUrl('/api/notebook/status'));
             const data = await res.json();
             if (data.url) url = data.url;
             if (data.opencode_url) opencodeUrl = data.opencode_url;
@@ -442,7 +442,7 @@
               React.createElement('div', { className: 'template-desc' }, tpl.description || (hasNotebook(tpl) ? `${tpl.repo_url} · ${tpl.notebook_path}` : `${tpl.image.split('/').pop()} workspace`)),
               React.createElement('div', { className: 'template-meta' }, (tpl.tags || []).slice(0, 3).map(tag => React.createElement(Tag, { key: tag }, tag))),
               React.createElement('div', { className: 'template-actions' },
-                hasNotebook(tpl) && React.createElement(Button, { href: `/templates/${tpl.id}/preview`, target: '_blank' }, 'Preview'),
+                hasNotebook(tpl) && React.createElement(Button, { href: appUrl(`/templates/${tpl.id}/preview`), target: '_blank' }, 'Preview'),
                 readyTemplateId === tpl.id && readyUrl
                   ? React.createElement(Button, { type:'primary', ghost: true, href: readyUrl, target: '_blank', title: 'Open Notebook (Jupyter)' }, brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter'))
                   : React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch'),
@@ -502,8 +502,8 @@
           ) : React.createElement('div', null,
             React.createElement(Paragraph, null, 'Login first to create your own Gallery template.'),
             React.createElement(Space, null,
-              React.createElement(Button, { type:'primary', href:'/auth/github/login' }, 'Login with GitHub'),
-              React.createElement(Button, { href:'/auth/modelscope/login' }, 'Login with ModelScope')
+              React.createElement(Button, { type:'primary', href:appUrl('/auth/github/login') }, 'Login with GitHub'),
+              React.createElement(Button, { href:appUrl('/auth/modelscope/login') }, 'Login with ModelScope')
             )
           )
         ),

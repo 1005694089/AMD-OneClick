@@ -77,7 +77,7 @@ function App(){
   async function load(){
     setLoading(true);
     try{
-      const [imgRes, instRes, userRes, tplRes, statsRes] = await Promise.all([fetch('/api/admin/images'), fetch('/api/admin/instances'), fetch('/api/admin/users'), fetch('/api/admin/templates'), fetch('/api/admin/stats')]);
+      const [imgRes, instRes, userRes, tplRes, statsRes] = await Promise.all([fetch(appUrl('/api/admin/images')), fetch(appUrl('/api/admin/instances')), fetch(appUrl('/api/admin/users')), fetch(appUrl('/api/admin/templates')), fetch(appUrl('/api/admin/stats'))]);
       const imgData = await imgRes.json();
       const instData = await instRes.json();
       const userData = await userRes.json();
@@ -121,9 +121,9 @@ function App(){
       form.resetFields(); setImageModalOpen(false); load();
     } else message.error(data.detail || 'Failed to add image');
   }
-  async function syncImage(id){ const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Sync started':'Sync failed'); load(); }
-  async function deleteImage(id){ const r=await fetch(`/api/admin/images/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Deleted':'Delete failed'); load(); }
-  async function deleteInstance(id){ const r=await fetch(`/api/admin/instance/${encodeURIComponent(id)}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Destroyed':'Destroy failed'); load(); }
+  async function syncImage(id){ const r=await fetch(appUrl(`/api/admin/images/${id}/sync`),{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Sync started':'Sync failed'); load(); }
+  async function deleteImage(id){ const r=await fetch(appUrl(`/api/admin/images/${id}`),{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Deleted':'Delete failed'); load(); }
+  async function deleteInstance(id){ const r=await fetch(appUrl(`/api/admin/instance/${encodeURIComponent(id)}`),{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Destroyed':'Destroy failed'); load(); }
   function openTemplateModal(record){
     setEditingTemplate(record||null);
     templateForm.setFieldsValue(record ? {...record, tags:(record.tags||[]).join(', ')} : {branch:'main', enabled:true, sort_order:0});
@@ -131,18 +131,18 @@ function App(){
   }
   async function saveTemplate(values){
     const payload = {...values, enabled: values.enabled !== false, tags: values.tags || ''};
-    const url = editingTemplate ? `/api/admin/templates/${editingTemplate.id}` : '/api/admin/templates';
+    const url = editingTemplate ? appUrl(`/api/admin/templates/${editingTemplate.id}`) : appUrl('/api/admin/templates');
     const res = await fetch(url,{method:editingTemplate?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     if(res.ok){ message.success(editingTemplate?'Template updated':'Template added'); templateForm.resetFields(); setEditingTemplate(null); setTemplateModalOpen(false); load(); } else {
       const data = await res.json().catch(()=>({detail:'Template save failed'}));
       message.error(data.detail || 'Template save failed');
     }
   }
-  async function deleteTemplate(id){ const r=await fetch(`/api/admin/templates/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Template deleted':'Delete failed'); load(); }
+  async function deleteTemplate(id){ const r=await fetch(appUrl(`/api/admin/templates/${id}`),{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Template deleted':'Delete failed'); load(); }
   async function bulkDestroyInstances(values){
     setBulkDestroyLoading(true);
     try{
-      const res=await fetch('/api/admin/instances/bulk-destroy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({matcher:values.matcher})});
+      const res=await fetch(appUrl('/api/admin/instances/bulk-destroy'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({matcher:values.matcher})});
       const data=await res.json().catch(()=>({detail:'Bulk destroy failed'}));
       if(!res.ok) throw new Error(data.detail || 'Bulk destroy failed');
       message[data.failed_count?'warning':'success'](`Destroyed ${data.destroyed_count || 0}/${data.matched_count || 0} matched instances`);
@@ -157,7 +157,7 @@ function App(){
   }
   async function grantCredits(values){
     if(!creditModalUser) return;
-    const res=await fetch(`/api/admin/users/${creditModalUser.id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
+    const res=await fetch(appUrl(`/api/admin/users/${creditModalUser.id}/credits`),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
     if(res.ok){ message.success('Credits granted'); creditForm.resetFields(); setCreditModalUser(null); load(); } else {
       const data = await res.json().catch(()=>({detail:'Failed to grant credits'}));
       message.error(data.detail || 'Failed to grant credits');
@@ -185,7 +185,7 @@ function App(){
     {title:'Source',width:360,render:(_,r)=>r.repo_url&&r.notebook_path?React.createElement('div',null,React.createElement(Text,{code:true,copyable:true,className:'table-code',title:r.repo_url},r.repo_url),React.createElement('br'),React.createElement(Text,{type:'secondary'},`${r.branch}/${r.notebook_path}`)):React.createElement(Tag,{color:'blue'},'Image only')},
     {title:'Status',dataIndex:'enabled',width:100,render:v=>React.createElement(Tag,{color:v?'green':'default'},v?'enabled':'disabled')},
     {title:'Actions',width:210,render:(_,r)=>React.createElement(Space,null,
-      r.repo_url&&r.notebook_path&&React.createElement(Button,{size:'small',href:`/templates/${r.id}/preview`,target:'_blank'},'Preview'),
+      r.repo_url&&r.notebook_path&&React.createElement(Button,{size:'small',href:appUrl(`/templates/${r.id}/preview`),target:'_blank'},'Preview'),
       React.createElement(Button,{size:'small',onClick:()=>openTemplateModal(r)},'Edit'),
       React.createElement(Popconfirm,{title:'Delete template?',onConfirm:()=>deleteTemplate(r.id)},React.createElement(Button,{size:'small',danger:true},'Delete'))
     )}

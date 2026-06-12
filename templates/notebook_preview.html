@@ -100,7 +100,8 @@
 
     function resolveAssetUrl(url) {
       const clean = String(url || '').trim();
-      if (!clean || /^(https?:|data:|\/|#)/i.test(clean)) return clean;
+      if (!clean || /^(https?:|data:|#)/i.test(clean) || clean.startsWith('//')) return clean;
+      if (clean.startsWith('/')) return appUrl(clean);
       return assetBaseUrl + clean.split('/').map(encodeURIComponent).join('/');
     }
 
@@ -147,7 +148,7 @@
       const timer = setInterval(async () => {
         attempts += 1;
         try {
-          const res = await fetch('/api/notebook/status');
+          const res = await fetch(appUrl('/api/notebook/status'));
           const data = await res.json();
           if (data.url) url = data.url;
           if (data.status === 'ready') {
@@ -173,7 +174,7 @@
       button.textContent = 'Launching...';
       setStatus('Creating your notebook instance...');
       try {
-        const res = await fetch(`/api/templates/${template.id}/launch`, {
+        const res = await fetch(appUrl(`/api/templates/${template.id}/launch`), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ gpu_count: 1 })
