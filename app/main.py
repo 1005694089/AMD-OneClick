@@ -664,6 +664,8 @@ def _decode_credit_coupon(encrypted_coupon_b64: str) -> dict:
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, response: Response, user: Optional[dict] = Depends(session_user)):
     """Render the main request page"""
+    if settings.PUBLIC_PATH_PREFIX and request.url.path == "/":
+        return RedirectResponse(_public_path("/"))
     images = list_images(enabled_only=True)
     notebook_templates = list_notebook_templates(enabled_only=True)
     # Also surface the logged-in user's own templates (including profile-only ones, e.g.
