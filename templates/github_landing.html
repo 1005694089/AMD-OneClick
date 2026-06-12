@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AMD OneClick - Loading Notebook</title>
+    <script>window.__APP_BASE_PATH__ = {{ app_base_path | tojson }};</script>
+    <script src="{{ public_path('/static/app-path.js') }}"></script>
     <style>
         * {
             margin: 0;
@@ -300,7 +302,7 @@
                     branch: githubBranch,
                     path: githubPath
                 });
-                const response = await fetch('/api/github/notebook/create?' + params.toString(), {
+                const response = await fetch(appUrl('/api/github/notebook/create?' + params.toString()), {
                     method: 'POST'
                 });
 
@@ -332,7 +334,7 @@
 
         async function checkStatus() {
             try {
-                const response = await fetch(`/api/github/notebook/status?instance_id=${encodeURIComponent(instanceId)}`);
+                const response = await fetch(appUrl(`/api/github/notebook/status?instance_id=${encodeURIComponent(instanceId)}`));
                 const data = await response.json();
 
                 if (!response.ok) {

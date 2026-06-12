@@ -99,6 +99,8 @@ class K8sClient:
         }
     
     def _jupyter_base_url(self, instance_id: str) -> str:
+        if settings.PUBLIC_PATH_PREFIX:
+            return f"{settings.PUBLIC_PATH_PREFIX}/instances/{instance_id}/"
         return f"/instances/{instance_id}/"
 
     def _workspace_host_path(self, instance_id: str) -> str:

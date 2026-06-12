@@ -3,6 +3,24 @@ Configuration settings for AMD OneClick Notebook Manager
 """
 import os
 from typing import Optional
+from urllib.parse import urlparse
+
+
+def _normalize_path_prefix(value: str) -> str:
+    prefix = (value or "").strip()
+    if not prefix or prefix == "/":
+        return ""
+    return "/" + prefix.strip("/")
+
+
+def _path_prefix_from_public_base_url(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("/"):
+        return urlparse(raw).path
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    return parsed.path
 
 
 INSTANCE_TYPES = {
@@ -134,6 +152,10 @@ class Settings:
 
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
+    PUBLIC_PATH_PREFIX: str = _normalize_path_prefix(
+        os.getenv("PUBLIC_PATH_PREFIX", "")
+        or _path_prefix_from_public_base_url(os.getenv("PUBLIC_BASE_URL", ""))
+    )
     NODE_PORT_BASE: int = int(os.getenv("NODE_PORT_BASE", "30000"))
 
     PYPI_MIRROR: str = "https://pypi.tuna.tsinghua.edu.cn/simple"

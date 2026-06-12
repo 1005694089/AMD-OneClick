@@ -104,7 +104,8 @@ app = FastAPI(
     title="AMD OneClick Notebook Manager",
     description="Kubernetes-based Jupyter Notebook instance management",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    root_path=settings.PUBLIC_PATH_PREFIX,
 )
 if not settings.SSO_ENABLED:
     app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET)
@@ -128,6 +129,39 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Templates
 templates = Jinja2Templates(directory="templates")
+
+
+def _public_path(path: str = "/") -> str:
+    value = str(path or "/")
+    if value.startswith(("http://", "https://", "mailto:", "tel:", "data:", "blob:", "#")):
+        return value
+    if value.startswith("//"):
+        return value
+    if not value.startswith("/"):
+        value = f"/{value}"
+
+    prefix = settings.PUBLIC_PATH_PREFIX
+    if not prefix:
+        return value
+    if value == prefix or value.startswith(f"{prefix}/") or value.startswith(f"{prefix}?"):
+        return value
+    if value == "/":
+        return f"{prefix}/"
+    return f"{prefix}{value}"
+
+
+def _instance_route_path(instance_id: str, path: str = "") -> str:
+    suffix = str(path or "").lstrip("/")
+    base = f"/instances/{instance_id}/"
+    return f"{base}{suffix}" if suffix else base
+
+
+def _instance_jupyter_path(instance_id: str, path: str = "") -> str:
+    return _public_path(_instance_route_path(instance_id, path))
+
+
+templates.env.globals["app_base_path"] = settings.PUBLIC_PATH_PREFIX
+templates.env.globals["public_path"] = _public_path
 
 # HTTP Basic Auth for admin
 security = HTTPBasic()
@@ -323,11 +357,17 @@ def _request_public_origin(request: Request) -> str:
     return f"{proto}://{host}".rstrip("/")
 
 
+def _request_public_base_url(request: Request) -> str:
+    if settings.PUBLIC_BASE_URL:
+        return settings.PUBLIC_BASE_URL.rstrip("/")
+    return f"{_request_public_origin(request)}{settings.PUBLIC_PATH_PREFIX}".rstrip("/")
+
+
 def _instance_public_url(request: Request, instance_id: str, notebook_path: Optional[str] = None) -> str:
     path = f"/instances/{instance_id}/lab"
     if notebook_path:
         path += f"/tree/{quote(notebook_path.lstrip('/'), safe='/')}"
-    return f"{_request_public_origin(request)}{path}?token={settings.NOTEBOOK_TOKEN}"
+    return f"{_request_public_base_url(request)}{path}?token={settings.NOTEBOOK_TOKEN}"
 
 
 def _validate_resource_profile(profile: Optional[str]) -> str:
@@ -429,11 +469,15 @@ def _proxy_headers(headers) -> dict:
 
 
 def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
-    public_prefix = f"/instances/{instance_id}/"
+    public_prefix = _public_path(f"/instances/{instance_id}/")
+    jupyter_prefix = _instance_jupyter_path(instance_id).rstrip("/")
+    if location.startswith(f"{target_base}{jupyter_prefix}"):
+        return location.replace(f"{target_base}{jupyter_prefix}", public_prefix.rstrip("/"), 1)
     if location.startswith(target_base):
-        return location.replace(target_base, public_prefix.rstrip("/"), 1)
+        rest = location[len(target_base):] or "/"
+        return _public_path(rest)
     if location.startswith("/"):
-        return location
+        return _public_path(location)
     return location
 
 
@@ -517,6 +561,9 @@ async def index(request: Request, user: Optional[dict] = Depends(session_user)):
             "active_instance_json": json.dumps(active_instance or {}),
             "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
             "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
+            "sso_enabled": settings.SSO_ENABLED,
+            "sso_bind_entry_url": settings.SSO_BIND_ENTRY_URL,
+            "sso_bind_return_query_key": settings.SSO_BIND_RETURN_QUERY_KEY,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
         },
@@ -603,7 +650,7 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
 
         await report_user_registered_event(user)
     request.session["user_id"] = user["id"]
-    return RedirectResponse("/")
+    return RedirectResponse(_public_path("/"))
 
 
 @app.get("/auth/modelscope/login")
@@ -679,17 +726,17 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
 
         await report_user_registered_event(user)
     request.session["user_id"] = user["id"]
-    return RedirectResponse("/")
+    return RedirectResponse(_public_path("/"))
 
 
 @app.get("/auth/logout")
 async def logout(request: Request):
     if settings.SSO_ENABLED:
-        response = RedirectResponse("/")
+        response = RedirectResponse(_public_path("/"))
         await developer_logout(request, response)
         return response
     request.session.clear()
-    return RedirectResponse("/")
+    return RedirectResponse(_public_path("/"))
 
 
 @app.post("/auth/workshop/login")
@@ -942,8 +989,9 @@ async def profile_delete_template(template_id: int, user: dict = Depends(current
 
 
 @app.get("/api/templates/{template_id}/preview-status")
-async def template_preview_status(request: Request, template_id: int):
-    template = _template_accessible_to_user(template_id, session_user(request))
+async def template_preview_status(request: Request, response: Response, template_id: int):
+    user = await session_user(request, response)
+    template = _template_accessible_to_user(template_id, user)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     if not template.get("repo_url") or not template.get("notebook_path"):
@@ -968,8 +1016,8 @@ async def profile_sync_template_preview(template_id: int, user: dict = Depends(c
 
 
 @app.get("/templates/{template_id}/preview", response_class=HTMLResponse)
-async def preview_notebook_template(request: Request, template_id: int):
-    user = session_user(request)
+async def preview_notebook_template(request: Request, response: Response, template_id: int):
+    user = await session_user(request, response)
     template = _template_accessible_to_user(template_id, user)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -1015,15 +1063,16 @@ async def preview_notebook_template(request: Request, template_id: int):
         {
             "template_json": json.dumps(template),
             "notebook_json": json.dumps(notebook),
-            "asset_base_url": _template_asset_base_path(template_id, template["notebook_path"]),
+            "asset_base_url": _public_path(_template_asset_base_path(template_id, template["notebook_path"])),
             "preview_json": json.dumps(cache or {}),
         },
     )
 
 
 @app.get("/templates/{template_id}/assets/{asset_path:path}")
-async def preview_notebook_template_asset(request: Request, template_id: int, asset_path: str):
-    template = _template_accessible_to_user(template_id, session_user(request))
+async def preview_notebook_template_asset(request: Request, response: Response, template_id: int, asset_path: str):
+    user = await session_user(request, response)
+    template = _template_accessible_to_user(template_id, user)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     if not template.get("repo_url") or not template.get("notebook_path"):
@@ -1337,7 +1386,7 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request, use
         raise HTTPException(status_code=403, detail="Forbidden")
 
     target_base = _instance_service_base(instance_id)
-    target_url = f"{target_base}/instances/{instance_id}/{path}"
+    target_url = f"{target_base}{_instance_jupyter_path(instance_id, path)}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
@@ -1380,7 +1429,7 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
     await websocket.accept()
     try:
         target_base = _instance_service_base(instance_id).replace("http://", "ws://")
-        target_url = f"{target_base}/instances/{instance_id}/{path}"
+        target_url = f"{target_base}{_instance_jupyter_path(instance_id, path)}"
         if websocket.url.query:
             target_url += f"?{websocket.url.query}"
 

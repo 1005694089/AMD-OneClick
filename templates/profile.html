@@ -9,6 +9,8 @@
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
+  <script>window.__APP_BASE_PATH__ = {{ app_base_path | tojson }};</script>
+  <script src="{{ public_path('/static/app-path.js') }}"></script>
   <style>
     body { margin:0; background:#f5f6fb; }
     #root { min-height:100vh; }
@@ -47,7 +49,7 @@
     }
 
     async function confirmBindAccount() {
-      const res = await fetch('/api/account/bind', { method: 'POST' });
+      const res = await fetch(appUrl('/api/account/bind'), { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || 'Bind account failed');
       return data;
@@ -65,23 +67,23 @@
           return React.createElement(Button, {shape:'round', href:`${ssoBindEntryUrl}${encodeURIComponent(window.location.href)}`}, 'Login');
         }
         const items = [
-          githubEnabled ? { key:'github', label:React.createElement('a', {href:'/auth/github/login'}, 'Login with GitHub') } : null,
-          modelscopeEnabled ? { key:'modelscope', label:React.createElement('a', {href:'/auth/modelscope/login'}, 'Login with ModelScope') } : null,
+          githubEnabled ? { key:'github', label:React.createElement('a', {href:appUrl('/auth/github/login')}, 'Login with GitHub') } : null,
+          modelscopeEnabled ? { key:'modelscope', label:React.createElement('a', {href:appUrl('/auth/modelscope/login')}, 'Login with ModelScope') } : null,
         ].filter(Boolean);
         return React.createElement(Dropdown, { menu:{items}, placement:'bottomRight', trigger:['click'] }, React.createElement(Button, {shape:'round'}, 'Login'));
       }
       const items = [
-        { key:'profile', label:React.createElement('a', {href:'/profile'}, 'Profile') },
+        { key:'profile', label:React.createElement('a', {href:appUrl('/profile')}, 'Profile') },
         ...(user.needs_bind ? [{ key:'bind', label:React.createElement('a', {href:buildBindRedirectUrl()}, 'Bind Account') }] : []),
         { type:'divider' },
-        { key:'logout', label:React.createElement('a', {href:'/auth/logout'}, 'Logout') },
+        { key:'logout', label:React.createElement('a', {href:appUrl('/auth/logout')}, 'Logout') },
       ];
       return React.createElement(Dropdown, { menu:{items}, placement:'bottomRight', trigger:['click'] }, React.createElement(Button, {type:'text'}, React.createElement(Space, null, avatarNode(user, 36), React.createElement('span', {className:'avatar-name'}, user.name || user.email))));
     }
 
 
     async function destroyCurrentInstance() {
-      const res = await fetch('/api/notebook/current', { method: 'DELETE' });
+      const res = await fetch(appUrl('/api/notebook/current'), { method: 'DELETE' });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success) {
         message.success('Instance destroyed');
@@ -114,7 +116,7 @@
         if (!user || !user.email) return;
         setEditorLoading(true);
         try {
-          const res = await fetch('/api/profile/templates');
+          const res = await fetch(appUrl('/api/profile/templates'));
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Failed to load templates');
           setEditorTemplates(data.templates || []);
@@ -172,7 +174,7 @@
           enabled: isEditor ? (editingTemplate ? editingTemplate.enabled !== false : true) : false,
           sort_order: 0,
         };
-        const url = editingTemplate ? `/api/profile/templates/${editingTemplate.id}` : '/api/profile/templates';
+        const url = editingTemplate ? appUrl(`/api/profile/templates/${editingTemplate.id}`) : appUrl('/api/profile/templates');
         const res = await fetch(url, {
           method: editingTemplate ? 'PUT' : 'POST',
           headers: {'Content-Type': 'application/json'},
@@ -191,7 +193,7 @@
       }
 
       async function deleteTemplate(id) {
-        const res = await fetch(`/api/profile/templates/${id}`, { method: 'DELETE' });
+        const res = await fetch(appUrl(`/api/profile/templates/${id}`), { method: 'DELETE' });
         if (res.ok) {
           message.success('Template deleted');
           loadEditorTemplates();
@@ -208,7 +210,7 @@
         }
         setRedeemLoading(true);
         try {
-          const res = await fetch('/api/credits/redeem', {
+          const res = await fetch(appUrl('/api/credits/redeem'), {
             method:'POST',
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({coupon: values.coupon}),
@@ -229,7 +231,7 @@
       async function launchTemplate(record) {
         setLaunchingTemplateId(record.id);
         try {
-          const res = await fetch(`/api/templates/${record.id}/launch`, {
+          const res = await fetch(appUrl(`/api/templates/${record.id}/launch`), {
             method:'POST',
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({gpu_count:1}),
@@ -249,7 +251,7 @@
         const timer = setInterval(async () => {
           attempts += 1;
           try {
-            const res = await fetch('/api/notebook/status');
+            const res = await fetch(appUrl('/api/notebook/status'));
             const data = await res.json();
             if (data.status === 'ready') {
               clearInterval(timer);
@@ -277,7 +279,7 @@
         {title:'Source',width:320,render:(_,r)=>r.repo_url&&r.notebook_path?React.createElement('div',null,React.createElement(Text,{code:true,copyable:true,style:{display:'block',maxWidth:300,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},title:r.repo_url},r.repo_url),React.createElement(Text,{type:'secondary'},`${r.branch}/${r.notebook_path}`)):React.createElement(Tag,{color:'blue'},'Image only')},
         {title:'Visibility',dataIndex:'enabled',width:120,render:v=>React.createElement(Tag,{color:v?'green':'blue'},v?'Gallery':'Profile only')},
         {title:'Actions',width:280,render:(_,r)=>React.createElement(Space,null,
-          r.repo_url&&r.notebook_path&&React.createElement(Button,{size:'small',href:`/templates/${r.id}/preview`,target:'_blank'},'Preview'),
+          r.repo_url&&r.notebook_path&&React.createElement(Button,{size:'small',href:appUrl(`/templates/${r.id}/preview`),target:'_blank'},'Preview'),
           React.createElement(Button,{size:'small',type:'primary',loading:launchingTemplateId===r.id,onClick:()=>launchTemplate(r)},'Launch'),
           React.createElement(Button,{size:'small',onClick:()=>openTemplateModal(r)},'Edit'),
           React.createElement(Popconfirm,{title:'Delete template?',description:'This only removes the template record.',onConfirm:()=>deleteTemplate(r.id)},React.createElement(Button,{size:'small',danger:true},'Delete'))
@@ -319,7 +321,7 @@
           React.createElement('div', {className:'left-header'},
             React.createElement('div', {className:'brand'}, React.createElement('img', {src:'https://amd-ai-academy.com/static/image.png'}), React.createElement('span', null, 'Radeon Cloud')),
             React.createElement(Menu, {mode:'horizontal', selectedKeys:[], items:[
-              {key:'gallery',label:React.createElement('a',{href:'/'},'Gallery')},
+              {key:'gallery',label:React.createElement('a',{href:appUrl('/')},'Gallery')},
               {key:'space',label:'Space',disabled:true},
               {key:'contest',label:'Contest',disabled:true}
             ], style:{borderBottom:0,minWidth:300}})
@@ -378,8 +380,8 @@
           ) : React.createElement(React.Fragment, null,
             React.createElement('section', {className:'profile-hero'}, React.createElement(Text, {style:{color:'#aaa7bc'}}, 'Account'), React.createElement(Title, {level:1, style:{color:'#fff', marginTop:8}}, 'Sign in to Radeon Cloud'), React.createElement(Paragraph, {style:{color:'#c5c2cf', maxWidth:620}}, 'Use GitHub or ModelScope to claim credits and launch GPU notebooks.')),
             React.createElement('div', {className:'profile-grid'},
-              React.createElement(Card, {title:'GitHub'}, React.createElement(Paragraph, {type:'secondary'}, 'Recommended for GitHub-based developer workflows.'), githubEnabled ? React.createElement(Button, {type:'primary', href:'/auth/github/login'}, 'Continue with GitHub') : React.createElement(Alert, {type:'warning', message:'GitHub OAuth is not configured'})),
-              React.createElement(Card, {title:'ModelScope'}, React.createElement(Paragraph, {type:'secondary'}, 'Use your ModelScope identity and avatar.'), modelscopeEnabled ? React.createElement(Button, {type:'primary', href:'/auth/modelscope/login'}, 'Continue with ModelScope') : React.createElement(Alert, {type:'warning', message:'ModelScope OAuth is not configured'}))
+              React.createElement(Card, {title:'GitHub'}, React.createElement(Paragraph, {type:'secondary'}, 'Recommended for GitHub-based developer workflows.'), githubEnabled ? React.createElement(Button, {type:'primary', href:appUrl('/auth/github/login')}, 'Continue with GitHub') : React.createElement(Alert, {type:'warning', message:'GitHub OAuth is not configured'})),
+              React.createElement(Card, {title:'ModelScope'}, React.createElement(Paragraph, {type:'secondary'}, 'Use your ModelScope identity and avatar.'), modelscopeEnabled ? React.createElement(Button, {type:'primary', href:appUrl('/auth/modelscope/login')}, 'Continue with ModelScope') : React.createElement(Alert, {type:'warning', message:'ModelScope OAuth is not configured'}))
             )
           )
         )
