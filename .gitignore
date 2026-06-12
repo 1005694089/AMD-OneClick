@@ -1,4 +1,6 @@
 k8s-deployment-v2.local.yaml
+k8s-*.local.yaml
+local-deploy-history/
 cluster.yaml
 external-url-dump.txt
 app/__pycache__/
