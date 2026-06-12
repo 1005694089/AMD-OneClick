@@ -22,7 +22,7 @@ data:
     }
 
     server {
-      listen 80;
+      listen 36.150.116.200:80;
       server_name _;
 
       client_max_body_size 0;
@@ -57,7 +57,7 @@ data:
     }
 
     server {
-      listen 443 ssl http2;
+      listen 36.150.116.200:443 ssl http2;
       server_name _;
 
       ssl_certificate /etc/nginx/tls/tls.crt;
@@ -115,6 +115,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
+        kubernetes.io/hostname: wx-ms-w7900d-0004
       tolerations:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
@@ -127,7 +128,7 @@ spec:
           effect: NoExecute
       containers:
         - name: nginx
-          image: nginx:alpine
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:nginx-alpine-20260611
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -138,12 +139,14 @@ spec:
               hostPort: 443
           readinessProbe:
             httpGet:
+              host: 36.150.116.200
               path: /edge-healthz
               port: 80
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
             httpGet:
+              host: 36.150.116.200
               path: /edge-healthz
               port: 80
             initialDelaySeconds: 10

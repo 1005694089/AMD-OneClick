@@ -515,10 +515,8 @@ async def index(request: Request, user: Optional[dict] = Depends(session_user)):
             "instance_types_json": json.dumps(INSTANCE_TYPES),
             "user_json": json.dumps(user or {}),
             "active_instance_json": json.dumps(active_instance or {}),
-            "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED and not settings.SSO_ENABLED,
-            "sso_enabled": settings.SSO_ENABLED,
-            "sso_bind_entry_url": settings.SSO_BIND_ENTRY_URL,
-            "sso_bind_return_query_key": settings.SSO_BIND_RETURN_QUERY_KEY,
+            "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
+            "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
         },
@@ -707,6 +705,22 @@ async def workshop_login(request: Request):
         raise HTTPException(status_code=401, detail="Invalid workshop credentials")
     user = get_or_create_user("workshop", f"workshop{index}", f"workshop{index}@amd.com", f"WORKSHOP{index}", "")
     user = ensure_user_min_credits(user["id"], settings.WORKSHOP_CREDITS) or user
+    request.session.clear()
+    request.session["user_id"] = user["id"]
+    return {"user": user}
+
+
+@app.post("/auth/admin/login")
+async def admin_login(request: Request):
+    if not settings.ADMIN_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Admin login is not enabled")
+    payload = await request.json()
+    username = str(payload.get("username") or "")
+    password = str(payload.get("password") or "")
+    if username != "admin" or not secrets.compare_digest(password, settings.ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
+    user = get_or_create_user("admin", "admin", "admin@radeon.local", "Radeon Cloud Admin", "")
+    user = ensure_user_min_credits(user["id"], settings.ADMIN_LOGIN_CREDITS) or user
     request.session.clear()
     request.session["user_id"] = user["id"]
     return {"user": user}

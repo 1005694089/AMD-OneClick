@@ -78,9 +78,7 @@
     const defaultImage = {{ default_image | tojson }};
     const initialActiveInstance = {{ active_instance_json | safe }};
     const showWorkshopLogin = {{ workshop_login_enabled | tojson }};
-    const ssoEnabled = {{ sso_enabled | tojson }};
-    const ssoBindEntryUrl = {{ sso_bind_entry_url | tojson }};
-    const ssoBindReturnQueryKey = {{ sso_bind_return_query_key | tojson }};
+    const showAdminLogin = {{ admin_login_enabled | tojson }};
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
 
@@ -113,6 +111,7 @@
           { key: 'modelscope', label: React.createElement('a', { href: '/auth/modelscope/login' }, 'Login with ModelScope') },
         ];
         if (showWorkshopLogin) items.unshift({ key: 'workshop', label: React.createElement('span', { onClick: () => window.dispatchEvent(new Event('open-workshop-login')) }, 'Workshop Login') });
+        if (showAdminLogin) items.unshift({ key: 'admin', label: React.createElement('span', { onClick: () => window.dispatchEvent(new Event('open-admin-login')) }, 'Admin Login') });
         return React.createElement(Dropdown, { menu: { items }, placement: 'bottomRight', trigger: ['click'] }, React.createElement(Button, { shape: 'round' }, 'Login'));
       }
       const items = [
@@ -139,6 +138,9 @@
       const [workshopLoginOpen, setWorkshopLoginOpen] = React.useState(false);
       const [workshopLoginLoading, setWorkshopLoginLoading] = React.useState(false);
       const [workshopForm] = Form.useForm();
+      const [adminLoginOpen, setAdminLoginOpen] = React.useState(false);
+      const [adminLoginLoading, setAdminLoginLoading] = React.useState(false);
+      const [adminForm] = Form.useForm();
       const initialTab = new URLSearchParams(window.location.search).get('tab') === 'notebook' ? 'notebook' : 'gallery';
       const [activeTab, setActiveTab] = React.useState(initialTab);
       const [gallerySearch, setGallerySearch] = React.useState('');
@@ -161,6 +163,11 @@
         const open = () => setWorkshopLoginOpen(true);
         window.addEventListener('open-workshop-login', open);
         return () => window.removeEventListener('open-workshop-login', open);
+      }, []);
+      React.useEffect(() => {
+        const open = () => setAdminLoginOpen(true);
+        window.addEventListener('open-admin-login', open);
+        return () => window.removeEventListener('open-admin-login', open);
       }, []);
 
       React.useEffect(() => {
@@ -198,6 +205,20 @@
           message.error(err.message || 'Workshop login failed');
         } finally {
           setWorkshopLoginLoading(false);
+        }
+      }
+
+      async function loginAdmin(values) {
+        setAdminLoginLoading(true);
+        try {
+          const res = await fetch('/auth/admin/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(values) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Admin login failed');
+          window.location.href = '/?tab=notebook';
+        } catch (err) {
+          message.error(err.message || 'Admin login failed');
+        } finally {
+          setAdminLoginLoading(false);
         }
       }
 
@@ -367,6 +388,13 @@
             React.createElement(Form.Item, { name:'email', label:'Email', rules:[{required:true,message:'Email is required'}] }, React.createElement(Input, { placeholder:'WORKSHOP1@amd.com' })),
             React.createElement(Form.Item, { name:'password', label:'Password', rules:[{required:true,message:'Password is required'}] }, React.createElement(Input.Password, { placeholder:'amdyes1' })),
             React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:workshopLoginLoading }, 'Login')
+          )
+        ),
+        React.createElement(Modal, { title:'Admin Login', open:adminLoginOpen, onCancel:()=>setAdminLoginOpen(false), footer:null, destroyOnClose:true },
+          React.createElement(Form, { form:adminForm, layout:'vertical', onFinish:loginAdmin, initialValues:{username:'admin'} },
+            React.createElement(Form.Item, { name:'username', label:'Username', rules:[{required:true,message:'Username is required'}] }, React.createElement(Input)),
+            React.createElement(Form.Item, { name:'password', label:'Password', rules:[{required:true,message:'Password is required'}] }, React.createElement(Input.Password)),
+            React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:adminLoginLoading }, 'Login')
           )
         )
       );

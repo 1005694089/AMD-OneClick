@@ -272,6 +272,20 @@ def ensure_default_image(conn):
     exists = conn.execute(select(images.c.id).where(images.c.image == settings.DEFAULT_IMAGE)).first()
     if exists:
         return
+    existing_by_name = conn.execute(select(images.c.id).where(images.c.name == "AMD OneClick Base")).first()
+    if existing_by_name:
+        conn.execute(
+            update(images)
+            .where(images.c.id == existing_by_name.id)
+            .values(
+                image=settings.DEFAULT_IMAGE,
+                description="Default ROCm Jupyter/OpenCode image",
+                enabled=True,
+                sync_status="ready",
+                updated_at=now,
+            )
+        )
+        return
     conn.execute(
         images.insert().values(
             name="AMD OneClick Base",
