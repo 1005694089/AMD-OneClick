@@ -992,9 +992,7 @@ async def list_my_custom_images(user: dict = Depends(current_user)):
 
 
 def _custom_image_tag(user_id: int, name: str) -> str:
-    if settings.CUSTOM_IMAGE_REPOSITORY:
-        return f"{settings.CUSTOM_IMAGE_REPOSITORY}:user-{user_id}-{name}"
-    return f"{settings.CUSTOM_IMAGE_REGISTRY}/user-{user_id}:{name}"
+    return f"{settings.CUSTOM_IMAGE_REGISTRY}/user-{int(user_id):02d}-{name}:latest"
 
 
 @app.post("/api/custom-images/build")
@@ -1617,7 +1615,10 @@ async def admin_page(request: Request, username: str = Depends(verify_admin)):
     return templates.TemplateResponse(
         request,
         "admin.html",
-        {"username": username},
+        {
+            "username": username,
+            "admin_image_upload_repository": settings.ADMIN_IMAGE_UPLOAD_REPOSITORY,
+        },
     )
 
 

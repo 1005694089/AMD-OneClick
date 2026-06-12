@@ -46,6 +46,7 @@
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const user = {{ (user or {}) | tojson }};
+    const userImageRepoPrefix = 'user-' + String(user && user.id ? user.id : 0).padStart(2, '0') + '-';
     const activeInstance = {{ (active_instance or {}) | tojson }};
     const githubEnabled = {{ github_enabled | tojson }};
     const modelscopeEnabled = {{ modelscope_enabled | tojson }};
@@ -486,7 +487,7 @@
           React.createElement(Table, {rowKey:'id', columns:columns, dataSource:customImages, loading:customLoading, pagination:false, scroll:{x:880}, size:'middle'}),
           React.createElement(Modal, {title:'Build Custom Image', open:buildModalOpen, onCancel:()=>{setBuildModalOpen(false); buildForm.resetFields();}, footer:null, destroyOnClose:true, width:760},
             React.createElement(Form, {form:buildForm, layout:'vertical', onFinish:buildCustomImage},
-              React.createElement(Form.Item, {name:'name', label:'Image Name', rules:[{required:true,message:'Name is required'},{pattern:/^[a-z0-9][a-z0-9-]{0,38}$/,message:'1-39 chars: lowercase letters, digits, hyphens; start with letter or digit'}]}, React.createElement(Input, {placeholder:'my-workspace', addonBefore:'user-{id}:'})),
+              React.createElement(Form.Item, {name:'name', label:'Image Name', rules:[{required:true,message:'Name is required'},{pattern:/^[a-z0-9][a-z0-9-]{0,38}$/,message:'1-39 chars: lowercase letters, digits, hyphens; start with letter or digit'}]}, React.createElement(Input, {placeholder:'my-workspace', addonBefore:userImageRepoPrefix})),
               React.createElement(Form.Item, {name:'dockerfile', label:'Dockerfile', rules:[{required:true,message:'Dockerfile is required'}]}, React.createElement(Input.TextArea, {autoSize:{minRows:10,maxRows:24}, style:{fontFamily:'monospace'}, placeholder:'FROM ...'})),
               React.createElement(Button, {type:'primary', htmlType:'submit', block:true, loading:buildLoading}, 'Queue Build')
             )

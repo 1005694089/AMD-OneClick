@@ -59,6 +59,10 @@ class Settings:
         "radeon-cloud-registry.cn-shanghai.cr.aliyuncs.com",
     ).rstrip("/")
     ADMIN_IMAGE_REGISTRY: str = os.getenv("ADMIN_IMAGE_REGISTRY", f"{ENTERPRISE_REGISTRY_HOST}/admin").rstrip("/")
+    ADMIN_IMAGE_UPLOAD_REPOSITORY: str = os.getenv(
+        "ADMIN_IMAGE_UPLOAD_REPOSITORY",
+        f"{ENTERPRISE_REGISTRY_HOST}/admin/radeon-admin-upload",
+    ).rstrip("/")
 
     DEFAULT_IMAGE: str = os.getenv(
         "DEFAULT_IMAGE",
@@ -172,8 +176,8 @@ class Settings:
         "CUSTOM_IMAGE_REGISTRY",
         f"{ENTERPRISE_REGISTRY_HOST}/cloud_user",
     ).rstrip("/")
-    # Optional full repository for custom images when the push credential is
-    # scoped to an existing ACR repo. Tags are generated as user-<id>-<name>.
+    # Legacy compatibility: no longer used for new user build tags. New user
+    # builds always use CUSTOM_IMAGE_REGISTRY/user-XX-<name>:latest.
     CUSTOM_IMAGE_REPOSITORY: str = os.getenv("CUSTOM_IMAGE_REPOSITORY", "").rstrip("/")
 
     CUSTOM_IMAGE_MAX_PER_USER: int = int(os.getenv("CUSTOM_IMAGE_MAX_PER_USER", "2"))

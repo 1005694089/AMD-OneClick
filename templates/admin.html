@@ -53,6 +53,7 @@
 const { Button, Card, Form, Input, InputNumber, Layout, Menu, Modal, Select, Space, Statistic, Table, Tag, Typography, Popconfirm, message } = antd;
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
+const adminImageUploadRepository = {{ admin_image_upload_repository | tojson }};
 
 function App(){
   const [images,setImages]=React.useState([]);
@@ -231,7 +232,7 @@ function App(){
       React.createElement(Modal,{title:'Add Image',open:imageModalOpen,onCancel:()=>setImageModalOpen(false),footer:null,destroyOnClose:true},
         React.createElement(Form,{form,layout:'vertical',onFinish:addImage},
           React.createElement(Form.Item,{name:'name',label:'Display name',rules:[{required:true}]},React.createElement(Input,{placeholder:'amd-geis'})),
-          React.createElement(Form.Item,{name:'image',label:'Image reference',rules:[{required:true}]},React.createElement(Input.TextArea,{autoSize:true,placeholder:'registry/repo/image:tag'})),
+          React.createElement(Form.Item,{name:'image',label:'Image reference',rules:[{required:true}]},React.createElement(Input.TextArea,{autoSize:true,placeholder:adminImageUploadRepository ? `${adminImageUploadRepository}:latest` : 'registry/repo/image:tag'})),
           React.createElement(Form.Item,{name:'description',label:'Description'},React.createElement(Input,{placeholder:'optional'})),
           React.createElement(Button,{type:'primary',htmlType:'submit',block:true},'Add and Sync')
         )
