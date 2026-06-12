@@ -45,6 +45,8 @@ POLL_INTERVAL = float(_env("POLL_INTERVAL_SECONDS", "10"))
 DOCKER = _env("DOCKER_BIN", "docker")
 BUILD_TIMEOUT = int(_env("BUILD_TIMEOUT_SECONDS", "1800"))
 BUILD_MEMORY = _env("BUILD_MEMORY", "8g")
+SKOPEO = _env("SKOPEO_BIN", "skopeo")
+IMAGE_COPY_TIMEOUT = int(_env("IMAGE_COPY_TIMEOUT_SECONDS", "7200"))
 BUILD_CPUSET = _env("BUILD_CPUSET", "")            # e.g. "0-3"; empty = no pin
 BUILD_NETWORK = _env("BUILD_NETWORK", "")          # e.g. a restricted docker network name
 MIN_FREE_DISK_GB = float(_env("MIN_FREE_DISK_GB", "20"))
@@ -89,6 +91,18 @@ def report_result(image_id, status):
     _request(f"/api/internal/builds/{image_id}/result", {"status": status})
 
 
+def push_import_log(import_id, chunk):
+    if chunk:
+        try:
+            _request(f"/api/internal/admin-image-imports/{import_id}/log", {"log": chunk})
+        except Exception as exc:
+            print(f"[agent] import log push failed for {import_id}: {exc}", file=sys.stderr)
+
+
+def report_import_result(import_id, status):
+    _request(f"/api/internal/admin-image-imports/{import_id}/result", {"status": status})
+
+
 def free_disk_gb(path):
     try:
         return shutil.disk_usage(path).free / (1024 ** 3)
@@ -102,9 +116,9 @@ def _build_env():
     return env
 
 
-def stream_command(image_id, cmd, env=None):
+def stream_command(image_id, cmd, env=None, timeout=None, log_func=push_log):
     """Run a command, streaming its combined output to the manager. Returns True on rc==0."""
-    push_log(image_id, "$ " + " ".join(cmd) + "\n")
+    log_func(image_id, "$ " + " ".join(cmd) + "\n")
     try:
         proc = subprocess.Popen(
             cmd,
@@ -124,19 +138,20 @@ def stream_command(image_id, cmd, env=None):
 
     def flush():
         if buffer:
-            push_log(image_id, "".join(buffer))
+            log_func(image_id, "".join(buffer))
             buffer.clear()
 
+    effective_timeout = timeout or BUILD_TIMEOUT
     for line in proc.stdout:
         buffer.append(line)
         now = time.time()
         if now - last_flush > LOG_FLUSH_SECONDS:
             flush()
             last_flush = now
-        if now - start > BUILD_TIMEOUT:
+        if now - start > effective_timeout:
             proc.kill()
             flush()
-            push_log(image_id, f"\nBuild exceeded {BUILD_TIMEOUT}s timeout; killed.\n")
+            log_func(image_id, f"\nCommand exceeded {effective_timeout}s timeout; killed.\n")
             return False
     proc.wait()
     flush()
@@ -190,6 +205,35 @@ def run_build(job):
         subprocess.run([DOCKER, "image", "rm", "-f", tag], capture_output=True)
 
 
+def _docker_ref(ref):
+    return ref if ref.startswith("docker://") else f"docker://{ref}"
+
+
+def run_admin_image_import(job):
+    import_id = job["id"]
+    source = job["source"]
+    destination = job["destination"]
+
+    push_import_log(import_id, f"Copying admin image:\n  source: {source}\n  destination: {destination}\n")
+    copy_cmd = [
+        SKOPEO,
+        "copy",
+        "--all",
+        "--retry-times",
+        "3",
+        _docker_ref(source),
+        _docker_ref(destination),
+    ]
+    if not stream_command(import_id, copy_cmd, timeout=IMAGE_COPY_TIMEOUT, log_func=push_import_log):
+        report_import_result(import_id, "failed")
+        return
+    if not stream_command(import_id, [SKOPEO, "inspect", _docker_ref(destination)], timeout=300, log_func=push_import_log):
+        report_import_result(import_id, "failed")
+        return
+    push_import_log(import_id, "\nImage copy complete.\n")
+    report_import_result(import_id, "ready")
+
+
 def main():
     print(f"[agent] starting: manager={MANAGER_URL} id={AGENT_ID} poll={POLL_INTERVAL}s")
     while True:
@@ -208,13 +252,20 @@ def main():
             time.sleep(POLL_INTERVAL)
             continue
 
-        print(f"[agent] building image id={job['id']} tag={job['tag']}")
+        job_type = job.get("type", "custom_build")
+        print(f"[agent] running job type={job_type} id={job.get('id')}")
         try:
-            run_build(job)
+            if job_type == "admin_image_import":
+                run_admin_image_import(job)
+            else:
+                run_build(job)
         except Exception as exc:
-            print(f"[agent] build error for {job.get('id')}: {exc}", file=sys.stderr)
+            print(f"[agent] job error for {job.get('id')}: {exc}", file=sys.stderr)
             try:
-                report_result(job["id"], "failed")
+                if job_type == "admin_image_import":
+                    report_import_result(job["id"], "failed")
+                else:
+                    report_result(job["id"], "failed")
             except Exception:
                 pass
 

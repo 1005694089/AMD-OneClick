@@ -80,10 +80,15 @@ from .store import (
     get_custom_image,
     create_custom_image,
     claim_next_build,
+    claim_next_admin_image_import,
     append_custom_image_log,
+    append_admin_image_import_log,
     update_custom_image_status,
+    update_admin_image_import_status,
     delete_custom_image,
     get_ready_custom_image_by_value,
+    create_admin_image_import,
+    set_image_enabled,
 )
 
 # Configure logging
@@ -409,6 +414,8 @@ def _active_instance_context(user: Optional[dict], request: Optional[Request] = 
 
 
 CUSTOM_IMAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}$")
+ADMIN_IMAGE_IMPORT_SYNC_STATUSES = {"import_pending", "importing", "import_failed"}
+ADMIN_UPLOAD_TAG_UNSAFE_RE = re.compile(r"[^a-z0-9_.-]+")
 
 
 def _custom_image_public(record: dict) -> dict:
@@ -1049,16 +1056,60 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
 @app.post("/api/internal/builds/claim")
 async def claim_build(req: BuildClaimRequest, _agent: bool = Depends(verify_build_agent)):
     job = claim_next_build(req.agent_id)
-    if not job:
-        return {"job": None}
-    # The agent always builds with OpenCode + Hermes appended.
-    dockerfile = job["dockerfile"] + "\n" + settings.DOCKERFILE_SUFFIX
-    return {"job": {"id": job["id"], "tag": job["image"], "dockerfile": dockerfile}}
+    if job:
+        # The agent always builds with OpenCode + Hermes appended.
+        dockerfile = job["dockerfile"] + "\n" + settings.DOCKERFILE_SUFFIX
+        return {"job": {"type": "custom_build", "id": job["id"], "tag": job["image"], "dockerfile": dockerfile}}
+
+    import_job = claim_next_admin_image_import(req.agent_id)
+    if import_job:
+        update_image_sync_status(
+            import_job["image_id"],
+            "importing",
+            0,
+            0,
+            f"Copying image from {import_job['source_image']} to {import_job['destination_image']}",
+            False,
+        )
+        return {"job": {
+            "type": "admin_image_import",
+            "id": import_job["id"],
+            "image_id": import_job["image_id"],
+            "source": import_job["source_image"],
+            "destination": import_job["destination_image"],
+        }}
+    return {"job": None}
 
 
 @app.post("/api/internal/builds/{image_id}/log")
 async def push_build_log(image_id: int, req: BuildLogRequest, _agent: bool = Depends(verify_build_agent)):
     append_custom_image_log(image_id, req.log or "")
+    return {"ok": True}
+
+
+@app.post("/api/internal/admin-image-imports/{import_id}/log")
+async def push_admin_image_import_log(import_id: int, req: BuildLogRequest, _agent: bool = Depends(verify_build_agent)):
+    append_admin_image_import_log(import_id, req.log or "")
+    return {"ok": True}
+
+
+@app.post("/api/internal/admin-image-imports/{import_id}/result")
+async def report_admin_image_import_result(import_id: int, req: BuildResultRequest, _agent: bool = Depends(verify_build_agent)):
+    status = req.status if req.status in {"ready", "failed"} else "failed"
+    record = update_admin_image_import_status(import_id, status=status)
+    if not record:
+        raise HTTPException(status_code=404, detail="Import job not found")
+    if status != "ready":
+        update_image_sync_status(record["image_id"], "import_failed", 0, 0, "Image import failed; see build-agent logs", True)
+        return {"ok": True}
+
+    try:
+        sync = await _run_blocking(k8s_client.sync_image_to_nodes, record["image_id"], record["destination_image"])
+        update_image_sync_status(record["image_id"], sync["status"], sync["desired_count"], sync["ready_count"], sync["message"], sync["completed"])
+        set_image_enabled(record["image_id"], bool(record.get("enabled")))
+    except Exception as e:
+        logger.warning("Failed to start prepull for imported admin image %s: %s", record["image_id"], e)
+        update_image_sync_status(record["image_id"], "import_failed", 0, 0, f"Image copied, but prepull failed: {e}", True)
     return {"ok": True}
 
 
@@ -1723,6 +1774,8 @@ async def admin_sync_template_preview(template_id: int, username: str = Depends(
 @app.get("/api/admin/images")
 async def admin_list_images(username: str = Depends(verify_admin)):
     for image in list_images(enabled_only=False):
+        if image.get("sync_status") in ADMIN_IMAGE_IMPORT_SYNC_STATUSES:
+            continue
         sync = await _run_blocking(k8s_client.get_image_sync_status, image["id"])
         if (
             image.get("sync_status") != sync["status"]
@@ -1740,18 +1793,52 @@ async def admin_list_images(username: str = Depends(verify_admin)):
             )
     return {"images": list_images(enabled_only=False)}
 
+def _safe_admin_upload_tag_part(value: str) -> str:
+    clean = ADMIN_UPLOAD_TAG_UNSAFE_RE.sub("-", (value or "").strip().lower()).strip(".-_")
+    return clean[:80].strip(".-_") or "image"
+
+
+def _admin_upload_image_ref(name: str, source_image: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    name_part = _safe_admin_upload_tag_part(name)
+    source_hash = hashlib.sha256(source_image.strip().encode("utf-8")).hexdigest()[:10]
+    return f"{settings.ADMIN_IMAGE_UPLOAD_REPOSITORY}:{name_part}-{source_hash}-{timestamp}"
+
+
+def _is_admin_upload_image(image: str) -> bool:
+    repo = settings.ADMIN_IMAGE_UPLOAD_REPOSITORY.rstrip("/")
+    image = (image or "").strip()
+    return bool(repo and (image.startswith(f"{repo}:") or image.startswith(f"{repo}@")))
+
 
 @app.post("/api/admin/images")
 async def admin_create_image(req: ImageRequest, username: str = Depends(verify_admin)):
-    image = upsert_image(req.name, req.image, req.description or "", req.enabled)
-    sync = await _run_blocking(k8s_client.sync_image_to_nodes, image["id"], image["image"])
+    source_image = req.image.strip()
+    if not source_image:
+        raise HTTPException(status_code=400, detail="Source image must not be empty")
+
+    if _is_admin_upload_image(source_image):
+        image = upsert_image(req.name, source_image, req.description or "", req.enabled)
+        sync = await _run_blocking(k8s_client.sync_image_to_nodes, image["id"], image["image"])
+        return update_image_sync_status(
+            image["id"],
+            sync["status"],
+            sync["desired_count"],
+            sync["ready_count"],
+            sync["message"],
+            sync["completed"],
+        )
+
+    destination_image = _admin_upload_image_ref(req.name, source_image)
+    image = upsert_image(req.name, destination_image, req.description or "", False)
+    create_admin_image_import(image["id"], source_image, destination_image, enabled=req.enabled)
     return update_image_sync_status(
         image["id"],
-        sync["status"],
-        sync["desired_count"],
-        sync["ready_count"],
-        sync["message"],
-        sync["completed"],
+        "import_pending",
+        0,
+        0,
+        f"Queued import from {source_image} to {destination_image}",
+        False,
     )
 
 

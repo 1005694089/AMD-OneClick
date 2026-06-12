@@ -90,6 +90,22 @@ images = Table(
     Column("updated_at", String(64), nullable=False),
 )
 
+admin_image_imports = Table(
+    "admin_image_imports",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("image_id", Integer, ForeignKey("images.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("source_image", Text, nullable=False),
+    Column("destination_image", Text, nullable=False),
+    Column("enabled", Boolean, nullable=False, default=True),
+    Column("status", String(32), nullable=False, default="pending"),
+    Column("import_log", Text),
+    Column("claimed_by", String(128)),
+    Column("claimed_at", String(64)),
+    Column("created_at", String(64), nullable=False),
+    Column("updated_at", String(64), nullable=False),
+)
+
 notebook_templates = Table(
     "notebook_templates",
     metadata,
@@ -239,6 +255,7 @@ custom_images = Table(
 # Build queue states that count against a user's quota and block re-use of a name.
 CUSTOM_IMAGE_ACTIVE_STATUSES = ("pending", "building", "ready")
 CUSTOM_IMAGE_LOG_MAX_CHARS = 60000
+ADMIN_IMAGE_IMPORT_LOG_MAX_CHARS = 60000
 
 
 def utc_now() -> str:
@@ -1028,6 +1045,7 @@ def update_image_sync_status(
 
 def delete_image(image_id: int) -> bool:
     with engine.begin() as conn:
+        conn.execute(admin_image_imports.delete().where(admin_image_imports.c.image_id == image_id))
         result = conn.execute(images.delete().where(images.c.id == image_id))
         return result.rowcount > 0
 
@@ -1036,6 +1054,101 @@ def get_image_by_value(image: str) -> Optional[dict]:
     with engine.begin() as conn:
         return row_to_dict(
             conn.execute(select(images).where(images.c.image == image, images.c.enabled == True)).mappings().first()  # noqa: E712
+        )
+
+
+def set_image_enabled(image_id: int, enabled: bool) -> Optional[dict]:
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(select(images.c.id).where(images.c.id == image_id)).first()
+        if not current:
+            return None
+        conn.execute(update(images).where(images.c.id == image_id).values(enabled=enabled, updated_at=now))
+        return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
+
+
+def create_admin_image_import(
+    image_id: int,
+    source_image: str,
+    destination_image: str,
+    enabled: bool = True,
+) -> dict:
+    now = utc_now()
+    with engine.begin() as conn:
+        result = conn.execute(
+            admin_image_imports.insert().values(
+                image_id=image_id,
+                source_image=source_image.strip(),
+                destination_image=destination_image.strip(),
+                enabled=enabled,
+                status="pending",
+                import_log="",
+                claimed_by=None,
+                claimed_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        import_id = result.inserted_primary_key[0]
+        return row_to_dict(
+            conn.execute(select(admin_image_imports).where(admin_image_imports.c.id == import_id)).mappings().first()
+        )
+
+
+def claim_next_admin_image_import(agent_id: str) -> Optional[dict]:
+    now = utc_now()
+    with engine.begin() as conn:
+        pending = conn.execute(
+            select(admin_image_imports)
+            .where(admin_image_imports.c.status == "pending")
+            .order_by(admin_image_imports.c.id)
+            .limit(1)
+        ).mappings().first()
+        if not pending:
+            return None
+        conn.execute(
+            update(admin_image_imports)
+            .where(admin_image_imports.c.id == pending["id"], admin_image_imports.c.status == "pending")
+            .values(status="copying", claimed_by=agent_id, claimed_at=now, updated_at=now)
+        )
+        return row_to_dict(
+            conn.execute(select(admin_image_imports).where(admin_image_imports.c.id == pending["id"])).mappings().first()
+        )
+
+
+def append_admin_image_import_log(import_id: int, chunk: str) -> None:
+    if not chunk:
+        return
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(
+            select(admin_image_imports.c.import_log).where(admin_image_imports.c.id == import_id)
+        ).first()
+        if not current:
+            return
+        combined = (current[0] or "") + chunk
+        if len(combined) > ADMIN_IMAGE_IMPORT_LOG_MAX_CHARS:
+            combined = combined[-ADMIN_IMAGE_IMPORT_LOG_MAX_CHARS:]
+        conn.execute(
+            update(admin_image_imports)
+            .where(admin_image_imports.c.id == import_id)
+            .values(import_log=combined, updated_at=now)
+        )
+
+
+def update_admin_image_import_status(import_id: int, status: str) -> Optional[dict]:
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(select(admin_image_imports.c.id).where(admin_image_imports.c.id == import_id)).first()
+        if not current:
+            return None
+        conn.execute(
+            update(admin_image_imports)
+            .where(admin_image_imports.c.id == import_id)
+            .values(status=status, updated_at=now)
+        )
+        return row_to_dict(
+            conn.execute(select(admin_image_imports).where(admin_image_imports.c.id == import_id)).mappings().first()
         )
 
 
