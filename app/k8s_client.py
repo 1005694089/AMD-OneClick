@@ -8,6 +8,8 @@ import re
 import shlex
 import socket
 import time
+import random
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
@@ -18,6 +20,9 @@ from kubernetes.client.rest import ApiException
 from .config import settings, INSTANCE_TYPES
 
 logger = logging.getLogger(__name__)
+
+NODE_PORT_MAX = 32767
+_node_port_lock = threading.Lock()
 
 RESOURCE_PROFILES = {
     "standard": {
@@ -64,23 +69,21 @@ class K8sClient:
             config.load_kube_config()
             logger.info("Loaded kubeconfig file")
 
-        # kubernetes>=35 generated clients use the BearerToken auth name, while
-        # load_incluster_config may populate the older "authorization" key.
-        self._ensure_bearer_token_auth()
-        
-        self.core_v1 = client.CoreV1Api()
-        self.apps_v1 = client.AppsV1Api()
+        api_client = self._authenticated_api_client()
+
+        self.core_v1 = client.CoreV1Api(api_client)
+        self.apps_v1 = client.AppsV1Api(api_client)
         self.namespace = settings.K8S_NAMESPACE
 
-    def _ensure_bearer_token_auth(self):
+    def _authenticated_api_client(self):
         token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-        if not os.path.exists(token_path):
-            return
-        token = open(token_path, encoding="utf-8").read().strip()
         cfg = client.Configuration.get_default_copy()
-        cfg.api_key["BearerToken"] = token
-        cfg.api_key_prefix["BearerToken"] = "Bearer"
+        if not os.path.exists(token_path) or cfg.auth_settings():
+            return client.ApiClient(cfg)
+        token = open(token_path, encoding="utf-8").read().strip()
+        cfg.api_key["BearerToken"] = f"Bearer {token}"
         client.Configuration.set_default(cfg)
+        return client.ApiClient(cfg)
     
     def _generate_instance_id(self, email: str) -> str:
         """Generate a unique instance ID from email"""
@@ -125,6 +128,14 @@ class K8sClient:
     def _network_disk_nfs_path(self, instance_id: str) -> str:
         prefix = "/" + settings.NETWORK_DISK_NFS_PATH_PREFIX.strip("/")
         return f"{prefix}/{self._safe_storage_segment(instance_id)}"
+
+    def _workspace_quota_enabled(self) -> bool:
+        return bool(settings.WORKSPACE_QUOTA_ENABLED)
+
+    def _ensure_workspace_quota(self, instance_id: str) -> Optional[str]:
+        if not settings.WORKSPACE_QUOTA_ENABLED:
+            return None
+        return settings.WORKSPACE_QUOTA_NODE_NAME.strip() or None
 
     def _ensure_network_disk(self, instance_id: str) -> Optional[str]:
         if not self._network_disk_dynamic_enabled():
@@ -369,7 +380,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                           gpu_count: int = 1,
                           github_info: Optional[dict] = None,
                           resource_profile: Optional[str] = None,
-                          network_disk_claim_name: Optional[str] = None) -> dict:
+                          network_disk_claim_name: Optional[str] = None,
+                          workspace_quota_node_name: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -392,6 +404,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/network-disk-pvc"] = network_disk_pvc_name
             if network_disk_sub_path:
                 annotations["amd-oneclick/network-disk-sub-path"] = network_disk_sub_path
+        if workspace_quota_node_name:
+            annotations["amd-oneclick/workspace-quota"] = f"{settings.WORKSPACE_QUOTA_SIZE_GI}Gi"
+            annotations["amd-oneclick/workspace-quota-node"] = workspace_quota_node_name
 
         if github_info:
             annotations["amd-oneclick/github-org"] = github_info.get("org", "")
@@ -404,6 +419,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/template-title"] = github_info.get("template_title", "")
 
         startup_script = self._build_startup_script(instance_id, instance_type, github_info)
+
+        workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
+        workspace_uses_empty_dir = workspace_volume_type == "emptydir"
 
         volume_mounts = [
             {"name": "shm", "mountPath": "/dev/shm"},
@@ -425,14 +443,20 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     "type": "DirectoryOrCreate"
                 }
             },
-            {
+        ]
+        if workspace_uses_empty_dir:
+            workspace_empty_dir = {}
+            if settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
+                workspace_empty_dir["sizeLimit"] = settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip()
+            volumes.append({"name": "workspace", "emptyDir": workspace_empty_dir})
+        else:
+            volumes.append({
                 "name": "workspace",
                 "hostPath": {
                     "path": self._workspace_host_path(instance_id),
                     "type": "DirectoryOrCreate"
                 }
-            },
-        ]
+            })
         env = [
             {"name": "SHELL", "value": "/bin/bash"},
             {"name": "USER_EMAIL", "value": email},
@@ -458,6 +482,119 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             })
             env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
 
+        init_containers = []
+        if settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir:
+            safe_id = self._safe_storage_segment(instance_id)
+            quota_image_path = f"/quota-images/{safe_id}.img"
+            init_containers.append({
+                "name": "workspace-quota",
+                "image": "docker.m.daocloud.io/library/ubuntu:24.04",
+                "imagePullPolicy": "IfNotPresent",
+                "securityContext": {"privileged": True},
+                "command": ["/bin/bash", "-lc"],
+                "args": [f"""
+set -eux
+img={shlex.quote(quota_image_path)}
+mnt={shlex.quote(settings.WORKSPACE_MOUNT_PATH)}
+mkdir -p /quota-images "$mnt"
+current_source="$(findmnt -n -o SOURCE "$mnt" || true)"
+if printf '%s' "$current_source" | grep -Fq "$img"; then
+  df -h "$mnt"
+  findmnt "$mnt"
+  exit 0
+fi
+if [ ! -f "$img" ]; then
+  truncate -s {int(settings.WORKSPACE_QUOTA_SIZE_GI)}G "$img"
+  mkfs.ext4 -F "$img"
+fi
+mount -o loop "$img" "$mnt"
+chmod 0777 "$mnt"
+df -h "$mnt"
+findmnt "$mnt"
+"""],
+                "volumeMounts": [
+                    {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH, "mountPropagation": "Bidirectional"},
+                    {"name": "workspace-quota-images", "mountPath": "/quota-images"},
+                ],
+            })
+            volume_mounts[2]["mountPropagation"] = "HostToContainer"
+            volumes.append({
+                "name": "workspace-quota-images",
+                "hostPath": {
+                    "path": settings.WORKSPACE_QUOTA_IMAGE_ROOT,
+                    "type": "DirectoryOrCreate"
+                }
+            })
+
+        container_limits = {
+            "cpu": resources["cpu_limit"],
+            "memory": resources["memory_limit"],
+            "amd.com/gpu": str(gpu_count)
+        }
+        container_requests = {
+            "cpu": resources["cpu_request"],
+            "memory": resources["memory_request"],
+            "amd.com/gpu": str(gpu_count)
+        }
+        if settings.EPHEMERAL_STORAGE_LIMIT.strip():
+            container_limits["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_LIMIT.strip()
+        if settings.EPHEMERAL_STORAGE_REQUEST.strip():
+            container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
+
+        spec = {
+            "securityContext": {
+                "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
+            },
+            "dnsPolicy": "None",
+            "dnsConfig": {
+                "nameservers": ["8.8.8.8", "8.8.4.4"],
+                "searches": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
+                "options": [
+                    {"name": "ndots", "value": "5"}
+                ]
+            },
+            "hostAliases": [
+                {
+                    "ip": "36.151.243.83",
+                    "hostnames": ["github.com"]
+                }
+            ],
+            "tolerations": [
+                {
+                    "key": "amd.com/gpu",
+                    "operator": "Exists",
+                    "effect": "NoSchedule"
+                }
+            ],
+            "containers": [
+                {
+                    "name": "notebook",
+                    "image": image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["/bin/bash", "-c"],
+                    "args": [startup_script],
+                    "ports": [
+                        {
+                            "containerPort": settings.NOTEBOOK_PORT,
+                            "name": "jupyter"
+                        }
+                    ],
+                    "resources": {
+                        "limits": container_limits,
+                        "requests": container_requests,
+                    },
+                    "env": env,
+                    "volumeMounts": volume_mounts
+                }
+            ],
+            "volumes": volumes,
+            "restartPolicy": "Always"
+        }
+        if init_containers:
+            spec["initContainers"] = init_containers
+        if workspace_quota_node_name:
+            spec["nodeName"] = workspace_quota_node_name
+
         return {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -467,63 +604,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 "labels": labels,
                 "annotations": annotations
             },
-            "spec": {
-                "securityContext": {
-                    "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
-                },
-                "dnsPolicy": "None",
-                "dnsConfig": {
-                    "nameservers": ["8.8.8.8", "8.8.4.4"],
-                    "searches": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
-                    "options": [
-                        {"name": "ndots", "value": "5"}
-                    ]
-                },
-                "hostAliases": [
-                    {
-                        "ip": "36.151.243.83",
-                        "hostnames": ["github.com"]
-                    }
-                ],
-                "tolerations": [
-                    {
-                        "key": "amd.com/gpu",
-                        "operator": "Exists",
-                        "effect": "NoSchedule"
-                    }
-                ],
-                "containers": [
-                    {
-                        "name": "notebook",
-                        "image": image,
-                        "imagePullPolicy": "IfNotPresent",
-                        "command": ["/bin/bash", "-c"],
-                        "args": [startup_script],
-                        "ports": [
-                            {
-                                "containerPort": settings.NOTEBOOK_PORT,
-                                "name": "jupyter"
-                            }
-                        ],
-                        "resources": {
-                            "limits": {
-                                "cpu": resources["cpu_limit"],
-                                "memory": resources["memory_limit"],
-                                "amd.com/gpu": str(gpu_count)
-                            },
-                            "requests": {
-                                "cpu": resources["cpu_request"],
-                                "memory": resources["memory_request"],
-                                "amd.com/gpu": str(gpu_count)
-                            }
-                        },
-                        "env": env,
-                        "volumeMounts": volume_mounts
-                    }
-                ],
-                "volumes": volumes,
-                "restartPolicy": "Always"
-            }
+            "spec": spec
         }
     
     def _get_service_manifest(self, email: str, instance_id: str, node_port: int) -> dict:
@@ -552,25 +633,62 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             }
         }
     
-    def _allocate_node_port(self) -> int:
-        """Allocate an available NodePort"""
-        used_ports = set()
-        
-        try:
-            services = self.core_v1.list_namespaced_service(namespace=self.namespace)
-            for svc in services.items:
-                for port in svc.spec.ports or []:
-                    if port.node_port:
-                        used_ports.add(port.node_port)
-        except ApiException as e:
-            logger.warning(f"Error listing services: {e}")
-        
-        # Find available port starting from base
-        port = settings.NODE_PORT_BASE
-        while port in used_ports and port < 32767:
+    def _used_node_ports(self) -> set[int]:
+        used_ports: set[int] = set()
+        services = self.core_v1.list_service_for_all_namespaces()
+        for svc in services.items:
+            for port in svc.spec.ports or []:
+                if port.node_port:
+                    used_ports.add(int(port.node_port))
+        return used_ports
+
+    def _allocate_node_port(self, used_ports: Optional[set[int]] = None, start_port: Optional[int] = None) -> int:
+        """Allocate an available NodePort candidate."""
+        used_ports = used_ports if used_ports is not None else self._used_node_ports()
+        port = start_port or settings.NODE_PORT_BASE
+        while port in used_ports and port <= NODE_PORT_MAX:
             port += 1
-        
-        return port
+        if port <= NODE_PORT_MAX:
+            return port
+        for port in range(settings.NODE_PORT_BASE, NODE_PORT_MAX + 1):
+            if port not in used_ports:
+                return port
+        raise RuntimeError("No available NodePort in configured range")
+
+    def _create_service_with_nodeport_retry(self, email: str, instance_id: str) -> tuple[int, bool]:
+        try:
+            existing = self.core_v1.read_namespaced_service(name=f"{instance_id}-svc", namespace=self.namespace)
+            node_port = existing.spec.ports[0].node_port if existing.spec.ports else None
+            if node_port:
+                return int(node_port), False
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        with _node_port_lock:
+            used_ports = self._used_node_ports()
+            start = settings.NODE_PORT_BASE + random.randint(0, min(200, max(0, NODE_PORT_MAX - settings.NODE_PORT_BASE)))
+            node_port = self._allocate_node_port(used_ports, start_port=start)
+            for _ in range(512):
+                try:
+                    self.core_v1.create_namespaced_service(namespace=self.namespace, body=self._get_service_manifest(email, instance_id, node_port))
+                    logger.info("Created service %s-svc with NodePort %s", instance_id, node_port)
+                    return node_port, True
+                except ApiException as e:
+                    message = str(e)
+                    if e.status == 409:
+                        existing = self.core_v1.read_namespaced_service(name=f"{instance_id}-svc", namespace=self.namespace)
+                        existing_port = existing.spec.ports[0].node_port if existing.spec.ports else None
+                        if existing_port:
+                            return int(existing_port), False
+                        raise
+                    if e.status == 422 and ("provided port is already allocated" in message or "invalid" in message.lower()):
+                        used_ports = self._used_node_ports()
+                        used_ports.add(node_port)
+                        node_port = self._allocate_node_port(used_ports, start_port=node_port + 1)
+                        continue
+                    raise
+        raise RuntimeError("Unable to allocate NodePort for service")
 
     def _prepull_name(self, image_id: int) -> str:
         return f"image-prepull-catalog-{image_id}"
@@ -751,9 +869,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         if existing:
             return existing
 
+        workspace_quota_node_name = self._ensure_workspace_quota(instance_id)
         network_disk_claim_name = self._ensure_network_disk(instance_id)
-        node_port = self._allocate_node_port()
-
         pod_manifest = self._get_pod_manifest(
             email, instance_id, image,
             instance_type=instance_type,
@@ -761,6 +878,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             github_info=github_info,
             resource_profile=resource_profile,
             network_disk_claim_name=network_disk_claim_name,
+            workspace_quota_node_name=workspace_quota_node_name,
         )
         for attempt in range(1, 7):
             try:
@@ -778,28 +896,12 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                 logger.error(f"Failed to create pod: {e}")
                 raise
 
-        service_created = False
-        for _ in range(20):
-            svc_manifest = self._get_service_manifest(email, instance_id, node_port)
-            try:
-                self.core_v1.create_namespaced_service(
-                    namespace=self.namespace,
-                    body=svc_manifest
-                )
-                logger.info(f"Created service {instance_id}-svc with NodePort {node_port}")
-                service_created = True
-                break
-            except ApiException as e:
-                if e.status == 422:
-                    logger.warning(f"NodePort {node_port} rejected by API server, retrying next port: {e}")
-                    node_port += 1
-                    continue
-                logger.error(f"Failed to create service: {e}")
-                self.delete_instance_by_id(instance_id)
-                raise
-        if not service_created:
+        try:
+            node_port, service_created = self._create_service_with_nodeport_retry(email, instance_id)
+        except Exception as e:
+            logger.error("Failed to create service for %s: %s", instance_id, e)
             self.delete_instance_by_id(instance_id)
-            raise RuntimeError("Unable to allocate NodePort for service")
+            raise
 
         notebook_path = github_info.get("path") if github_info else None
 
