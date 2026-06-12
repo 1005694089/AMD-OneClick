@@ -952,14 +952,8 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
 
 
 @app.get("/api/notebook/status", response_model=NotebookStatus)
-async def check_status(request: Request, email: Optional[str] = Query(None, description="User email")):
+async def check_status(request: Request, email: Optional[str] = Query(None, description="User email"), user: dict = Depends(current_user)):
     """Check the status of a notebook instance"""
-    user_id = request.session.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Login required")
-    user = get_user(int(user_id))
-    if not user:
-        raise HTTPException(status_code=401, detail="Login required")
     email = user["email"].lower()
     
     try:
@@ -1222,8 +1216,8 @@ async def profile_delete_template(template_id: int, user: dict = Depends(current
 
 
 @app.get("/api/templates/{template_id}/preview-status")
-async def template_preview_status(request: Request, template_id: int):
-    template = _template_accessible_to_user(template_id, session_user(request))
+async def template_preview_status(request: Request, template_id: int, user: Optional[dict] = Depends(session_user)):
+    template = _template_accessible_to_user(template_id, user)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     if not template.get("repo_url") or not template.get("notebook_path"):
@@ -1248,8 +1242,7 @@ async def profile_sync_template_preview(template_id: int, user: dict = Depends(c
 
 
 @app.get("/templates/{template_id}/preview", response_class=HTMLResponse)
-async def preview_notebook_template(request: Request, template_id: int):
-    user = session_user(request)
+async def preview_notebook_template(request: Request, template_id: int, user: Optional[dict] = Depends(session_user)):
     template = _template_accessible_to_user(template_id, user)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -1302,8 +1295,8 @@ async def preview_notebook_template(request: Request, template_id: int):
 
 
 @app.get("/templates/{template_id}/assets/{asset_path:path}")
-async def preview_notebook_template_asset(request: Request, template_id: int, asset_path: str):
-    template = _template_accessible_to_user(template_id, session_user(request))
+async def preview_notebook_template_asset(request: Request, template_id: int, asset_path: str, user: Optional[dict] = Depends(session_user)):
+    template = _template_accessible_to_user(template_id, user)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
     if not template.get("repo_url") or not template.get("notebook_path"):
