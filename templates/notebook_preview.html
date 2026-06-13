@@ -97,16 +97,36 @@
       return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     }
 
-    function resolveAssetUrl(url) {
+    function attachmentDataUrl(cell, url) {
       const clean = String(url || '').trim();
+      if (!clean.toLowerCase().startsWith('attachment:')) return '';
+      const name = clean.slice('attachment:'.length);
+      const attachments = (cell && cell.attachments) || {};
+      let decodedName = name;
+      try { decodedName = decodeURIComponent(name); } catch (e) {}
+      const payload = attachments[name] || attachments[decodedName];
+      if (!payload) return clean;
+      const mimeKeys = Object.keys(payload);
+      const mime = mimeKeys.find(key => key.startsWith('image/')) || mimeKeys[0] || 'application/octet-stream';
+      const data = Array.isArray(payload[mime]) ? payload[mime].join('') : payload[mime];
+      return data ? `data:${mime};base64,${data}` : clean;
+    }
+
+    function resolveAssetUrl(url, cell) {
+      const clean = String(url || '').trim();
+      if (/^attachment:/i.test(clean)) return attachmentDataUrl(cell, clean);
       if (!clean || /^(https?:|data:|\/|#)/i.test(clean)) return clean;
       return assetBaseUrl + clean.split('/').map(encodeURIComponent).join('/');
     }
 
-    function rewriteMarkdownAssets(markdown) {
-      return textOf(markdown).replace(/!\[([^\]]*)\]\(([^)\s]+)([^)]*)\)/g, (match, alt, url, rest) => {
-        return `![${alt}](${resolveAssetUrl(url)}${rest || ''})`;
-      });
+    function rewriteMarkdownAssets(cell) {
+      return textOf(cell.source)
+        .replace(/!\[([^\]]*)\]\(([^)\s]+)([^)]*)\)/g, (match, alt, url, rest) => {
+          return `![${alt}](${resolveAssetUrl(url, cell)}${rest || ''})`;
+        })
+        .replace(/(<img\b[^>]*\bsrc=["'])([^"']+)(["'][^>]*>)/gi, (match, prefix, url, suffix) => {
+          return `${prefix}${resolveAssetUrl(url, cell)}${suffix}`;
+        });
     }
 
     document.getElementById('title').textContent = template.title;
@@ -126,7 +146,7 @@
 
     document.getElementById('notebook').innerHTML = (notebook.cells || []).map((cell, index) => {
       if (cell.cell_type === 'markdown') {
-        return `<article class="cell markdown">${marked.parse(rewriteMarkdownAssets(cell.source))}</article>`;
+        return `<article class="cell markdown">${marked.parse(rewriteMarkdownAssets(cell))}</article>`;
       }
       if (cell.cell_type === 'code') {
         return `<article class="cell"><div class="prompt">In [${index + 1}]</div><pre><code>${escapeHtml(textOf(cell.source))}</code></pre>${renderOutputs(cell.outputs)}</article>`;

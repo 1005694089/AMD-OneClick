@@ -699,6 +699,24 @@ findmnt "$mnt"
             "image-id": str(image_id),
         }
 
+    def _eligible_prepull_nodes(self) -> set[str]:
+        """Nodes that should count toward image availability."""
+        eligible: set[str] = set()
+        nodes = self.core_v1.list_node()
+        for node in nodes.items:
+            labels = node.metadata.labels or {}
+            conditions = {cond.type: cond.status for cond in node.status.conditions or []}
+            if labels.get("amd-oneclick-prepull") != "enabled":
+                continue
+            if getattr(node.spec, "unschedulable", False):
+                continue
+            if conditions.get("Ready") != "True":
+                continue
+            if conditions.get("DiskPressure") == "True":
+                continue
+            eligible.add(node.metadata.name)
+        return eligible
+
     def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
         """Create or replace a DaemonSet that pulls the image on every node."""
         image = image.strip()
@@ -727,6 +745,7 @@ findmnt "$mnt"
                 "template": {
                     "metadata": {"labels": labels},
                     "spec": {
+                        "nodeSelector": {"amd-oneclick-prepull": "enabled"},
                         "tolerations": [{"operator": "Exists"}],
                         "containers": [
                             {
@@ -756,7 +775,8 @@ findmnt "$mnt"
         name = self._prepull_name(image_id)
         try:
             ds = self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
-            desired = ds.status.desired_number_scheduled or 0
+            eligible_nodes = self._eligible_prepull_nodes()
+            desired = len(eligible_nodes) or (ds.status.desired_number_scheduled or 0)
             ds_uid = ds.metadata.uid
             image = ds.spec.template.spec.containers[0].image
             pulled_nodes = set()
@@ -776,10 +796,11 @@ findmnt "$mnt"
                 if status.image == image and status.image_id:
                     pulled_nodes.add(pod.spec.node_name)
 
-            ready = len(pulled_nodes)
+            effective_pulled_nodes = pulled_nodes & eligible_nodes if eligible_nodes else pulled_nodes
+            ready = len(effective_pulled_nodes)
             target = max(1, int(desired * 0.8 + 0.999)) if desired else 0
             status = "ready" if target > 0 and ready >= target else "pulling"
-            message = f"{ready}/{desired} nodes pulled (threshold {target}, 80%)"
+            message = f"{ready}/{desired} eligible nodes pulled (threshold {target}, 80%)"
             return {
                 "status": status,
                 "desired_count": desired,

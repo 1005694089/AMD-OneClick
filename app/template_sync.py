@@ -70,7 +70,7 @@ def _source_text(source) -> str:
 
 def _is_relative_asset(url: str) -> bool:
     clean = (url or "").strip()
-    return bool(clean) and not re.match(r"^(https?:|data:|/|#)", clean, re.IGNORECASE)
+    return bool(clean) and not re.match(r"^(https?:|data:|attachment:|/|#)", clean, re.IGNORECASE)
 
 
 def _resolve_asset_path(notebook_path: str, asset_url: str) -> str:

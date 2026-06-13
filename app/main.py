@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.background import BackgroundTask
 from starlette.middleware.sessions import SessionMiddleware
 import secrets
 import httpx
@@ -422,6 +423,11 @@ def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
     if location.startswith("/"):
         return location
     return location
+
+
+async def _close_httpx_stream(upstream: httpx.Response, client: httpx.AsyncClient):
+    await upstream.aclose()
+    await client.aclose()
 
 
 def _request_with_retries(method: str, url: str, retries: int = 3, **kwargs) -> requests.Response:
@@ -1303,13 +1309,16 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
 
     body = await request.body()
     timeout = httpx.Timeout(3600.0, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        upstream = await client.request(
+    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    upstream = await client.send(
+        client.build_request(
             request.method,
             target_url,
             headers=_proxy_headers(request.headers),
             content=body,
-        )
+        ),
+        stream=True,
+    )
 
     response_headers = {
         k: v for k, v in upstream.headers.items()
@@ -1317,7 +1326,12 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
     }
     if "location" in response_headers:
         response_headers["location"] = _rewrite_location(response_headers["location"], instance_id, target_base)
-    response = Response(content=upstream.content, status_code=upstream.status_code, headers=response_headers)
+    response = StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        background=BackgroundTask(_close_httpx_stream, upstream, client),
+    )
     for cookie in upstream.headers.get_list("set-cookie"):
         response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
     return response
@@ -1337,7 +1351,7 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
         if websocket.headers.get("cookie"):
             headers.append(("cookie", websocket.headers["cookie"]))
 
-        async with websockets.connect(target_url, additional_headers=headers, open_timeout=10) as upstream:
+        async with websockets.connect(target_url, additional_headers=headers, open_timeout=10, max_size=16 * 1024 * 1024, max_queue=4) as upstream:
             async def client_to_upstream():
                 while True:
                     msg = await websocket.receive()
