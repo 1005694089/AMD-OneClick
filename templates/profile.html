@@ -41,6 +41,8 @@
   <script src="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}"></script>
   <script src="/static/vendor/dayjs.min.js?v={{ static_asset_version }}"></script>
   <script src="/static/vendor/antd.min.js?v={{ static_asset_version }}"></script>
+  <script>window.__APP_BASE_PATH__ = {{ app_base_path | tojson }};</script>
+  <script src="{{ public_path('/static/app-path.js') }}?v={{ static_asset_version }}"></script>
   <script>
     const { Avatar, Button, Card, Descriptions, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Progress, Select, Space, Statistic, Table, Tag, Typography, Alert, message } = antd;
     const { Header, Content } = Layout;
