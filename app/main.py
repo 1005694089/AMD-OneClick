@@ -164,6 +164,8 @@ if not settings.SSO_ENABLED:
 
 @app.middleware("http")
 async def log_slow_requests(request: Request, call_next):
+    if settings.PUBLIC_PATH_PREFIX and request.scope.get("path", "").startswith("/static/"):
+        request.scope["path"] = f"{settings.PUBLIC_PATH_PREFIX}{request.scope['path']}"
     start = time.monotonic()
     status_code = 500
     try:
