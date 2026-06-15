@@ -4,11 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Profile - Radeon Cloud</title>
-  <link rel="stylesheet" href="/static/vendor/antd-reset.css?v={{ static_asset_version }}" />
-  <link rel="preload" href="/static/vendor/react.production.min.js?v={{ static_asset_version }}" as="script" />
-  <link rel="preload" href="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}" as="script" />
-  <link rel="preload" href="/static/vendor/dayjs.min.js?v={{ static_asset_version }}" as="script" />
-  <link rel="preload" href="/static/vendor/antd.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="stylesheet" href="{{ public_path('/static/vendor/antd-reset.css') }}?v={{ static_asset_version }}" />
+  <link rel="preload" href="{{ public_path('/static/vendor/react.production.min.js') }}?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="{{ public_path('/static/vendor/react-dom.production.min.js') }}?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="{{ public_path('/static/vendor/dayjs.min.js') }}?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="{{ public_path('/static/vendor/antd.min.js') }}?v={{ static_asset_version }}" as="script" />
   <style>
     body { margin:0; background:#f5f6fb; }
     #root { min-height:100vh; }
@@ -33,14 +33,14 @@
 <body>
   <div id="root">
     <div class="boot-shell">
-      <div class="boot-brand"><img src="/static/vendor/amd-logo.png?v={{ static_asset_version }}" alt="AMD" /><span>Radeon Cloud</span></div>
+      <div class="boot-brand"><img src="{{ public_path('/static/vendor/amd-logo.png') }}?v={{ static_asset_version }}" alt="AMD" /><span>Radeon Cloud</span></div>
       <div class="boot-line"></div>
     </div>
   </div>
-  <script src="/static/vendor/react.production.min.js?v={{ static_asset_version }}"></script>
-  <script src="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}"></script>
-  <script src="/static/vendor/dayjs.min.js?v={{ static_asset_version }}"></script>
-  <script src="/static/vendor/antd.min.js?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/react.production.min.js') }}?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/react-dom.production.min.js') }}?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/dayjs.min.js') }}?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/antd.min.js') }}?v={{ static_asset_version }}"></script>
   <script>window.__APP_BASE_PATH__ = {{ app_base_path | tojson }};</script>
   <script src="{{ public_path('/static/app-path.js') }}?v={{ static_asset_version }}"></script>
   <script>
@@ -65,9 +65,9 @@
       'RUN pip install --no-cache-dir transformers datasets',
       ''
     ].join('\n');
-    const JUPYTER_LOGO = '/static/vendor/jupyter.svg?v={{ static_asset_version }}';
-    const OPENCODE_LOGO = '/static/vendor/opencode.svg?v={{ static_asset_version }}';
-    const HERMES_LOGO = '/static/vendor/hermes.ico?v={{ static_asset_version }}';
+    const JUPYTER_LOGO = appUrl('/static/vendor/jupyter.svg?v={{ static_asset_version }}');
+    const OPENCODE_LOGO = appUrl('/static/vendor/opencode.svg?v={{ static_asset_version }}');
+    const HERMES_LOGO = appUrl('/static/vendor/hermes.ico?v={{ static_asset_version }}');
     // Render a brand logo with a small, always-visible one-word label next to it.
     // If the logo fails to load, the label alone still identifies the button.
     function brandContent(src, alt, label) {
@@ -192,7 +192,7 @@
         if (!user || !user.email) return;
         setCustomLoading(true);
         try {
-          const res = await fetch('/api/custom-images');
+          const res = await fetch(appUrl('/api/custom-images'));
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Failed to load custom images');
           setCustomImages(data.custom_images || []);
@@ -210,7 +210,7 @@
         let cancelled = false;
         async function loadBackupStatus() {
           try {
-            const res = await fetch('/api/oss/status');
+            const res = await fetch(appUrl('/api/oss/status'));
             const data = await res.json().catch(() => ({}));
             if (!cancelled && res.ok) setBackupStatus(data);
           } catch (e) {}
@@ -236,7 +236,7 @@
         let timer = null;
         async function check() {
           try {
-            const res = await fetch('/api/notebook/status');
+            const res = await fetch(appUrl('/api/notebook/status'));
             const data = await res.json();
             if (cancelled) return;
             if (data.status === 'ready') {
@@ -255,7 +255,7 @@
       async function buildCustomImage(values) {
         setBuildLoading(true);
         try {
-          const res = await fetch('/api/custom-images/build', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ name: values.name, dockerfile: values.dockerfile }) });
+          const res = await fetch(appUrl('/api/custom-images/build'), { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ name: values.name, dockerfile: values.dockerfile }) });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Build failed to start');
           message.success('Build queued');
@@ -270,7 +270,7 @@
       }
 
       async function deleteCustomImage(id) {
-        const res = await fetch(`/api/custom-images/${id}`, { method:'DELETE' });
+        const res = await fetch(appUrl(`/api/custom-images/${id}`), { method:'DELETE' });
         if (res.ok) {
           message.success('Custom image deleted');
           loadCustomImages();
@@ -283,7 +283,7 @@
       async function launchCustomImage(ci) {
         if (activeInstance && activeInstance.instance_id) { message.warning('Only one active instance is allowed. Open or destroy it first.'); return; }
         try {
-          const res = await fetch('/api/notebook/request', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ image: ci.image, gpu_count: 1, resource_profile: 'auto', instance_type: 'opencode' }) });
+          const res = await fetch(appUrl('/api/notebook/request'), { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ image: ci.image, gpu_count: 1, resource_profile: 'auto', instance_type: 'opencode' }) });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           message.info('Launching custom workspace...');
@@ -526,7 +526,7 @@
       return React.createElement(Layout, null,
         React.createElement(Header, {className:'app-header'},
           React.createElement('div', {className:'left-header'},
-            React.createElement('div', {className:'brand'}, React.createElement('img', {src:'/static/vendor/amd-logo.png?v={{ static_asset_version }}'}), React.createElement('span', null, 'Radeon Cloud')),
+            React.createElement('div', {className:'brand'}, React.createElement('img', {src:appUrl('/static/vendor/amd-logo.png?v={{ static_asset_version }}')}), React.createElement('span', null, 'Radeon Cloud')),
             React.createElement(Menu, {mode:'horizontal', selectedKeys:[], items:[
               {key:'gallery',label:React.createElement('a',{href:appUrl('/')},'Gallery')},
               {key:'space',label:'Space',disabled:true},

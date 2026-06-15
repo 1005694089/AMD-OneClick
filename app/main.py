@@ -1668,7 +1668,7 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request, use
     if not active or active.get("instance_id") != instance_id:
         raise HTTPException(status_code=403, detail="Forbidden")
     target_base = await _run_blocking(_instance_service_base, instance_id)
-    target_url = f"{target_base}/instances/{instance_id}/{path}"
+    target_url = f"{target_base}{_instance_jupyter_path(instance_id, path)}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
@@ -1716,7 +1716,7 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
     await websocket.accept()
     try:
         target_base = (await _run_blocking(_instance_service_base, instance_id)).replace("http://", "ws://")
-        target_url = f"{target_base}/instances/{instance_id}/{path}"
+        target_url = f"{target_base}{_instance_jupyter_path(instance_id, path)}"
         if websocket.url.query:
             target_url += f"?{websocket.url.query}"
 

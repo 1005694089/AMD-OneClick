@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Notebook Preview - Radeon Cloud</title>
-  <link rel="stylesheet" href="/static/vendor/antd-reset.css?v={{ static_asset_version }}" />
-  <link rel="preload" href="/static/vendor/marked.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="stylesheet" href="{{ public_path('/static/vendor/antd-reset.css') }}?v={{ static_asset_version }}" />
+  <link rel="preload" href="{{ public_path('/static/vendor/marked.min.js') }}?v={{ static_asset_version }}" as="script" />
   <style>
     body { margin: 0; background: #f7f8fc; color: #1f2430; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     .topbar { height: 64px; display:flex; align-items:center; justify-content:space-between; padding:0 28px; background:#fff; border-bottom:1px solid #edf0f5; position:sticky; top:0; z-index:10; }
@@ -57,8 +57,8 @@
 </head>
 <body>
   <div class="topbar">
-    <div class="brand"><img src="/static/vendor/amd-logo.png?v={{ static_asset_version }}" alt="AMD" /><span>Radeon Cloud</span></div>
-    <a class="btn secondary" style="background:#f0f2f7;color:#24283a;border-color:#e3e6ef" href="/">Back to Notebook</a>
+    <div class="brand"><img src="{{ public_path('/static/vendor/amd-logo.png') }}?v={{ static_asset_version }}" alt="AMD" /><span>Radeon Cloud</span></div>
+    <a class="btn secondary" style="background:#f0f2f7;color:#24283a;border-color:#e3e6ef" href="{{ public_path('/') }}">Back to Notebook</a>
   </div>
   <main class="wrap">
     <section class="hero">
@@ -74,7 +74,7 @@
     <div class="cache-note" id="cacheNote"></div>
     <section class="notebook" id="notebook"></section>
   </main>
-  <script src="/static/vendor/marked.min.js?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/marked.min.js') }}?v={{ static_asset_version }}"></script>
   <script>window.__APP_BASE_PATH__ = {{ app_base_path | tojson }};</script>
   <script src="{{ public_path('/static/app-path.js') }}?v={{ static_asset_version }}"></script>
   <script>

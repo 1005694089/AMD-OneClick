@@ -4,11 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Radeon Cloud</title>
-  <link rel="stylesheet" href="/static/vendor/antd-reset.css?v={{ static_asset_version }}" />
-  <link rel="preload" href="/static/vendor/react.production.min.js?v={{ static_asset_version }}" as="script" />
-  <link rel="preload" href="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}" as="script" />
-  <link rel="preload" href="/static/vendor/dayjs.min.js?v={{ static_asset_version }}" as="script" />
-  <link rel="preload" href="/static/vendor/antd.min.js?v={{ static_asset_version }}" as="script" />
+  <link rel="stylesheet" href="{{ public_path('/static/vendor/antd-reset.css') }}?v={{ static_asset_version }}" />
+  <link rel="preload" href="{{ public_path('/static/vendor/react.production.min.js') }}?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="{{ public_path('/static/vendor/react-dom.production.min.js') }}?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="{{ public_path('/static/vendor/dayjs.min.js') }}?v={{ static_asset_version }}" as="script" />
+  <link rel="preload" href="{{ public_path('/static/vendor/antd.min.js') }}?v={{ static_asset_version }}" as="script" />
   <style>
     body { margin: 0; background: #f5f6fb; }
     #root { min-height: 100vh; }
@@ -76,14 +76,14 @@
 <body>
   <div id="root">
     <div class="boot-shell">
-      <div class="boot-brand"><img src="/static/vendor/amd-logo.png?v={{ static_asset_version }}" alt="AMD" /><span>Radeon Cloud</span></div>
+      <div class="boot-brand"><img src="{{ public_path('/static/vendor/amd-logo.png') }}?v={{ static_asset_version }}" alt="AMD" /><span>Radeon Cloud</span></div>
       <div class="boot-line"></div>
     </div>
   </div>
-  <script src="/static/vendor/react.production.min.js?v={{ static_asset_version }}"></script>
-  <script src="/static/vendor/react-dom.production.min.js?v={{ static_asset_version }}"></script>
-  <script src="/static/vendor/dayjs.min.js?v={{ static_asset_version }}"></script>
-  <script src="/static/vendor/antd.min.js?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/react.production.min.js') }}?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/react-dom.production.min.js') }}?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/dayjs.min.js') }}?v={{ static_asset_version }}"></script>
+  <script src="{{ public_path('/static/vendor/antd.min.js') }}?v={{ static_asset_version }}"></script>
   <script>window.__APP_BASE_PATH__ = {{ app_base_path | tojson }};</script>
   <script src="{{ public_path('/static/app-path.js') }}?v={{ static_asset_version }}"></script>
   <script>
@@ -103,9 +103,9 @@
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
 
-    const JUPYTER_LOGO = '/static/vendor/jupyter.svg?v={{ static_asset_version }}';
-    const OPENCODE_LOGO = '/static/vendor/opencode.svg?v={{ static_asset_version }}';
-    const HERMES_LOGO = '/static/vendor/hermes.ico?v={{ static_asset_version }}';
+    const JUPYTER_LOGO = appUrl('/static/vendor/jupyter.svg?v={{ static_asset_version }}');
+    const OPENCODE_LOGO = appUrl('/static/vendor/opencode.svg?v={{ static_asset_version }}');
+    const HERMES_LOGO = appUrl('/static/vendor/hermes.ico?v={{ static_asset_version }}');
     // Render a brand logo with a small, always-visible one-word label next to it.
     // If the logo fails to load, the label alone still identifies the button.
     function brandContent(src, alt, label) {
@@ -223,7 +223,7 @@
         let cancelled = false; let timer = null;
         async function check() {
           try {
-            const res = await fetch('/api/notebook/status');
+            const res = await fetch(appUrl('/api/notebook/status'));
             const data = await res.json();
             if (cancelled) return;
             if (data.status === 'ready') { setInstanceReady(true); if (timer) clearInterval(timer); }
@@ -301,7 +301,7 @@
         const gpuCount = form.getFieldValue('gpu_count') || 1;
         setLaunchingTemplateId(`custom-${ci.id}`); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
         try {
-          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: ci.image, gpu_count: gpuCount, resource_profile: 'auto', instance_type: 'opencode' }) });
+          const res = await fetch(appUrl('/api/notebook/request'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: ci.image, gpu_count: gpuCount, resource_profile: 'auto', instance_type: 'opencode' }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           pollStatus(data.url, { type: 'template', templateId: `custom-${ci.id}` }); message.success(`Launching ${ci.name}`);
@@ -458,7 +458,7 @@
       return React.createElement(Layout, null,
         React.createElement(Header, { className: 'app-header' },
           React.createElement('div', { className: 'left-header' },
-            React.createElement('div', { className: 'brand' }, React.createElement('img', { src: '/static/vendor/amd-logo.png?v={{ static_asset_version }}' }), React.createElement('span', null, 'Radeon Cloud')),
+            React.createElement('div', { className: 'brand' }, React.createElement('img', { src: appUrl('/static/vendor/amd-logo.png?v={{ static_asset_version }}') }), React.createElement('span', null, 'Radeon Cloud')),
             React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'space', label: 'Space', disabled: true }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 300 } })
           ), React.createElement(UserMenu)
         ),
