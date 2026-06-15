@@ -60,6 +60,14 @@ class TemplateLaunchRequest(BaseModel):
     gpu_count: int = 1
 
 
+class HuggingFaceNotebookLaunchRequest(BaseModel):
+    """Request model for launching a GitHub notebook from the Hugging Face demo API"""
+    user_name: str
+    notebook_path: str
+    gpu_count: int = 1
+    image: Optional[str] = None
+
+
 class GitHubNotebookInfo(BaseModel):
     """GitHub notebook information"""
     org: str

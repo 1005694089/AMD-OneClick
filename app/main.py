@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse, urlunparse, unquote
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -38,6 +38,7 @@ from .models import (
     CouponRedeemRequest,
     NotebookTemplateRequest,
     TemplateLaunchRequest,
+    HuggingFaceNotebookLaunchRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .email_service import send_notebook_url_email
@@ -53,8 +54,10 @@ from .store import (
     get_image_by_value,
     get_notebook_template,
     get_or_create_user,
+    get_or_create_external_user,
     get_template_preview_asset,
     get_template_preview_cache,
+    get_user_by_provider,
     get_user,
     ensure_user_min_credits,
     grant_user_credits,
@@ -128,6 +131,7 @@ templates = Jinja2Templates(directory="templates")
 
 # HTTP Basic Auth for admin
 security = HTTPBasic()
+HF_DEMO_PROVIDER = "huggingface_demo"
 
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -161,6 +165,42 @@ def session_user(request: Request) -> Optional[dict]:
     if not user_id:
         return None
     return get_user(int(user_id))
+
+
+def verify_huggingface_demo_api(request: Request) -> None:
+    tokens = [token.strip() for token in settings.HUGGINGFACE_DEMO_API_TOKENS.split(",") if token.strip()]
+    if not tokens:
+        raise HTTPException(status_code=503, detail="Hugging Face demo API is not configured")
+
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    candidate = token.strip()
+    if scheme.lower() != "bearer" or not candidate:
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not any(secrets.compare_digest(candidate, allowed) for allowed in tokens):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _huggingface_demo_user_identity(user_name: str) -> tuple[str, str, str]:
+    display_name = (user_name or "").strip()
+    provider_id = display_name.lower()
+    if not provider_id:
+        raise HTTPException(status_code=400, detail="user_name is required")
+    if len(provider_id) > 255:
+        raise HTTPException(status_code=400, detail="user_name is too long")
+
+    digest = hashlib.sha256(provider_id.encode("utf-8")).hexdigest()[:16]
+    email = f"hf-{digest}@huggingface.oneclick.local"
+    return provider_id, display_name[:255], email
+
 
 def _workshop_index_from_email(email: str) -> Optional[int]:
     raw = (email or "").strip().lower()
@@ -1118,6 +1158,231 @@ def _parse_github_path(full_path: str) -> dict:
         "path": path,
         "raw_url": raw_url
     }
+
+
+def _parse_huggingface_notebook_url(raw_url: str) -> Optional[dict]:
+    parsed = urlparse(raw_url)
+    host = parsed.netloc.lower()
+    if host not in {"huggingface.co", "www.huggingface.co"}:
+        return None
+
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        raise ValueError("Hugging Face notebook URL must include an .ipynb file")
+
+    marker_index = next((idx for idx, part in enumerate(parts) if part in {"blob", "resolve"}), None)
+    if marker_index is not None:
+        if marker_index < 1 or len(parts) <= marker_index + 2:
+            raise ValueError("Hugging Face notebook URL must look like /repo/blob/revision/path.ipynb")
+        repo_parts = parts[:marker_index]
+        branch = parts[marker_index + 1]
+        file_parts = parts[marker_index + 2:]
+        if not file_parts[-1].lower().endswith(".ipynb"):
+            raise ValueError("Hugging Face notebook URL must point to an .ipynb file")
+        repo_id = "/".join(repo_parts)
+        file_path = "/".join(file_parts)
+        download_path = f"/{repo_id}/resolve/{branch}/{quote(file_path, safe='/')}"
+        download_url = urlunparse((parsed.scheme or "https", parsed.netloc, download_path, "", parsed.query, ""))
+    else:
+        if not parts[-1].lower().endswith(".ipynb"):
+            raise ValueError("Hugging Face notebook URL must point to an .ipynb file")
+        repo_parts = parts[:-1]
+        branch = "main"
+        file_parts = [parts[-1]]
+        download_url = urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, "", parsed.query, ""))
+
+    filename = unquote(file_parts[-1])
+    repo_id = "/".join(repo_parts) if repo_parts else "huggingface"
+    return {
+        "org": "huggingface",
+        "repo": repo_id,
+        "branch": branch,
+        "path": filename,
+        "raw_url": download_url,
+    }
+
+
+def _parse_huggingface_demo_notebook_path(notebook_path: str) -> dict:
+    raw = (notebook_path or "").strip()
+    if not raw:
+        raise ValueError("notebook_path is required")
+
+    parsed = urlparse(raw)
+    huggingface_info = _parse_huggingface_notebook_url(raw) if parsed.scheme or parsed.netloc else None
+    if huggingface_info:
+        return huggingface_info
+
+    path = parsed.path.lstrip("/") if parsed.scheme or parsed.netloc else raw.lstrip("/")
+    if path.startswith("github/"):
+        path = path[len("github/"):]
+
+    parts = path.split("/")
+    if len(parts) < 5 or any(not part for part in parts[:4]) or parts[2] != "blob":
+        raise ValueError("notebook_path must look like /github/org/repo/blob/branch/path.ipynb")
+    if not parts[-1].lower().endswith(".ipynb"):
+        raise ValueError("notebook_path must point to an .ipynb file")
+
+    github_info = _parse_github_path(path)
+    github_info["repo_url"] = _github_clone_url(f"https://github.com/{github_info['org']}/{github_info['repo']}")
+    return github_info
+
+
+@app.post("/api/huggingface/notebooks", response_model=NotebookStatus)
+async def launch_huggingface_demo_notebook(
+    request: Request,
+    req: HuggingFaceNotebookLaunchRequest,
+    _auth: None = Depends(verify_huggingface_demo_api),
+):
+    try:
+        github_info = _parse_huggingface_demo_notebook_path(req.notebook_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    provider_id, display_name, email = _huggingface_demo_user_identity(req.user_name)
+    gpu_count = req.gpu_count or 1
+    image = req.image or settings.DEFAULT_IMAGE
+
+    if gpu_count not in [1, 2, 4]:
+        raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
+    if not get_image_by_value(image):
+        raise HTTPException(status_code=400, detail="Invalid image selected")
+
+    user = get_or_create_external_user(
+        HF_DEMO_PROVIDER,
+        provider_id,
+        email,
+        name=display_name,
+        initial_credits=0,
+    )
+    user = ensure_user_min_credits(user["id"], settings.HUGGINGFACE_DEMO_MIN_CREDITS) or user
+
+    active = get_active_instance_for_user(user["id"])
+    if active:
+        if k8s_client.get_instance_by_id(active["instance_id"]):
+            raise HTTPException(status_code=400, detail="Each user can only have one active instance")
+        mark_instance_deleted(active["instance_id"])
+
+    if int(user["credits"]) < gpu_count:
+        raise HTTPException(status_code=400, detail="Insufficient credits")
+
+    try:
+        instance_id = f"hf-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
+        instance = k8s_client.create_instance(
+            email,
+            image,
+            instance_type="jupyter",
+            gpu_count=gpu_count,
+            github_info=github_info,
+            custom_instance_id=instance_id,
+            resource_profile="auto",
+        )
+        record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count, instance.get("node_port"))
+        record_instance_launch_event(user["id"], email, instance["id"], image, "jupyter", gpu_count)
+        from .telemetry import report_gpu_instance_created_event
+
+        await report_gpu_instance_created_event(
+            instance_id=instance["id"],
+            user_id=user["id"],
+            instance_type="jupyter",
+            gpu_count=gpu_count,
+        )
+
+        return NotebookStatus(
+            status="allocating",
+            message="Allocating resources for the Hugging Face demo notebook...",
+            url=_instance_public_url(request, instance["id"], github_info.get("path")),
+            email=email,
+            instance_id=instance["id"],
+        )
+    except Exception as e:
+        logger.error("Error launching Hugging Face demo notebook for %s: %s", email, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/huggingface/notebooks/current", response_model=NotebookStatus)
+async def huggingface_demo_notebook_status(
+    request: Request,
+    user_name: str = Query(...),
+    _auth: None = Depends(verify_huggingface_demo_api),
+):
+    provider_id, _, email = _huggingface_demo_user_identity(user_name)
+    user = get_user_by_provider(HF_DEMO_PROVIDER, provider_id)
+    if not user:
+        return NotebookStatus(
+            status="not_found",
+            message="No notebook instance found for this user",
+            email=email,
+        )
+
+    try:
+        active = get_active_instance_for_user(user["id"])
+        if not active:
+            return NotebookStatus(
+                status="not_found",
+                message="No notebook instance found for this user",
+                email=email,
+            )
+
+        instance = k8s_client.get_instance_by_id(active["instance_id"])
+        if not instance:
+            mark_instance_deleted(active["instance_id"])
+            return NotebookStatus(
+                status="not_found",
+                message="No notebook instance found for this user",
+                email=email,
+                instance_id=active["instance_id"],
+            )
+
+        status = k8s_client.get_pod_status(email, instance_id=active["instance_id"])
+        status_messages = {
+            "ready": "The notebook is ready",
+            "running": "Container is running, starting Jupyter...",
+            "jupyter_starting": "Jupyter is starting up...",
+            "pending": "Waiting for resources...",
+            "initializing": "Initializing notebook environment...",
+            "loading": "Loading notebook image...",
+            "failed": "Notebook creation failed",
+            "unknown": "Checking status...",
+        }
+
+        return NotebookStatus(
+            status=status or "unknown",
+            message=status_messages.get(status, "Checking status..."),
+            url=_instance_public_url(request, instance["id"], instance.get("github_path")),
+            email=email,
+            instance_id=instance["id"],
+        )
+    except Exception as e:
+        logger.error("Error checking Hugging Face demo notebook for %s: %s", email, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/huggingface/notebooks/current", response_model=DestroyResponse)
+async def destroy_huggingface_demo_notebook(
+    user_name: str = Query(...),
+    _auth: None = Depends(verify_huggingface_demo_api),
+):
+    provider_id, _, _ = _huggingface_demo_user_identity(user_name)
+    user = get_user_by_provider(HF_DEMO_PROVIDER, provider_id)
+    if not user:
+        return DestroyResponse(success=False, message="No active instance found", destroyed_count=0)
+
+    active = get_active_instance_for_user(user["id"])
+    if not active:
+        return DestroyResponse(success=False, message="No active instance found", destroyed_count=0)
+
+    instance_id = active["instance_id"]
+    try:
+        deleted = k8s_client.delete_instance_by_id(instance_id)
+        mark_instance_deleted(instance_id)
+        return DestroyResponse(
+            success=True,
+            message=f"Instance {instance_id} {'destroyed' if deleted else 'marked deleted'}",
+            destroyed_count=1 if deleted else 0,
+        )
+    except Exception as e:
+        logger.error("Error destroying Hugging Face demo notebook %s: %s", instance_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/github/{full_path:path}", response_class=HTMLResponse)

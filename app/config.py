@@ -133,6 +133,10 @@ class Settings:
     WORKSHOP_USER_COUNT: int = int(os.getenv("WORKSHOP_USER_COUNT", "150"))
     WORKSHOP_CREDITS: int = int(os.getenv("WORKSHOP_CREDITS", "10000"))
 
+    HUGGINGFACE_DEMO_API_TOKENS: str = os.getenv("HUGGINGFACE_DEMO_API_TOKENS", os.getenv("HUGGINGFACE_API_TOKENS", ""))
+    HUGGINGFACE_DEMO_MIN_CREDITS: int = int(
+        os.getenv("HUGGINGFACE_DEMO_MIN_CREDITS", os.getenv("HUGGINGFACE_MIN_CREDITS", "48"))
+    )
     TELEMETRY_API_URL: str = os.getenv("TELEMETRY_API_URL", "")
     METRICS_INGEST_API_KEY: str = os.getenv("METRICS_INGEST_API_KEY", "")
     ONECLICK_TELEMETRY_ENABLED: bool = os.getenv("ONECLICK_TELEMETRY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}

@@ -362,6 +362,64 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
         return user
 
 
+def get_user_by_provider(provider: str, provider_id: str) -> Optional[dict]:
+    with engine.begin() as conn:
+        return row_to_dict(
+            conn.execute(select(users).where(users.c.provider == provider, users.c.provider_id == provider_id))
+            .mappings()
+            .first()
+        )
+
+
+def get_or_create_external_user(
+    provider: str,
+    provider_id: str,
+    email: str,
+    name: str = "",
+    avatar_url: str = "",
+    initial_credits: int = 0,
+) -> dict:
+    """Create an API-backed user without relinking an existing email-owned OAuth user."""
+    now = utc_now()
+    try:
+        with engine.begin() as conn:
+            existing = conn.execute(
+                select(users).where(users.c.provider == provider, users.c.provider_id == provider_id)
+            ).mappings().first()
+            if existing:
+                conn.execute(
+                    update(users)
+                    .where(users.c.id == existing["id"])
+                    .values(email=email, name=name, avatar_url=avatar_url, updated_at=now)
+                )
+                user = row_to_dict(conn.execute(select(users).where(users.c.id == existing["id"])).mappings().first())
+                user["_created"] = False
+                return user
+
+            result = conn.execute(
+                users.insert().values(
+                    provider=provider,
+                    provider_id=provider_id,
+                    email=email,
+                    name=name,
+                    avatar_url=avatar_url,
+                    credits=initial_credits,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            user_id = result.inserted_primary_key[0]
+            user = row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+            user["_created"] = True
+            return user
+    except IntegrityError:
+        user = get_user_by_provider(provider, provider_id)
+        if user:
+            user["_created"] = False
+            return user
+        raise
+
+
 def get_user(user_id: int) -> Optional[dict]:
     with engine.begin() as conn:
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
