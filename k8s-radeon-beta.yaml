@@ -1,0 +1,221 @@
+# Radeon beta stack. Secrets are intentionally not stored in git.
+# Before rollout, create amd-oneclick-radeon-beta-secrets in this namespace with:
+# POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD, DATABASE_URL, SESSION_SECRET,
+# HUGGINGFACE_DEMO_API_TOKENS, and any optional OAuth/admin/telemetry secrets.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: amd-oneclick-radeon-beta
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: amd-oneclick-radeon-beta-manager
+  namespace: amd-oneclick-radeon-beta
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: amd-oneclick-radeon-beta-manager
+  namespace: amd-oneclick-radeon-beta
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: amd-oneclick-radeon-beta-manager
+  namespace: amd-oneclick-radeon-beta
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: amd-oneclick-radeon-beta-manager
+subjects:
+  - kind: ServiceAccount
+    name: amd-oneclick-radeon-beta-manager
+    namespace: amd-oneclick-radeon-beta
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amd-oneclick-radeon-beta-config
+  namespace: amd-oneclick-radeon-beta
+data:
+  K8S_NAMESPACE: "amd-oneclick-radeon-beta"
+  DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
+  IMAGE_PULL_SECRET_NAME: "amd-oneclick-radeon-beta-regcred"
+  CPU_LIMIT: "16"
+  MEMORY_LIMIT: "64Gi"
+  GPU_LIMIT: "1"
+  CPU_REQUEST: "8"
+  MEMORY_REQUEST: "32Gi"
+  HF_CACHE_HOST_PATH: "/var/lib/amd-oneclick-radeon-beta/hf-cache"
+  HF_CACHE_MOUNT_PATH: "/root/.cache/huggingface"
+  HF_HUB_DISABLE_XET: "1"
+  WORKSPACE_HOST_ROOT: "/workspace/amd-oneclick-radeon-beta"
+  WORKSPACE_MOUNT_PATH: "/workspace"
+  WORKSPACE_VOLUME_TYPE: "emptyDir"
+  WORKSPACE_EMPTYDIR_SIZE_LIMIT: "100Gi"
+  WORKSPACE_QUOTA_ENABLED: "false"
+  NETWORK_DISK_ENABLED: "false"
+  IDLE_TIMEOUT_MINUTES: "10"
+  MAX_LIFETIME_HOURS: "6"
+  SERVICE_HOST: "36.150.116.220"
+  PUBLIC_BASE_URL: "https://radeon-beta.anruicloud.com"
+  NODE_PORT_BASE: "32500"
+  NODE_PORT_MAX: "32699"
+  NODE_PORT_CLUSTER_SCAN_ENABLED: "false"
+  NOTEBOOK_TOKEN: "amd-oneclick"
+  NOTEBOOK_LABEL_PREFIX: "amd-oneclick-radeon-beta"
+  NOTEBOOK_NODE_NAME: "wx-ms-w7900d-0044"
+  NOTEBOOK_TOLERATION_KEY: "amd-oneclick/beta"
+  NOTEBOOK_TOLERATION_VALUE: "radeon"
+  NOTEBOOK_TOLERATION_EFFECT: "NoSchedule"
+  HUGGINGFACE_DEMO_MIN_CREDITS: "48"
+  RUN_SCHEDULER: "false"
+  ADMIN_LOGIN_ENABLED: "false"
+  COUPON_REDEEM_ENABLED: "false"
+  ONECLICK_TELEMETRY_ENABLED: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amd-oneclick-radeon-beta-postgres
+  namespace: amd-oneclick-radeon-beta
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amd-oneclick-radeon-beta-postgres
+  template:
+    metadata:
+      labels:
+        app: amd-oneclick-radeon-beta-postgres
+    spec:
+      nodeName: wx-ms-w7900d-0044
+      imagePullSecrets:
+        - name: amd-oneclick-radeon-beta-regcred
+      tolerations:
+        - key: amd-oneclick/beta
+          operator: Equal
+          value: radeon
+          effect: NoSchedule
+      containers:
+        - name: postgres
+          image: crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: amd-oneclick-radeon-beta-secrets
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: pgdata
+          hostPath:
+            path: /var/lib/amd-oneclick-radeon-beta/postgres
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amd-oneclick-radeon-beta-postgres
+  namespace: amd-oneclick-radeon-beta
+spec:
+  selector:
+    app: amd-oneclick-radeon-beta-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amd-oneclick-radeon-beta-manager
+  namespace: amd-oneclick-radeon-beta
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amd-oneclick-radeon-beta-manager
+  template:
+    metadata:
+      labels:
+        app: amd-oneclick-radeon-beta-manager
+    spec:
+      nodeName: wx-ms-w7900d-0044
+      imagePullSecrets:
+        - name: amd-oneclick-radeon-beta-regcred
+      tolerations:
+        - key: amd-oneclick/beta
+          operator: Equal
+          value: radeon
+          effect: NoSchedule
+      serviceAccountName: amd-oneclick-radeon-beta-manager
+      dnsPolicy: ClusterFirst
+      containers:
+        - name: manager
+          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-hf-demo-20260615-2222-pullsecret
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: amd-oneclick-radeon-beta-config
+            - secretRef:
+                name: amd-oneclick-radeon-beta-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amd-oneclick-radeon-beta-manager
+  namespace: amd-oneclick-radeon-beta
+spec:
+  selector:
+    app: amd-oneclick-radeon-beta-manager
+  type: NodePort
+  ports:
+    - port: 80
+      targetPort: 8000
+      nodePort: 30444

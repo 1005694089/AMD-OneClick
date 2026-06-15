@@ -11,7 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import quote, urlencode, urlparse, urlunparse, unquote
+from urllib.parse import quote, urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +41,11 @@ from .models import (
     HuggingFaceNotebookLaunchRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
+from .notebook_sources import (
+    parse_github_path,
+    parse_huggingface_demo_notebook_path,
+    parse_huggingface_notebook_url,
+)
 from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
 from .template_sync import sync_template_preview
@@ -1137,94 +1142,15 @@ def _generate_user_session() -> str:
 
 
 def _parse_github_path(full_path: str) -> dict:
-    """Parse GitHub path like org/repo/blob/branch/path/to/notebook.ipynb"""
-    parts = full_path.split("/")
-    if len(parts) < 5:
-        raise ValueError("Invalid GitHub path format")
-    
-    org = parts[0]
-    repo = parts[1]
-    # parts[2] should be 'blob'
-    branch = parts[3]
-    path = "/".join(parts[4:])
-    
-    # Construct raw GitHub URL
-    raw_url = f"https://raw.githubusercontent.com/{org}/{repo}/{branch}/{path}"
-    
-    return {
-        "org": org,
-        "repo": repo,
-        "branch": branch,
-        "path": path,
-        "raw_url": raw_url
-    }
+    return parse_github_path(full_path)
 
 
 def _parse_huggingface_notebook_url(raw_url: str) -> Optional[dict]:
-    parsed = urlparse(raw_url)
-    host = parsed.netloc.lower()
-    if host not in {"huggingface.co", "www.huggingface.co"}:
-        return None
-
-    parts = [part for part in parsed.path.strip("/").split("/") if part]
-    if len(parts) < 2:
-        raise ValueError("Hugging Face notebook URL must include an .ipynb file")
-
-    marker_index = next((idx for idx, part in enumerate(parts) if part in {"blob", "resolve"}), None)
-    if marker_index is not None:
-        if marker_index < 1 or len(parts) <= marker_index + 2:
-            raise ValueError("Hugging Face notebook URL must look like /repo/blob/revision/path.ipynb")
-        repo_parts = parts[:marker_index]
-        branch = parts[marker_index + 1]
-        file_parts = parts[marker_index + 2:]
-        if not file_parts[-1].lower().endswith(".ipynb"):
-            raise ValueError("Hugging Face notebook URL must point to an .ipynb file")
-        repo_id = "/".join(repo_parts)
-        file_path = "/".join(file_parts)
-        download_path = f"/{repo_id}/resolve/{branch}/{quote(file_path, safe='/')}"
-        download_url = urlunparse((parsed.scheme or "https", parsed.netloc, download_path, "", parsed.query, ""))
-    else:
-        if not parts[-1].lower().endswith(".ipynb"):
-            raise ValueError("Hugging Face notebook URL must point to an .ipynb file")
-        repo_parts = parts[:-1]
-        branch = "main"
-        file_parts = [parts[-1]]
-        download_url = urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, "", parsed.query, ""))
-
-    filename = unquote(file_parts[-1])
-    repo_id = "/".join(repo_parts) if repo_parts else "huggingface"
-    return {
-        "org": "huggingface",
-        "repo": repo_id,
-        "branch": branch,
-        "path": filename,
-        "raw_url": download_url,
-    }
+    return parse_huggingface_notebook_url(raw_url)
 
 
 def _parse_huggingface_demo_notebook_path(notebook_path: str) -> dict:
-    raw = (notebook_path or "").strip()
-    if not raw:
-        raise ValueError("notebook_path is required")
-
-    parsed = urlparse(raw)
-    huggingface_info = _parse_huggingface_notebook_url(raw) if parsed.scheme or parsed.netloc else None
-    if huggingface_info:
-        return huggingface_info
-
-    path = parsed.path.lstrip("/") if parsed.scheme or parsed.netloc else raw.lstrip("/")
-    if path.startswith("github/"):
-        path = path[len("github/"):]
-
-    parts = path.split("/")
-    if len(parts) < 5 or any(not part for part in parts[:4]) or parts[2] != "blob":
-        raise ValueError("notebook_path must look like /github/org/repo/blob/branch/path.ipynb")
-    if not parts[-1].lower().endswith(".ipynb"):
-        raise ValueError("notebook_path must point to an .ipynb file")
-
-    github_info = _parse_github_path(path)
-    github_info["repo_url"] = _github_clone_url(f"https://github.com/{github_info['org']}/{github_info['repo']}")
-    return github_info
+    return parse_huggingface_demo_notebook_path(notebook_path)
 
 
 @app.post("/api/huggingface/notebooks", response_model=NotebookStatus)

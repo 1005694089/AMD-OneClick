@@ -1,0 +1,184 @@
+# Shared PR1 edge router config.
+# Applying this ConfigMap requires an explicit rollout/restart of
+# deployment/amd-oneclick-pr1-edge-nginx in namespace amd-oneclick-pr1-edge-proxy.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amd-oneclick-pr1-edge-nginx
+  namespace: amd-oneclick-pr1-edge-proxy
+data:
+  default.conf: |
+    map $http_upgrade $connection_upgrade {
+      default upgrade;
+      '' close;
+    }
+
+    upstream amd_oneclick_pr1_manager {
+      server 10.233.51.189:80;
+      keepalive 64;
+    }
+
+    upstream amd_oneclick_radeon_beta_manager {
+      server 10.233.98.233:80;
+      keepalive 64;
+    }
+
+    server {
+      listen 36.150.116.220:80;
+      server_name radeon-beta.anruicloud.com;
+
+      client_max_body_size 0;
+      client_body_timeout 3600s;
+      send_timeout 3600s;
+      proxy_http_version 1.1;
+      proxy_connect_timeout 30s;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+      proxy_request_buffering off;
+      proxy_buffering off;
+      proxy_max_temp_file_size 0;
+
+      location /edge-healthz {
+        add_header Content-Type text/plain;
+        return 200 'ok';
+      }
+
+      location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_set_header X-Forwarded-Port 80;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_pass http://amd_oneclick_radeon_beta_manager;
+      }
+    }
+
+    server {
+      listen 36.150.116.220:443 ssl http2;
+      server_name radeon-beta.anruicloud.com;
+
+      ssl_certificate /etc/nginx/tls/tls.crt;
+      ssl_certificate_key /etc/nginx/tls/tls.key;
+      ssl_protocols TLSv1.2 TLSv1.3;
+      ssl_session_cache shared:SSL:10m;
+      ssl_session_timeout 10m;
+
+      client_max_body_size 0;
+      client_body_timeout 3600s;
+      send_timeout 3600s;
+      proxy_http_version 1.1;
+      proxy_connect_timeout 30s;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+      proxy_request_buffering off;
+      proxy_buffering off;
+      proxy_max_temp_file_size 0;
+
+      location /edge-healthz {
+        add_header Content-Type text/plain;
+        return 200 'ok';
+      }
+
+      location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port 443;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_pass http://amd_oneclick_radeon_beta_manager;
+      }
+    }
+
+    server {
+      listen 36.150.116.220:80 default_server;
+      server_name _;
+
+      client_max_body_size 0;
+      client_body_timeout 3600s;
+      send_timeout 3600s;
+      proxy_http_version 1.1;
+      proxy_connect_timeout 30s;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+      proxy_request_buffering off;
+      proxy_buffering off;
+      proxy_max_temp_file_size 0;
+
+      location /edge-healthz {
+        add_header Content-Type text/plain;
+        return 200 'ok';
+      }
+
+      location = / {
+        return 302 /radeon/;
+      }
+
+      location = /radeon {
+        return 302 /radeon/;
+      }
+
+      location ^~ /radeon/ {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto http;
+        proxy_set_header X-Forwarded-Port 80;
+        proxy_set_header X-Forwarded-Prefix /radeon;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_pass http://amd_oneclick_pr1_manager;
+      }
+    }
+
+    server {
+      listen 36.150.116.220:443 ssl http2 default_server;
+      server_name _;
+
+      ssl_certificate /etc/nginx/tls/tls.crt;
+      ssl_certificate_key /etc/nginx/tls/tls.key;
+      ssl_protocols TLSv1.2 TLSv1.3;
+      ssl_session_cache shared:SSL:10m;
+      ssl_session_timeout 10m;
+
+      client_max_body_size 0;
+      proxy_http_version 1.1;
+      proxy_connect_timeout 30s;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+      proxy_request_buffering off;
+      proxy_buffering off;
+
+      location /edge-healthz {
+        add_header Content-Type text/plain;
+        return 200 'ok';
+      }
+
+      location = / {
+        return 302 /radeon/;
+      }
+
+      location = /radeon {
+        return 302 /radeon/;
+      }
+
+      location ^~ /radeon/ {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port 443;
+        proxy_set_header X-Forwarded-Prefix /radeon;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_pass http://amd_oneclick_pr1_manager;
+      }
+    }

@@ -40,6 +40,7 @@ class Settings:
         "DEFAULT_IMAGE",
         "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
     )
+    IMAGE_PULL_SECRET_NAME: str = os.getenv("IMAGE_PULL_SECRET_NAME", "")
 
     @property
     def AVAILABLE_IMAGES(self) -> list:
@@ -62,6 +63,10 @@ class Settings:
     NOTEBOOK_TOKEN: str = os.getenv("NOTEBOOK_TOKEN", "amd-oneclick")
     NOTEBOOK_PORT: int = 8888
     NOTEBOOK_LABEL_PREFIX: str = os.getenv("NOTEBOOK_LABEL_PREFIX", "amd-oneclick")
+    NOTEBOOK_NODE_NAME: str = os.getenv("NOTEBOOK_NODE_NAME", "")
+    NOTEBOOK_TOLERATION_KEY: str = os.getenv("NOTEBOOK_TOLERATION_KEY", "")
+    NOTEBOOK_TOLERATION_VALUE: str = os.getenv("NOTEBOOK_TOLERATION_VALUE", "")
+    NOTEBOOK_TOLERATION_EFFECT: str = os.getenv("NOTEBOOK_TOLERATION_EFFECT", "NoSchedule")
 
     CPU_LIMIT: str = os.getenv("CPU_LIMIT", "16")
     MEMORY_LIMIT: str = os.getenv("MEMORY_LIMIT", "64Gi")
@@ -110,6 +115,11 @@ class Settings:
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     NODE_PORT_BASE: int = int(os.getenv("NODE_PORT_BASE", "30000"))
+    NODE_PORT_MAX: int = int(os.getenv("NODE_PORT_MAX", "32767"))
+    NODE_PORT_CLUSTER_SCAN_ENABLED: bool = os.getenv(
+        "NODE_PORT_CLUSTER_SCAN_ENABLED",
+        "true",
+    ).lower() in {"1", "true", "yes", "on"}
 
     PYPI_MIRROR: str = "https://pypi.tuna.tsinghua.edu.cn/simple"
     PYPI_HOST: str = "pypi.tuna.tsinghua.edu.cn"

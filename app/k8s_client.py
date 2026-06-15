@@ -21,7 +21,6 @@ from .config import settings, INSTANCE_TYPES
 
 logger = logging.getLogger(__name__)
 
-NODE_PORT_MAX = 32767
 _node_port_lock = threading.Lock()
 
 RESOURCE_PROFILES = {
@@ -136,6 +135,34 @@ class K8sClient:
         if not settings.WORKSPACE_QUOTA_ENABLED:
             return None
         return settings.WORKSPACE_QUOTA_NODE_NAME.strip() or None
+
+    def _resolve_notebook_node_name(self, workspace_quota_node_name: Optional[str] = None) -> Optional[str]:
+        notebook_node_name = settings.NOTEBOOK_NODE_NAME.strip()
+        quota_node_name = (workspace_quota_node_name or "").strip()
+        if notebook_node_name and quota_node_name and notebook_node_name != quota_node_name:
+            raise RuntimeError(
+                "NOTEBOOK_NODE_NAME must match WORKSPACE_QUOTA_NODE_NAME when workspace quota is enabled"
+            )
+        return notebook_node_name or quota_node_name or None
+
+    def _notebook_tolerations(self) -> list[dict]:
+        tolerations = [
+            {
+                "key": "amd.com/gpu",
+                "operator": "Exists",
+                "effect": "NoSchedule"
+            }
+        ]
+        toleration_key = settings.NOTEBOOK_TOLERATION_KEY.strip()
+        if toleration_key:
+            toleration = {
+                "key": toleration_key,
+                "operator": "Equal",
+                "value": settings.NOTEBOOK_TOLERATION_VALUE.strip(),
+                "effect": settings.NOTEBOOK_TOLERATION_EFFECT.strip() or "NoSchedule",
+            }
+            tolerations.append(toleration)
+        return tolerations
 
     def _ensure_network_disk(self, instance_id: str) -> Optional[str]:
         if not self._network_disk_dynamic_enabled():
@@ -381,7 +408,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                           github_info: Optional[dict] = None,
                           resource_profile: Optional[str] = None,
                           network_disk_claim_name: Optional[str] = None,
-                          workspace_quota_node_name: Optional[str] = None) -> dict:
+                          workspace_quota_node_name: Optional[str] = None,
+                          notebook_node_name: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -407,6 +435,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         if workspace_quota_node_name:
             annotations["amd-oneclick/workspace-quota"] = f"{settings.WORKSPACE_QUOTA_SIZE_GI}Gi"
             annotations["amd-oneclick/workspace-quota-node"] = workspace_quota_node_name
+        if notebook_node_name:
+            annotations["amd-oneclick/notebook-node"] = notebook_node_name
 
         if github_info:
             annotations["amd-oneclick/github-org"] = github_info.get("org", "")
@@ -559,13 +589,7 @@ findmnt "$mnt"
                     "hostnames": ["github.com"]
                 }
             ],
-            "tolerations": [
-                {
-                    "key": "amd.com/gpu",
-                    "operator": "Exists",
-                    "effect": "NoSchedule"
-                }
-            ],
+            "tolerations": self._notebook_tolerations(),
             "containers": [
                 {
                     "name": "notebook",
@@ -592,8 +616,11 @@ findmnt "$mnt"
         }
         if init_containers:
             spec["initContainers"] = init_containers
-        if workspace_quota_node_name:
-            spec["nodeName"] = workspace_quota_node_name
+        if notebook_node_name:
+            spec["nodeName"] = notebook_node_name
+        image_pull_secret_name = settings.IMAGE_PULL_SECRET_NAME.strip()
+        if image_pull_secret_name:
+            spec["imagePullSecrets"] = [{"name": image_pull_secret_name}]
 
         return {
             "apiVersion": "v1",
@@ -633,7 +660,17 @@ findmnt "$mnt"
             }
         }
     
+    def _node_port_bounds(self) -> tuple[int, int]:
+        lower = settings.NODE_PORT_BASE
+        upper = settings.NODE_PORT_MAX
+        if lower > upper:
+            raise RuntimeError(f"Invalid NodePort range: {lower}-{upper}")
+        return lower, upper
+
     def _used_node_ports(self) -> set[int]:
+        if not settings.NODE_PORT_CLUSTER_SCAN_ENABLED:
+            return set()
+
         used_ports: set[int] = set()
         services = self.core_v1.list_service_for_all_namespaces()
         for svc in services.items:
@@ -644,16 +681,23 @@ findmnt "$mnt"
 
     def _allocate_node_port(self, used_ports: Optional[set[int]] = None, start_port: Optional[int] = None) -> int:
         """Allocate an available NodePort candidate."""
+        lower, upper = self._node_port_bounds()
         used_ports = used_ports if used_ports is not None else self._used_node_ports()
-        port = start_port or settings.NODE_PORT_BASE
-        while port in used_ports and port <= NODE_PORT_MAX:
+        port = start_port or lower
+        if port < lower:
+            port = lower
+        while port in used_ports and port <= upper:
             port += 1
-        if port <= NODE_PORT_MAX:
+        if port <= upper:
             return port
-        for port in range(settings.NODE_PORT_BASE, NODE_PORT_MAX + 1):
+        for port in range(lower, upper + 1):
             if port not in used_ports:
                 return port
         raise RuntimeError("No available NodePort in configured range")
+
+    def _is_node_port_conflict(self, exc: ApiException) -> bool:
+        message = str(exc).lower()
+        return exc.status in {409, 422} and "already allocated" in message
 
     def _create_service_with_nodeport_retry(self, email: str, instance_id: str) -> tuple[int, bool]:
         try:
@@ -666,24 +710,26 @@ findmnt "$mnt"
                 raise
 
         with _node_port_lock:
+            lower, upper = self._node_port_bounds()
             used_ports = self._used_node_ports()
-            start = settings.NODE_PORT_BASE + random.randint(0, min(200, max(0, NODE_PORT_MAX - settings.NODE_PORT_BASE)))
+            start = lower + random.randint(0, min(200, max(0, upper - lower)))
             node_port = self._allocate_node_port(used_ports, start_port=start)
-            for _ in range(512):
+            max_attempts = min(512, upper - lower + 1)
+            for _ in range(max_attempts):
                 try:
                     self.core_v1.create_namespaced_service(namespace=self.namespace, body=self._get_service_manifest(email, instance_id, node_port))
                     logger.info("Created service %s-svc with NodePort %s", instance_id, node_port)
                     return node_port, True
                 except ApiException as e:
-                    message = str(e)
-                    if e.status == 409:
+                    if e.status == 409 and not self._is_node_port_conflict(e):
                         existing = self.core_v1.read_namespaced_service(name=f"{instance_id}-svc", namespace=self.namespace)
                         existing_port = existing.spec.ports[0].node_port if existing.spec.ports else None
                         if existing_port:
                             return int(existing_port), False
                         raise
-                    if e.status == 422 and ("provided port is already allocated" in message or "invalid" in message.lower()):
-                        used_ports = self._used_node_ports()
+                    if self._is_node_port_conflict(e):
+                        if settings.NODE_PORT_CLUSTER_SCAN_ENABLED:
+                            used_ports = self._used_node_ports()
                         used_ports.add(node_port)
                         node_port = self._allocate_node_port(used_ports, start_port=node_port + 1)
                         continue
@@ -891,6 +937,7 @@ findmnt "$mnt"
             return existing
 
         workspace_quota_node_name = self._ensure_workspace_quota(instance_id)
+        notebook_node_name = self._resolve_notebook_node_name(workspace_quota_node_name)
         network_disk_claim_name = self._ensure_network_disk(instance_id)
         pod_manifest = self._get_pod_manifest(
             email, instance_id, image,
@@ -900,6 +947,7 @@ findmnt "$mnt"
             resource_profile=resource_profile,
             network_disk_claim_name=network_disk_claim_name,
             workspace_quota_node_name=workspace_quota_node_name,
+            notebook_node_name=notebook_node_name,
         )
         for attempt in range(1, 7):
             try:

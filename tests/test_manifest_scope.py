@@ -1,0 +1,55 @@
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BETA_MANIFESTS = [
+    ROOT / "k8s-radeon-beta.yaml",
+    ROOT / "k8s-pr1-edge-shared-router.yaml",
+]
+PRODUCTION_V2_TOKENS = [
+    "amd-oneclick-manager-v2",
+    "amd-oneclick-config-v2",
+    "amd-oneclick-secrets-v2",
+    "amd-oneclick-postgres",
+]
+
+
+class ManifestScopeTests(unittest.TestCase):
+    def test_beta_manifests_do_not_reference_production_v2_resources(self):
+        combined = "\n".join(path.read_text(encoding="utf-8") for path in BETA_MANIFESTS)
+
+        for token in PRODUCTION_V2_TOKENS:
+            with self.subTest(token=token):
+                self.assertNotIn(token, combined)
+
+    def test_beta_manager_uses_cluster_dns(self):
+        manifest = (ROOT / "k8s-radeon-beta.yaml").read_text(encoding="utf-8")
+
+        self.assertIn("dnsPolicy: ClusterFirst", manifest)
+        self.assertNotIn("dnsPolicy: None", manifest)
+        self.assertNotIn("8.8.8.8", manifest)
+
+    def test_beta_notebooks_are_node_pinned(self):
+        manifest = (ROOT / "k8s-radeon-beta.yaml").read_text(encoding="utf-8")
+
+        self.assertIn('NOTEBOOK_NODE_NAME: "wx-ms-w7900d-0044"', manifest)
+        self.assertIn('NOTEBOOK_TOLERATION_KEY: "amd-oneclick/beta"', manifest)
+        self.assertIn("key: amd-oneclick/beta", manifest)
+        self.assertIn('IMAGE_PULL_SECRET_NAME: "amd-oneclick-radeon-beta-regcred"', manifest)
+        self.assertIn("imagePullSecrets:", manifest)
+
+    def test_edge_router_uses_stable_service_dns_and_valid_beta_hostname(self):
+        manifest = (ROOT / "k8s-pr1-edge-shared-router.yaml").read_text(encoding="utf-8")
+
+        self.assertIn("server 10.233.51.189:80;", manifest)
+        self.assertIn("server 10.233.98.233:80;", manifest)
+        self.assertIn("listen 36.150.116.220:80 default_server;", manifest)
+        self.assertIn("listen 36.150.116.220:443 ssl http2 default_server;", manifest)
+        self.assertIn("server_name radeon-beta.anruicloud.com;", manifest)
+        self.assertNotIn("radeon_beta.anruicloud.com", manifest)
+        self.assertNotIn(".svc.cluster.local", manifest)
+
+
+if __name__ == "__main__":
+    unittest.main()
