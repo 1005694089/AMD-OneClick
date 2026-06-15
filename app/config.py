@@ -80,6 +80,7 @@ class Settings:
     # Host-level Hugging Face cache shared by model-sync jobs and notebook instances.
     HF_CACHE_HOST_PATH: str = os.getenv("HF_CACHE_HOST_PATH", "/var/lib/amd-oneclick/hf-cache")
     HF_CACHE_MOUNT_PATH: str = os.getenv("HF_CACHE_MOUNT_PATH", "/root/.cache/huggingface")
+    HF_ENDPOINT: str = os.getenv("HF_ENDPOINT", "")
     HF_HUB_DISABLE_XET: str = os.getenv("HF_HUB_DISABLE_XET", "1")
     WORKSPACE_HOST_ROOT: str = os.getenv("WORKSPACE_HOST_ROOT", "/workspace/amd-oneclick")
     WORKSPACE_MOUNT_PATH: str = os.getenv("WORKSPACE_MOUNT_PATH", "/workspace")

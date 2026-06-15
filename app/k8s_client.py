@@ -12,7 +12,7 @@ import random
 import threading
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -367,7 +367,7 @@ cd {workspace}/notebooks
 if [ ! -f {shlex.quote(notebook_filename)} ]; then
     echo "Downloading {notebook_filename}..."
     for i in 1 2 3; do
-        if curl -fsSL --connect-timeout 30 --max-time 120 -o {shlex.quote(notebook_filename)} {shlex.quote(github_info["raw_url"])}; then
+        if curl -fsSL --connect-timeout 30 --max-time 120 -o {shlex.quote(notebook_filename)} {shlex.quote(self._notebook_download_url(github_info["raw_url"]))}; then
             echo "Downloaded: {notebook_filename}"
             break
         else
@@ -401,6 +401,27 @@ export PATH="/root/.opencode/bin:$PATH"
 cd {workspace}
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
 """
+
+    def _notebook_download_url(self, raw_url: str) -> str:
+        endpoint = settings.HF_ENDPOINT.strip().rstrip("/")
+        if not endpoint:
+            return raw_url
+
+        parsed = urlparse(raw_url)
+        if parsed.netloc.lower() not in {"huggingface.co", "www.huggingface.co"}:
+            return raw_url
+
+        endpoint_parsed = urlparse(endpoint if "://" in endpoint else f"https://{endpoint}")
+        endpoint_path = endpoint_parsed.path.rstrip("/")
+        rewritten_path = f"{endpoint_path}{parsed.path}" if endpoint_path else parsed.path
+        return urlunparse((
+            endpoint_parsed.scheme,
+            endpoint_parsed.netloc,
+            rewritten_path,
+            "",
+            parsed.query,
+            parsed.fragment,
+        ))
 
     def _get_pod_manifest(self, email: str, instance_id: str, image: str,
                           instance_type: str = "jupyter",
@@ -496,6 +517,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
         ]
+        if settings.HF_ENDPOINT.strip():
+            env.append({"name": "HF_ENDPOINT", "value": settings.HF_ENDPOINT.strip()})
         if network_disk_enabled:
             network_disk_mount = {
                 "name": "network-disk",

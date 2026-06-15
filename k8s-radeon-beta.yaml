@@ -63,6 +63,7 @@ data:
   MEMORY_REQUEST: "32Gi"
   HF_CACHE_HOST_PATH: "/var/lib/amd-oneclick-radeon-beta/hf-cache"
   HF_CACHE_MOUNT_PATH: "/root/.cache/huggingface"
+  HF_ENDPOINT: "http://134.199.133.77"
   HF_HUB_DISABLE_XET: "1"
   WORKSPACE_HOST_ROOT: "/workspace/amd-oneclick-radeon-beta"
   WORKSPACE_MOUNT_PATH: "/workspace"
@@ -176,7 +177,7 @@ spec:
       dnsPolicy: ClusterFirst
       containers:
         - name: manager
-          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-hf-demo-20260615-2222-pullsecret
+          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-hf-demo-20260615-2308-hfendpoint
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

@@ -167,5 +167,49 @@ class NotebookNodePinningTests(unittest.TestCase):
             client._resolve_notebook_node_name("wx-ms-w7900d-0042")
 
 
+class HuggingFaceEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.original = k8s_module.settings.HF_ENDPOINT
+
+    def tearDown(self):
+        k8s_module.settings.HF_ENDPOINT = self.original
+
+    def test_huggingface_download_url_uses_configured_endpoint(self):
+        k8s_module.settings.HF_ENDPOINT = "http://134.199.133.77"
+        client = object.__new__(k8s_module.K8sClient)
+
+        self.assertEqual(
+            client._notebook_download_url("https://huggingface.co/Qwen/Qwen3.6-27B.ipynb"),
+            "http://134.199.133.77/Qwen/Qwen3.6-27B.ipynb",
+        )
+        self.assertEqual(
+            client._notebook_download_url("https://huggingface.co/org/model/resolve/main/notebooks/demo.ipynb"),
+            "http://134.199.133.77/org/model/resolve/main/notebooks/demo.ipynb",
+        )
+
+    def test_non_huggingface_download_url_is_not_rewritten(self):
+        k8s_module.settings.HF_ENDPOINT = "http://134.199.133.77"
+        client = object.__new__(k8s_module.K8sClient)
+
+        self.assertEqual(
+            client._notebook_download_url("https://raw.githubusercontent.com/org/repo/main/demo.ipynb"),
+            "https://raw.githubusercontent.com/org/repo/main/demo.ipynb",
+        )
+
+    def test_notebook_pod_exposes_huggingface_endpoint(self):
+        k8s_module.settings.HF_ENDPOINT = "http://134.199.133.77"
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+
+        manifest = client._get_pod_manifest(
+            "hf-user@example.test",
+            "hf-demo",
+            "notebook-image",
+        )
+        env = manifest["spec"]["containers"][0]["env"]
+
+        self.assertIn({"name": "HF_ENDPOINT", "value": "http://134.199.133.77"}, env)
+
+
 if __name__ == "__main__":
     unittest.main()
