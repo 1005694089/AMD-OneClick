@@ -364,10 +364,20 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
 mkdir -p {workspace}/notebooks
 cd {workspace}/notebooks
 
+download_notebook() {{
+    output_path="$1"
+    source_url="$2"
+    if [ -n "${{HF_TOKEN:-}}" ]; then
+        curl -fsSL --connect-timeout 30 --max-time 120 -H "Authorization: Bearer ${{HF_TOKEN}}" -o "$output_path" "$source_url"
+    else
+        curl -fsSL --connect-timeout 30 --max-time 120 -o "$output_path" "$source_url"
+    fi
+}}
+
 if [ ! -f {shlex.quote(notebook_filename)} ]; then
     echo "Downloading {notebook_filename}..."
     for i in 1 2 3; do
-        if curl -fsSL --connect-timeout 30 --max-time 120 -o {shlex.quote(notebook_filename)} {shlex.quote(self._notebook_download_url(github_info["raw_url"]))}; then
+        if download_notebook {shlex.quote(notebook_filename)} {shlex.quote(self._notebook_download_url(github_info["raw_url"]))}; then
             echo "Downloaded: {notebook_filename}"
             break
         else
@@ -519,6 +529,20 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
         ]
         if settings.HF_ENDPOINT.strip():
             env.append({"name": "HF_ENDPOINT", "value": settings.HF_ENDPOINT.strip()})
+        hf_token_secret_name = settings.HF_TOKEN_SECRET_NAME.strip()
+        if hf_token_secret_name:
+            env.append({
+                "name": "HF_TOKEN",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": hf_token_secret_name,
+                        "key": settings.HF_TOKEN_SECRET_KEY.strip() or "HF_TOKEN",
+                        "optional": True,
+                    }
+                },
+            })
+        elif settings.HF_TOKEN.strip():
+            env.append({"name": "HF_TOKEN", "value": settings.HF_TOKEN.strip()})
         if network_disk_enabled:
             network_disk_mount = {
                 "name": "network-disk",

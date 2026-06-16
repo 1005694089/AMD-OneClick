@@ -169,10 +169,20 @@ class NotebookNodePinningTests(unittest.TestCase):
 
 class HuggingFaceEndpointTests(unittest.TestCase):
     def setUp(self):
-        self.original = k8s_module.settings.HF_ENDPOINT
+        self.original = (
+            k8s_module.settings.HF_ENDPOINT,
+            k8s_module.settings.HF_TOKEN,
+            k8s_module.settings.HF_TOKEN_SECRET_NAME,
+            k8s_module.settings.HF_TOKEN_SECRET_KEY,
+        )
 
     def tearDown(self):
-        k8s_module.settings.HF_ENDPOINT = self.original
+        (
+            k8s_module.settings.HF_ENDPOINT,
+            k8s_module.settings.HF_TOKEN,
+            k8s_module.settings.HF_TOKEN_SECRET_NAME,
+            k8s_module.settings.HF_TOKEN_SECRET_KEY,
+        ) = self.original
 
     def test_huggingface_download_url_uses_configured_endpoint(self):
         k8s_module.settings.HF_ENDPOINT = "http://134.199.133.77"
@@ -209,6 +219,47 @@ class HuggingFaceEndpointTests(unittest.TestCase):
         env = manifest["spec"]["containers"][0]["env"]
 
         self.assertIn({"name": "HF_ENDPOINT", "value": "http://134.199.133.77"}, env)
+
+    def test_notebook_pod_reads_huggingface_token_from_secret(self):
+        k8s_module.settings.HF_TOKEN_SECRET_NAME = "amd-oneclick-radeon-beta-secrets"
+        k8s_module.settings.HF_TOKEN_SECRET_KEY = "HF_TOKEN"
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+
+        manifest = client._get_pod_manifest(
+            "hf-user@example.test",
+            "hf-demo",
+            "notebook-image",
+        )
+        env = manifest["spec"]["containers"][0]["env"]
+
+        self.assertIn(
+            {
+                "name": "HF_TOKEN",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "amd-oneclick-radeon-beta-secrets",
+                        "key": "HF_TOKEN",
+                        "optional": True,
+                    }
+                },
+            },
+            env,
+        )
+
+    def test_huggingface_download_script_sends_token_when_available(self):
+        client = object.__new__(k8s_module.K8sClient)
+
+        script = client._build_startup_script(
+            "hf-demo",
+            github_info={
+                "path": "Qwen3.6-27B.ipynb",
+                "raw_url": "https://huggingface.co/Qwen/Qwen3.6-27B.ipynb",
+            },
+        )
+
+        self.assertIn('Authorization: Bearer ${HF_TOKEN}', script)
+        self.assertIn('download_notebook Qwen3.6-27B.ipynb', script)
 
 
 class ImagePrepullTests(unittest.TestCase):
