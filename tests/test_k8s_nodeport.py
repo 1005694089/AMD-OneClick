@@ -211,5 +211,33 @@ class HuggingFaceEndpointTests(unittest.TestCase):
         self.assertIn({"name": "HF_ENDPOINT", "value": "http://134.199.133.77"}, env)
 
 
+class ImagePrepullTests(unittest.TestCase):
+    def setUp(self):
+        self.original = k8s_module.settings.IMAGE_PREPULL_ENABLED
+
+    def tearDown(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = self.original
+
+    def test_disabled_image_prepull_returns_disabled_status_without_daemonset(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        client = object.__new__(k8s_module.K8sClient)
+
+        status = client.sync_image_to_nodes(1, "notebook-image")
+
+        self.assertEqual(status["status"], "disabled")
+        self.assertEqual(status["desired_count"], 0)
+        self.assertEqual(status["ready_count"], 0)
+
+    def test_forbidden_node_list_returns_best_effort_empty_eligible_set(self):
+        class ForbiddenCoreV1:
+            def list_node(self):
+                raise ApiException(status=403, reason="Forbidden")
+
+        client = object.__new__(k8s_module.K8sClient)
+        client.core_v1 = ForbiddenCoreV1()
+
+        self.assertEqual(client._eligible_prepull_nodes(), set())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,7 @@ data:
   K8S_NAMESPACE: "amd-oneclick-radeon-beta"
   DEFAULT_IMAGE: "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"
   IMAGE_PULL_SECRET_NAME: "amd-oneclick-radeon-beta-regcred"
+  IMAGE_PREPULL_ENABLED: "false"
   CPU_LIMIT: "16"
   MEMORY_LIMIT: "64Gi"
   GPU_LIMIT: "1"
@@ -177,7 +178,7 @@ spec:
       dnsPolicy: ClusterFirst
       containers:
         - name: manager
-          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-hf-demo-20260615-2308-hfendpoint
+          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-hf-demo-20260616-1116-adminfix
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

@@ -771,7 +771,13 @@ findmnt "$mnt"
     def _eligible_prepull_nodes(self) -> set[str]:
         """Nodes that should count toward image availability."""
         eligible: set[str] = set()
-        nodes = self.core_v1.list_node()
+        try:
+            nodes = self.core_v1.list_node()
+        except ApiException as e:
+            if e.status == 403:
+                logger.warning("Cannot list nodes for image pre-pull status; returning best-effort status")
+                return eligible
+            raise
         for node in nodes.items:
             labels = node.metadata.labels or {}
             conditions = {cond.type: cond.status for cond in node.status.conditions or []}
@@ -788,6 +794,9 @@ findmnt "$mnt"
 
     def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
         """Create or replace a DaemonSet that pulls the image on every node."""
+        if not settings.IMAGE_PREPULL_ENABLED:
+            return self.get_image_sync_status(image_id)
+
         image = image.strip()
         if not image:
             raise ValueError("image must not be empty")
@@ -841,6 +850,15 @@ findmnt "$mnt"
 
     def get_image_sync_status(self, image_id: int) -> dict:
         """Return DaemonSet sync status for an image catalog entry."""
+        if not settings.IMAGE_PREPULL_ENABLED:
+            return {
+                "status": "disabled",
+                "desired_count": 0,
+                "ready_count": 0,
+                "message": "Image pre-pull is disabled for this deployment",
+                "completed": False,
+            }
+
         name = self._prepull_name(image_id)
         try:
             ds = self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
