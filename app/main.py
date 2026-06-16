@@ -1687,7 +1687,7 @@ async def admin_sync_template_preview(template_id: int, username: str = Depends(
 @app.get("/api/admin/images")
 async def admin_list_images(username: str = Depends(verify_admin)):
     for image in list_images(enabled_only=False):
-        sync = k8s_client.get_image_sync_status(image["id"])
+        sync = k8s_client.get_image_sync_status(image["id"], image["image"])
         if (
             image.get("sync_status") != sync["status"]
             or image.get("desired_count") != sync["desired_count"]

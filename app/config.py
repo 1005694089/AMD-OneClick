@@ -86,6 +86,7 @@ class Settings:
     HF_TOKEN_SECRET_KEY: str = os.getenv("HF_TOKEN_SECRET_KEY", "HF_TOKEN")
     HF_HUB_DISABLE_XET: str = os.getenv("HF_HUB_DISABLE_XET", "1")
     IMAGE_PREPULL_ENABLED: bool = os.getenv("IMAGE_PREPULL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    IMAGE_PULL_PROBE_ENABLED: bool = os.getenv("IMAGE_PULL_PROBE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     WORKSPACE_HOST_ROOT: str = os.getenv("WORKSPACE_HOST_ROOT", "/workspace/amd-oneclick")
     WORKSPACE_MOUNT_PATH: str = os.getenv("WORKSPACE_MOUNT_PATH", "/workspace")
     WORKSPACE_VOLUME_TYPE: str = os.getenv("WORKSPACE_VOLUME_TYPE", "hostPath")

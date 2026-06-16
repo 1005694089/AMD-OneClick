@@ -556,7 +556,9 @@ def redeem_user_coupon(user_id: int, coupon: dict) -> dict:
 def list_images(enabled_only: bool = False) -> list[dict]:
     stmt = select(images).order_by(images.c.id)
     if enabled_only:
-        stmt = stmt.where(images.c.enabled == True, images.c.sync_status == "ready")  # noqa: E712
+        stmt = stmt.where(images.c.enabled == True)  # noqa: E712
+        if settings.IMAGE_PREPULL_ENABLED:
+            stmt = stmt.where(images.c.sync_status == "ready")
     with engine.begin() as conn:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
 

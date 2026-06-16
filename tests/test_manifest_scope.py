@@ -23,11 +23,11 @@ class ManifestScopeTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertNotIn(token, combined)
 
-    def test_beta_manager_uses_cluster_dns(self):
+    def test_beta_manager_uses_beta_dns_override(self):
         manifest = (ROOT / "k8s-radeon-beta.yaml").read_text(encoding="utf-8")
 
-        self.assertIn("dnsPolicy: ClusterFirst", manifest)
-        self.assertNotIn("dnsPolicy: None", manifest)
+        self.assertIn("dnsPolicy: None", manifest)
+        self.assertIn("10.233.0.10", manifest)
         self.assertNotIn("8.8.8.8", manifest)
 
     def test_beta_notebooks_are_node_pinned(self):

@@ -792,6 +792,125 @@ findmnt "$mnt"
             "image-id": str(image_id),
         }
 
+    def _pull_probe_name(self, image_id: int) -> str:
+        return f"image-pull-catalog-{image_id}"
+
+    def _pull_probe_labels(self, image_id: int) -> dict:
+        return {
+            "app": "amd-oneclick-image-pull-check",
+            "managed-by": "amd-oneclick-manager",
+            "image-id": str(image_id),
+        }
+
+    def _image_pull_probe_enabled(self) -> bool:
+        return (
+            not settings.IMAGE_PREPULL_ENABLED
+            and bool(settings.IMAGE_PULL_PROBE_ENABLED)
+            and bool(settings.NOTEBOOK_NODE_NAME.strip())
+        )
+
+    def _pull_probe_admin_auth_block_message(self) -> Optional[str]:
+        if settings.ADMIN_PASSWORD == "admin123":
+            return "Image pull probe disabled until ADMIN_PASSWORD is set to a non-default beta secret"
+        return None
+
+    def _pull_probe_desired_count(self) -> int:
+        return 1 if settings.NOTEBOOK_NODE_NAME.strip() else 0
+
+    def _pull_probe_status(
+        self,
+        status: str,
+        ready_count: int = 0,
+        message: str = "",
+        completed: bool = False,
+    ) -> dict:
+        return {
+            "status": status,
+            "desired_count": self._pull_probe_desired_count(),
+            "ready_count": ready_count,
+            "message": message,
+            "completed": completed,
+        }
+
+    def _pull_probe_node_block_message(self) -> Optional[str]:
+        node_name = settings.NOTEBOOK_NODE_NAME.strip()
+        if not node_name:
+            return "IMAGE_PULL_PROBE_ENABLED requires NOTEBOOK_NODE_NAME"
+        try:
+            node = self.core_v1.read_node(name=node_name)
+        except ApiException as e:
+            reason = e.reason or str(e)
+            return f"Cannot inspect pull node {node_name}: {reason}"
+
+        conditions = {cond.type: cond for cond in (node.status.conditions or [])}
+        disk_pressure = conditions.get("DiskPressure")
+        if disk_pressure and disk_pressure.status == "True":
+            detail = disk_pressure.message or disk_pressure.reason or "DiskPressure=True"
+            return f"{node_name} DiskPressure=True: {detail}"
+
+        ready = conditions.get("Ready")
+        if not ready or ready.status != "True":
+            detail = (ready.message or ready.reason) if ready else "Ready condition missing"
+            return f"{node_name} is not Ready: {detail}"
+        return None
+
+    def _image_cached_on_pull_node(self, image: str) -> bool:
+        image = (image or "").strip()
+        node_name = settings.NOTEBOOK_NODE_NAME.strip()
+        if not image or not node_name:
+            return False
+        try:
+            node = self.core_v1.read_node(name=node_name)
+        except ApiException:
+            return False
+        for item in node.status.images or []:
+            if image in (item.names or []):
+                return True
+        return False
+
+    def _is_managed_pull_probe(self, pod, image_id: int) -> bool:
+        labels = pod.metadata.labels or {}
+        expected = self._pull_probe_labels(image_id)
+        return all(labels.get(key) == value for key, value in expected.items())
+
+    def _delete_image_pull_probe(self, image_id: int, wait: bool = False):
+        name = self._pull_probe_name(image_id)
+        try:
+            pod = self.core_v1.read_namespaced_pod(name=name, namespace=self.namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return
+            raise
+
+        if not self._is_managed_pull_probe(pod, image_id):
+            raise RuntimeError(f"Refusing to delete unmanaged pull probe pod {name}")
+
+        self.core_v1.delete_namespaced_pod(name=name, namespace=self.namespace)
+        if not wait:
+            return
+        for _ in range(30):
+            try:
+                self.core_v1.read_namespaced_pod(name=name, namespace=self.namespace)
+                time.sleep(1)
+            except ApiException as e:
+                if e.status == 404:
+                    return
+                raise
+
+    def _active_pull_probe_name(self, exclude_name: Optional[str] = None) -> Optional[str]:
+        pods = self.core_v1.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector="app=amd-oneclick-image-pull-check,managed-by=amd-oneclick-manager",
+        )
+        for pod in pods.items:
+            name = pod.metadata.name
+            if exclude_name and name == exclude_name:
+                continue
+            phase = getattr(pod.status, "phase", "") or ""
+            if phase not in {"Succeeded", "Failed"}:
+                return name
+        return None
+
     def _eligible_prepull_nodes(self) -> set[str]:
         """Nodes that should count toward image availability."""
         eligible: set[str] = set()
@@ -816,9 +935,91 @@ findmnt "$mnt"
             eligible.add(node.metadata.name)
         return eligible
 
+    def _configured_notebook_node_count(self) -> int:
+        """Return the configured runtime node count when pre-pull is intentionally off."""
+        return 1 if settings.NOTEBOOK_NODE_NAME else 0
+
+    def _create_image_pull_probe(self, image_id: int, image: str):
+        name = self._pull_probe_name(image_id)
+        labels = self._pull_probe_labels(image_id)
+        node_name = settings.NOTEBOOK_NODE_NAME.strip()
+        spec = {
+            "nodeName": node_name,
+            "restartPolicy": "Never",
+            "activeDeadlineSeconds": 7200,
+            "automountServiceAccountToken": False,
+            "tolerations": self._notebook_tolerations(),
+            "containers": [
+                {
+                    "name": "pull",
+                    "image": image,
+                    "imagePullPolicy": "Always",
+                    "command": ["sh", "-c"],
+                    "args": ["echo image pull probe ready on $(hostname)"],
+                    "resources": {
+                        "requests": {"cpu": "10m", "memory": "16Mi"},
+                        "limits": {"cpu": "100m", "memory": "64Mi"},
+                    },
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {"drop": ["ALL"]},
+                        "readOnlyRootFilesystem": True,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                }
+            ],
+        }
+        image_pull_secret_name = settings.IMAGE_PULL_SECRET_NAME.strip()
+        if image_pull_secret_name:
+            spec["imagePullSecrets"] = [{"name": image_pull_secret_name}]
+        body = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": self.namespace,
+                "labels": labels,
+                "annotations": {
+                    "amd-oneclick/image": image,
+                    "amd-oneclick/pull-node": node_name,
+                },
+            },
+            "spec": spec,
+        }
+        self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
+
+    def _sync_image_pull_probe(self, image_id: int, image: str) -> dict:
+        image = image.strip()
+        if not image:
+            raise ValueError("image must not be empty")
+
+        auth_message = self._pull_probe_admin_auth_block_message()
+        if auth_message:
+            return self._pull_probe_status("failed", 0, auth_message, False)
+
+        blocking_message = self._pull_probe_node_block_message()
+        if blocking_message:
+            return self._pull_probe_status("failed", 0, blocking_message, False)
+
+        probe_name = self._pull_probe_name(image_id)
+        active_probe = self._active_pull_probe_name(exclude_name=probe_name)
+        if active_probe:
+            return self._pull_probe_status(
+                "queued",
+                0,
+                f"Another image pull is active ({active_probe}); click Sync after it finishes",
+                False,
+            )
+
+        self._delete_image_pull_probe(image_id, wait=True)
+        self._create_image_pull_probe(image_id, image)
+        return self.get_image_sync_status(image_id, image)
+
     def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
         """Create or replace a DaemonSet that pulls the image on every node."""
         if not settings.IMAGE_PREPULL_ENABLED:
+            if self._image_pull_probe_enabled():
+                return self._sync_image_pull_probe(image_id, image)
             return self.get_image_sync_status(image_id)
 
         image = image.strip()
@@ -872,14 +1073,90 @@ findmnt "$mnt"
         self.apps_v1.create_namespaced_daemon_set(namespace=self.namespace, body=body)
         return self.get_image_sync_status(image_id)
 
-    def get_image_sync_status(self, image_id: int) -> dict:
+    def _pull_probe_message_from_waiting(self, waiting) -> str:
+        reason = waiting.reason or "waiting"
+        message = waiting.message or ""
+        node_name = settings.NOTEBOOK_NODE_NAME.strip()
+        suffix = f": {message}" if message else ""
+        return f"{node_name} {reason}{suffix}"
+
+    def _get_image_pull_probe_status(self, image_id: int, image: Optional[str] = None) -> dict:
+        auth_message = self._pull_probe_admin_auth_block_message()
+        if auth_message:
+            return self._pull_probe_status("failed", 0, auth_message, False)
+
+        node_name = settings.NOTEBOOK_NODE_NAME.strip()
+        image = (image or "").strip()
+        name = self._pull_probe_name(image_id)
+        try:
+            pod = self.core_v1.read_namespaced_pod(name=name, namespace=self.namespace)
+        except ApiException as e:
+            if e.status == 404:
+                if image and self._image_cached_on_pull_node(image):
+                    return self._pull_probe_status("ready", 1, f"Image cached on {node_name}", True)
+                return self._pull_probe_status("pending", 0, f"not pulled on {node_name}", False)
+            raise
+
+        if not self._is_managed_pull_probe(pod, image_id):
+            return self._pull_probe_status("failed", 0, f"Probe pod {name} has unexpected labels", False)
+
+        pod_status = pod.status
+        phase = getattr(pod_status, "phase", "") or "Pending"
+        pod_reason = getattr(pod_status, "reason", "") or ""
+        pod_message = getattr(pod_status, "message", "") or ""
+        statuses = getattr(pod_status, "container_statuses", None) or []
+        container_status = next((status for status in statuses if getattr(status, "name", "") == "pull"), None)
+        container_status = container_status or (statuses[0] if statuses else None)
+
+        if container_status:
+            image_id_value = getattr(container_status, "image_id", "") or ""
+            if image_id_value:
+                state = getattr(container_status, "state", None)
+                terminated = getattr(state, "terminated", None) if state else None
+                if terminated and phase == "Failed":
+                    reason = terminated.reason or "terminated"
+                    return self._pull_probe_status(
+                        "ready",
+                        1,
+                        f"Image pulled on {node_name}; probe command ended with {reason}",
+                        True,
+                    )
+                return self._pull_probe_status("ready", 1, f"Image pulled on {node_name}", True)
+
+            state = getattr(container_status, "state", None)
+            waiting = getattr(state, "waiting", None) if state else None
+            if waiting:
+                reason = waiting.reason or "waiting"
+                message = self._pull_probe_message_from_waiting(waiting)
+                if reason in {"ErrImagePull", "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError", "RunContainerError"}:
+                    return self._pull_probe_status("failed", 0, message, False)
+                return self._pull_probe_status("pulling", 0, message, False)
+
+            terminated = getattr(state, "terminated", None) if state else None
+            if terminated:
+                reason = terminated.reason or "terminated"
+                detail = terminated.message or ""
+                suffix = f": {detail}" if detail else ""
+                return self._pull_probe_status("failed", 0, f"{node_name} probe {reason}{suffix}", False)
+
+        if phase == "Succeeded":
+            return self._pull_probe_status("failed", 0, f"{node_name} probe succeeded but image id was not reported", False)
+        if phase == "Failed":
+            detail = pod_message or pod_reason or "probe pod failed"
+            return self._pull_probe_status("failed", 0, f"{node_name} {detail}", False)
+        return self._pull_probe_status("pulling", 0, f"{node_name} probe phase {phase}", False)
+
+    def get_image_sync_status(self, image_id: int, image: Optional[str] = None) -> dict:
         """Return DaemonSet sync status for an image catalog entry."""
         if not settings.IMAGE_PREPULL_ENABLED:
+            if self._image_pull_probe_enabled():
+                return self._get_image_pull_probe_status(image_id, image)
+            desired = self._configured_notebook_node_count()
             return {
-                "status": "disabled",
-                "desired_count": 0,
+                "status": "skipped",
+                "desired_count": desired,
                 "ready_count": 0,
-                "message": "Image pre-pull is disabled for this deployment",
+                "message": "Image pre-pull disabled; catalog image remains launchable on configured runtime nodes",
                 "completed": False,
             }
 
@@ -936,6 +1213,8 @@ findmnt "$mnt"
         except ApiException as e:
             if e.status != 404:
                 raise
+        if settings.IMAGE_PULL_PROBE_ENABLED:
+            self._delete_image_pull_probe(image_id)
     
     def get_instance_by_email(self, email: str) -> Optional[dict]:
         """Get existing notebook instance for an email"""

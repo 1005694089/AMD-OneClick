@@ -98,9 +98,9 @@ function App(){
 
   async function addImage(values){
     const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...values, enabled:true})});
-    if(res.ok){ message.success('Image added and sync started'); form.resetFields(); setImageModalOpen(false); load(); } else message.error('Failed to add image');
+    if(res.ok){ message.success('Image added; pull started'); form.resetFields(); setImageModalOpen(false); load(); } else message.error('Failed to add image');
   }
-  async function syncImage(id){ const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Sync started':'Sync failed'); load(); }
+  async function syncImage(id){ const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Pull started':'Sync failed'); load(); }
   async function deleteImage(id){ const r=await fetch(`/api/admin/images/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Deleted':'Delete failed'); load(); }
   async function deleteInstance(id){ const r=await fetch(`/api/admin/instance/${encodeURIComponent(id)}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Destroyed':'Destroy failed'); load(); }
   function openTemplateModal(record){
@@ -143,10 +143,21 @@ function App(){
     }
   }
 
+  function imageStatusColor(status){
+    if(status === 'ready') return 'green';
+    if(status === 'failed') return 'red';
+    if(status === 'skipped') return 'blue';
+    if(status === 'queued') return 'gold';
+    return 'gold';
+  }
+  function imageStatusLabel(r){
+    const count = r.desired_count ? ` (${r.ready_count}/${r.desired_count})` : '';
+    return `${r.sync_status}${count}`;
+  }
   const imageColumns=[
     {title:'Name',dataIndex:'name',width:180},
     {title:'Image',dataIndex:'image',width:460,render:v=>React.createElement(Text,{code:true,copyable:true,className:'table-code',title:v},v)},
-    {title:'Status',width:150,render:(_,r)=>React.createElement(Tag,{color:r.sync_status==='ready'?'green':'gold'},`${r.sync_status} ${r.desired_count?`(${r.ready_count}/${r.desired_count})`:''}`)},
+    {title:'Status',width:150,render:(_,r)=>React.createElement(Tag,{color:imageStatusColor(r.sync_status)},imageStatusLabel(r))},
     {title:'Message',dataIndex:'sync_message',width:220},
     {title:'Actions',width:170,render:(_,r)=>React.createElement(Space,null,
       React.createElement(Button,{size:'small',onClick:()=>syncImage(r.id)},'Sync'),

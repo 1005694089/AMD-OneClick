@@ -262,22 +262,311 @@ class HuggingFaceEndpointTests(unittest.TestCase):
         self.assertIn('download_notebook Qwen3.6-27B.ipynb', script)
 
 
+class FakeAppsV1:
+    def __init__(self):
+        self.daemonset_body = None
+        self.deleted_daemonsets = []
+
+    def create_namespaced_daemon_set(self, namespace, body):
+        self.daemonset_body = body
+        return SimpleNamespace()
+
+    def read_namespaced_daemon_set(self, name, namespace):
+        raise ApiException(status=404, reason="Not Found")
+
+    def delete_namespaced_daemon_set(self, name, namespace):
+        self.deleted_daemonsets.append(name)
+        raise ApiException(status=404, reason="Not Found")
+
+
+def node_with_conditions(ready="True", disk_pressure="False", images=None):
+    return SimpleNamespace(
+        status=SimpleNamespace(
+            conditions=[
+                SimpleNamespace(type="Ready", status=ready, reason="KubeletReady", message="ready"),
+                SimpleNamespace(type="DiskPressure", status=disk_pressure, reason="KubeletHasNoDiskPressure", message="disk ok"),
+            ],
+            images=images or [],
+        )
+    )
+
+
+def pull_probe_pod(image_id=1, phase="Pending", labels=None, container_statuses=None, reason="", message="", name=None):
+    labels = labels if labels is not None else {
+        "app": "amd-oneclick-image-pull-check",
+        "managed-by": "amd-oneclick-manager",
+        "image-id": str(image_id),
+    }
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name or f"image-pull-catalog-{image_id}", labels=labels),
+        status=SimpleNamespace(
+            phase=phase,
+            reason=reason,
+            message=message,
+            container_statuses=container_statuses or [],
+        ),
+    )
+
+
+class FakeProbeCoreV1:
+    def __init__(self, read_pod=None, listed_pods=None, node=None):
+        self.read_pod = read_pod
+        self.listed_pods = listed_pods or []
+        self.node = node or node_with_conditions()
+        self.created_pod_body = None
+        self.deleted_pods = []
+
+    def read_node(self, name):
+        return self.node
+
+    def list_namespaced_pod(self, namespace, label_selector=None):
+        return SimpleNamespace(items=self.listed_pods)
+
+    def read_namespaced_pod(self, name, namespace):
+        if self.read_pod is None:
+            raise ApiException(status=404, reason="Not Found")
+        return self.read_pod
+
+    def create_namespaced_pod(self, namespace, body):
+        self.created_pod_body = body
+        self.read_pod = pull_probe_pod(
+            image_id=int(body["metadata"]["labels"]["image-id"]),
+            phase="Pending",
+            name=body["metadata"]["name"],
+        )
+        return SimpleNamespace()
+
+    def delete_namespaced_pod(self, name, namespace):
+        self.deleted_pods.append(name)
+        self.read_pod = None
+        return SimpleNamespace()
+
+
 class ImagePrepullTests(unittest.TestCase):
     def setUp(self):
-        self.original = k8s_module.settings.IMAGE_PREPULL_ENABLED
+        self.original_prepull_enabled = k8s_module.settings.IMAGE_PREPULL_ENABLED
+        self.original_probe_enabled = k8s_module.settings.IMAGE_PULL_PROBE_ENABLED
+        self.original_notebook_node_name = k8s_module.settings.NOTEBOOK_NODE_NAME
+        self.original_pull_secret = k8s_module.settings.IMAGE_PULL_SECRET_NAME
+        self.original_admin_password = k8s_module.settings.ADMIN_PASSWORD
+        self.original_toleration = (
+            k8s_module.settings.NOTEBOOK_TOLERATION_KEY,
+            k8s_module.settings.NOTEBOOK_TOLERATION_VALUE,
+            k8s_module.settings.NOTEBOOK_TOLERATION_EFFECT,
+        )
+        k8s_module.settings.ADMIN_PASSWORD = "test-admin-password"
 
     def tearDown(self):
-        k8s_module.settings.IMAGE_PREPULL_ENABLED = self.original
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = self.original_prepull_enabled
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = self.original_probe_enabled
+        k8s_module.settings.NOTEBOOK_NODE_NAME = self.original_notebook_node_name
+        k8s_module.settings.IMAGE_PULL_SECRET_NAME = self.original_pull_secret
+        k8s_module.settings.ADMIN_PASSWORD = self.original_admin_password
+        (
+            k8s_module.settings.NOTEBOOK_TOLERATION_KEY,
+            k8s_module.settings.NOTEBOOK_TOLERATION_VALUE,
+            k8s_module.settings.NOTEBOOK_TOLERATION_EFFECT,
+        ) = self.original_toleration
 
-    def test_disabled_image_prepull_returns_disabled_status_without_daemonset(self):
+    def test_disabled_image_prepull_without_probe_returns_skipped_without_daemonset(self):
         k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = False
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
         client = object.__new__(k8s_module.K8sClient)
 
         status = client.sync_image_to_nodes(1, "notebook-image")
 
-        self.assertEqual(status["status"], "disabled")
-        self.assertEqual(status["desired_count"], 0)
+        self.assertEqual(status["status"], "skipped")
+        self.assertEqual(status["desired_count"], 1)
         self.assertEqual(status["ready_count"], 0)
+
+    def test_production_prepull_still_creates_daemonset_when_probe_enabled(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = True
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "default"
+        client.apps_v1 = FakeAppsV1()
+        client.core_v1 = FakeProbeCoreV1()
+
+        status = client.sync_image_to_nodes(7, "notebook-image")
+
+        self.assertEqual(status["status"], "pending")
+        self.assertEqual(client.apps_v1.daemonset_body["kind"], "DaemonSet")
+        self.assertEqual(client.apps_v1.daemonset_body["spec"]["template"]["spec"]["containers"][0]["image"], "notebook-image")
+
+    def test_beta_probe_path_creates_single_hardened_pull_pod(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        k8s_module.settings.IMAGE_PULL_SECRET_NAME = "regcred"
+        k8s_module.settings.NOTEBOOK_TOLERATION_KEY = "amd-oneclick/beta"
+        k8s_module.settings.NOTEBOOK_TOLERATION_VALUE = "radeon"
+        k8s_module.settings.NOTEBOOK_TOLERATION_EFFECT = "NoSchedule"
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1()
+
+        status = client.sync_image_to_nodes(2, "registry/image:tag")
+
+        body = client.core_v1.created_pod_body
+        self.assertEqual(status["status"], "pulling")
+        self.assertEqual(body["metadata"]["name"], "image-pull-catalog-2")
+        self.assertEqual(body["metadata"]["labels"]["app"], "amd-oneclick-image-pull-check")
+        self.assertEqual(body["spec"]["nodeName"], "beta-node")
+        self.assertEqual(body["spec"]["restartPolicy"], "Never")
+        self.assertFalse(body["spec"]["automountServiceAccountToken"])
+        self.assertEqual(body["spec"]["imagePullSecrets"], [{"name": "regcred"}])
+        container = body["spec"]["containers"][0]
+        self.assertEqual(container["image"], "registry/image:tag")
+        self.assertEqual(container["imagePullPolicy"], "Always")
+        self.assertNotIn("amd.com/gpu", container["resources"]["requests"])
+        self.assertFalse(container["securityContext"]["allowPrivilegeEscalation"])
+        self.assertEqual(container["securityContext"]["capabilities"]["drop"], ["ALL"])
+        self.assertTrue(container["securityContext"]["readOnlyRootFilesystem"])
+
+    def test_probe_status_ready_when_container_reports_image_id(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        container_status = SimpleNamespace(
+            name="pull",
+            image_id="registry/image@sha256:abc",
+            state=SimpleNamespace(running=SimpleNamespace()),
+        )
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(read_pod=pull_probe_pod(2, "Running", container_statuses=[container_status]))
+
+        status = client.get_image_sync_status(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["ready_count"], 1)
+
+    def test_probe_status_failed_when_image_pull_backoff(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        waiting = SimpleNamespace(reason="ImagePullBackOff", message="pull access denied")
+        container_status = SimpleNamespace(name="pull", image_id="", state=SimpleNamespace(waiting=waiting))
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(read_pod=pull_probe_pod(2, "Pending", container_statuses=[container_status]))
+
+        status = client.get_image_sync_status(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("ImagePullBackOff", status["message"])
+
+    def test_probe_status_pending_when_no_probe_pod(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1()
+
+        status = client.get_image_sync_status(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "pending")
+
+    def test_probe_status_ready_from_node_cache_when_no_probe_pod(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        node = node_with_conditions(images=[SimpleNamespace(names=["registry/image:tag"])])
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(node=node)
+
+        status = client.get_image_sync_status(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["ready_count"], 1)
+
+    def test_probe_status_prefers_active_probe_over_node_cache(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        node = node_with_conditions(images=[SimpleNamespace(names=["registry/image:tag"])])
+        waiting = SimpleNamespace(reason="ContainerCreating", message="")
+        container_status = SimpleNamespace(name="pull", image_id="", state=SimpleNamespace(waiting=waiting))
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(
+            read_pod=pull_probe_pod(2, "Pending", container_statuses=[container_status]),
+            node=node,
+        )
+
+        status = client.get_image_sync_status(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "pulling")
+        self.assertEqual(status["ready_count"], 0)
+
+    def test_probe_sync_queues_when_another_probe_is_active(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        active = pull_probe_pod(1, "Pending")
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(listed_pods=[active])
+
+        status = client.sync_image_to_nodes(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "queued")
+        self.assertIsNone(client.core_v1.created_pod_body)
+
+    def test_probe_sync_fails_before_create_when_node_has_disk_pressure(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(node=node_with_conditions(disk_pressure="True"))
+
+        status = client.sync_image_to_nodes(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("DiskPressure", status["message"])
+        self.assertIsNone(client.core_v1.created_pod_body)
+
+    def test_probe_sync_refuses_default_admin_password(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        k8s_module.settings.ADMIN_PASSWORD = "admin123"
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1()
+
+        status = client.sync_image_to_nodes(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("ADMIN_PASSWORD", status["message"])
+        self.assertIsNone(client.core_v1.created_pod_body)
+
+    def test_delete_probe_removes_only_verified_exact_pod(self):
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.apps_v1 = FakeAppsV1()
+        client.core_v1 = FakeProbeCoreV1(read_pod=pull_probe_pod(2))
+
+        client.delete_image_sync(2)
+
+        self.assertEqual(client.core_v1.deleted_pods, ["image-pull-catalog-2"])
+
+    def test_delete_probe_refuses_unmanaged_same_name_pod(self):
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.apps_v1 = FakeAppsV1()
+        client.core_v1 = FakeProbeCoreV1(read_pod=pull_probe_pod(2, labels={"app": "other"}))
+
+        with self.assertRaises(RuntimeError):
+            client.delete_image_sync(2)
+
+        self.assertEqual(client.core_v1.deleted_pods, [])
 
     def test_forbidden_node_list_returns_best_effort_empty_eligible_set(self):
         class ForbiddenCoreV1:

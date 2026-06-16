@@ -47,6 +47,28 @@ subjects:
     name: amd-oneclick-radeon-beta-manager
     namespace: amd-oneclick-radeon-beta
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: amd-oneclick-radeon-beta-node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: amd-oneclick-radeon-beta-node-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: amd-oneclick-radeon-beta-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: amd-oneclick-radeon-beta-manager
+    namespace: amd-oneclick-radeon-beta
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -68,6 +90,7 @@ data:
   HF_TOKEN_SECRET_NAME: "amd-oneclick-radeon-beta-secrets"
   HF_TOKEN_SECRET_KEY: "HF_TOKEN"
   HF_HUB_DISABLE_XET: "1"
+  IMAGE_PULL_PROBE_ENABLED: "true"
   WORKSPACE_HOST_ROOT: "/workspace/amd-oneclick-radeon-beta"
   WORKSPACE_MOUNT_PATH: "/workspace"
   WORKSPACE_VOLUME_TYPE: "emptyDir"
@@ -177,10 +200,20 @@ spec:
           value: radeon
           effect: NoSchedule
       serviceAccountName: amd-oneclick-radeon-beta-manager
-      dnsPolicy: ClusterFirst
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 10.233.0.10
+        searches:
+          - amd-oneclick-radeon-beta.svc.amd.gpu.dc
+          - svc.amd.gpu.dc
+          - amd.gpu.dc
+        options:
+          - name: ndots
+            value: "5"
       containers:
         - name: manager
-          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-hf-demo-20260616-1254-hftoken
+          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-pull-probe-20260616-1959
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
