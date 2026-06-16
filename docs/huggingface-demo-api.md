@@ -14,45 +14,6 @@ If public DNS is not live yet, backend smoke tests can temporarily resolve the h
 36.150.116.220
 ```
 
-## Public DNS Setup
-
-Create or update this DNS record in the DNS provider for `anruicloud.com`:
-
-| Type | Host/Name | Value | TTL |
-| --- | --- | --- | --- |
-| `A` | `radeon-beta` | `36.150.116.220` | `300` seconds recommended |
-
-The full public hostname should resolve as:
-
-```text
-radeon-beta.anruicloud.com -> 36.150.116.220
-```
-
-Do not use an underscore hostname such as `radeon_beta.anruicloud.com`.
-
-After saving the DNS record, verify it from a terminal:
-
-```bash
-getent ahostsv4 radeon-beta.anruicloud.com
-dig +short radeon-beta.anruicloud.com A
-curl -k https://radeon-beta.anruicloud.com/health
-```
-
-Expected health response:
-
-```json
-{"status":"healthy"}
-```
-
-If DNS has not propagated yet, verify the edge route directly with a temporary local resolve:
-
-```bash
-curl -k --resolve radeon-beta.anruicloud.com:443:36.150.116.220 \
-  https://radeon-beta.anruicloud.com/health
-```
-
-Once the plain `curl -k https://radeon-beta.anruicloud.com/health` command returns healthy without `--resolve`, public DNS is live.
-
 ## Authentication
 
 Every Hugging Face demo API call requires a Radeon Beta API bearer token:
