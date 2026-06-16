@@ -55,7 +55,7 @@ Once the plain `curl -k https://radeon-beta.anruicloud.com/health` command retur
 
 ## Authentication
 
-Every Hugging Face demo API call requires a bearer token:
+Every Hugging Face demo API call requires a Radeon Beta API bearer token:
 
 ```http
 Authorization: Bearer <HUGGINGFACE_DEMO_API_TOKEN>
@@ -64,9 +64,11 @@ Authorization: Bearer <HUGGINGFACE_DEMO_API_TOKEN>
 Do not put this token in a public frontend bundle. The recommended frontend flow is:
 
 1. Frontend calls your own backend.
-2. Your backend attaches the bearer token.
+2. Your backend attaches the Radeon Beta API bearer token.
 3. Your backend calls the Radeon Beta API.
 4. Your backend returns the safe response payload to the frontend.
+
+This bearer token is separate from the upstream Hugging Face access token. The upstream `HF_TOKEN` is configured server-side in the beta deployment and is used only by notebook pods when downloading `.ipynb` files through the internal Hugging Face proxy. Frontend code should never send or know the upstream `HF_TOKEN`.
 
 ## Launch A Notebook
 
@@ -98,6 +100,7 @@ Rules:
 
 - `user_name` is required and is used as the stable demo user identity.
 - `notebook_path` must point to an `.ipynb` file.
+- Hugging Face notebook URLs are downloaded server-side through the configured internal Hugging Face proxy and server-side `HF_TOKEN`.
 - `gpu_count` must be `1`, `2`, or `4`. Default is `1`.
 - Each `user_name` can have only one active notebook.
 
@@ -201,4 +204,5 @@ export type DestroyResponse = {
 - If launch returns `400` with `Each user can only have one active instance`, call the status endpoint and show the existing notebook.
 - If status stays `initializing` or `jupyter_starting`, keep polling.
 - If status is `failed`, show an error and offer retry or cleanup.
+- If the notebook URL opens but the expected `.ipynb` is missing, report it as a backend download issue. Frontend clients should not retry direct Hugging Face downloads themselves.
 - Always call delete when the user explicitly ends the demo session.
