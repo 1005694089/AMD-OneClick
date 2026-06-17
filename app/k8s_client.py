@@ -1225,6 +1225,29 @@ findmnt "$mnt"
         if not self._is_managed_pull_probe(pod, image_id):
             return self._pull_probe_status("failed", 0, f"Probe pod {name} has unexpected labels", False)
 
+        # The probe pod is named by image_id, not by image, so a pod left over from a previous
+        # image value for this catalog entry can still be present (or terminating) after the admin
+        # edits the image. Its imageID then proves the OLD image is pulled, not the requested one --
+        # never treat that as readiness for the new image. The probe records the image it pulled in
+        # an annotation; the imageID is only trustworthy as proof for the requested image when that
+        # annotation confirms it. If it disagrees -- OR is absent (a legacy pod from before this
+        # annotation shipped, where we cannot prove which image was pulled) -- force a re-Sync
+        # rather than trusting the digest.
+        if image:
+            probe_annotations = getattr(pod.metadata, "annotations", None) or {}
+            probe_image = (probe_annotations.get("amd-oneclick/image") or "").strip()
+            if probe_image != image:
+                detail = (
+                    f"last pulled {probe_image}" if probe_image
+                    else "cannot confirm which image this probe pulled"
+                )
+                return self._pull_probe_status(
+                    "pending",
+                    0,
+                    f"{node_name} {detail}; click Sync to pull {image}",
+                    False,
+                )
+
         pod_status = pod.status
         phase = getattr(pod_status, "phase", "") or "Pending"
         pod_reason = getattr(pod_status, "reason", "") or ""
@@ -1247,6 +1270,15 @@ findmnt "$mnt"
                         True,
                     )
                 return self._pull_probe_status("ready", 1, f"Image pulled on {node_name}", True)
+
+            # After activeDeadlineSeconds, Kubernetes marks the pod Failed/DeadlineExceeded while
+            # the container can still report state.waiting (e.g. ContainerCreating) because it never
+            # started. That must read as a terminal timeout, not an indefinite "pulling" -- check it
+            # before the waiting branch below, but after the image-pulled success above so a probe
+            # that actually pulled then hit the deadline still counts as ready.
+            if phase == "Failed" or pod_reason == "DeadlineExceeded":
+                detail = pod_message or pod_reason or "probe deadline exceeded"
+                return self._pull_probe_status("failed", 0, f"{node_name} {detail}", False)
 
             if pod.metadata.deletion_timestamp:
                 return self._pull_probe_status(
@@ -1282,7 +1314,7 @@ findmnt "$mnt"
 
         if phase == "Succeeded":
             return self._pull_probe_status("failed", 0, f"{node_name} probe succeeded but image id was not reported", False)
-        if phase == "Failed":
+        if phase == "Failed" or pod_reason == "DeadlineExceeded":
             detail = pod_message or pod_reason or "probe pod failed"
             return self._pull_probe_status("failed", 0, f"{node_name} {detail}", False)
         return self._pull_probe_status("pulling", 0, self._with_elapsed(pod, f"{node_name} probe phase {phase}"), False)

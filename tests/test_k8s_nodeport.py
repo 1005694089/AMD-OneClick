@@ -348,16 +348,23 @@ def node_with_conditions(ready="True", disk_pressure="False", images=None):
 
 def pull_probe_pod(image_id=1, phase="Pending", labels=None, container_statuses=None,
                    reason="", message="", name=None,
-                   deletion_timestamp=None, start_time=None, creation_timestamp=None):
+                   deletion_timestamp=None, start_time=None, creation_timestamp=None,
+                   annotations="__default__"):
     labels = labels if labels is not None else {
         "app": "amd-oneclick-image-pull-check",
         "managed-by": "amd-oneclick-manager",
         "image-id": str(image_id),
     }
+    # A real probe pod always carries the image it was created to pull; default to the image string
+    # the probe tests request so the staleness guard sees a match. Pass annotations=None explicitly
+    # to simulate a legacy pre-annotation pod, or a dict to simulate a different/old image.
+    if annotations == "__default__":
+        annotations = {"amd-oneclick/image": "registry/image:tag"}
     return SimpleNamespace(
         metadata=SimpleNamespace(
             name=name or f"image-pull-catalog-{image_id}",
             labels=labels,
+            annotations=annotations,
             deletion_timestamp=deletion_timestamp,
             creation_timestamp=creation_timestamp,
         ),
@@ -506,6 +513,127 @@ class ImagePrepullTests(unittest.TestCase):
 
         self.assertEqual(status["status"], "ready")
         self.assertEqual(status["ready_count"], 1)
+
+    def test_probe_status_pending_when_pod_pulled_a_different_image(self):
+        # A probe pod left over from the OLD image value for this catalog id must not be reported
+        # ready for the NEWLY requested image just because it has an imageID for the old one.
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        container_status = SimpleNamespace(
+            name="pull",
+            image_id="registry/old@sha256:abc",
+            state=SimpleNamespace(running=SimpleNamespace()),
+        )
+        pod = pull_probe_pod(
+            2, "Running",
+            container_statuses=[container_status],
+            annotations={"amd-oneclick/image": "registry/old:tag"},
+        )
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(read_pod=pod)
+
+        status = client.get_image_sync_status(2, "registry/new:tag")
+
+        self.assertEqual(status["status"], "pending")
+        self.assertIn("registry/old:tag", status["message"])
+        self.assertIn("registry/new:tag", status["message"])
+        self.assertEqual(status["ready_count"], 0)
+
+    def test_probe_status_ready_when_annotation_matches_requested_image(self):
+        # The staleness guard must NOT fire when the probe pulled the requested image.
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        container_status = SimpleNamespace(
+            name="pull",
+            image_id="registry/image@sha256:abc",
+            state=SimpleNamespace(running=SimpleNamespace()),
+        )
+        pod = pull_probe_pod(
+            2, "Running",
+            container_statuses=[container_status],
+            annotations={"amd-oneclick/image": "registry/image:tag"},
+        )
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(read_pod=pod)
+
+        status = client.get_image_sync_status(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["ready_count"], 1)
+
+    def test_probe_status_pending_when_legacy_pod_has_no_image_annotation(self):
+        # A probe pod created before the amd-oneclick/image annotation shipped proves nothing about
+        # WHICH image its imageID belongs to. We must not trust its imageID as readiness for the
+        # requested image -- force a re-Sync instead.
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        container_status = SimpleNamespace(
+            name="pull",
+            image_id="registry/whatever@sha256:abc",
+            state=SimpleNamespace(running=SimpleNamespace()),
+        )
+        pod = pull_probe_pod(
+            2, "Running",
+            container_statuses=[container_status],
+            annotations=None,  # legacy pod: no annotation at all
+        )
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(read_pod=pod)
+
+        status = client.get_image_sync_status(2, "registry/new:tag")
+
+        self.assertEqual(status["status"], "pending")
+        self.assertEqual(status["ready_count"], 0)
+        self.assertIn("registry/new:tag", status["message"])
+
+    def test_probe_status_failed_when_deadline_exceeded_while_container_creating(self):
+        # activeDeadlineSeconds expiry sets phase=Failed/reason=DeadlineExceeded while the container
+        # is still ContainerCreating (never started). That is a terminal timeout, not "pulling".
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        waiting = SimpleNamespace(reason="ContainerCreating", message="")
+        container_status = SimpleNamespace(name="pull", image_id="", state=SimpleNamespace(waiting=waiting))
+        pod = pull_probe_pod(
+            2, "Failed",
+            reason="DeadlineExceeded",
+            message="Pod was active longer than the specified deadline",
+            container_statuses=[container_status],
+        )
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(read_pod=pod)
+
+        status = client.get_image_sync_status(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("deadline", status["message"].lower())
+
+    def test_probe_status_failed_when_deadline_exceeded_without_container_status(self):
+        # Same terminal timeout but no container status reported yet -- the tail Failed/Deadline
+        # check must also catch it.
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        pod = pull_probe_pod(
+            2, "Failed",
+            reason="DeadlineExceeded",
+            message="Pod was active longer than the specified deadline",
+        )
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(read_pod=pod)
+
+        status = client.get_image_sync_status(2, "registry/image:tag")
+
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("deadline", status["message"].lower())
 
     def test_probe_status_failed_when_image_pull_backoff(self):
         k8s_module.settings.IMAGE_PREPULL_ENABLED = False
