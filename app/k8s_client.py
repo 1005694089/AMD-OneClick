@@ -650,6 +650,14 @@ findmnt "$mnt"
         if settings.EPHEMERAL_STORAGE_REQUEST.strip():
             container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
 
+        # Custom images reuse the tag user-{id}:{name} across rebuilds, so IfNotPresent could
+        # launch a stale cached layer on the node after a delete+rebuild. Force Always for the
+        # custom registry so the freshly pushed image is always pulled.
+        is_custom_image = bool(
+            settings.CUSTOM_IMAGE_REGISTRY and image.startswith(settings.CUSTOM_IMAGE_REGISTRY)
+        )
+        notebook_pull_policy = "Always" if is_custom_image else "IfNotPresent"
+
         spec = {
             "securityContext": {
                 "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
@@ -676,7 +684,7 @@ findmnt "$mnt"
                 {
                     "name": "notebook",
                     "image": image,
-                    "imagePullPolicy": "IfNotPresent",
+                    "imagePullPolicy": notebook_pull_policy,
                     "command": ["/bin/bash", "-c"],
                     "args": [startup_script],
                     "ports": [
@@ -977,8 +985,10 @@ findmnt "$mnt"
             phase = getattr(pod.status, "phase", "") or ""
             if phase in {"Succeeded", "Failed"}:
                 continue
-            if getattr(pod.metadata, "deletion_timestamp", None):
-                continue
+            # A terminating probe still holds containerd image-pull work and disk on the
+            # node until it is fully gone, so it must keep counting as active. The caller
+            # only soft-queues on this (user retries Sync), so a draining pod can't wedge
+            # future pulls -- it disappears once deletion completes.
             return name
         return None
 

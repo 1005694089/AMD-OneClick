@@ -5,6 +5,7 @@ Uses PostgreSQL when DATABASE_URL is set; falls back to local SQLite for dev.
 """
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -47,6 +48,15 @@ if DATABASE_URL.startswith("sqlite:///"):
 
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 metadata = MetaData()
+
+# Serializes the count-and-insert in create_custom_image within a single process so the
+# per-user cap can't be bypassed by concurrent different-name requests. Across multiple
+# Postgres workers a transaction-level advisory lock (taken inside that function) provides
+# the cross-process guarantee; SQLite is single-writer so this in-process lock suffices.
+_custom_image_cap_lock = threading.Lock()
+# Arbitrary fixed namespace for the two-int pg_advisory_xact_lock keyspace; pairs with
+# user_id so different users never contend.
+_CUSTOM_IMAGE_CAP_LOCK_NS = 0x0A3D_C0DE
 
 users = Table(
     "users",
@@ -1071,7 +1081,15 @@ def create_custom_image(user_id: int, name: str, image: str, dockerfile: str, ma
     name = name.strip()
     image = image.strip()
     now = utc_now()
-    with engine.begin() as conn:
+    with _custom_image_cap_lock, engine.begin() as conn:
+        # On Postgres, also take a transaction-scoped advisory lock keyed on the user so
+        # concurrent workers (separate processes, unaffected by the in-process lock above)
+        # serialize on the same count-and-insert. Released automatically at txn end.
+        if conn.dialect.name == "postgresql":
+            conn.execute(
+                text("SELECT pg_advisory_xact_lock(:k1, :k2)"),
+                {"k1": _CUSTOM_IMAGE_CAP_LOCK_NS, "k2": int(user_id)},
+            )
         active = conn.execute(
             select(custom_images.c.id).where(
                 custom_images.c.user_id == user_id,

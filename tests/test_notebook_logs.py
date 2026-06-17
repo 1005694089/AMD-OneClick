@@ -89,6 +89,34 @@ class CustomImageCapTests(unittest.TestCase):
         # The shipped default must be 1.
         self.assertEqual(main_module.settings.CUSTOM_IMAGE_MAX_PER_USER, 1)
 
+    def test_concurrent_different_name_builds_respect_cap(self):
+        # Two concurrent requests with different names must not both slip past a cap of 1.
+        # The in-process lock around count-and-insert serializes them so exactly one wins.
+        import threading
+
+        barrier = threading.Barrier(2)
+        outcomes = []
+        lock = threading.Lock()
+
+        def attempt(name):
+            barrier.wait()
+            try:
+                store.create_custom_image(99, name, f"registry/{name}:1", "FROM scratch", 1)
+                result = "ok"
+            except ValueError:
+                result = "rejected"
+            with lock:
+                outcomes.append(result)
+
+        threads = [threading.Thread(target=attempt, args=(n,)) for n in ("alpha", "beta")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(outcomes), ["ok", "rejected"])
+        self.assertEqual(store.count_active_custom_images(99), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

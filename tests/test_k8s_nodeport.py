@@ -144,6 +144,42 @@ class NotebookNodePinningTests(unittest.TestCase):
             [{"name": "amd-oneclick-radeon-beta-regcred"}],
         )
 
+    def test_custom_image_notebook_uses_always_pull_policy(self):
+        # Custom images reuse the user-{id}:{name} tag across rebuilds, so the notebook pod
+        # must pull Always to avoid serving a stale cached layer after delete+rebuild.
+        orig = k8s_module.settings.CUSTOM_IMAGE_REGISTRY
+        try:
+            k8s_module.settings.CUSTOM_IMAGE_REGISTRY = "reg.example/custom"
+            client = object.__new__(k8s_module.K8sClient)
+            client.namespace = "amd-oneclick-radeon-beta"
+            manifest = client._get_pod_manifest(
+                "hf-user@example.test",
+                "hf-demo",
+                "reg.example/custom/user-1:demo",
+            )
+        finally:
+            k8s_module.settings.CUSTOM_IMAGE_REGISTRY = orig
+
+        container = manifest["spec"]["containers"][0]
+        self.assertEqual(container["imagePullPolicy"], "Always")
+
+    def test_standard_image_notebook_keeps_ifnotpresent(self):
+        orig = k8s_module.settings.CUSTOM_IMAGE_REGISTRY
+        try:
+            k8s_module.settings.CUSTOM_IMAGE_REGISTRY = "reg.example/custom"
+            client = object.__new__(k8s_module.K8sClient)
+            client.namespace = "amd-oneclick-radeon-beta"
+            manifest = client._get_pod_manifest(
+                "hf-user@example.test",
+                "hf-demo",
+                "docker.io/library/standard-notebook:1.0",
+            )
+        finally:
+            k8s_module.settings.CUSTOM_IMAGE_REGISTRY = orig
+
+        container = manifest["spec"]["containers"][0]
+        self.assertEqual(container["imagePullPolicy"], "IfNotPresent")
+
     def test_notebook_toleration_config_is_added(self):
         k8s_module.settings.NOTEBOOK_TOLERATION_KEY = "amd-oneclick/beta"
         k8s_module.settings.NOTEBOOK_TOLERATION_VALUE = "radeon"
@@ -620,7 +656,9 @@ class ImagePrepullTests(unittest.TestCase):
         self.assertEqual(status["status"], "ready")
         self.assertEqual(status["ready_count"], 1)
 
-    def test_active_probe_name_skips_terminating_pod(self):
+    def test_active_probe_name_counts_terminating_pod(self):
+        # A terminating probe still holds containerd pull work and disk on the node, so it
+        # must keep counting as active to preserve the one-pull-at-a-time disk guard.
         k8s_module.settings.IMAGE_PREPULL_ENABLED = False
         k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
         k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
@@ -628,6 +666,17 @@ class ImagePrepullTests(unittest.TestCase):
         client = object.__new__(k8s_module.K8sClient)
         client.namespace = "amd-oneclick-radeon-beta"
         client.core_v1 = FakeProbeCoreV1(listed_pods=[terminating])
+
+        self.assertEqual(client._active_pull_probe_name(), "image-pull-catalog-1")
+
+    def test_active_probe_name_ignores_completed_pod(self):
+        k8s_module.settings.IMAGE_PREPULL_ENABLED = False
+        k8s_module.settings.IMAGE_PULL_PROBE_ENABLED = True
+        k8s_module.settings.NOTEBOOK_NODE_NAME = "beta-node"
+        done = pull_probe_pod(1, "Succeeded")
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeProbeCoreV1(listed_pods=[done])
 
         self.assertIsNone(client._active_pull_probe_name())
 

@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -46,7 +47,12 @@ DOCKER = _env("DOCKER_BIN", "docker")
 BUILD_TIMEOUT = int(_env("BUILD_TIMEOUT_SECONDS", "1800"))
 BUILD_MEMORY = _env("BUILD_MEMORY", "8g")
 BUILD_CPUSET = _env("BUILD_CPUSET", "")            # e.g. "0-3"; empty = no pin
-BUILD_NETWORK = _env("BUILD_NETWORK", "")          # e.g. a restricted docker network name
+BUILD_NETWORK = _env("BUILD_NETWORK", "")          # restricted docker network name, or "none"
+# User Dockerfile RUN steps execute on the R9700 host. With the default Docker bridge they
+# get egress into private/internal networks, so we fail closed: the admin must make an
+# explicit choice. Set BUILD_NETWORK to "none" (no egress; breaks apt/pip), a restricted
+# network name, or "default"/"bridge" to deliberately opt into unrestricted egress.
+BUILD_NETWORK_REQUIRED = _env("BUILD_NETWORK_REQUIRED", "1") not in {"0", "false", "False", ""}
 MIN_FREE_DISK_GB = float(_env("MIN_FREE_DISK_GB", "20"))
 DISK_CHECK_PATH = _env("DISK_CHECK_PATH", "/")
 LOG_FLUSH_SECONDS = float(_env("LOG_FLUSH_SECONDS", "3"))
@@ -120,27 +126,49 @@ def stream_command(image_id, cmd, env=None):
 
     buffer = []
     last_flush = time.time()
-    start = time.time()
 
     def flush():
         if buffer:
             push_log(image_id, "".join(buffer))
             buffer.clear()
 
-    for line in proc.stdout:
-        buffer.append(line)
-        now = time.time()
-        if now - last_flush > LOG_FLUSH_SECONDS:
-            flush()
-            last_flush = now
-        if now - start > BUILD_TIMEOUT:
+    # Watchdog: kills the process at BUILD_TIMEOUT even when it produces no output
+    # (e.g. `RUN sleep 999999` or a stalled push), which the read loop alone can't catch.
+    timed_out = threading.Event()
+
+    def _watchdog():
+        timed_out.set()
+        try:
             proc.kill()
-            flush()
-            push_log(image_id, f"\nBuild exceeded {BUILD_TIMEOUT}s timeout; killed.\n")
-            return False
-    proc.wait()
-    flush()
-    return proc.returncode == 0
+        except OSError:
+            # Process already reaped; cancel() lost the race. Harmless.
+            pass
+
+    watchdog = threading.Timer(BUILD_TIMEOUT, _watchdog)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        for line in proc.stdout:
+            buffer.append(line)
+            now = time.time()
+            if now - last_flush > LOG_FLUSH_SECONDS:
+                flush()
+                last_flush = now
+        proc.wait()
+    finally:
+        watchdog.cancel()
+        if proc.stdout:
+            proc.stdout.close()
+        flush()
+
+    # returncode is the source of truth: a build that exited 0 succeeded even if the timer
+    # fired in the cancel() race window. Only treat it as a timeout when the process did not
+    # exit cleanly AND the watchdog tripped.
+    if proc.returncode == 0:
+        return True
+    if timed_out.is_set():
+        push_log(image_id, f"\nBuild exceeded {BUILD_TIMEOUT}s timeout; killed.\n")
+    return False
 
 
 def run_build(job):
@@ -151,6 +179,16 @@ def run_build(job):
     free = free_disk_gb(DISK_CHECK_PATH)
     if free < MIN_FREE_DISK_GB:
         push_log(image_id, f"Insufficient free disk on build host: {free:.1f}GB < {MIN_FREE_DISK_GB}GB. Aborting.\n")
+        report_result(image_id, "failed")
+        return
+
+    if BUILD_NETWORK_REQUIRED and not BUILD_NETWORK:
+        push_log(
+            image_id,
+            "Build host is misconfigured: BUILD_NETWORK is not set. User Dockerfile builds are\n"
+            "refused by default to avoid giving build steps unrestricted host network egress.\n"
+            "Set BUILD_NETWORK to 'none', a restricted docker network, or 'default' to opt in.\n",
+        )
         report_result(image_id, "failed")
         return
 
@@ -172,6 +210,9 @@ def run_build(job):
             build_cmd += ["--cpuset-cpus", BUILD_CPUSET]
         if BUILD_NETWORK:
             build_cmd += ["--network", BUILD_NETWORK]
+        else:
+            # Only reachable when BUILD_NETWORK_REQUIRED is explicitly disabled.
+            push_log(image_id, "WARNING: building with unrestricted default network egress.\n")
         build_cmd += ["-f", os.path.join(workdir, "Dockerfile"), workdir]
 
         if not stream_command(image_id, build_cmd, env=_build_env()):
