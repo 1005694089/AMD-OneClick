@@ -75,6 +75,19 @@ function App(){
     setLoading(false);
   }
   React.useEffect(()=>{ load(); },[]);
+  async function refreshImages(){
+    try{
+      const res=await fetch('/api/admin/images');
+      const data=await res.json();
+      setImages(data.images||[]);
+    }catch(e){ /* silent -- stale data is fine for a poll */ }
+  }
+  React.useEffect(()=>{
+    const hasActivePull = images.some(img => ['pulling','queued','pending'].includes(img.sync_status));
+    if(!hasActivePull) return;
+    const interval = setInterval(refreshImages, 15000);
+    return ()=>clearInterval(interval);
+  },[images]);
   React.useEffect(()=>{
     const node=document.getElementById('adminDailyStatsChart');
     if(!node || !window.echarts) return;
@@ -96,12 +109,42 @@ function App(){
     return()=>{window.removeEventListener('resize',resize); chart.dispose();};
   },[stats]);
 
-  async function addImage(values){
-    const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...values, enabled:true})});
-    if(res.ok){ message.success('Image added; pull started'); form.resetFields(); setImageModalOpen(false); load(); } else message.error('Failed to add image');
+  function confirmLargeImage(){
+    if(!stats.image_pull_probe_enabled) return Promise.resolve(true);
+    return new Promise(resolve=>{
+      Modal.confirm({
+        title:'Start image pull?',
+        content:'Image pulls for large images (tens of GB) can sit in ContainerCreating for an extended period. Continue?',
+        okText:'Continue', cancelText:'Cancel',
+        onOk:()=>resolve(true), onCancel:()=>resolve(false),
+      });
+    });
   }
-  async function syncImage(id){ const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Pull started':'Sync failed'); load(); }
-  async function deleteImage(id){ const r=await fetch(`/api/admin/images/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Deleted':'Delete failed'); load(); }
+  async function addImage(values){
+    if(!(await confirmLargeImage())) return;
+    const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...values, enabled:true})});
+    if(res.ok){ message.success('Image added; pull started'); form.resetFields(); setImageModalOpen(false); load(); } else {
+      const data = await res.json().catch(()=>({detail:'Failed to add image'}));
+      message.error(data.detail || 'Failed to add image');
+    }
+  }
+  async function syncImage(id){
+    if(!(await confirmLargeImage())) return;
+    const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'});
+    if(r.ok){ message.success('Pull started'); } else {
+      const data = await r.json().catch(()=>({detail:'Sync failed'}));
+      message.error(data.detail || 'Sync failed');
+    }
+    load();
+  }
+  async function deleteImage(id){
+    const r=await fetch(`/api/admin/images/${id}`,{method:'DELETE'});
+    if(r.ok){ message.success('Deleted'); } else {
+      const data = await r.json().catch(()=>({detail:'Delete failed'}));
+      message.error(data.detail || 'Delete failed');
+    }
+    load();
+  }
   async function deleteInstance(id){ const r=await fetch(`/api/admin/instance/${encodeURIComponent(id)}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Destroyed':'Destroy failed'); load(); }
   function openTemplateModal(record){
     setEditingTemplate(record||null);

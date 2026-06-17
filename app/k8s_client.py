@@ -907,8 +907,11 @@ findmnt "$mnt"
             if exclude_name and name == exclude_name:
                 continue
             phase = getattr(pod.status, "phase", "") or ""
-            if phase not in {"Succeeded", "Failed"}:
-                return name
+            if phase in {"Succeeded", "Failed"}:
+                continue
+            if getattr(pod.metadata, "deletion_timestamp", None):
+                continue
+            return name
         return None
 
     def _eligible_prepull_nodes(self) -> set[str]:
@@ -946,7 +949,7 @@ findmnt "$mnt"
         spec = {
             "nodeName": node_name,
             "restartPolicy": "Never",
-            "activeDeadlineSeconds": 7200,
+            "activeDeadlineSeconds": settings.IMAGE_PULL_PROBE_DEADLINE_SECONDS,
             "automountServiceAccountToken": False,
             "tolerations": self._notebook_tolerations(),
             "containers": [
@@ -1012,7 +1015,27 @@ findmnt "$mnt"
             )
 
         self._delete_image_pull_probe(image_id, wait=True)
-        self._create_image_pull_probe(image_id, image)
+        node_name = settings.NOTEBOOK_NODE_NAME.strip()
+        for attempt in range(1, 7):
+            try:
+                self._create_image_pull_probe(image_id, image)
+                break
+            except ApiException as e:
+                if e.status == 409 and attempt < 6:
+                    logger.warning(
+                        "Pull probe %s still terminating while creating; retry %s",
+                        probe_name, attempt,
+                    )
+                    time.sleep(5)
+                    continue
+                if e.status == 409:
+                    return self._pull_probe_status(
+                        "queued",
+                        0,
+                        f"Previous pull probe still terminating on {node_name}; click Sync again shortly",
+                        False,
+                    )
+                raise
         return self.get_image_sync_status(image_id, image)
 
     def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
@@ -1080,6 +1103,15 @@ findmnt "$mnt"
         suffix = f": {message}" if message else ""
         return f"{node_name} {reason}{suffix}"
 
+    def _with_elapsed(self, pod, message: str) -> str:
+        start = getattr(pod.status, "start_time", None) or getattr(pod.metadata, "creation_timestamp", None)
+        if not start:
+            return message
+        elapsed = datetime.now(timezone.utc) - start
+        elapsed_min = int(elapsed.total_seconds() // 60)
+        deadline_min = int(settings.IMAGE_PULL_PROBE_DEADLINE_SECONDS // 60)
+        return f"{message} ({elapsed_min}m / {deadline_min}m deadline)"
+
     def _get_image_pull_probe_status(self, image_id: int, image: Optional[str] = None) -> dict:
         auth_message = self._pull_probe_admin_auth_block_message()
         if auth_message:
@@ -1123,6 +1155,14 @@ findmnt "$mnt"
                     )
                 return self._pull_probe_status("ready", 1, f"Image pulled on {node_name}", True)
 
+            if pod.metadata.deletion_timestamp:
+                return self._pull_probe_status(
+                    "failed",
+                    0,
+                    f"{node_name} previous pull stuck terminating; retry Sync once it clears",
+                    False,
+                )
+
             state = getattr(container_status, "state", None)
             waiting = getattr(state, "waiting", None) if state else None
             if waiting:
@@ -1130,7 +1170,7 @@ findmnt "$mnt"
                 message = self._pull_probe_message_from_waiting(waiting)
                 if reason in {"ErrImagePull", "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError", "RunContainerError"}:
                     return self._pull_probe_status("failed", 0, message, False)
-                return self._pull_probe_status("pulling", 0, message, False)
+                return self._pull_probe_status("pulling", 0, self._with_elapsed(pod, message), False)
 
             terminated = getattr(state, "terminated", None) if state else None
             if terminated:
@@ -1139,12 +1179,20 @@ findmnt "$mnt"
                 suffix = f": {detail}" if detail else ""
                 return self._pull_probe_status("failed", 0, f"{node_name} probe {reason}{suffix}", False)
 
+        if pod.metadata.deletion_timestamp:
+            return self._pull_probe_status(
+                "failed",
+                0,
+                f"{node_name} previous pull stuck terminating; retry Sync once it clears",
+                False,
+            )
+
         if phase == "Succeeded":
             return self._pull_probe_status("failed", 0, f"{node_name} probe succeeded but image id was not reported", False)
         if phase == "Failed":
             detail = pod_message or pod_reason or "probe pod failed"
             return self._pull_probe_status("failed", 0, f"{node_name} {detail}", False)
-        return self._pull_probe_status("pulling", 0, f"{node_name} probe phase {phase}", False)
+        return self._pull_probe_status("pulling", 0, self._with_elapsed(pod, f"{node_name} probe phase {phase}"), False)
 
     def get_image_sync_status(self, image_id: int, image: Optional[str] = None) -> dict:
         """Return DaemonSet sync status for an image catalog entry."""

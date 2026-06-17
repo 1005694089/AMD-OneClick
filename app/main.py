@@ -24,6 +24,7 @@ import secrets
 import httpx
 import requests
 import websockets
+from kubernetes.client.rest import ApiException
 
 from .config import settings, INSTANCE_TYPES
 from .models import (
@@ -1628,7 +1629,10 @@ async def admin_list_users(username: str = Depends(verify_admin)):
 
 @app.get("/api/admin/stats")
 async def admin_stats(username: str = Depends(verify_admin)):
-    return get_admin_daily_stats()
+    stats = get_admin_daily_stats()
+    if isinstance(stats, dict):
+        stats["image_pull_probe_enabled"] = bool(settings.IMAGE_PULL_PROBE_ENABLED)
+    return stats
 
 
 @app.post("/api/admin/users/{user_id}/credits")
@@ -1687,20 +1691,27 @@ async def admin_sync_template_preview(template_id: int, username: str = Depends(
 @app.get("/api/admin/images")
 async def admin_list_images(username: str = Depends(verify_admin)):
     for image in list_images(enabled_only=False):
-        sync = k8s_client.get_image_sync_status(image["id"], image["image"])
-        if (
-            image.get("sync_status") != sync["status"]
-            or image.get("desired_count") != sync["desired_count"]
-            or image.get("ready_count") != sync["ready_count"]
-            or image.get("sync_message") != sync["message"]
-        ):
-            update_image_sync_status(
+        try:
+            sync = k8s_client.get_image_sync_status(image["id"], image["image"])
+            if (
+                image.get("sync_status") != sync["status"]
+                or image.get("desired_count") != sync["desired_count"]
+                or image.get("ready_count") != sync["ready_count"]
+                or image.get("sync_message") != sync["message"]
+            ):
+                update_image_sync_status(
+                    image["id"],
+                    sync["status"],
+                    sync["desired_count"],
+                    sync["ready_count"],
+                    sync["message"],
+                    sync["completed"],
+                )
+        except Exception:
+            logger.warning(
+                "Failed to refresh sync status for image %s; using stale data",
                 image["id"],
-                sync["status"],
-                sync["desired_count"],
-                sync["ready_count"],
-                sync["message"],
-                sync["completed"],
+                exc_info=True,
             )
     return {"images": list_images(enabled_only=False)}
 
@@ -1708,7 +1719,12 @@ async def admin_list_images(username: str = Depends(verify_admin)):
 @app.post("/api/admin/images")
 async def admin_create_image(req: ImageRequest, username: str = Depends(verify_admin)):
     image = upsert_image(req.name, req.image, req.description or "", req.enabled)
-    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    try:
+        sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    except ApiException as e:
+        raise HTTPException(status_code=e.status or 502, detail=f"Image sync failed: {e.reason or str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     return update_image_sync_status(
         image["id"],
         sync["status"],
@@ -1724,7 +1740,12 @@ async def admin_update_image(image_id: int, req: ImageRequest, username: str = D
     image = upsert_image(req.name, req.image, req.description or "", req.enabled, image_id=image_id)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
-    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    try:
+        sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    except ApiException as e:
+        raise HTTPException(status_code=e.status or 502, detail=f"Image sync failed: {e.reason or str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     return update_image_sync_status(
         image["id"],
         sync["status"],
@@ -1740,7 +1761,12 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
     image = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
-    sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    try:
+        sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+    except ApiException as e:
+        raise HTTPException(status_code=e.status or 502, detail=f"Image sync failed: {e.reason or str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     return update_image_sync_status(
         image["id"],
         sync["status"],
@@ -1753,7 +1779,12 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
 
 @app.delete("/api/admin/images/{image_id}")
 async def admin_delete_image(image_id: int, username: str = Depends(verify_admin)):
-    k8s_client.delete_image_sync(image_id)
+    try:
+        k8s_client.delete_image_sync(image_id)
+    except ApiException as e:
+        raise HTTPException(status_code=e.status or 502, detail=f"Image delete failed: {e.reason or str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     if not delete_image(image_id):
         raise HTTPException(status_code=404, detail="Image not found")
     return {"success": True}
