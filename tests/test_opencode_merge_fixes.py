@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import os
 import tempfile
 import unittest
@@ -43,6 +45,14 @@ class OpenCodeAuthTests(unittest.TestCase):
             k8s_module.settings.SERVICE_HOST,
         ) = self._orig
 
+    @staticmethod
+    def _expected_pw(instance_id):
+        return hmac.new(
+            k8s_module.settings.NOTEBOOK_TOKEN.encode("utf-8"),
+            instance_id.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
     def test_pod_env_injects_opencode_basic_auth_credentials(self):
         client = object.__new__(k8s_module.K8sClient)
         client.namespace = "amd-oneclick-radeon-beta"
@@ -53,30 +63,49 @@ class OpenCodeAuthTests(unittest.TestCase):
         env = manifest["spec"]["containers"][0]["env"]
 
         self.assertIn({"name": "OPENCODE_SERVER_USERNAME", "value": "opencode"}, env)
-        self.assertIn({"name": "OPENCODE_SERVER_PASSWORD", "value": "secret-tok"}, env)
+        # Password is the per-instance HMAC, NOT the raw shared NOTEBOOK_TOKEN.
+        self.assertIn(
+            {"name": "OPENCODE_SERVER_PASSWORD", "value": self._expected_pw("hf-demo")}, env
+        )
+        self.assertNotIn(
+            {"name": "OPENCODE_SERVER_PASSWORD", "value": "secret-tok"}, env
+        )
+
+    def test_opencode_password_is_per_instance(self):
+        # Two different instances must get two different OpenCode passwords, so a credential
+        # leaked from one cannot authenticate against another instance's NodePort.
+        client = object.__new__(k8s_module.K8sClient)
+        pw_a = client._opencode_password("inst-a")
+        pw_b = client._opencode_password("inst-b")
+        self.assertNotEqual(pw_a, pw_b)
+        self.assertNotEqual(pw_a, k8s_module.settings.NOTEBOOK_TOKEN)
+        # Deterministic: same instance recomputes the same value (pod env vs URL must agree).
+        self.assertEqual(pw_a, client._opencode_password("inst-a"))
 
     def test_opencode_url_embeds_credentials(self):
         k8s_module.settings.PUBLIC_BASE_URL = "http://1.2.3.4:8080"
         client = object.__new__(k8s_module.K8sClient)
 
-        url = client._build_opencode_url(31000)
+        url = client._build_opencode_url(31000, "inst-a")
 
-        self.assertEqual(url, "http://opencode:secret-tok@1.2.3.4:31000/")
+        self.assertEqual(
+            url, f"http://opencode:{self._expected_pw('inst-a')}@1.2.3.4:31000/"
+        )
 
-    def test_opencode_url_percent_encodes_token(self):
+    def test_opencode_url_percent_encodes_username(self):
+        # The derived password is hex (URL-safe), but the username may contain reserved chars.
         k8s_module.settings.PUBLIC_BASE_URL = "http://1.2.3.4:8080"
-        k8s_module.settings.NOTEBOOK_TOKEN = "a/b@c:d"
+        k8s_module.settings.OPENCODE_WEB_USERNAME = "a/b@c:d"
         client = object.__new__(k8s_module.K8sClient)
 
-        url = client._build_opencode_url(31000)
+        url = client._build_opencode_url(31000, "inst-a")
 
-        # reserved chars must be escaped so the authority parses correctly
-        self.assertIn("a%2Fb%40c%3Ad@", url)
-        self.assertNotIn("a/b@c:d@", url)
+        self.assertIn("a%2Fb%40c%3Ad:", url)
+        self.assertNotIn("a/b@c:d:", url)
 
     def test_opencode_url_none_when_no_port(self):
         client = object.__new__(k8s_module.K8sClient)
-        self.assertIsNone(client._build_opencode_url(None))
+        self.assertIsNone(client._build_opencode_url(None, "inst-a"))
 
 
 class CustomImageNoPrepullTests(unittest.TestCase):

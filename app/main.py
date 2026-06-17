@@ -1067,7 +1067,10 @@ async def custom_image_status(image_id: int, user: dict = Depends(current_user))
 
 @app.delete("/api/custom-images/{image_id}")
 async def delete_my_custom_image(image_id: int, user: dict = Depends(current_user)):
-    record = delete_custom_image(image_id, user["id"])
+    try:
+        record = delete_custom_image(image_id, user["id"])
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not record:
         raise HTTPException(status_code=404, detail="Custom image not found")
     try:

@@ -16,6 +16,14 @@ MANAGER_URL="${MANAGER_URL:?set MANAGER_URL}"
 BUILD_AGENT_TOKEN="${BUILD_AGENT_TOKEN:?set BUILD_AGENT_TOKEN}"
 KUBECONFIG_PATH="${KUBECONFIG_PATH:-/home/zijun/7900_cluster_config}"
 AGENT_USER="${AGENT_USER:-buildagent}"
+# Validate up front: AGENT_USER is interpolated into useradd, chown, AND a sed replacement
+# string below. Restrict to the portable-safe username charset so a value containing sed
+# metacharacters (& / \) can't silently corrupt the rewritten unit, and an odd value can't
+# slip into chown/useradd. Fail loudly rather than write a broken service file.
+if ! printf '%s' "${AGENT_USER}" | grep -Eq '^[a-z_][a-z0-9_-]*\$?$'; then
+  echo "ERROR: AGENT_USER='${AGENT_USER}' is invalid; use [a-z_][a-z0-9_-]* (POSIX username chars)." >&2
+  exit 1
+fi
 # The agent refuses builds unless BUILD_NETWORK is set (fail-closed against unrestricted
 # build-time egress). Default to "none" so a fresh install can build immediately and safely;
 # note "none" blocks ALL egress, so apt/pip in RUN steps will fail until the operator creates
@@ -66,8 +74,15 @@ POLL_INTERVAL_SECONDS=10
 EOF
 chmod 600 "${ENV_FILE}"
 
-echo "==> Installing systemd unit"
-install -m 0644 "${SRC_DIR}/systemd/build-agent.service" /etc/systemd/system/build-agent.service
+echo "==> Installing systemd unit (User/Group set to '${AGENT_USER}')"
+# The shipped unit hard-codes User=buildagent/Group=buildagent. If the operator overrode
+# AGENT_USER, the service must run as THAT account — otherwise it runs as buildagent and
+# cannot read the DOCKER_CONFIG dir (chowned to ${AGENT_USER} above) or the rootless socket.
+# Substitute the selected user into the installed copy rather than shipping a templated unit.
+sed -e "s/^User=.*/User=${AGENT_USER}/" \
+    -e "s/^Group=.*/Group=${AGENT_USER}/" \
+    "${SRC_DIR}/systemd/build-agent.service" > /etc/systemd/system/build-agent.service
+chmod 0644 /etc/systemd/system/build-agent.service
 systemctl daemon-reload
 
 cat <<NEXT

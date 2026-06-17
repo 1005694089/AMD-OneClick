@@ -2,6 +2,7 @@
 Kubernetes client for managing notebook instances
 """
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -565,10 +566,11 @@ cd {workspace}
             {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
             # Protect OpenCode web (bound to 0.0.0.0 on a NodePort) with HTTP Basic auth.
-            # OpenCode reads these for both `serve` and `web`; reuse the Jupyter token so the
-            # owner already has the credential embedded in their returned opencode_url.
+            # OpenCode reads these for both `serve` and `web`. The password is per-instance
+            # (HMAC of NOTEBOOK_TOKEN + instance_id) so it can't be reused against another
+            # owner's NodePort; the same value is embedded in this owner's opencode_url.
             {"name": "OPENCODE_SERVER_USERNAME", "value": settings.OPENCODE_WEB_USERNAME},
-            {"name": "OPENCODE_SERVER_PASSWORD", "value": settings.NOTEBOOK_TOKEN},
+            {"name": "OPENCODE_SERVER_PASSWORD", "value": self._opencode_password(instance_id)},
         ]
         if settings.HF_ENDPOINT.strip():
             env.append({"name": "HF_ENDPOINT", "value": settings.HF_ENDPOINT.strip()})
@@ -1398,7 +1400,7 @@ findmnt "$mnt"
                 "node_port": node_port,
                 "opencode_node_port": opencode_node_port,
                 "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
-                "opencode_url": self._build_opencode_url(opencode_node_port),
+                "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
             }
         except ApiException as e:
             if e.status == 404:
@@ -1433,19 +1435,37 @@ findmnt "$mnt"
                 return host
         return settings.SERVICE_HOST
 
-    def _build_opencode_url(self, opencode_node_port: Optional[int]) -> Optional[str]:
+    def _opencode_password(self, instance_id: str) -> str:
+        """Derive the OpenCode Basic-auth password for one instance.
+
+        Per-instance (NOT a single shared secret): HMAC-SHA256(NOTEBOOK_TOKEN, instance_id).
+        Both the pod env injection and the owner URL recompute this from instance_id, so the
+        value never needs to be persisted, yet it differs for every pod. This closes the
+        horizontal-reuse hole where a user who saw one OpenCode URL held the password for
+        every other instance's NodePort. NOTEBOOK_TOKEN stays the server-side master secret
+        and is never itself sent as the OpenCode password.
+        """
+        return hmac.new(
+            settings.NOTEBOOK_TOKEN.encode("utf-8"),
+            instance_id.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _build_opencode_url(self, opencode_node_port: Optional[int], instance_id: str) -> Optional[str]:
         """Build the OpenCode web URL for the instance owner.
 
         OpenCode web enforces HTTP Basic auth (OPENCODE_SERVER_USERNAME/PASSWORD injected
-        into the pod env), so the NodePort is not exposed unauthenticated. Credentials are
-        embedded in the owner-only URL; browsers honor them on top-level navigation (they
-        are only stripped from cross-origin subresource requests). This matches the existing
-        Jupyter trust model (shared NOTEBOOK_TOKEN visible in every URL).
+        into the pod env), so the NodePort is not exposed unauthenticated. The password is
+        per-instance (see _opencode_password) so it cannot be reused against another owner's
+        NodePort. Credentials are embedded in the owner-only URL; browsers honor them on
+        top-level navigation (they are only stripped from cross-origin subresource requests).
+        NOTE: still cleartext HTTP — a manager-side HTTPS proxy with ownership checks is the
+        follow-up; this change removes the shared-secret reuse, not the lack of TLS.
         """
         if not opencode_node_port:
             return None
         user = quote(settings.OPENCODE_WEB_USERNAME, safe="")
-        password = quote(settings.NOTEBOOK_TOKEN, safe="")
+        password = quote(self._opencode_password(instance_id), safe="")
         return f"http://{user}:{password}@{self._opencode_host()}:{opencode_node_port}/"
 
     def _extract_node_ports(self, svc) -> tuple:
@@ -1529,7 +1549,7 @@ findmnt "$mnt"
             "node_port": node_port,
             "opencode_node_port": opencode_node_port,
             "url": self._build_url(node_port, notebook_path, instance_id, use_path_proxy=True),
-            "opencode_url": self._build_opencode_url(opencode_node_port),
+            "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
             "github_info": github_info
         }
     
@@ -1573,7 +1593,7 @@ findmnt "$mnt"
                 "node_port": node_port,
                 "opencode_node_port": opencode_node_port,
                 "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
-                "opencode_url": self._build_opencode_url(opencode_node_port),
+                "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
                 "instance_type": instance_type,
                 "gpu_count": gpu_count,
                 "resource_profile": pod.metadata.annotations.get("amd-oneclick/resource-profile"),
@@ -1681,7 +1701,7 @@ findmnt "$mnt"
                     "node_port": node_port,
                     "opencode_node_port": opencode_node_port,
                     "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
-                    "opencode_url": self._build_opencode_url(opencode_node_port),
+                    "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
                     "uptime_minutes": uptime_minutes,
                     "instance_type": instance_type,
                     "gpu_count": gpu_count,

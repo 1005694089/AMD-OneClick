@@ -1226,14 +1226,34 @@ def update_custom_image_status(image_id: int, status: Optional[str] = None, imag
 
 
 def delete_custom_image(image_id: int, user_id: int) -> Optional[dict]:
-    """Delete a user's custom image; returns the deleted row (for cleanup) or None."""
+    """Delete a user's custom image; returns the deleted row (for cleanup) or None.
+
+    Refuses to delete a build that is still pending or building: the image tag is mutable and
+    reused (user-{id}:{name}), so deleting an in-flight build lets the user recreate the same
+    name while the old agent is still running and later docker-pushes stale content onto the
+    new tag — leaving a fresh-looking 'ready' row pointing at the wrong image. The build must
+    reach a terminal state (ready/failed, incl. the stale-build reaper) before it can be
+    removed. Raises ValueError if the build is in-flight.
+    """
     with engine.begin() as conn:
         row = conn.execute(
             select(custom_images).where(custom_images.c.id == image_id, custom_images.c.user_id == user_id)
         ).mappings().first()
         if not row:
             return None
-        conn.execute(custom_images.delete().where(custom_images.c.id == image_id, custom_images.c.user_id == user_id))
+        if row["build_status"] in ("pending", "building"):
+            raise ValueError("Cannot delete a build that is still pending or building; wait for it to finish or fail")
+        # Guard the DELETE on the same non-in-flight statuses so a build that gets claimed
+        # between the SELECT and the DELETE (PostgreSQL READ COMMITTED) is not removed mid-flight.
+        result = conn.execute(
+            custom_images.delete().where(
+                custom_images.c.id == image_id,
+                custom_images.c.user_id == user_id,
+                custom_images.c.build_status.notin_(("pending", "building")),
+            )
+        )
+        if result.rowcount == 0:
+            raise ValueError("Cannot delete a build that is still pending or building; wait for it to finish or fail")
         return dict(row)
 
 

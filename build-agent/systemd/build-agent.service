@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=simple
 # Dedicated low-privilege user. With rootless Docker/Podman this user is NOT in the
 # host `docker` group (which would be root-equivalent). See setup.sh.
+# NOTE: setup.sh rewrites these two lines to the operator's AGENT_USER at install time;
+# 'buildagent' is only the default. Edit AGENT_USER (or these lines) — not just one.
 User=buildagent
 Group=buildagent
 EnvironmentFile=/etc/amd-oneclick-build-agent.env

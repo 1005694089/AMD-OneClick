@@ -38,9 +38,14 @@ INSTANCE_TYPES = {
 # constant so the build-agent and the API share one definition.
 DOCKERFILE_SUFFIX = """
 # --- AMD OneClick: auto-appended (Jupyter + OpenCode + Hermes) ---
-# JupyterLab provides the Jupyter server + Lab UI the workspace launches with. Best-effort
-# across pip variants; harmless/idempotent if the base image already ships Jupyter.
-RUN pip3 install --no-cache-dir jupyterlab || pip install --no-cache-dir jupyterlab || python3 -m pip install --no-cache-dir jupyterlab || true
+# JupyterLab provides the Jupyter server + Lab UI the workspace launches with. Try each pip
+# variant in turn, but DO NOT swallow the final failure: the workspace cannot start without
+# Jupyter, so a build that can't install it must fail here rather than be pushed as "ready"
+# and then crash-loop at launch. (Idempotent/harmless if the base image already ships Jupyter.)
+RUN pip3 install --no-cache-dir jupyterlab || pip install --no-cache-dir jupyterlab || python3 -m pip install --no-cache-dir jupyterlab
+# Hard gate: the image is only usable if `jupyter lab` is actually on PATH and runnable.
+# This converts a silently-incomplete base (no working pip, missing deps) into a build failure.
+RUN jupyter lab --version
 # Pin the OpenCode version so the installer skips its "fetch latest version" network call,
 # which intermittently fails in the build sandbox and silently left OpenCode uninstalled.
 # Symlink into /usr/local/bin so `opencode` is on the default PATH (survives login shells).
