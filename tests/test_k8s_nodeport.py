@@ -60,14 +60,18 @@ class NodePortAllocationTests(unittest.TestCase):
         client.core_v1 = FakeCoreV1()
 
         with patch.object(k8s_module.random, "randint", return_value=0):
-            node_port, created = client._create_service_with_nodeport_retry(
+            node_port, opencode_node_port, created = client._create_service_with_nodeport_retry(
                 "hf-user@example.test",
                 "hf-demo",
             )
 
+        # First attempt allocates the pair (32500, 32501); the stub rejects the
+        # jupyter port 32500 with a 422, so the retry adds both to the used set
+        # and reallocates the next free pair (32502, 32503).
         self.assertTrue(created)
-        self.assertEqual(node_port, 32501)
-        self.assertEqual(client.core_v1.created_ports, [32500, 32501])
+        self.assertEqual(node_port, 32502)
+        self.assertEqual(opencode_node_port, 32503)
+        self.assertEqual(client.core_v1.created_ports, [32500, 32502])
 
     def test_allocation_respects_configured_upper_bound(self):
         client = object.__new__(k8s_module.K8sClient)
@@ -721,6 +725,158 @@ class ImagePrepullTests(unittest.TestCase):
         client.core_v1 = ForbiddenCoreV1()
 
         self.assertEqual(client._eligible_prepull_nodes(), set())
+
+
+def _event(reason, message, ts):
+    return SimpleNamespace(
+        reason=reason,
+        message=message,
+        last_timestamp=ts,
+        first_timestamp=ts,
+        event_time=None,
+    )
+
+
+def _starting_pod(phase="Pending", waiting_reason="ContainerCreating", waiting_message="",
+                  start_time=None, container_statuses=None):
+    cs = container_statuses
+    if cs is None and waiting_reason is not None:
+        cs = [SimpleNamespace(
+            name="notebook",
+            ready=False,
+            state=SimpleNamespace(
+                waiting=SimpleNamespace(reason=waiting_reason, message=waiting_message),
+                running=None,
+            ),
+        )]
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name="nb-1"),
+        status=SimpleNamespace(
+            phase=phase,
+            container_statuses=cs,
+            start_time=start_time,
+        ),
+    )
+
+
+class StartupDetailCoreV1:
+    def __init__(self, pod=None, events=None, log="", log_exc=None, read_exc=None):
+        self._pod = pod
+        self._events = events or []
+        self._log = log
+        self._log_exc = log_exc
+        self._read_exc = read_exc
+
+    def read_namespaced_pod(self, name, namespace):
+        if self._read_exc is not None:
+            raise self._read_exc
+        if self._pod is None:
+            raise ApiException(status=404, reason="Not Found")
+        return self._pod
+
+    def list_namespaced_event(self, namespace, field_selector=None):
+        return SimpleNamespace(items=list(self._events))
+
+    def read_namespaced_pod_log(self, name, namespace, tail_lines=None, limit_bytes=None):
+        if self._log_exc is not None:
+            raise self._log_exc
+        return self._log
+
+
+class StartupDetailTests(unittest.TestCase):
+    def test_startup_detail_reports_pulling_with_elapsed(self):
+        start = datetime(2026, 6, 16, 0, 0, 0, tzinfo=timezone.utc)
+        events = [_event("Pulling", 'Pulling image "user-7:llm"', start)]
+        pod = _starting_pod(waiting_reason="ContainerCreating", start_time=start)
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "ns"
+        client.core_v1 = StartupDetailCoreV1(pod=pod, events=events)
+
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                fixed = start + timedelta(minutes=4)
+                return fixed.astimezone(tz) if tz else fixed
+
+        with patch("app.k8s_client.datetime", FixedDatetime):
+            msg = client.get_startup_detail("nb-1")
+
+        self.assertIsNotNone(msg)
+        self.assertIn("user-7:llm", msg)
+        self.assertIn("4m", msg)
+
+    def test_startup_detail_reports_scheduling_block(self):
+        when = datetime(2026, 6, 16, 0, 0, 0, tzinfo=timezone.utc)
+        events = [_event("FailedScheduling", "0/1 nodes are available: 1 Insufficient amd.com/gpu", when)]
+        pod = _starting_pod(phase="Pending", waiting_reason=None, container_statuses=None)
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "ns"
+        client.core_v1 = StartupDetailCoreV1(pod=pod, events=events)
+
+        msg = client.get_startup_detail("nb-1")
+        self.assertIsNotNone(msg)
+        self.assertIn("Insufficient amd.com/gpu", msg)
+
+    def test_startup_detail_reports_image_pull_failure(self):
+        pod = _starting_pod(waiting_reason="ImagePullBackOff", waiting_message="pull access denied")
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "ns"
+        client.core_v1 = StartupDetailCoreV1(pod=pod, events=[])
+
+        msg = client.get_startup_detail("nb-1")
+        self.assertIsNotNone(msg)
+        self.assertIn("pull access denied", msg)
+
+    def test_startup_detail_none_when_pod_missing(self):
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "ns"
+        client.core_v1 = StartupDetailCoreV1(pod=None)
+        self.assertIsNone(client.get_startup_detail("nb-1"))
+
+    def test_get_pod_logs_returns_events_and_container(self):
+        when = datetime(2026, 6, 16, 0, 0, 0, tzinfo=timezone.utc)
+        events = [_event("Pulling", "Pulling image", when), _event("Started", "Started container", when)]
+        pod = _starting_pod(phase="Running", waiting_reason=None,
+                            container_statuses=[SimpleNamespace(name="nb", ready=True,
+                                                                state=SimpleNamespace(waiting=None, running=SimpleNamespace()))])
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "ns"
+        client.core_v1 = StartupDetailCoreV1(pod=pod, events=events, log="hello world\n")
+
+        out = client.get_pod_logs("nb-1")
+        self.assertEqual(out["container"], "hello world\n")
+        self.assertEqual(len(out["events"]), 2)
+        self.assertEqual(out["events"][0]["reason"], "Pulling")
+
+    def test_get_pod_logs_empty_container_during_pull(self):
+        when = datetime(2026, 6, 16, 0, 0, 0, tzinfo=timezone.utc)
+        events = [_event("Pulling", "Pulling image", when)]
+        pod = _starting_pod(waiting_reason="ContainerCreating")
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "ns"
+        client.core_v1 = StartupDetailCoreV1(
+            pod=pod, events=events, log_exc=ApiException(status=400, reason="ContainerCreating"))
+
+        out = client.get_pod_logs("nb-1")
+        self.assertEqual(out["container"], "")
+        self.assertEqual(len(out["events"]), 1)
+
+    def test_pod_events_swallows_non_api_exception(self):
+        class BoomCoreV1:
+            def list_namespaced_event(self, namespace, field_selector=None):
+                raise RuntimeError("connection reset")
+
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "ns"
+        client.core_v1 = BoomCoreV1()
+        self.assertEqual(client._pod_events("nb-1"), [])
+
+    def test_get_pod_logs_not_found(self):
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "ns"
+        client.core_v1 = StartupDetailCoreV1(pod=None)
+        out = client.get_pod_logs("nb-1")
+        self.assertEqual(out, {"events": [], "container": "", "status": "not_found"})
 
 
 if __name__ == "__main__":

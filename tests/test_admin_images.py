@@ -58,10 +58,11 @@ class AdminImageRouteTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        try:
-            os.remove(_DB_PATH)
-        except OSError:
-            pass
+        # NOTE: do not os.remove(_DB_PATH) here. app.store.engine is a process-wide
+        # singleton bound to whichever DB-backed test module imported first; deleting the
+        # file mid-suite breaks other modules' writes under `unittest discover`. The temp
+        # file is harmless and the OS reclaims it.
+        pass
 
     def test_sync_route_maps_apiexception_status(self):
         def boom(image_id, image):

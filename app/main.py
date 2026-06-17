@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import base64
 import asyncio
 import time
@@ -40,6 +41,10 @@ from .models import (
     NotebookTemplateRequest,
     TemplateLaunchRequest,
     HuggingFaceNotebookLaunchRequest,
+    CustomImageBuildRequest,
+    BuildClaimRequest,
+    BuildLogRequest,
+    BuildResultRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .notebook_sources import (
@@ -80,6 +85,14 @@ from .store import (
     upsert_notebook_template,
     update_image_sync_status,
     upsert_image,
+    list_custom_images,
+    get_custom_image,
+    create_custom_image,
+    claim_next_build,
+    append_custom_image_log,
+    update_custom_image_status,
+    delete_custom_image,
+    get_ready_custom_image_by_value,
 )
 
 # Configure logging
@@ -309,8 +322,8 @@ def _save_notebook_template(
     sort_order: Optional[int] = None,
     enabled_override: Optional[bool] = None,
 ) -> dict:
-    if not get_image_by_value(req.image):
-        raise ValueError("Template image must be an enabled image catalog entry")
+    if not get_image_by_value(req.image) and not (owner_user_id and get_ready_custom_image_by_value(owner_user_id, req.image)):
+        raise ValueError("Template image must be an enabled catalog image or one of your build-ready custom images")
     has_repo = bool((req.repo_url or "").strip())
     has_notebook = bool((req.notebook_path or "").strip())
     if has_repo != has_notebook:
@@ -397,10 +410,61 @@ def _active_instance_context(user: Optional[dict], request: Optional[Request] = 
         _instance_public_url(request, live_instance["id"], live_instance.get("github_path"))
         if request else live_instance.get("url")
     )
+    active_instance["opencode_url"] = live_instance.get("opencode_url")
     active_instance["github_path"] = live_instance.get("github_path")
     active_instance["template_id"] = live_instance.get("template_id")
     active_instance["template_title"] = live_instance.get("template_title")
     return active_instance
+
+
+CUSTOM_IMAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}$")
+
+
+def _custom_image_public(record: dict) -> dict:
+    """Strip heavy/internal fields from a custom image row for API responses."""
+    if not record:
+        return {}
+    return {
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "image": record.get("image"),
+        "build_status": record.get("build_status"),
+        "build_log": record.get("build_log") or "",
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+    }
+
+
+def _resolve_launchable_image(user: dict, image: str) -> bool:
+    """An image is launchable if it is an enabled catalog entry OR the caller's own
+    build-ready custom image. Custom images never enter the global catalog."""
+    if get_image_by_value(image):
+        return True
+    return bool(get_ready_custom_image_by_value(user["id"], image))
+
+
+def verify_build_agent(request: Request):
+    """Authenticate the R9700 build-agent for internal endpoints.
+
+    Fails closed: if no BUILD_AGENT_TOKEN is configured, internal endpoints are disabled.
+    The optional IP allowlist checks only the real TCP peer (request.client.host); the
+    client-supplied X-Forwarded-For header is NOT trusted, since these endpoints are reached
+    directly over a NodePort with no header-sanitizing reverse proxy in front, so trusting it
+    would let any token-holder spoof an allowed IP. The bearer token is the primary gate.
+    """
+    token = settings.BUILD_AGENT_TOKEN
+    if not token:
+        raise HTTPException(status_code=404, detail="Not found")
+    header = request.headers.get("authorization", "")
+    expected = f"Bearer {token}"
+    if not secrets.compare_digest(header, expected):
+        raise HTTPException(status_code=401, detail="Invalid build-agent token")
+    allowed = settings.BUILD_AGENT_ALLOWED_IPS
+    if allowed:
+        client_ip = request.client.host if request.client else ""
+        if client_ip not in allowed:
+            raise HTTPException(status_code=403, detail="Source IP not allowed")
+    return True
 
 
 def _can_manage_template(template: dict, user: Optional[dict]) -> bool:
@@ -543,6 +607,13 @@ async def index(request: Request):
     user = get_user(int(request.session["user_id"])) if request.session.get("user_id") else None
     images = list_images(enabled_only=True)
     notebook_templates = list_notebook_templates(enabled_only=True)
+    # Also surface the logged-in user's own templates (including profile-only ones, e.g.
+    # templates built on their custom images) in their gallery view, deduped by id.
+    if user:
+        existing_ids = {t["id"] for t in notebook_templates}
+        for t in list_notebook_templates(enabled_only=False, owner_user_id=user["id"]):
+            if t["id"] not in existing_ids:
+                notebook_templates.append(t)
     active_instance = _active_instance_context(user, request)
     return templates.TemplateResponse(
         request,
@@ -555,6 +626,9 @@ async def index(request: Request):
             "instance_types_json": json.dumps(INSTANCE_TYPES),
             "user_json": json.dumps(user or {}),
             "active_instance_json": json.dumps(active_instance or {}),
+            "custom_images_json": json.dumps(
+                [_custom_image_public(ci) for ci in list_custom_images(user["id"])] if user else []
+            ),
             "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
             "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
@@ -778,7 +852,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
 
-    if not get_image_by_value(image):
+    if not _resolve_launchable_image(user, image):
         raise HTTPException(status_code=400, detail="Invalid image selected")
 
     type_cfg = INSTANCE_TYPES.get(instance_type)
@@ -804,7 +878,8 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             resource_profile=resource_profile,
         )
         record_instance(
-            user["id"], email, instance["id"], image, instance_type, gpu_count, instance.get("node_port")
+            user["id"], email, instance["id"], image, instance_type, gpu_count,
+            instance.get("node_port"), instance.get("opencode_node_port"),
         )
         record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count)
         from .telemetry import report_gpu_instance_created_event
@@ -824,6 +899,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             status="allocating",
             message="Allocating resources for your instance...",
             url=public_url,
+            opencode_url=instance.get("opencode_url"),
             email=email
         )
 
@@ -874,16 +950,40 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
             "unknown": "Checking status..."
         }
         
+        message = status_messages.get(status, "Checking status...")
+        if status not in ("ready", "failed"):
+            try:
+                detail = k8s_client.get_startup_detail(active["instance_id"])
+            except Exception as e:
+                logger.debug("get_startup_detail failed for %s: %s", active["instance_id"], e)
+                detail = None
+            if detail:
+                message = detail
+
         return NotebookStatus(
             status=status or "unknown",
-            message=status_messages.get(status, "Checking status..."),
+            message=message,
             url=_instance_public_url(request, instance["id"], instance.get("github_path")),
+            opencode_url=instance.get("opencode_url"),
             email=email
         )
-        
+
     except Exception as e:
         logger.error(f"Error checking status for {email}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/notebook/logs")
+async def notebook_logs(user: dict = Depends(current_user)):
+    """Pod events + container stdout for the user's active instance, for the live startup view."""
+    active = get_active_instance_for_user(user["id"])
+    if not active:
+        return {"events": [], "container": "", "status": "not_found"}
+    try:
+        return k8s_client.get_pod_logs(active["instance_id"])
+    except Exception as e:
+        logger.error("Error fetching pod logs for %s: %s", active["instance_id"], e)
+        return {"events": [], "container": "", "status": "error"}
 
 
 @app.delete("/api/notebook/current", response_model=DestroyResponse)
@@ -909,6 +1009,101 @@ async def destroy_current_notebook(user: dict = Depends(current_user)):
     except Exception as e:
         logger.error(f"Error destroying current user instance {instance_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Custom Image Endpoints (user-facing)
+# =============================================================================
+
+@app.get("/api/custom-images")
+async def list_my_custom_images(user: dict = Depends(current_user)):
+    return {
+        "custom_images": [_custom_image_public(ci) for ci in list_custom_images(user["id"])],
+        "max_per_user": settings.CUSTOM_IMAGE_MAX_PER_USER,
+    }
+
+
+@app.post("/api/custom-images/build")
+async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(current_user)):
+    name = (req.name or "").strip().lower()
+    if not CUSTOM_IMAGE_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Name must be 1-39 chars: lowercase letters, digits, hyphens; must start with a letter or digit.",
+        )
+    dockerfile = req.dockerfile or ""
+    if not dockerfile.strip():
+        raise HTTPException(status_code=400, detail="Dockerfile must not be empty")
+    if len(dockerfile.encode("utf-8")) > settings.CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dockerfile exceeds {settings.CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES} bytes",
+        )
+
+    image_tag = f"{settings.CUSTOM_IMAGE_REGISTRY}/user-{user['id']}:{name}"
+    try:
+        record = create_custom_image(
+            user["id"], name, image_tag, dockerfile, settings.CUSTOM_IMAGE_MAX_PER_USER
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _custom_image_public(record)
+
+
+@app.get("/api/custom-images/{image_id}/status")
+async def custom_image_status(image_id: int, user: dict = Depends(current_user)):
+    record = get_custom_image(image_id, user_id=user["id"])
+    if not record:
+        raise HTTPException(status_code=404, detail="Custom image not found")
+    return _custom_image_public(record)
+
+
+@app.delete("/api/custom-images/{image_id}")
+async def delete_my_custom_image(image_id: int, user: dict = Depends(current_user)):
+    record = delete_custom_image(image_id, user["id"])
+    if not record:
+        raise HTTPException(status_code=404, detail="Custom image not found")
+    try:
+        k8s_client.delete_custom_image_sync(image_id)
+    except Exception as e:
+        logger.warning("Failed to delete custom prepull DaemonSet for image %s: %s", image_id, e)
+    return {"success": True}
+
+
+# =============================================================================
+# Internal Build-Agent Endpoints (R9700 polling worker; token-guarded)
+# =============================================================================
+
+@app.post("/api/internal/builds/claim")
+async def claim_build(req: BuildClaimRequest, _agent: bool = Depends(verify_build_agent)):
+    job = claim_next_build(req.agent_id)
+    if not job:
+        return {"job": None}
+    # The agent always builds with OpenCode + Hermes appended.
+    dockerfile = job["dockerfile"] + "\n" + settings.DOCKERFILE_SUFFIX
+    return {"job": {"id": job["id"], "tag": job["image"], "dockerfile": dockerfile}}
+
+
+@app.post("/api/internal/builds/{image_id}/log")
+async def push_build_log(image_id: int, req: BuildLogRequest, _agent: bool = Depends(verify_build_agent)):
+    # Only the agent that leased this build (and only while it is still building) may log to it.
+    if not append_custom_image_log(image_id, req.log or "", agent_id=req.agent_id):
+        raise HTTPException(status_code=409, detail="Build not claimed by this agent or not building")
+    return {"ok": True}
+
+
+@app.post("/api/internal/builds/{image_id}/result")
+async def report_build_result(image_id: int, req: BuildResultRequest, _agent: bool = Depends(verify_build_agent)):
+    status = (req.status or "").strip().lower()
+    if status not in ("ready", "failed"):
+        raise HTTPException(status_code=400, detail="status must be 'ready' or 'failed'")
+    # Only the agent that leased this build (and only while it is still building) may finalize it.
+    record = update_custom_image_status(image_id, status=status, require_claimed_by=req.agent_id)
+    if not record:
+        raise HTTPException(status_code=409, detail="Build not claimed by this agent or not building")
+    # Custom user images are NOT prepulled to nodes. The image lives in ACR (pushed by the
+    # build-agent); the notebook pod pulls it lazily on first launch via CUSTOM_IMAGE_PULL_SECRET_NAME.
+    return {"ok": True}
 
 
 # =============================================================================
@@ -1065,8 +1260,8 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
     gpu_count = req.gpu_count or 1
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
-    if not get_image_by_value(template["image"]):
-        raise HTTPException(status_code=400, detail="Template image is disabled or not in the image catalog")
+    if not get_image_by_value(template["image"]) and not get_ready_custom_image_by_value(user["id"], template["image"]):
+        raise HTTPException(status_code=400, detail="Template image is not available (catalog image disabled, or custom image not ready/owned by you)")
 
     active = get_active_instance_for_user(user["id"])
     if active:
@@ -1089,8 +1284,13 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             github_info=github_info,
             custom_instance_id=instance_id,
             resource_profile="auto",
+            template_id=str(template["id"]),
+            template_title=template["title"],
         )
-        record_instance(user["id"], email, instance["id"], template["image"], "opencode", gpu_count, instance.get("node_port"))
+        record_instance(
+            user["id"], email, instance["id"], template["image"], "opencode", gpu_count,
+            instance.get("node_port"), instance.get("opencode_node_port"),
+        )
         record_instance_launch_event(
             user["id"],
             email,
@@ -1117,6 +1317,7 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             status="allocating",
             message="Allocating resources for your notebook template...",
             url=public_url,
+            opencode_url=instance.get("opencode_url"),
             email=email,
             instance_id=instance["id"],
         )
@@ -1203,7 +1404,8 @@ async def launch_huggingface_demo_notebook(
             custom_instance_id=instance_id,
             resource_profile="auto",
         )
-        record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count, instance.get("node_port"))
+        record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,
+                        instance.get("node_port"), instance.get("opencode_node_port"))
         record_instance_launch_event(user["id"], email, instance["id"], image, "jupyter", gpu_count)
         from .telemetry import report_gpu_instance_created_event
 
@@ -1218,6 +1420,7 @@ async def launch_huggingface_demo_notebook(
             status="allocating",
             message="Allocating resources for the Hugging Face demo notebook...",
             url=_instance_public_url(request, instance["id"], github_info.get("path")),
+            opencode_url=instance.get("opencode_url"),
             email=email,
             instance_id=instance["id"],
         )
@@ -1272,10 +1475,21 @@ async def huggingface_demo_notebook_status(
             "unknown": "Checking status...",
         }
 
+        message = status_messages.get(status, "Checking status...")
+        if status not in ("ready", "failed"):
+            try:
+                detail = k8s_client.get_startup_detail(active["instance_id"])
+            except Exception as e:
+                logger.debug("get_startup_detail failed for %s: %s", active["instance_id"], e)
+                detail = None
+            if detail:
+                message = detail
+
         return NotebookStatus(
             status=status or "unknown",
-            message=status_messages.get(status, "Checking status..."),
+            message=message,
             url=_instance_public_url(request, instance["id"], instance.get("github_path")),
+            opencode_url=instance.get("opencode_url"),
             email=email,
             instance_id=instance["id"],
         )
@@ -1412,6 +1626,7 @@ async def create_github_notebook(
             status="exists",
             message="Instance already exists",
             url=existing.get("url"),
+            opencode_url=existing.get("opencode_url"),
             instance_id=instance_id
         )
     
@@ -1438,9 +1653,10 @@ async def create_github_notebook(
             status="allocating",
             message="Allocating resources for your notebook...",
             url=instance.get("url"),
+            opencode_url=instance.get("opencode_url"),
             instance_id=instance_id
         )
-        
+
     except Exception as e:
         logger.error(f"Error creating GitHub notebook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1479,9 +1695,10 @@ async def check_github_status(instance_id: str = Query(...)):
             status=status or "unknown",
             message=status_messages.get(status, "Checking status..."),
             url=instance.get("url"),
+            opencode_url=instance.get("opencode_url"),
             instance_id=instance_id
         )
-        
+
     except Exception as e:
         logger.error(f"Error checking GitHub status: {e}")
         raise HTTPException(status_code=500, detail=str(e))

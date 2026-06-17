@@ -33,6 +33,24 @@ INSTANCE_TYPES = {
 }
 
 
+# Appended to every user-supplied custom Dockerfile (and usable to rebuild the base
+# image) so that OpenCode + Hermes are always present and on PATH. Kept as a module
+# constant so the build-agent and the API share one definition.
+DOCKERFILE_SUFFIX = """
+# --- AMD OneClick: auto-appended (Jupyter + OpenCode + Hermes) ---
+# JupyterLab provides the Jupyter server + Lab UI the workspace launches with. Best-effort
+# across pip variants; harmless/idempotent if the base image already ships Jupyter.
+RUN pip3 install --no-cache-dir jupyterlab || pip install --no-cache-dir jupyterlab || python3 -m pip install --no-cache-dir jupyterlab || true
+# Pin the OpenCode version so the installer skips its "fetch latest version" network call,
+# which intermittently fails in the build sandbox and silently left OpenCode uninstalled.
+# Symlink into /usr/local/bin so `opencode` is on the default PATH (survives login shells).
+RUN curl -fsSL https://opencode.ai/install | bash -s -- --version 1.16.2 || npm i -g opencode-ai@latest || true
+RUN ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode 2>/dev/null || true
+RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash || true
+ENV PATH="/root/.opencode/bin:/root/.hermes/bin:${PATH}"
+"""
+
+
 class Settings:
     K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "default")
 
@@ -159,6 +177,40 @@ class Settings:
     ONECLICK_TELEMETRY_ENABLED: bool = os.getenv("ONECLICK_TELEMETRY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     ONECLICK_TELEMETRY_SOURCE: str = os.getenv("ONECLICK_TELEMETRY_SOURCE", "amd_oneclick")
     ONECLICK_TELEMETRY_PRODUCT: str = os.getenv("ONECLICK_TELEMETRY_PRODUCT", "radeon_cloud")
+
+    # OpenCode web (second in-pod service alongside Jupyter). Reuses NOTEBOOK_TOKEN as the
+    # HTTP basic-auth password so the web UI is never exposed unauthenticated on a NodePort.
+    OPENCODE_WEB_PORT: int = int(os.getenv("OPENCODE_WEB_PORT", "4096"))
+    OPENCODE_WEB_USERNAME: str = os.getenv("OPENCODE_WEB_USERNAME", "opencode")
+    # Appended to every custom-image build. The default uses upstream `curl | bash` installers
+    # (opencode.ai, nousresearch.com) — a third-party supply-chain dependency. Operators who
+    # want to remove that exposure can set DOCKERFILE_SUFFIX to a vendored, checksum-pinned
+    # equivalent (e.g. COPY a verified installer from the build context) via the env var.
+    DOCKERFILE_SUFFIX: str = os.getenv("DOCKERFILE_SUFFIX", "").strip() or DOCKERFILE_SUFFIX
+
+    # Custom user image builds (built off-cluster by the R9700 build-agent, pushed to ACR).
+    CUSTOM_IMAGE_REGISTRY: str = os.getenv(
+        "CUSTOM_IMAGE_REGISTRY",
+        "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud-user",
+    )
+    CUSTOM_IMAGE_MAX_PER_USER: int = int(os.getenv("CUSTOM_IMAGE_MAX_PER_USER", "1"))
+    CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS", "1800"))
+    CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES: int = int(os.getenv("CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES", "65536"))
+    # Optional registry pull secret referenced by notebook + prepull pods for the custom
+    # registry. Empty means "assume nodes can already pull" (no imagePullSecrets injected).
+    CUSTOM_IMAGE_PULL_SECRET_NAME: str = os.getenv("CUSTOM_IMAGE_PULL_SECRET_NAME", "")
+    # Name of the dockerconfigjson secret the R9700 agent uses to push (referenced for docs).
+    ACR_PUSH_SECRET_NAME: str = os.getenv("ACR_PUSH_SECRET_NAME", "acr-push-secret")
+
+    # Internal build-agent channel (R9700 -> manager). Token guards /api/internal/builds/*.
+    BUILD_AGENT_TOKEN: str = os.getenv("BUILD_AGENT_TOKEN", "")
+    BUILD_AGENT_ALLOWED_IPS: list = [
+        ip.strip() for ip in os.getenv("BUILD_AGENT_ALLOWED_IPS", "").split(",") if ip.strip()
+    ]
+    # Builds whose lease is older than this are reaped back to "failed" by the scheduler.
+    CUSTOM_IMAGE_BUILD_LEASE_TIMEOUT_SECONDS: int = int(
+        os.getenv("CUSTOM_IMAGE_BUILD_LEASE_TIMEOUT_SECONDS", "3600")
+    )
 
 
 settings = Settings()

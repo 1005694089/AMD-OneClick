@@ -36,6 +36,34 @@
     const modelscopeEnabled = {{ modelscope_enabled | tojson }};
     const couponRedeemEnabled = {{ coupon_redeem_enabled | tojson }};
     const couponRedeemDisabledMessage = {{ coupon_redeem_disabled_message | tojson }};
+    const DEFAULT_DOCKERFILE = [
+      '# Start from the AMD ROCm base (recommended) or any public image.',
+      'FROM crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416',
+      '',
+      '# Add your packages. Jupyter, OpenCode and Hermes are appended automatically.',
+      'RUN pip install --no-cache-dir transformers datasets',
+      ''
+    ].join('\n');
+    const JUPYTER_LOGO = 'https://cdn.jsdelivr.net/npm/simple-icons@13/icons/jupyter.svg';
+    const OPENCODE_LOGO = 'https://opencode.ai/favicon.svg';
+    const HERMES_LOGO = 'https://hermes-agent.nousresearch.com/favicon.ico';
+    // Render a brand logo with a small, always-visible one-word label next to it.
+    // If the logo fails to load, the label alone still identifies the button.
+    function brandContent(src, alt, label) {
+      return React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+        React.createElement('img', { src, alt, style: { height: 18, width: 18, objectFit: 'contain', display: 'block' }, onError: (e) => { e.target.style.display = 'none'; } }),
+        React.createElement('span', { style: { fontSize: 12, lineHeight: 1 } }, label)
+      );
+    }
+    // Disabled Hermes button — placeholder for a future experimental feature.
+    function hermesButton(opts) {
+      return React.createElement(Button, Object.assign({ disabled: true, title: 'Hermes - experimental, coming soon' }, opts || {}),
+        React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+          brandContent(HERMES_LOGO, 'Hermes', 'Hermes'),
+          React.createElement('span', { style: { fontSize: 10, opacity: 0.6 } }, 'soon')
+        )
+      );
+    }
 
     function avatarNode(u, size=48) {
       if (!u || !u.email) return React.createElement(Avatar, { size, style:{ background:'linear-gradient(135deg,#8ea7ff,#b865ff)' } }, '?');
@@ -87,6 +115,15 @@
       const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
       const [redeemModalOpen, setRedeemModalOpen] = React.useState(false);
       const [redeemLoading, setRedeemLoading] = React.useState(false);
+      const [customImages, setCustomImages] = React.useState([]);
+      const [customMax, setCustomMax] = React.useState(2);
+      const [customLoading, setCustomLoading] = React.useState(false);
+      const [buildModalOpen, setBuildModalOpen] = React.useState(false);
+      const [buildLoading, setBuildLoading] = React.useState(false);
+      const [logModal, setLogModal] = React.useState({ open: false, title: '', log: '' });
+      const [buildForm] = Form.useForm();
+      // null = still checking, true = pod ready, false = pod still starting/pulling image
+      const [instanceReady, setInstanceReady] = React.useState(null);
       const isEditor = !!(user && user.is_editor);
       const activeGpuCount = Number((activeInstance && activeInstance.gpu_count) || 1);
       const remainingRunHours = activeGpuCount > 0 ? Math.floor(Number(user.credits || 0) / activeGpuCount) : 0;
@@ -108,6 +145,101 @@
       }
 
       React.useEffect(() => { loadEditorTemplates(); }, [user && user.email]);
+
+      async function loadCustomImages() {
+        if (!user || !user.email) return;
+        setCustomLoading(true);
+        try {
+          const res = await fetch('/api/custom-images');
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Failed to load custom images');
+          setCustomImages(data.custom_images || []);
+          if (typeof data.max_per_user === 'number') setCustomMax(data.max_per_user);
+        } catch (e) {
+          message.error(e.message || 'Failed to load custom images');
+        }
+        setCustomLoading(false);
+      }
+
+      React.useEffect(() => { loadCustomImages(); }, [user && user.email]);
+
+      // Auto-refresh while any build is in progress.
+      React.useEffect(() => {
+        const inProgress = (customImages || []).some(ci => ci.build_status === 'pending' || ci.build_status === 'building');
+        if (!inProgress) return;
+        const timer = setInterval(loadCustomImages, 5000);
+        return () => clearInterval(timer);
+      }, [customImages]);
+
+      // Poll whether the active instance's pod is actually ready (the image may still be
+      // pulling onto the node, especially for large custom images). Gates the Open buttons.
+      React.useEffect(() => {
+        if (!activeInstance || !activeInstance.instance_id) return;
+        let cancelled = false;
+        let timer = null;
+        async function check() {
+          try {
+            const res = await fetch('/api/notebook/status');
+            const data = await res.json();
+            if (cancelled) return;
+            if (data.status === 'ready') {
+              setInstanceReady(true);
+              if (timer) clearInterval(timer);
+            } else {
+              setInstanceReady(false);
+            }
+          } catch (e) {}
+        }
+        check();
+        timer = setInterval(check, 5000);
+        return () => { cancelled = true; if (timer) clearInterval(timer); };
+      }, []);
+
+      async function buildCustomImage(values) {
+        setBuildLoading(true);
+        try {
+          const res = await fetch('/api/custom-images/build', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ name: values.name, dockerfile: values.dockerfile }) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Build failed to start');
+          message.success('Build queued');
+          setBuildModalOpen(false);
+          buildForm.resetFields();
+          loadCustomImages();
+        } catch (e) {
+          message.error(e.message || 'Build failed to start');
+        } finally {
+          setBuildLoading(false);
+        }
+      }
+
+      async function deleteCustomImage(id) {
+        const res = await fetch(`/api/custom-images/${id}`, { method:'DELETE' });
+        if (res.ok) {
+          message.success('Custom image deleted');
+          loadCustomImages();
+        } else {
+          const data = await res.json().catch(() => ({}));
+          message.error(data.detail || 'Delete failed');
+        }
+      }
+
+      async function launchCustomImage(ci) {
+        if (activeInstance && activeInstance.instance_id) { message.warning('Only one active instance is allowed. Open or destroy it first.'); return; }
+        try {
+          const res = await fetch('/api/notebook/request', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ image: ci.image, gpu_count: 1, resource_profile: 'auto', instance_type: 'opencode' }) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Launch failed');
+          message.info('Launching custom workspace...');
+          pollNotebookReady();
+        } catch (e) {
+          message.error(e.message || 'Launch failed');
+        }
+      }
+
+      function openBuildModal() {
+        buildForm.setFieldsValue({ name: '', dockerfile: DEFAULT_DOCKERFILE });
+        setBuildModalOpen(true);
+      }
 
       function openTemplateModal(record) {
         setEditingTemplate(record || null);
@@ -259,7 +391,7 @@
                 React.createElement(Form.Item, {name:'category', label:'Category', style:{width:180}}, React.createElement(Input, {placeholder:'LLM'})),
                 React.createElement(Form.Item, {name:'tags', label:'Tags', style:{flex:1}}, React.createElement(Input, {placeholder:'tutorial, Qwen3, agent'}))
               ),
-              React.createElement(Form.Item, {name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}]}, React.createElement(Select, {options:editorImages.map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`}))})),
+              React.createElement(Form.Item, {name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}]}, React.createElement(Select, {options:[...editorImages.map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`})), ...(customImages||[]).filter(ci=>ci.build_status==='ready').map(ci=>({value:ci.image,label:`${ci.name} (custom)`}))]})),
               React.createElement(Form.Item, {name:'repo_url', label:'GitHub Repo URL'}, React.createElement(Input, {placeholder:'optional, e.g. https://github.com/org/repo'})),
               React.createElement(Space, {style:{width:'100%'}, size:16},
                 React.createElement(Form.Item, {name:'branch', label:'Branch', style:{width:180}}, React.createElement(Input, {placeholder:'main'})),
@@ -268,6 +400,41 @@
               React.createElement(Form.Item, {name:'cover_url', label:'Cover URL'}, React.createElement(Input, {placeholder:'optional'})),
               React.createElement(Button, {type:'primary', htmlType:'submit', block:true}, editingTemplate?'Save Template':'Add Template')
             )
+          )
+        );
+      }
+
+      function renderCustomImages() {
+        if (!user || !user.email) return null;
+        const statusColor = { ready:'green', building:'blue', pending:'gold', failed:'red' };
+        const activeCount = (customImages || []).filter(ci => ['pending','building','ready'].includes(ci.build_status)).length;
+        const atLimit = activeCount >= customMax;
+        const columns = [
+          {title:'Name',dataIndex:'name',width:160,render:v=>React.createElement('strong',null,v)},
+          {title:'Image',dataIndex:'image',width:300,render:v=>React.createElement(Text,{code:true,copyable:true,style:{display:'block',maxWidth:280,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'},title:v},v)},
+          {title:'Status',dataIndex:'build_status',width:120,render:v=>React.createElement(Tag,{color:statusColor[v]||'default'},v)},
+          {title:'Actions',width:300,render:(_,r)=>React.createElement(Space,null,
+            r.build_status==='ready'&&React.createElement(Button,{size:'small',type:'primary',onClick:()=>launchCustomImage(r)},'Launch'),
+            React.createElement(Button,{size:'small',onClick:()=>setLogModal({open:true,title:`Build log: ${r.name}`,log:r.build_log||'(no output yet)'})},'Logs'),
+            React.createElement(Popconfirm,{title:'Delete custom image?',description:'Removes the image record and its prepull on nodes.',onConfirm:()=>deleteCustomImage(r.id)},React.createElement(Button,{size:'small',danger:true},'Delete'))
+          )}
+        ];
+        return React.createElement(Card, {
+          className:'editor-panel',
+          title:`Custom Images (${activeCount}/${customMax})`,
+          extra:React.createElement(Button, {type:'primary', disabled:atLimit, title:atLimit?`Limit of ${customMax} reached. Delete one to build another.`:'', onClick:openBuildModal}, 'Build New Image')
+        },
+          React.createElement(Paragraph, {type:'secondary'}, 'Write a Dockerfile and build a private image. It is pushed to your registry namespace, prepulled to nodes, then launchable as a workspace. OpenCode and Hermes are added automatically.'),
+          React.createElement(Table, {rowKey:'id', columns:columns, dataSource:customImages, loading:customLoading, pagination:false, scroll:{x:880}, size:'middle'}),
+          React.createElement(Modal, {title:'Build Custom Image', open:buildModalOpen, onCancel:()=>{setBuildModalOpen(false); buildForm.resetFields();}, footer:null, destroyOnClose:true, width:760},
+            React.createElement(Form, {form:buildForm, layout:'vertical', onFinish:buildCustomImage},
+              React.createElement(Form.Item, {name:'name', label:'Image Name', rules:[{required:true,message:'Name is required'},{pattern:/^[a-z0-9][a-z0-9-]{0,38}$/,message:'1-39 chars: lowercase letters, digits, hyphens; start with letter or digit'}]}, React.createElement(Input, {placeholder:'my-workspace', addonBefore:'user-{id}:'})),
+              React.createElement(Form.Item, {name:'dockerfile', label:'Dockerfile', rules:[{required:true,message:'Dockerfile is required'}]}, React.createElement(Input.TextArea, {autoSize:{minRows:10,maxRows:24}, style:{fontFamily:'monospace'}, placeholder:'FROM ...'})),
+              React.createElement(Button, {type:'primary', htmlType:'submit', block:true, loading:buildLoading}, 'Queue Build')
+            )
+          ),
+          React.createElement(Modal, {title:logModal.title, open:logModal.open, onCancel:()=>setLogModal({open:false,title:'',log:''}), footer:null, width:820},
+            React.createElement('pre', {style:{maxHeight:480, overflow:'auto', background:'#0b0b0b', color:'#d6d6d6', padding:16, borderRadius:8, whiteSpace:'pre-wrap', wordBreak:'break-word'}}, logModal.log)
           )
         );
       }
@@ -319,8 +486,11 @@
                   activeInstance.template_title ? {key:'template', label:'Template', children:activeInstance.template_title} : null,
                   activeInstance.github_path ? {key:'notebook', label:'Notebook', children:activeInstance.github_path} : null,
                 ].filter(Boolean)}),
-                React.createElement(Space, {style:{marginTop:16}},
-                  activeInstance.url && React.createElement(Button, {type:'primary', href:activeInstance.url, target:'_blank'}, 'Open Notebook'),
+                instanceReady !== true && React.createElement(Alert, {type:'warning', showIcon:true, style:{marginTop:16}, message:'Workspace is starting', description:'The image is being pulled onto a GPU node. Large custom images can take several minutes on first launch. The Open buttons will enable automatically when it is ready.'}),
+                React.createElement(Space, {style:{marginTop:16}, wrap:true},
+                  activeInstance.url && React.createElement(Button, {type:'primary', ghost:true, href:instanceReady === true ? activeInstance.url : undefined, target:'_blank', disabled: instanceReady !== true, loading: instanceReady === null, title:'Open Notebook (Jupyter)'}, instanceReady === true ? brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter') : 'Preparing\u2026'),
+                  activeInstance.opencode_url && React.createElement(Button, {type:'primary', ghost:true, href:instanceReady === true ? activeInstance.opencode_url : undefined, target:'_blank', disabled: instanceReady !== true, title:'Open in OpenCode'}, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
+                  instanceReady === true && hermesButton({}),
                   React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current notebook instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))
                 )
               ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
@@ -332,7 +502,8 @@
                 React.createElement(Button, {type:'primary', htmlType:'submit', block:true, disabled:!couponRedeemEnabled, loading:redeemLoading}, 'Redeem')
               )
             ),
-            renderEditorTemplates()
+            renderEditorTemplates(),
+            renderCustomImages()
           ) : React.createElement(React.Fragment, null,
             React.createElement('section', {className:'profile-hero'}, React.createElement(Text, {style:{color:'#aaa7bc'}}, 'Account'), React.createElement(Title, {level:1, style:{color:'#fff', marginTop:8}}, 'Sign in to Radeon Cloud'), React.createElement(Paragraph, {style:{color:'#c5c2cf', maxWidth:620}}, 'Use GitHub or ModelScope to claim credits and launch GPU notebooks.')),
             React.createElement('div', {className:'profile-grid'},

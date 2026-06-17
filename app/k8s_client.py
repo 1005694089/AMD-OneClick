@@ -306,6 +306,27 @@ findmnt "$mnt"
             raise ValueError(f"Invalid resource profile '{resource_profile}'. Allowed values: {allowed}")
         return profile, RESOURCE_PROFILES[profile]
 
+    def _service_launch_snippet(self, instance_id: str, notebook_dir: str) -> str:
+        """Launch Jupyter Lab and OpenCode web side by side.
+
+        Security model: both services are on NodePorts and both require a credential.
+        Jupyter uses NOTEBOOK_TOKEN in its URL; OpenCode web enforces HTTP Basic auth via
+        OPENCODE_SERVER_USERNAME/OPENCODE_SERVER_PASSWORD (injected into the pod env, reusing
+        NOTEBOOK_TOKEN as the password) so the NodePort is never unauthenticated. errexit is
+        disabled so a failed optional service can never crash-loop the pod; `wait` keeps the
+        container alive while Jupyter runs.
+        """
+        base_url = self._jupyter_base_url(instance_id)
+        return (
+            "set +e\n"
+            f"jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root "
+            f"--ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{base_url}' "
+            f"--notebook-dir={notebook_dir} &\n"
+            f"opencode web --port {settings.OPENCODE_WEB_PORT} --hostname 0.0.0.0 "
+            ">/tmp/opencode-web.log 2>&1 &\n"
+            "wait\n"
+        )
+
     def _build_startup_script(self, instance_id: str,
                               instance_type: str = "jupyter",
                               github_info: Optional[dict] = None) -> str:
@@ -357,8 +378,7 @@ if [ ! -f {notebook_path_q} ]; then
     find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
 fi
 
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/repo
-"""
+{self._service_launch_snippet(instance_id, f"{workspace}/repo")}"""
             return f"""
 {model_link_script}
 mkdir -p {workspace}/notebooks
@@ -393,24 +413,21 @@ if [ ! -f {shlex.quote(notebook_filename)} ]; then
     echo "Warning: Failed to download notebook, starting with empty directory"
 fi
 
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/notebooks
-"""
+{self._service_launch_snippet(instance_id, f"{workspace}/notebooks")}"""
 
         if instance_type == "opencode":
             return f"""
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 cd {workspace}
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
-"""
+{self._service_launch_snippet(instance_id, workspace)}"""
 
         # Default: jupyter
         return f"""
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 cd {workspace}
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
-"""
+{self._service_launch_snippet(instance_id, workspace)}"""
 
     def _notebook_download_url(self, raw_url: str) -> str:
         endpoint = settings.HF_ENDPOINT.strip().rstrip("/")
@@ -440,7 +457,9 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                           resource_profile: Optional[str] = None,
                           network_disk_claim_name: Optional[str] = None,
                           workspace_quota_node_name: Optional[str] = None,
-                          notebook_node_name: Optional[str] = None) -> dict:
+                          notebook_node_name: Optional[str] = None,
+                          template_id: Optional[str] = None,
+                          template_title: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -478,6 +497,14 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/github-repo-url"] = github_info.get("repo_url", "")
             annotations["amd-oneclick/template-id"] = github_info.get("template_id", "")
             annotations["amd-oneclick/template-title"] = github_info.get("template_title", "")
+
+        # Tag the instance with its source template even for image-only templates (no
+        # github_info), so the active instance is attributable to the template rather
+        # than just its underlying image.
+        if template_id:
+            annotations["amd-oneclick/template-id"] = str(template_id)
+        if template_title:
+            annotations["amd-oneclick/template-title"] = template_title
 
         startup_script = self._build_startup_script(instance_id, instance_type, github_info)
 
@@ -526,6 +553,11 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             {"name": "HF_HOME", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
+            # Protect OpenCode web (bound to 0.0.0.0 on a NodePort) with HTTP Basic auth.
+            # OpenCode reads these for both `serve` and `web`; reuse the Jupyter token so the
+            # owner already has the credential embedded in their returned opencode_url.
+            {"name": "OPENCODE_SERVER_USERNAME", "value": settings.OPENCODE_WEB_USERNAME},
+            {"name": "OPENCODE_SERVER_PASSWORD", "value": settings.NOTEBOOK_TOKEN},
         ]
         if settings.HF_ENDPOINT.strip():
             env.append({"name": "HF_ENDPOINT", "value": settings.HF_ENDPOINT.strip()})
@@ -622,6 +654,9 @@ findmnt "$mnt"
             "securityContext": {
                 "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
             },
+            # Notebook pods don't call the K8s API; dropping the token reduces blast
+            # radius if a user (root in their pod) tries to reach the apiserver.
+            "automountServiceAccountToken": False,
             "dnsPolicy": "None",
             "dnsConfig": {
                 "nameservers": ["8.8.8.8", "8.8.4.4"],
@@ -648,6 +683,10 @@ findmnt "$mnt"
                         {
                             "containerPort": settings.NOTEBOOK_PORT,
                             "name": "jupyter"
+                        },
+                        {
+                            "containerPort": settings.OPENCODE_WEB_PORT,
+                            "name": "opencode"
                         }
                     ],
                     "resources": {
@@ -665,9 +704,17 @@ findmnt "$mnt"
             spec["initContainers"] = init_containers
         if notebook_node_name:
             spec["nodeName"] = notebook_node_name
+
+        image_pull_secrets = []
         image_pull_secret_name = settings.IMAGE_PULL_SECRET_NAME.strip()
         if image_pull_secret_name:
-            spec["imagePullSecrets"] = [{"name": image_pull_secret_name}]
+            image_pull_secrets.append({"name": image_pull_secret_name})
+        # Additionally attach the custom-registry pull secret for images from the custom
+        # registry, when one is configured. Other images keep relying on node-level credentials.
+        if settings.CUSTOM_IMAGE_PULL_SECRET_NAME and image.startswith(settings.CUSTOM_IMAGE_REGISTRY):
+            image_pull_secrets.append({"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME})
+        if image_pull_secrets:
+            spec["imagePullSecrets"] = image_pull_secrets
 
         return {
             "apiVersion": "v1",
@@ -680,9 +727,9 @@ findmnt "$mnt"
             },
             "spec": spec
         }
-    
-    def _get_service_manifest(self, email: str, instance_id: str, node_port: int) -> dict:
-        """Generate Service manifest"""
+
+    def _get_service_manifest(self, email: str, instance_id: str, node_port: int, opencode_node_port: int) -> dict:
+        """Generate Service manifest exposing both Jupyter and OpenCode web."""
         labels = self._get_labels(email, instance_id)
         
         return {
@@ -702,6 +749,12 @@ findmnt "$mnt"
                         "port": settings.NOTEBOOK_PORT,
                         "targetPort": settings.NOTEBOOK_PORT,
                         "nodePort": node_port
+                    },
+                    {
+                        "name": "opencode",
+                        "port": settings.OPENCODE_WEB_PORT,
+                        "targetPort": settings.OPENCODE_WEB_PORT,
+                        "nodePort": opencode_node_port
                     }
                 ]
             }
@@ -742,16 +795,26 @@ findmnt "$mnt"
                 return port
         raise RuntimeError("No available NodePort in configured range")
 
+    def _allocate_node_port_pair(self, used_ports: Optional[set[int]] = None,
+                                 start_port: Optional[int] = None) -> tuple[int, int]:
+        """Allocate two distinct available NodePorts (jupyter + opencode)."""
+        used_ports = set(used_ports) if used_ports is not None else self._used_node_ports()
+        jupyter_port = self._allocate_node_port(used_ports, start_port=start_port)
+        opencode_port = self._allocate_node_port(used_ports | {jupyter_port},
+                                                 start_port=jupyter_port + 1)
+        return jupyter_port, opencode_port
+
     def _is_node_port_conflict(self, exc: ApiException) -> bool:
         message = str(exc).lower()
         return exc.status in {409, 422} and "already allocated" in message
 
-    def _create_service_with_nodeport_retry(self, email: str, instance_id: str) -> tuple[int, bool]:
+    def _create_service_with_nodeport_retry(self, email: str, instance_id: str) -> tuple[int, int, bool]:
         try:
             existing = self.core_v1.read_namespaced_service(name=f"{instance_id}-svc", namespace=self.namespace)
-            node_port = existing.spec.ports[0].node_port if existing.spec.ports else None
-            if node_port:
-                return int(node_port), False
+            if existing.spec.ports:
+                jupyter_port, opencode_port = self._extract_node_ports(existing)
+                if jupyter_port:
+                    return int(jupyter_port), int(opencode_port) if opencode_port else None, False
         except ApiException as e:
             if e.status != 404:
                 raise
@@ -760,25 +823,30 @@ findmnt "$mnt"
             lower, upper = self._node_port_bounds()
             used_ports = self._used_node_ports()
             start = lower + random.randint(0, min(200, max(0, upper - lower)))
-            node_port = self._allocate_node_port(used_ports, start_port=start)
+            node_port, opencode_port = self._allocate_node_port_pair(used_ports, start_port=start)
             max_attempts = min(512, upper - lower + 1)
             for _ in range(max_attempts):
                 try:
-                    self.core_v1.create_namespaced_service(namespace=self.namespace, body=self._get_service_manifest(email, instance_id, node_port))
-                    logger.info("Created service %s-svc with NodePort %s", instance_id, node_port)
-                    return node_port, True
+                    self.core_v1.create_namespaced_service(
+                        namespace=self.namespace,
+                        body=self._get_service_manifest(email, instance_id, node_port, opencode_port),
+                    )
+                    logger.info("Created service %s-svc with NodePorts %s/%s", instance_id, node_port, opencode_port)
+                    return node_port, opencode_port, True
                 except ApiException as e:
                     if e.status == 409 and not self._is_node_port_conflict(e):
                         existing = self.core_v1.read_namespaced_service(name=f"{instance_id}-svc", namespace=self.namespace)
-                        existing_port = existing.spec.ports[0].node_port if existing.spec.ports else None
-                        if existing_port:
-                            return int(existing_port), False
+                        if existing.spec.ports:
+                            existing_jupyter, existing_opencode = self._extract_node_ports(existing)
+                            if existing_jupyter:
+                                return int(existing_jupyter), int(existing_opencode) if existing_opencode else None, False
                         raise
                     if self._is_node_port_conflict(e):
                         if settings.NODE_PORT_CLUSTER_SCAN_ENABLED:
                             used_ports = self._used_node_ports()
                         used_ports.add(node_port)
-                        node_port = self._allocate_node_port(used_ports, start_port=node_port + 1)
+                        used_ports.add(opencode_port)
+                        node_port, opencode_port = self._allocate_node_port_pair(used_ports, start_port=node_port + 1)
                         continue
                     raise
         raise RuntimeError("Unable to allocate NodePort for service")
@@ -1263,7 +1331,20 @@ findmnt "$mnt"
                 raise
         if settings.IMAGE_PULL_PROBE_ENABLED:
             self._delete_image_pull_probe(image_id)
-    
+
+    def _custom_prepull_name(self, custom_image_id: int) -> str:
+        return f"image-prepull-custom-{custom_image_id}"
+
+    def delete_custom_image_sync(self, custom_image_id: int):
+        # Custom user images are never prepulled (pulled lazily by the notebook pod on launch).
+        # This remains a best-effort cleanup of any pre-existing custom-prepull DaemonSet from
+        # an older deployment that did auto-prepull.
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(name=self._custom_prepull_name(custom_image_id), namespace=self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
     def get_instance_by_email(self, email: str) -> Optional[dict]:
         """Get existing notebook instance for an email"""
         instance_id = self._generate_instance_id(email)
@@ -1280,9 +1361,10 @@ findmnt "$mnt"
                     name=f"{instance_id}-svc",
                     namespace=self.namespace
                 )
-                node_port = svc.spec.ports[0].node_port if svc.spec.ports else None
+                node_port, opencode_node_port = self._extract_node_ports(svc)
             except ApiException:
                 node_port = None
+                opencode_node_port = None
             
             return {
                 "id": instance_id,
@@ -1293,7 +1375,9 @@ findmnt "$mnt"
                 "status": pod.status.phase.lower(),
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
-                "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None
+                "opencode_node_port": opencode_node_port,
+                "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
+                "opencode_url": self._build_opencode_url(opencode_node_port),
             }
         except ApiException as e:
             if e.status == 404:
@@ -1313,13 +1397,55 @@ findmnt "$mnt"
             encoded_path = quote(notebook_path.lstrip("/"), safe="/")
             return f"http://{settings.SERVICE_HOST}:{node_port}/lab/tree/{encoded_path}?token={settings.NOTEBOOK_TOKEN}"
         return base_url
+
+    def _opencode_host(self) -> str:
+        """Host for direct OpenCode NodePort access.
+
+        Must be the host users actually reach the cluster on (the hostname in
+        PUBLIC_BASE_URL, e.g. 36.150.116.200), NOT SERVICE_HOST (36.151.243.69),
+        which is only used for the path-proxied Jupyter URLs and is not routable
+        for direct NodePort access from the browser.
+        """
+        if settings.PUBLIC_BASE_URL:
+            host = urlparse(settings.PUBLIC_BASE_URL).hostname
+            if host:
+                return host
+        return settings.SERVICE_HOST
+
+    def _build_opencode_url(self, opencode_node_port: Optional[int]) -> Optional[str]:
+        """Build the OpenCode web URL for the instance owner.
+
+        OpenCode web enforces HTTP Basic auth (OPENCODE_SERVER_USERNAME/PASSWORD injected
+        into the pod env), so the NodePort is not exposed unauthenticated. Credentials are
+        embedded in the owner-only URL; browsers honor them on top-level navigation (they
+        are only stripped from cross-origin subresource requests). This matches the existing
+        Jupyter trust model (shared NOTEBOOK_TOKEN visible in every URL).
+        """
+        if not opencode_node_port:
+            return None
+        user = quote(settings.OPENCODE_WEB_USERNAME, safe="")
+        password = quote(settings.NOTEBOOK_TOKEN, safe="")
+        return f"http://{user}:{password}@{self._opencode_host()}:{opencode_node_port}/"
+
+    def _extract_node_ports(self, svc) -> tuple:
+        """Return (jupyter_node_port, opencode_node_port) from a Service object."""
+        jupyter_port = None
+        opencode_port = None
+        for port in (svc.spec.ports or []):
+            if port.name == "opencode":
+                opencode_port = port.node_port
+            elif port.name == "jupyter" or jupyter_port is None:
+                jupyter_port = port.node_port
+        return jupyter_port, opencode_port
     
     def create_instance(self, email: str, image: Optional[str] = None,
                         instance_type: str = "jupyter",
                         gpu_count: int = 1,
                         github_info: Optional[dict] = None,
                         custom_instance_id: Optional[str] = None,
-                        resource_profile: Optional[str] = None) -> dict:
+                        resource_profile: Optional[str] = None,
+                        template_id: Optional[str] = None,
+                        template_title: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -1340,6 +1466,8 @@ findmnt "$mnt"
             network_disk_claim_name=network_disk_claim_name,
             workspace_quota_node_name=workspace_quota_node_name,
             notebook_node_name=notebook_node_name,
+            template_id=template_id,
+            template_title=template_title,
         )
         for attempt in range(1, 7):
             try:
@@ -1358,7 +1486,7 @@ findmnt "$mnt"
                 raise
 
         try:
-            node_port, service_created = self._create_service_with_nodeport_retry(email, instance_id)
+            node_port, opencode_node_port, service_created = self._create_service_with_nodeport_retry(email, instance_id)
         except Exception as e:
             logger.error("Failed to create service for %s: %s", instance_id, e)
             self.delete_instance_by_id(instance_id)
@@ -1378,7 +1506,9 @@ findmnt "$mnt"
             "status": "pending",
             "created_at": datetime.now(timezone.utc),
             "node_port": node_port,
+            "opencode_node_port": opencode_node_port,
             "url": self._build_url(node_port, notebook_path, instance_id, use_path_proxy=True),
+            "opencode_url": self._build_opencode_url(opencode_node_port),
             "github_info": github_info
         }
     
@@ -1397,9 +1527,10 @@ findmnt "$mnt"
                     name=f"{instance_id}-svc",
                     namespace=self.namespace
                 )
-                node_port = svc.spec.ports[0].node_port if svc.spec.ports else None
+                node_port, opencode_node_port = self._extract_node_ports(svc)
             except ApiException:
                 node_port = None
+                opencode_node_port = None
 
             email = pod.metadata.annotations.get("amd-oneclick/email", "unknown")
             github_path = pod.metadata.annotations.get("amd-oneclick/github-path")
@@ -1419,7 +1550,9 @@ findmnt "$mnt"
                 "status": pod.status.phase.lower(),
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
+                "opencode_node_port": opencode_node_port,
                 "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
+                "opencode_url": self._build_opencode_url(opencode_node_port),
                 "instance_type": instance_type,
                 "gpu_count": gpu_count,
                 "resource_profile": pod.metadata.annotations.get("amd-oneclick/resource-profile"),
@@ -1493,12 +1626,13 @@ findmnt "$mnt"
                 
                 # Get NodePort from service
                 node_port = None
+                opencode_node_port = None
                 try:
                     svc = self.core_v1.read_namespaced_service(
                         name=f"{instance_id}-svc",
                         namespace=self.namespace
                     )
-                    node_port = svc.spec.ports[0].node_port if svc.spec.ports else None
+                    node_port, opencode_node_port = self._extract_node_ports(svc)
                 except ApiException:
                     pass
                 
@@ -1524,7 +1658,9 @@ findmnt "$mnt"
                     "status": pod.status.phase.lower() if pod.status.phase else "unknown",
                     "created_at": created_at.isoformat() if created_at else None,
                     "node_port": node_port,
+                    "opencode_node_port": opencode_node_port,
                     "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
+                    "opencode_url": self._build_opencode_url(opencode_node_port),
                     "uptime_minutes": uptime_minutes,
                     "instance_type": instance_type,
                     "gpu_count": gpu_count,
@@ -1589,7 +1725,170 @@ findmnt "$mnt"
             if e.status == 404:
                 return None
             raise
-    
+
+    def _pod_events(self, instance_id: str, limit: int = 50) -> list:
+        """Return pod events (oldest→newest) as plain dicts. Best-effort: [] on any failure."""
+        try:
+            resp = self.core_v1.list_namespaced_event(
+                namespace=self.namespace,
+                field_selector=f"involvedObject.name={instance_id}",
+            )
+        except Exception:
+            return []
+        items = list(getattr(resp, "items", None) or [])
+
+        def _ts(ev):
+            return (
+                getattr(ev, "last_timestamp", None)
+                or getattr(ev, "event_time", None)
+                or getattr(ev, "first_timestamp", None)
+            )
+
+        # Stable decorate-sort: events without a usable timestamp keep their original
+        # (API-returned, roughly chronological) order and sort after timestamped ones.
+        def _sort_key(pair):
+            i, ev = pair
+            t = _ts(ev)
+            return (0, t.timestamp(), i) if t is not None else (1, 0.0, i)
+
+        try:
+            items = [ev for _, ev in sorted(enumerate(items), key=_sort_key)]
+        except Exception:
+            pass
+        out = []
+        for ev in items[-limit:]:
+            t = _ts(ev)
+            out.append(
+                {
+                    "time": t.isoformat() if t is not None else None,
+                    "reason": getattr(ev, "reason", None) or "",
+                    "message": getattr(ev, "message", None) or "",
+                }
+            )
+        return out
+
+    def get_startup_detail(self, instance_id: str) -> Optional[str]:
+        """Best-effort human-readable detail of why an instance is still starting.
+
+        Returns a specific message (image pulling with elapsed time, image-pull failure,
+        scheduling blocked by resources, …) or None when nothing useful can be derived
+        (caller falls back to a static status message).
+        """
+        try:
+            pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+        except ApiException:
+            return None
+
+        status = getattr(pod, "status", None)
+        phase = (getattr(status, "phase", None) or "").lower() if status else ""
+        container_statuses = getattr(status, "container_statuses", None) if status else None
+
+        cs = container_statuses[0] if container_statuses else None
+        waiting = getattr(getattr(cs, "state", None), "waiting", None) if cs else None
+        waiting_reason = getattr(waiting, "reason", None) if waiting else None
+
+        if waiting_reason in ("ImagePullBackOff", "ErrImagePull"):
+            msg = getattr(waiting, "message", None) or "image could not be pulled"
+            return f"Image pull failed: {msg}"
+
+        events = self._pod_events(instance_id)
+
+        if waiting_reason in ("ContainerCreating", "PodInitializing") or (
+            cs is None and phase in ("pending", "")
+        ):
+            # Look for the most recent image-pull progress event.
+            pulling = None
+            for ev in reversed(events):
+                if ev["reason"] in ("Pulling", "Pulled"):
+                    pulling = ev
+                    break
+            if pulling is not None and pulling["reason"] == "Pulling":
+                image = self._image_from_pull_message(pulling["message"])
+                elapsed = self._elapsed_label(pulling["time"]) or self._elapsed_label(
+                    getattr(status, "start_time", None) if status else None
+                )
+                label = image or "image"
+                if elapsed:
+                    return f"Pulling image {label} ({elapsed})…"
+                return f"Pulling image {label}…"
+
+            # No pull yet — maybe scheduling is blocked by resources.
+            for ev in reversed(events):
+                if ev["reason"] in ("FailedScheduling", "FailedCreate") and ev["message"]:
+                    return f"Waiting: {ev['message']}"
+
+            if waiting_reason in ("ContainerCreating", "PodInitializing"):
+                return "Preparing container…"
+            if phase in ("pending", ""):
+                return "Waiting for resources…"
+
+        # Pending with no container status and no useful event → resource wait.
+        if phase == "pending":
+            for ev in reversed(events):
+                if ev["reason"] in ("FailedScheduling", "FailedCreate") and ev["message"]:
+                    return f"Waiting: {ev['message']}"
+            return "Waiting for resources…"
+
+        return None
+
+    @staticmethod
+    def _image_from_pull_message(message: Optional[str]) -> Optional[str]:
+        """Extract the image ref from a kubelet 'Pulling image "repo:tag"' event message."""
+        if not message:
+            return None
+        if '"' in message:
+            parts = message.split('"')
+            if len(parts) >= 2 and parts[1].strip():
+                return parts[1].strip()
+        return None
+
+    @staticmethod
+    def _elapsed_label(start) -> Optional[str]:
+        """Return a compact elapsed label (e.g. '4m', '45s') since an ISO timestamp/datetime."""
+        if start is None:
+            return None
+        if isinstance(start, str):
+            try:
+                start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if getattr(start, "tzinfo", None) is None:
+            start = start.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - start
+        secs = int(delta.total_seconds())
+        if secs < 0:
+            return None
+        if secs < 60:
+            return f"{secs}s"
+        return f"{secs // 60}m"
+
+    def get_pod_logs(self, instance_id: str, tail_lines: int = 200) -> dict:
+        """Return pod events plus container stdout for the live log view during startup.
+
+        Shape: {"events": [{"time","reason","message"}...], "container": "<stdout or ''>"}.
+        During image pull / pending the container has not started, so 'container' is "" and
+        the events carry the useful signal. Missing pod → empty payload.
+        """
+        try:
+            self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return {"events": [], "container": "", "status": "not_found"}
+            return {"events": [], "container": ""}
+
+        events = self._pod_events(instance_id)
+        container = ""
+        try:
+            container = self.core_v1.read_namespaced_pod_log(
+                name=instance_id,
+                namespace=self.namespace,
+                tail_lines=tail_lines,
+                limit_bytes=262144,
+            ) or ""
+        except ApiException:
+            container = ""
+        return {"events": events, "container": container}
+
     def _check_jupyter_ready(self, node_port: int, timeout: float = 2.0) -> bool:
         """Check if Jupyter is responding on the given port"""
         try:

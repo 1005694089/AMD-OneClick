@@ -68,6 +68,29 @@ class HuggingFaceNotebookLaunchRequest(BaseModel):
     image: Optional[str] = None
 
 
+class CustomImageBuildRequest(BaseModel):
+    """Request model for enqueuing a custom image build"""
+    name: str
+    dockerfile: str
+
+
+class BuildClaimRequest(BaseModel):
+    """Build-agent request to lease the next pending build"""
+    agent_id: str
+
+
+class BuildLogRequest(BaseModel):
+    """Build-agent log chunk"""
+    agent_id: str
+    log: str
+
+
+class BuildResultRequest(BaseModel):
+    """Build-agent terminal result for a build"""
+    agent_id: str
+    status: str  # ready | failed
+
+
 class GitHubNotebookInfo(BaseModel):
     """GitHub notebook information"""
     org: str
@@ -97,6 +120,7 @@ class NotebookStatus(BaseModel):
     status: str  # allocating, loading, initializing, ready, failed
     message: str
     url: Optional[str] = None
+    opencode_url: Optional[str] = None
     email: Optional[str] = None
     instance_id: Optional[str] = None
 

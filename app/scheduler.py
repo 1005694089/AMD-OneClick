@@ -85,6 +85,18 @@ async def template_preview_sync_job():
         logger.error(f"Template preview sync job failed: {e}")
 
 
+async def reap_stale_builds_job():
+    """Fail custom image builds whose agent lease has expired (agent died/stalled)."""
+    from .store import reap_stale_builds
+
+    try:
+        reaped = reap_stale_builds(settings.CUSTOM_IMAGE_BUILD_LEASE_TIMEOUT_SECONDS)
+        if reaped:
+            logger.warning("Reaped %s stale custom image build(s)", reaped)
+    except Exception as e:
+        logger.error(f"Stale build reaper failed: {e}")
+
+
 def start_scheduler():
     """Start the background scheduler"""
     scheduler.add_job(
@@ -99,6 +111,13 @@ def start_scheduler():
         trigger=IntervalTrigger(minutes=2),
         id="template_preview_sync_job",
         name="Sync notebook template preview cache",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        reap_stale_builds_job,
+        trigger=IntervalTrigger(minutes=5),
+        id="reap_stale_builds_job",
+        name="Reap stale custom image builds",
         replace_existing=True,
     )
     scheduler.start()
