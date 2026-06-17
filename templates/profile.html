@@ -43,6 +43,22 @@
       return React.createElement(Avatar, { size, style:{ background:'linear-gradient(135deg,#8ea7ff,#b865ff)' } }, (u.email||'?')[0].toUpperCase());
     }
 
+    function displayInstanceStatus(inst) {
+      if (!inst || !inst.live_status) return '';
+      if (inst.live_reason === 'Unschedulable') return 'Waiting for available GPU resources';
+      if (inst.live_reason === 'ImagePullBackOff' || inst.live_reason === 'ErrImagePull') return 'Image pull failed';
+      if (inst.live_reason === 'ContainerCreating') return 'Preparing workspace';
+      if (inst.live_reason === 'JupyterStarting') return 'Jupyter is starting';
+      if (inst.live_status === 'ready') return 'Ready';
+      return inst.live_message || inst.live_status;
+    }
+
+    function displayInstanceDetail(inst) {
+      if (!inst || !inst.live_status || inst.live_status === 'ready') return '';
+      if (inst.live_reason === 'Unschedulable') return 'No suitable GPU node is available yet. You can keep waiting or destroy and retry later.';
+      return inst.live_reason || '';
+    }
+
     function UserMenu() {
       if (!user || !user.email) {
         const items = [
@@ -315,10 +331,12 @@
                   {key:'id', label:'Instance', children:activeInstance.instance_id},
                   {key:'gpu', label:'GPU', children:`${activeInstance.gpu_count} GPU`},
                   {key:'runtime', label:'Runtime', children:`${activeInstance.runtime_minutes || 0} minutes`},
+                  activeInstance.live_status ? {key:'status', label:'Status', children:displayInstanceStatus(activeInstance)} : null,
                   {key:'image', label:'Image', children:activeInstance.image},
                   activeInstance.template_title ? {key:'template', label:'Template', children:activeInstance.template_title} : null,
                   activeInstance.github_path ? {key:'notebook', label:'Notebook', children:activeInstance.github_path} : null,
                 ].filter(Boolean)}),
+                activeInstance.live_status && activeInstance.live_status !== 'ready' && React.createElement(Alert, {type:activeInstance.live_status === 'failed' ? 'error' : 'info', showIcon:true, style:{marginTop:16}, message:displayInstanceStatus(activeInstance) || 'Instance is not ready yet', description:displayInstanceDetail(activeInstance) || undefined}),
                 React.createElement(Space, {style:{marginTop:16}},
                   activeInstance.url && React.createElement(Button, {type:'primary', href:activeInstance.url, target:'_blank'}, 'Open Notebook'),
                   React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current notebook instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))

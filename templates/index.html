@@ -60,6 +60,19 @@
     .template-actions { margin-top:auto; padding-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:8px; align-items:center; }
     .template-actions .ant-btn { width:100%; }
     .empty-gallery { padding:46px; text-align:center; background:#fff; border:1px dashed #d9e0ef; border-radius:18px; color:#747b8c; }
+    .launch-modal-body { padding:8px 4px 4px; }
+    .launch-modal-progress { margin-bottom:20px; }
+    .launch-modal-stage { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; font-weight:700; color:#3a4256; }
+    .launch-modal-pct { color:#8a93a6; font-weight:600; font-size:13px; }
+    .launch-modal-status { display:flex; align-items:flex-start; gap:0; padding:16px; border-radius:14px; background:#f6f8fd; border:1px solid #eaeefb; }
+    .launch-modal-status.ready { background:#f3fbf5; border-color:#cdeed5; }
+    .launch-modal-status.failed { background:#fff7f7; border-color:#ffd9d9; }
+    .launch-modal-title { font-weight:800; color:#273049; font-size:15px; }
+    .launch-modal-detail { margin-top:6px; color:#6b758c; line-height:1.5; font-size:13px; }
+    .launch-modal-technical { margin-top:14px; color:#6b758c; font-size:13px; }
+    .launch-modal-technical summary { cursor:pointer; color:#566175; font-weight:700; }
+    .launch-modal-technical-body { margin-top:8px; padding:10px 12px; border-radius:10px; background:#f5f6fa; white-space:pre-wrap; word-break:break-word; color:#7b8496; }
+    .launch-card .ant-steps { margin-top:8px; }
     @media (max-width: 1120px) { .template-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } .gallery-hero-inner { grid-template-columns:1fr; } .gallery-art { display:none; } }
     @media (max-width: 900px) { .gallery-bar { align-items:flex-start; flex-direction:column; } .template-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
     @media (max-width: 680px) { .template-grid { grid-template-columns: 1fr; } }
@@ -69,7 +82,7 @@
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Select, Space, Tag, Typography, message } = antd;
+    const { Alert, Avatar, Button, Card, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Progress, Select, Space, Spin, Steps, Tag, Typography, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const currentUser = {{ user_json | safe }};
@@ -120,6 +133,8 @@
       const [readyTemplateId, setReadyTemplateId] = React.useState(initialActiveInstance.template_id ? Number(initialActiveInstance.template_id) : null);
       const [createModalOpen, setCreateModalOpen] = React.useState(false);
       const [createLoading, setCreateLoading] = React.useState(false);
+      const [launchStatus, setLaunchStatus] = React.useState(null);
+      const [launchModalOpen, setLaunchModalOpen] = React.useState(false);
       const [workshopLoginOpen, setWorkshopLoginOpen] = React.useState(false);
       const [workshopLoginLoading, setWorkshopLoginLoading] = React.useState(false);
       const [workshopForm] = Form.useForm();
@@ -210,28 +225,142 @@
       async function launch() {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const values = await form.validateFields();
-        setNotebookLoading(true); setReadyUrl(''); setReadyTemplateId(null);
+        setNotebookLoading(true); setReadyUrl(''); setReadyTemplateId(null); setLaunchModalOpen(true); setLaunchStatus({ status: 'allocating', message: 'Allocating resources for your workspace...', target: { type: 'notebook' } });
         try {
           const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode' }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
-          pollStatus(data.url, { type: 'notebook' }); message.success('Instance requested');
-        } catch (err) { setNotebookLoading(false); message.error(err.message); }
+          pollStatus(data.url, { type: 'notebook' });
+        } catch (err) {
+          setNotebookLoading(false);
+          setLaunchStatus({ status:'failed', message:err.message || 'Launch failed', target: { type: 'notebook' } });
+        }
       }
       async function launchTemplate(tpl) {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const gpuCount = form.getFieldValue('gpu_count') || 1;
-        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyTemplateId(null);
+        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyTemplateId(null); setLaunchModalOpen(true); setLaunchStatus({ status: 'allocating', message: `Allocating resources for ${tpl.title}`, target: { type: 'template', templateId: tpl.id } });
         try {
           const res = await fetch(`/api/templates/${tpl.id}/launch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gpu_count: gpuCount }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
-          pollStatus(data.url, { type: 'template', templateId: tpl.id }); message.success(`Launching ${tpl.title}`);
-        } catch (err) { setLaunchingTemplateId(null); message.error(err.message); }
+          pollStatus(data.url, { type: 'template', templateId: tpl.id });
+        } catch (err) {
+          setLaunchingTemplateId(null);
+          setLaunchStatus({ status:'failed', message:err.message || 'Launch failed', target: { type: 'template', templateId: tpl.id } });
+        }
       }
       function finishPolling(target) {
         if (target && target.type === 'template') setLaunchingTemplateId(null);
         else setNotebookLoading(false);
+      }
+      const launchStepItems = [
+        { title: 'Requested' },
+        { title: 'Scheduling' },
+        { title: 'Preparing' },
+        { title: 'Starting' },
+        { title: 'Ready' },
+      ];
+      function launchStepIndex(data) {
+        if (!data) return 0;
+        if (data.status === 'ready') return 4;
+        if (data.status === 'jupyter_starting' || data.status === 'running') return 3;
+        if (data.status === 'initializing' || data.status === 'loading') return 2;
+        if (data.status === 'pending') return 1;
+        return 0;
+      }
+      function displayStatusMessage(data) {
+        if (!data) return 'Checking instance status...';
+        if (data.reason === 'Unschedulable') return 'Waiting for available GPU resources';
+        if (data.reason === 'ImagePullBackOff' || data.reason === 'ErrImagePull') return 'Image pull failed';
+        if (data.reason === 'ContainerCreating') return 'Preparing your workspace';
+        if (data.reason === 'JupyterStarting') return 'Jupyter is starting';
+        if (data.status === 'ready') return 'Workspace is ready';
+        if (data.status === 'failed') return data.message || 'Instance failed';
+        if (data.status === 'not_found') return data.message || 'Instance not found';
+        if (data.status === 'pending') return 'Waiting for resources';
+        return data.message || 'Checking instance status...';
+      }
+      function displayStatusDetail(data) {
+        if (!data) return '';
+        if (data.reason === 'Unschedulable') return 'The cluster has not found a suitable GPU node yet. You can keep waiting or destroy and retry later.';
+        if (data.status === 'failed') return data.detail || data.reason || '';
+        if (data.status === 'ready') return 'Your workspace is ready to open.';
+        return data.reason && data.reason !== data.message ? data.reason : '';
+      }
+      async function cancelLaunch() {
+        try {
+          const res = await fetch('/api/notebook/current', { method: 'DELETE' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Cancel failed');
+          setLaunchStatus(null);
+          setNotebookLoading(false);
+          setLaunchingTemplateId(null);
+          setReadyUrl('');
+          setReadyTemplateId(null);
+          setLaunchModalOpen(false);
+          message.success(data.message || 'Launch cancelled');
+        } catch (err) {
+          message.error(err.message || 'Cancel failed');
+        }
+      }
+      function closeLaunchModal() {
+        setLaunchModalOpen(false);
+      }
+      function renderLaunchModal() {
+        const data = launchStatus || {};
+        const failed = data.status === 'failed' || data.status === 'not_found';
+        const ready = data.status === 'ready' && (data.url || readyUrl);
+        const current = launchStepIndex(data);
+        const title = displayStatusMessage(data);
+        const detail = displayStatusDetail(data);
+        const openUrl = data.url || readyUrl;
+        const footer = ready
+          ? [
+              React.createElement(Button, { key:'close', onClick:closeLaunchModal }, 'Close'),
+              React.createElement(Button, { key:'open', type:'primary', href:openUrl, target:'_blank', onClick:closeLaunchModal }, 'Open Notebook')
+            ]
+          : failed
+            ? [ React.createElement(Button, { key:'close', type:'primary', onClick:()=>{ setLaunchStatus(null); closeLaunchModal(); } }, 'Close') ]
+            : [
+                React.createElement(Button, { key:'bg', onClick:closeLaunchModal }, 'Continue in background'),
+                React.createElement(Button, { key:'cancel', danger:true, onClick:cancelLaunch }, 'Cancel launch')
+              ];
+        return React.createElement(Modal, {
+            open: launchModalOpen,
+            title: 'Starting your workspace',
+            width: 560,
+            maskClosable: false,
+            keyboard: false,
+            onCancel: ready || failed ? closeLaunchModal : undefined,
+            closable: ready || failed,
+            footer
+          },
+          React.createElement('div', { className: 'launch-modal-body' },
+            React.createElement('div', { className: 'launch-modal-progress' },
+              React.createElement('div', { className: 'launch-modal-stage' },
+                React.createElement('span', null, failed ? 'Failed' : (ready ? 'Ready' : ((launchStepItems[current] && launchStepItems[current].title) || 'Requested'))),
+                React.createElement('span', { className: 'launch-modal-pct' }, failed ? '' : `${[12, 34, 58, 82, 100][current] || 0}%`)
+              ),
+              React.createElement(Progress, {
+                percent: failed ? 100 : ([12, 34, 58, 82, 100][current] || 0),
+                status: failed ? 'exception' : (ready ? 'success' : 'active'),
+                showInfo: false
+              })
+            ),
+            React.createElement('div', { className: `launch-modal-status ${failed ? 'failed' : (ready ? 'ready' : '')}` },
+              (!ready && !failed) && React.createElement(Spin, { size: 'small', style: { marginRight: 10 } }),
+              React.createElement('div', null,
+                React.createElement('div', { className: 'launch-modal-title' }, title),
+                detail && React.createElement('div', { className: 'launch-modal-detail' }, detail)
+              )
+            ),
+            (data.detail && data.detail !== detail) && React.createElement('details', { className: 'launch-modal-technical' },
+              React.createElement('summary', null, 'Technical details'),
+              React.createElement('div', { className: 'launch-modal-technical-body' }, data.detail)
+            )
+          )
+        );
       }
       function pollStatus(initialUrl, target) {
         let url = initialUrl || '';
@@ -242,10 +371,11 @@
             const res = await fetch('/api/notebook/status');
             const data = await res.json();
             if (data.url) url = data.url;
-            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setReadyUrl(url); if (target && target.templateId) setReadyTemplateId(target.templateId); message.success('Notebook is ready'); }
-            if (data.status === 'failed') { clearInterval(timer); finishPolling(target); message.error('Instance failed'); }
+            setLaunchStatus(Object.assign({}, data, { target }));
+            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setReadyUrl(url); if (target && target.templateId) setReadyTemplateId(target.templateId); setLaunchStatus(Object.assign({}, data, { url, target })); message.success('Notebook is ready'); }
+            if (data.status === 'failed') { clearInterval(timer); finishPolling(target); message.error(displayStatusMessage(data)); }
             if (data.status === 'not_found') { clearInterval(timer); finishPolling(target); message.error(data.message || 'Instance not found'); }
-            if (attempts >= 240) { clearInterval(timer); finishPolling(target); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
+            if (attempts >= 240) { clearInterval(timer); finishPolling(target); setLaunchStatus({ status:'pending', reason:'LongRunning', message:'Launch is taking longer than expected. You can keep waiting from Profile.', target }); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
           } catch (e) {}
         }, 3000);
       }
@@ -261,7 +391,8 @@
             React.createElement(Form.Item, { label: 'GPU Count', name: 'gpu_count', rules: [{ required: true }] }, React.createElement(Select, { options: [{ value: 1, label: '1 GPU / 1 credit per hour' }, { value: 2, label: '2 GPUs / 2 credits per hour' }, { value: 4, label: '4 GPUs / 4 credits per hour' }] })),
             React.createElement(Form.Item, { label: 'CPU / Memory', name: 'resource_profile', extra: selectedProfile === 'auto' ? `Auto currently uses ${recommendedResource}` : 'Use a larger profile if your workload was OOMKilled.' }, React.createElement(Select, { options: resourceProfileOptions })),
             React.createElement(Button, { type: 'primary', size: 'large', block: true, loading: notebookLoading, onClick: launch }, 'Launch Notebook')
-          ), readyUrl && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Button, { href: readyUrl, target: '_blank', block: true }, 'Open Notebook'))
+          ),
+          (!launchModalOpen && readyUrl && launchStatus && launchStatus.status === 'ready') && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Button, { type:'primary', href: readyUrl, target: '_blank', block: true }, 'Open Notebook'))
         );
       }
       function renderGallery() {
@@ -282,7 +413,7 @@
               React.createElement('div', { className: 'template-meta' }, (tpl.tags || []).slice(0, 3).map(tag => React.createElement(Tag, { key: tag }, tag))),
               React.createElement('div', { className: 'template-actions' },
                 hasNotebook(tpl) && React.createElement(Button, { href: `/templates/${tpl.id}/preview`, target: '_blank' }, 'Preview'),
-                readyTemplateId === tpl.id && readyUrl
+                (!launchModalOpen && readyTemplateId === tpl.id && readyUrl)
                   ? React.createElement(Button, { type:'primary', href: readyUrl, target: '_blank' }, 'Open Notebook')
                   : React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch')
               )
@@ -320,6 +451,7 @@
         React.createElement(Content, { className: activeTab === 'gallery' ? 'content gallery-content' : 'content' },
           activeTab === 'gallery' ? renderGallery() : renderNotebookLaunch()
         ),
+        renderLaunchModal(),
         React.createElement(Modal, { title:'Create Template', open:createModalOpen, onCancel:()=>setCreateModalOpen(false), footer:null, destroyOnClose:true, width:760 },
           currentUser && currentUser.email ? React.createElement(Form, { form:createForm, layout:'vertical', onFinish:createTemplate },
             React.createElement(Form.Item, { name:'title', label:'Title', rules:[{required:true,message:'Title is required'}] }, React.createElement(Input, { placeholder:'Blank OpenCode Workspace' })),

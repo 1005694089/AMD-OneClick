@@ -150,6 +150,8 @@ instance_records = Table(
     Column("created_at", String(64), nullable=False),
     Column("last_charged_at", String(64), nullable=False),
     Column("billing_session_id", String(255), nullable=False),
+    Column("ready_at", String(64)),
+    Column("billing_started_at", String(64)),
     Column("deleted_at", String(64)),
 )
 
@@ -234,6 +236,10 @@ def ensure_schema_columns(conn):
     if "billing_session_id" not in instance_columns:
         conn.execute(text("ALTER TABLE instance_records ADD COLUMN billing_session_id VARCHAR(255)"))
         conn.execute(text("UPDATE instance_records SET billing_session_id = instance_id WHERE billing_session_id IS NULL"))
+    if "ready_at" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN ready_at VARCHAR(64)"))
+    if "billing_started_at" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN billing_started_at VARCHAR(64)"))
 
     usage_columns = {col["name"] for col in inspector.get_columns("usage_charges")}
     if "billing_session_id" not in usage_columns:
@@ -955,7 +961,7 @@ def get_active_instance_for_user(user_id: int) -> Optional[dict]:
                 .where(
                     instance_records.c.user_id == user_id,
                     instance_records.c.deleted_at.is_(None),
-                    instance_records.c.status == "running",
+                    instance_records.c.status.in_(["pending", "running"]),
                 )
                 .order_by(instance_records.c.id.desc())
                 .limit(1)
@@ -977,10 +983,12 @@ def record_instance(user_id: int, email: str, instance_id: str, image: str, inst
             instance_type=instance_type,
             gpu_count=gpu_count,
             node_port=node_port,
-            status="running",
+            status="pending",
             created_at=now,
             last_charged_at=now,
             billing_session_id=billing_session_id,
+            ready_at=None,
+            billing_started_at=None,
             deleted_at=None,
         )
         if existing:
@@ -1022,6 +1030,26 @@ def mark_instance_deleted(instance_id: str):
             .where(instance_records.c.instance_id == instance_id, instance_records.c.deleted_at.is_(None))
             .values(status="deleted", deleted_at=utc_now())
         )
+
+
+def mark_instance_ready_for_billing(instance_id: str) -> Optional[dict]:
+    """Transition an instance to billable running state exactly when it is truly ready."""
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(
+            select(instance_records)
+            .where(instance_records.c.instance_id == instance_id, instance_records.c.deleted_at.is_(None))
+            .with_for_update()
+        ).mappings().first()
+        if not current:
+            return None
+        if current["status"] != "running":
+            conn.execute(
+                update(instance_records)
+                .where(instance_records.c.id == current["id"])
+                .values(status="running", ready_at=now, billing_started_at=now, last_charged_at=now)
+            )
+        return row_to_dict(conn.execute(select(instance_records).where(instance_records.c.id == current["id"])).mappings().first())
 
 
 def charge_user(user_id: int, amount: int, reason: str, instance_id: str):
@@ -1095,7 +1123,7 @@ def list_active_instances() -> list[dict]:
     stmt = (
         select(instance_records, users.c.credits)
         .join(users, users.c.id == instance_records.c.user_id)
-        .where(instance_records.c.deleted_at.is_(None), instance_records.c.status == "running")
+        .where(instance_records.c.deleted_at.is_(None), instance_records.c.status.in_(["pending", "running"]))
     )
     with engine.begin() as conn:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]

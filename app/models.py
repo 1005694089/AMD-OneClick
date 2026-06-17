@@ -91,6 +91,10 @@ class NotebookStatus(BaseModel):
     url: Optional[str] = None
     email: Optional[str] = None
     instance_id: Optional[str] = None
+    phase: Optional[str] = None
+    reason: Optional[str] = None
+    detail: Optional[str] = None
+    ready: bool = False
 
 
 class NotebookListItem(BaseModel):
