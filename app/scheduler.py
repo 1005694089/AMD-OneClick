@@ -19,7 +19,7 @@ scheduler = AsyncIOScheduler()
 async def cleanup_job():
     """Periodic job to cleanup idle and expired instances"""
     from .k8s_client import k8s_client
-    from .store import charge_usage_unit, list_active_instances, mark_instance_deleted, update_instance_charge_time
+    from .store import charge_usage_unit, list_active_instances, mark_instance_deleted, mark_instance_ready_for_billing, update_instance_charge_time
     
     logger.info("Running cleanup job...")
     try:
@@ -27,8 +27,25 @@ async def cleanup_job():
         now = datetime.now(timezone.utc)
         for record in list_active_instances():
             try:
-                created = datetime.fromisoformat(record["created_at"])
-                elapsed_seconds = int((now - created).total_seconds())
+                status_details = k8s_client.get_pod_status_details(record["email"], instance_id=record["instance_id"])
+                if status_details is None:
+                    mark_instance_deleted(record["instance_id"])
+                    continue
+                live_status = status_details.get("status")
+                if live_status != "ready":
+                    logger.info(
+                        "Skipping billing for %s while pod status is %s reason=%s message=%s",
+                        record["instance_id"],
+                        live_status,
+                        status_details.get("reason"),
+                        status_details.get("message"),
+                    )
+                    continue
+                if record.get("status") != "running":
+                    record = mark_instance_ready_for_billing(record["instance_id"]) or record
+                billing_started_at = record.get("billing_started_at") or record.get("created_at")
+                started = datetime.fromisoformat(billing_started_at)
+                elapsed_seconds = int((now - started).total_seconds())
                 if elapsed_seconds < 60:
                     continue
                 billable_units = max(1, math.ceil(elapsed_seconds / 3600))

@@ -1,0 +1,12 @@
+---
+description: Manager deployment preload and rollout safety
+alwaysApply: true
+---
+
+# Manager Deployment Preload
+
+- For manager Deployments pinned to `wx-ms-w7900d-0005` (`amd-oneclick-manager-v2`, `amd-oneclick-manager-v2-test`, `amd-oneclick-manager-pr1-zijun`), do not rely on `kubectl rollout status` while kubelet pulls a new image tag from the registry.
+- After building and pushing a new manager image, import or pre-pull that exact image on `wx-ms-w7900d-0005` before applying the manifest. Use a temporary privileged helper pod only when necessary, remove any `/host/tmp/*.tar`, and delete the helper pod after verification.
+- Verify the target node has the image in containerd/CRI before `kubectl apply`. Then run rollout with a bounded timeout and inspect pod events immediately if it is not ready.
+- Keep the previous ready replica serving during rollout. Do not delete the old ready pod unless the new replica is ready or an explicit rollback is being performed.
+- For Secret values injected as environment variables, ensure all values are UTF-8 strings. Binary random secrets must be encoded, for example as hex or base64 text.

@@ -1,0 +1,15 @@
+---
+description: Frontend deployment validation for manager pages
+alwaysApply: true
+---
+
+# Frontend Deployment Validation
+
+- Any deployment that changes `templates/*.html`, frontend scripts, static assets, or manager images must validate rendered page load, not just HTTP 200.
+- Before building the image, extract inline `<script>` blocks from changed templates, replace Jinja placeholders with valid literals, and run a JavaScript syntax check such as `node --check`.
+- After deploying to test or production, open the affected page in a browser and verify:
+  - the page renders the expected app shell;
+  - browser console has no `SyntaxError`, uncaught exception, or failed critical asset;
+  - the changed interaction path works at least once, or is blocked only by an expected login/manual condition.
+- A deployment is not complete until browser verification passes. If browser automation is unavailable, report that explicitly and do not claim full frontend validation.
+- For launch/status UI specifically, verify failed launches settle into a visible failed state and do not leave indefinite spinners or progress indicators.

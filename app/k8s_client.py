@@ -1110,6 +1110,11 @@ findmnt "$mnt"
     
     def get_pod_status(self, email: str, instance_id: Optional[str] = None) -> Optional[str]:
         """Get the current status of a pod"""
+        details = self.get_pod_status_details(email, instance_id=instance_id)
+        return details.get("status") if details else None
+
+    def get_pod_status_details(self, email: str, instance_id: Optional[str] = None) -> Optional[dict]:
+        """Return structured pod readiness and failure details for UI and billing gates."""
         if not instance_id:
             instance_id = self._generate_instance_id(email)
         
@@ -1120,6 +1125,24 @@ findmnt "$mnt"
             )
             
             phase = pod.status.phase.lower() if pod.status.phase else "unknown"
+            reason = pod.status.reason or ""
+            message = pod.status.message or ""
+            pod_scheduled = True
+
+            for condition in pod.status.conditions or []:
+                if condition.type == "PodScheduled" and condition.status != "True":
+                    pod_scheduled = False
+                    reason = condition.reason or reason or "Unschedulable"
+                    message = condition.message or message or "Pod is not scheduled"
+                    return {
+                        "status": "pending",
+                        "phase": phase,
+                        "reason": reason,
+                        "message": message,
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
             
             # Check container statuses for more detail
             if pod.status.container_statuses:
@@ -1129,22 +1152,99 @@ findmnt "$mnt"
                     instance = self.get_instance_by_id(instance_id)
                     if instance and instance.get("node_port"):
                         if self._check_jupyter_ready(instance["node_port"]):
-                            return "ready"
+                            return {
+                                "status": "ready",
+                                "phase": phase,
+                                "reason": "",
+                                "message": "Notebook is ready",
+                                "ready": True,
+                                "pod_scheduled": pod_scheduled,
+                                "jupyter_ready": True,
+                            }
                         else:
-                            return "jupyter_starting"
-                    return "running"
+                            return {
+                                "status": "jupyter_starting",
+                                "phase": phase,
+                                "reason": "JupyterStarting",
+                                "message": "Container is ready but Jupyter is not responding yet",
+                                "ready": False,
+                                "pod_scheduled": pod_scheduled,
+                                "jupyter_ready": False,
+                            }
+                    return {
+                        "status": "running",
+                        "phase": phase,
+                        "reason": "ServicePending",
+                        "message": "Container is ready but service endpoint is not available yet",
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
                 elif container_status.state.waiting:
                     reason = container_status.state.waiting.reason or "waiting"
-                    if reason in ["ContainerCreating", "PodInitializing"]:
-                        return "initializing"
-                    elif reason == "ImagePullBackOff":
-                        return "failed"
-                    return "loading"
+                    message = container_status.state.waiting.message or ""
+                    failed_reasons = {
+                        "ImagePullBackOff",
+                        "ErrImagePull",
+                        "CrashLoopBackOff",
+                        "CreateContainerConfigError",
+                        "CreateContainerError",
+                        "InvalidImageName",
+                    }
+                    status = "failed" if reason in failed_reasons else ("initializing" if reason in ["ContainerCreating", "PodInitializing"] else "loading")
+                    return {
+                        "status": status,
+                        "phase": phase,
+                        "reason": reason,
+                        "message": message or reason,
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
+                elif container_status.state.terminated:
+                    reason = container_status.state.terminated.reason or "Terminated"
+                    message = container_status.state.terminated.message or reason
+                    return {
+                        "status": "failed",
+                        "phase": phase,
+                        "reason": reason,
+                        "message": message,
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
                 elif container_status.state.running:
                     # Container is running but not ready yet
-                    return "running"
+                    return {
+                        "status": "running",
+                        "phase": phase,
+                        "reason": "ContainerNotReady",
+                        "message": "Container is running but readiness probe has not passed",
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
             
-            return phase
+            if phase == "failed":
+                return {
+                    "status": "failed",
+                    "phase": phase,
+                    "reason": reason or "PodFailed",
+                    "message": message or "Pod failed",
+                    "ready": False,
+                    "pod_scheduled": pod_scheduled,
+                    "jupyter_ready": False,
+                }
+
+            return {
+                "status": phase,
+                "phase": phase,
+                "reason": reason or phase,
+                "message": message or f"Pod phase is {phase}",
+                "ready": False,
+                "pod_scheduled": pod_scheduled,
+                "jupyter_ready": False,
+            }
         except ApiException as e:
             if e.status == 404:
                 return None

@@ -40,7 +40,6 @@ from .models import (
     TemplateLaunchRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
-from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
 from .template_sync import sync_template_preview
 from .store import (
@@ -64,6 +63,7 @@ from .store import (
     list_notebook_templates,
     list_users,
     mark_instance_deleted,
+    mark_instance_ready_for_billing,
     record_instance,
     record_instance_launch_event,
     redeem_user_coupon,
@@ -318,6 +318,30 @@ def _instance_public_url(request: Request, instance_id: str, notebook_path: Opti
     return f"{_request_public_origin(request)}{path}?token={settings.NOTEBOOK_TOKEN}"
 
 
+def _ready_instance_url(request: Request, instance: Optional[dict], status: Optional[str]) -> Optional[str]:
+    if status != "ready" or not instance:
+        return None
+    return _instance_public_url(request, instance["id"], instance.get("github_path"))
+
+
+def _notebook_status_message(status_details: Optional[dict]) -> str:
+    status = (status_details or {}).get("status") or "unknown"
+    detail = (status_details or {}).get("message") or ""
+    defaults = {
+        "ready": "Your notebook is ready!",
+        "running": "Container is running, waiting for readiness...",
+        "jupyter_starting": "Jupyter is starting up...",
+        "pending": "Waiting for resources...",
+        "initializing": "Initializing notebook environment...",
+        "loading": "Loading notebook image...",
+        "failed": "Notebook creation failed",
+        "unknown": "Checking status...",
+    }
+    if detail and status != "ready":
+        return detail
+    return defaults.get(status, "Checking status...")
+
+
 def _validate_resource_profile(profile: Optional[str]) -> str:
     value = (profile or "auto").strip().lower()
     if value == "auto" or value in RESOURCE_PROFILES:
@@ -338,19 +362,24 @@ def _active_instance_context(user: Optional[dict], request: Optional[Request] = 
         mark_instance_deleted(active_instance["instance_id"])
         return None
 
+    status_details = k8s_client.get_pod_status_details(user["email"].lower(), instance_id=active_instance["instance_id"]) or {}
+    live_status = status_details.get("status")
+    if live_status == "ready" and active_instance.get("status") != "running":
+        active_instance = mark_instance_ready_for_billing(active_instance["instance_id"]) or active_instance
+
     created_at = datetime.fromisoformat(active_instance["created_at"])
     now = datetime.now(timezone.utc)
-    runtime_seconds = max(0, int((now - created_at).total_seconds()))
+    runtime_seconds = max(0, int((now - created_at).total_seconds())) if active_instance.get("status") == "running" else 0
     active_instance["runtime_minutes"] = runtime_seconds // 60
     active_instance["runtime_hours_display"] = round(runtime_seconds / 3600, 2)
     active_instance["credits_consumed"] = get_charged_credits_for_instance(
         active_instance["instance_id"],
         active_instance.get("billing_session_id"),
     )
-    active_instance["url"] = (
-        _instance_public_url(request, live_instance["id"], live_instance.get("github_path"))
-        if request else live_instance.get("url")
-    )
+    active_instance["live_status"] = live_status or "unknown"
+    active_instance["live_reason"] = status_details.get("reason")
+    active_instance["live_message"] = status_details.get("message")
+    active_instance["url"] = _ready_instance_url(request, live_instance, live_status) if request else (live_instance.get("url") if live_status == "ready" else None)
     active_instance["github_path"] = live_instance.get("github_path")
     active_instance["template_id"] = live_instance.get("template_id")
     active_instance["template_title"] = live_instance.get("template_title")
@@ -770,14 +799,10 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             gpu_count=gpu_count,
         )
 
-        public_url = _instance_public_url(request, instance["id"])
-        if public_url:
-            send_notebook_url_email(email, public_url)
-
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your instance...",
-            url=public_url,
+            url=None,
             email=email
         )
 
@@ -815,24 +840,21 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
                 email=email
             )
         
-        status = k8s_client.get_pod_status(email, instance_id=active["instance_id"])
-        
-        status_messages = {
-            "ready": "Your notebook is ready!",
-            "running": "Container is running, starting Jupyter...",
-            "jupyter_starting": "Jupyter is starting up...",
-            "pending": "Waiting for resources...",
-            "initializing": "Initializing notebook environment...",
-            "loading": "Loading notebook image...",
-            "failed": "Notebook creation failed",
-            "unknown": "Checking status..."
-        }
+        status_details = k8s_client.get_pod_status_details(email, instance_id=active["instance_id"]) or {}
+        status = status_details.get("status")
+        if status == "ready" and active.get("status") != "running":
+            active = mark_instance_ready_for_billing(active["instance_id"]) or active
         
         return NotebookStatus(
             status=status or "unknown",
-            message=status_messages.get(status, "Checking status..."),
-            url=_instance_public_url(request, instance["id"], instance.get("github_path")),
-            email=email
+            message=_notebook_status_message(status_details),
+            url=_ready_instance_url(request, instance, status),
+            email=email,
+            instance_id=active["instance_id"],
+            phase=status_details.get("phase"),
+            reason=status_details.get("reason"),
+            detail=status_details.get("message"),
+            ready=bool(status_details.get("ready")),
         )
         
     except Exception as e:
@@ -1064,13 +1086,10 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             gpu_count=gpu_count,
             template_id=template["id"],
         )
-        public_url = _instance_public_url(request, instance["id"], github_info.get("path") if github_info else None)
-        if public_url:
-            send_notebook_url_email(email, public_url)
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your notebook template...",
-            url=public_url,
+            url=None,
             email=email,
             instance_id=instance["id"],
         )
@@ -1219,7 +1238,7 @@ async def create_github_notebook(
         return NotebookStatus(
             status="exists",
             message="Instance already exists",
-            url=existing.get("url"),
+            url=None,
             instance_id=instance_id
         )
     
@@ -1245,7 +1264,7 @@ async def create_github_notebook(
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your notebook...",
-            url=instance.get("url"),
+            url=None,
             instance_id=instance_id
         )
         
@@ -1267,27 +1286,23 @@ async def check_github_status(instance_id: str = Query(...)):
                 instance_id=instance_id
             )
         
-        status = k8s_client.get_pod_status("", instance_id=instance_id)
+        status_details = k8s_client.get_pod_status_details("", instance_id=instance_id) or {}
+        status = status_details.get("status")
         
         # Normalize status for frontend - 'ready' means 'running' and ready to use
+        ready = status == "ready"
         if status == "ready":
             status = "running"
         
-        status_messages = {
-            "running": "Your notebook is ready!",
-            "jupyter_starting": "Jupyter is starting up...",
-            "pending": "Waiting for resources...",
-            "initializing": "Initializing notebook environment...",
-            "loading": "Loading notebook image...",
-            "failed": "Notebook creation failed",
-            "unknown": "Checking status..."
-        }
-        
         return NotebookStatus(
             status=status or "unknown",
-            message=status_messages.get(status, "Checking status..."),
-            url=instance.get("url"),
-            instance_id=instance_id
+            message="Your notebook is ready!" if ready else _notebook_status_message(status_details),
+            url=instance.get("url") if ready else None,
+            instance_id=instance_id,
+            phase=status_details.get("phase"),
+            reason=status_details.get("reason"),
+            detail=status_details.get("message"),
+            ready=ready,
         )
         
     except Exception as e:
