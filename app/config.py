@@ -183,10 +183,15 @@ class Settings:
     ONECLICK_TELEMETRY_SOURCE: str = os.getenv("ONECLICK_TELEMETRY_SOURCE", "amd_oneclick")
     ONECLICK_TELEMETRY_PRODUCT: str = os.getenv("ONECLICK_TELEMETRY_PRODUCT", "radeon_cloud")
 
-    # OpenCode web (second in-pod service alongside Jupyter). Reuses NOTEBOOK_TOKEN as the
-    # HTTP basic-auth password so the web UI is never exposed unauthenticated on a NodePort.
+    # OpenCode web (second in-pod service alongside Jupyter). The HTTP basic-auth password is a
+    # per-instance HMAC so the web UI is never exposed unauthenticated on a NodePort.
     OPENCODE_WEB_PORT: int = int(os.getenv("OPENCODE_WEB_PORT", "4096"))
     OPENCODE_WEB_USERNAME: str = os.getenv("OPENCODE_WEB_USERNAME", "opencode")
+    # HMAC key for deriving per-instance OpenCode passwords. MUST be server-only: NOTEBOOK_TOKEN
+    # is unusable here because it is embedded in user-facing Jupyter URLs, so any user could
+    # re-derive every instance's password. Falls back to SESSION_SECRET (also server-only); set a
+    # dedicated value in production so it does not share fate with the cookie-signing key.
+    OPENCODE_PASSWORD_SECRET: str = os.getenv("OPENCODE_PASSWORD_SECRET") or SESSION_SECRET
     # Appended to every custom-image build. The default uses upstream `curl | bash` installers
     # (opencode.ai, nousresearch.com) — a third-party supply-chain dependency. Operators who
     # want to remove that exposure can set DOCKERFILE_SUFFIX to a vendored, checksum-pinned

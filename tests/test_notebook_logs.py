@@ -118,5 +118,46 @@ class CustomImageCapTests(unittest.TestCase):
         self.assertEqual(store.count_active_custom_images(99), 1)
 
 
+class GithubStatusAuthTests(unittest.TestCase):
+    """GET /api/github/notebook/status embeds credential-bearing URLs (Jupyter ?token= and the
+    OpenCode Basic-auth URL). The instance_id is a low-entropy md5[:8], so the endpoint must
+    only return them for the caller's OWN instance, identified by the httponly
+    `amd_oneclick_gh_instance` cookie set at create time."""
+
+    def setUp(self):
+        self.client = TestClient(main_module.app)
+        self._orig = main_module.k8s_client.get_instance_by_id
+        self._orig_status = main_module.k8s_client.get_pod_status
+        main_module.k8s_client.get_instance_by_id = lambda iid: {
+            "url": "http://h:30000/lab?token=user-visible-tok",
+            "opencode_url": "http://opencode:deadbeef@h:30001/",
+            "instance_id": iid,
+        }
+        main_module.k8s_client.get_pod_status = lambda email, instance_id=None: "ready"
+
+    def tearDown(self):
+        main_module.k8s_client.get_instance_by_id = self._orig
+        main_module.k8s_client.get_pod_status = self._orig_status
+
+    def test_status_rejected_without_matching_cookie(self):
+        # No cookie at all: cannot harvest another instance's credentials by guessing the id.
+        res = self.client.get("/api/github/notebook/status?instance_id=gh-deadbeef")
+        self.assertEqual(res.status_code, 403)
+
+    def test_status_rejected_when_cookie_mismatches(self):
+        # Caller owns gh-aaaa but asks about gh-deadbeef.
+        self.client.cookies.set("amd_oneclick_gh_instance", "gh-aaaa")
+        res = self.client.get("/api/github/notebook/status?instance_id=gh-deadbeef")
+        self.assertEqual(res.status_code, 403)
+        self.client.cookies.clear()
+
+    def test_status_allowed_for_own_instance(self):
+        self.client.cookies.set("amd_oneclick_gh_instance", "gh-deadbeef")
+        res = self.client.get("/api/github/notebook/status?instance_id=gh-deadbeef")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["opencode_url"], "http://opencode:deadbeef@h:30001/")
+        self.client.cookies.clear()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -108,6 +108,13 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     logger.info("Starting AMD OneClick Notebook Manager")
+    if settings.OPENCODE_PASSWORD_SECRET == "change-me-for-production":
+        logger.warning(
+            "OPENCODE_PASSWORD_SECRET is unset and SESSION_SECRET is the insecure default "
+            "'change-me-for-production'. OpenCode per-instance passwords are then derivable by "
+            "anyone, since the HMAC key is a well-known constant. Set OPENCODE_PASSWORD_SECRET "
+            "(or SESSION_SECRET) to a strong server-only value in production."
+        )
     init_db()
     if settings.RUN_SCHEDULER:
         start_scheduler()
@@ -1673,11 +1680,24 @@ async def create_github_notebook(
 
 
 @app.get("/api/github/notebook/status")
-async def check_github_status(instance_id: str = Query(...)):
-    """Check the status of a GitHub notebook instance"""
+async def check_github_status(
+    instance_id: str = Query(...),
+    gh_instance: Optional[str] = Cookie(None, alias="amd_oneclick_gh_instance"),
+):
+    """Check the status of a GitHub notebook instance.
+
+    The GitHub flow is anonymous: the caller's identity is the httponly
+    `amd_oneclick_gh_instance` cookie set at create time. The response embeds
+    credential-bearing URLs (Jupyter ?token= and the OpenCode Basic-auth URL), so we must
+    only return them for the caller's OWN instance. The instance_id is a low-entropy md5[:8]
+    that an attacker could brute-force, so trusting the query param alone would let anyone
+    harvest another instance's credentials. Require the cookie to match.
+    """
+    if not gh_instance or gh_instance != instance_id:
+        raise HTTPException(status_code=403, detail="Not your notebook instance")
     try:
         instance = k8s_client.get_instance_by_id(instance_id)
-        
+
         if not instance:
             return NotebookStatus(
                 status="not_found",

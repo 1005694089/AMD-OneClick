@@ -312,8 +312,9 @@ findmnt "$mnt"
 
         Security model: both services are on NodePorts and both require a credential.
         Jupyter uses NOTEBOOK_TOKEN in its URL; OpenCode web enforces HTTP Basic auth via
-        OPENCODE_SERVER_USERNAME/OPENCODE_SERVER_PASSWORD (injected into the pod env, reusing
-        NOTEBOOK_TOKEN as the password) so the NodePort is never unauthenticated. errexit is
+        OPENCODE_SERVER_USERNAME/OPENCODE_SERVER_PASSWORD (injected into the pod env; the
+        password is a per-instance HMAC keyed on the server-only OPENCODE_PASSWORD_SECRET, see
+        _opencode_password) so the NodePort is never unauthenticated. errexit is
         disabled so OpenCode (the optional service) failing to start can never crash the pod
         before Jupyter is up.
 
@@ -567,8 +568,9 @@ cd {workspace}
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
             # Protect OpenCode web (bound to 0.0.0.0 on a NodePort) with HTTP Basic auth.
             # OpenCode reads these for both `serve` and `web`. The password is per-instance
-            # (HMAC of NOTEBOOK_TOKEN + instance_id) so it can't be reused against another
-            # owner's NodePort; the same value is embedded in this owner's opencode_url.
+            # (HMAC keyed on the server-only OPENCODE_PASSWORD_SECRET + instance_id) so it can't
+            # be reused against another owner's NodePort; the same value is embedded in this
+            # owner's opencode_url.
             {"name": "OPENCODE_SERVER_USERNAME", "value": settings.OPENCODE_WEB_USERNAME},
             {"name": "OPENCODE_SERVER_PASSWORD", "value": self._opencode_password(instance_id)},
         ]
@@ -1438,15 +1440,18 @@ findmnt "$mnt"
     def _opencode_password(self, instance_id: str) -> str:
         """Derive the OpenCode Basic-auth password for one instance.
 
-        Per-instance (NOT a single shared secret): HMAC-SHA256(NOTEBOOK_TOKEN, instance_id).
-        Both the pod env injection and the owner URL recompute this from instance_id, so the
-        value never needs to be persisted, yet it differs for every pod. This closes the
-        horizontal-reuse hole where a user who saw one OpenCode URL held the password for
-        every other instance's NodePort. NOTEBOOK_TOKEN stays the server-side master secret
-        and is never itself sent as the OpenCode password.
+        Per-instance (NOT a single shared secret): HMAC-SHA256(OPENCODE_PASSWORD_SECRET,
+        instance_id). Both the pod env injection and the owner URL recompute this from
+        instance_id, so the value never needs to be persisted, yet it differs for every pod.
+        This closes the horizontal-reuse hole where a user who saw one OpenCode URL held the
+        password for every other instance's NodePort.
+
+        The key is OPENCODE_PASSWORD_SECRET, which is server-only. NOTEBOOK_TOKEN must NOT be
+        used here: it is embedded in user-facing Jupyter URLs (?token=...), so any user holds it
+        and could re-derive every other instance's password from the (predictable) instance_id.
         """
         return hmac.new(
-            settings.NOTEBOOK_TOKEN.encode("utf-8"),
+            settings.OPENCODE_PASSWORD_SECRET.encode("utf-8"),
             instance_id.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()

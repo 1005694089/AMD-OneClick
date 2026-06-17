@@ -30,16 +30,21 @@ class OpenCodeAuthTests(unittest.TestCase):
     def setUp(self):
         self._orig = (
             k8s_module.settings.NOTEBOOK_TOKEN,
+            k8s_module.settings.OPENCODE_PASSWORD_SECRET,
             k8s_module.settings.OPENCODE_WEB_USERNAME,
             k8s_module.settings.PUBLIC_BASE_URL,
             k8s_module.settings.SERVICE_HOST,
         )
-        k8s_module.settings.NOTEBOOK_TOKEN = "secret-tok"
+        # NOTEBOOK_TOKEN is deliberately DIFFERENT from the password secret: the OpenCode
+        # password must derive from the server-only secret, never from the user-visible token.
+        k8s_module.settings.NOTEBOOK_TOKEN = "user-visible-tok"
+        k8s_module.settings.OPENCODE_PASSWORD_SECRET = "server-only-secret"
         k8s_module.settings.OPENCODE_WEB_USERNAME = "opencode"
 
     def tearDown(self):
         (
             k8s_module.settings.NOTEBOOK_TOKEN,
+            k8s_module.settings.OPENCODE_PASSWORD_SECRET,
             k8s_module.settings.OPENCODE_WEB_USERNAME,
             k8s_module.settings.PUBLIC_BASE_URL,
             k8s_module.settings.SERVICE_HOST,
@@ -48,7 +53,7 @@ class OpenCodeAuthTests(unittest.TestCase):
     @staticmethod
     def _expected_pw(instance_id):
         return hmac.new(
-            k8s_module.settings.NOTEBOOK_TOKEN.encode("utf-8"),
+            k8s_module.settings.OPENCODE_PASSWORD_SECRET.encode("utf-8"),
             instance_id.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -63,12 +68,22 @@ class OpenCodeAuthTests(unittest.TestCase):
         env = manifest["spec"]["containers"][0]["env"]
 
         self.assertIn({"name": "OPENCODE_SERVER_USERNAME", "value": "opencode"}, env)
-        # Password is the per-instance HMAC, NOT the raw shared NOTEBOOK_TOKEN.
+        # Password is the per-instance HMAC keyed on the server-only secret.
         self.assertIn(
             {"name": "OPENCODE_SERVER_PASSWORD", "value": self._expected_pw("hf-demo")}, env
         )
+        # NOT the raw user-visible NOTEBOOK_TOKEN, and NOT an HMAC keyed on it.
         self.assertNotIn(
-            {"name": "OPENCODE_SERVER_PASSWORD", "value": "secret-tok"}, env
+            {"name": "OPENCODE_SERVER_PASSWORD", "value": k8s_module.settings.NOTEBOOK_TOKEN},
+            env,
+        )
+        forged = hmac.new(
+            k8s_module.settings.NOTEBOOK_TOKEN.encode("utf-8"),
+            b"hf-demo",
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertNotIn(
+            {"name": "OPENCODE_SERVER_PASSWORD", "value": forged}, env
         )
 
     def test_opencode_password_is_per_instance(self):
@@ -81,6 +96,38 @@ class OpenCodeAuthTests(unittest.TestCase):
         self.assertNotEqual(pw_a, k8s_module.settings.NOTEBOOK_TOKEN)
         # Deterministic: same instance recomputes the same value (pod env vs URL must agree).
         self.assertEqual(pw_a, client._opencode_password("inst-a"))
+
+    def test_opencode_password_not_derivable_from_notebook_token(self):
+        # NOTEBOOK_TOKEN is embedded in every user's Jupyter URL, so a user holds it. The
+        # OpenCode password MUST be keyed on the server-only OPENCODE_PASSWORD_SECRET instead,
+        # so a user cannot re-derive another instance's password from the token + instance_id.
+        client = object.__new__(k8s_module.K8sClient)
+        pw = client._opencode_password("inst-a")
+        forged = hmac.new(
+            k8s_module.settings.NOTEBOOK_TOKEN.encode("utf-8"),
+            b"inst-a",
+            hashlib.sha256,
+        ).hexdigest()
+        self.assertNotEqual(pw, forged)
+        # And it does track the server-only secret.
+        self.assertEqual(pw, self._expected_pw("inst-a"))
+
+    def test_pod_env_password_matches_url_password(self):
+        # End-to-end invariant: the password baked into the pod env MUST equal the password
+        # embedded in the owner's URL for the SAME instance, or Basic auth fails at runtime.
+        k8s_module.settings.PUBLIC_BASE_URL = "http://1.2.3.4:8080"
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+
+        manifest = client._get_pod_manifest(
+            "hf-user@example.test", "hf-demo", "notebook-image",
+        )
+        env = manifest["spec"]["containers"][0]["env"]
+        env_pw = next(
+            e["value"] for e in env if e["name"] == "OPENCODE_SERVER_PASSWORD"
+        )
+        url = client._build_opencode_url(31000, "hf-demo")
+        self.assertEqual(url, f"http://opencode:{env_pw}@1.2.3.4:31000/")
 
     def test_opencode_url_embeds_credentials(self):
         k8s_module.settings.PUBLIC_BASE_URL = "http://1.2.3.4:8080"
