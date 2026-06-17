@@ -322,8 +322,15 @@ def _save_notebook_template(
     sort_order: Optional[int] = None,
     enabled_override: Optional[bool] = None,
 ) -> dict:
-    if not get_image_by_value(req.image) and not (owner_user_id and get_ready_custom_image_by_value(owner_user_id, req.image)):
+    is_catalog_image = bool(get_image_by_value(req.image))
+    if not is_catalog_image and not (owner_user_id and get_ready_custom_image_by_value(owner_user_id, req.image)):
         raise ValueError("Template image must be an enabled catalog image or one of your build-ready custom images")
+    # A template backed by a user custom image must never be publicly listed, even when an
+    # editor creates it: the image is private to its owner, so other users would see a gallery
+    # entry they can never launch. Force it Profile-only until the image is promoted to a
+    # global catalog image. Catalog-image templates keep whatever enabled value was requested.
+    if not is_catalog_image:
+        enabled_override = False
     has_repo = bool((req.repo_url or "").strip())
     has_notebook = bool((req.notebook_path or "").strip())
     if has_repo != has_notebook:

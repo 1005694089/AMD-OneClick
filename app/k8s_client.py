@@ -313,8 +313,13 @@ findmnt "$mnt"
         Jupyter uses NOTEBOOK_TOKEN in its URL; OpenCode web enforces HTTP Basic auth via
         OPENCODE_SERVER_USERNAME/OPENCODE_SERVER_PASSWORD (injected into the pod env, reusing
         NOTEBOOK_TOKEN as the password) so the NodePort is never unauthenticated. errexit is
-        disabled so a failed optional service can never crash-loop the pod; `wait` keeps the
-        container alive while Jupyter runs.
+        disabled so OpenCode (the optional service) failing to start can never crash the pod
+        before Jupyter is up.
+
+        Jupyter is the REQUIRED process: we wait on its PID specifically (not a bare `wait`,
+        which would block on OpenCode too). If Jupyter exits -- crash or clean shutdown -- we
+        tear OpenCode down and exit the container with Jupyter's code, so a dead notebook can
+        never masquerade as a healthy, still-billable pod kept alive by a lingering OpenCode.
         """
         base_url = self._jupyter_base_url(instance_id)
         return (
@@ -322,9 +327,15 @@ findmnt "$mnt"
             f"jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root "
             f"--ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{base_url}' "
             f"--notebook-dir={notebook_dir} &\n"
+            "JUPYTER_PID=$!\n"
             f"opencode web --port {settings.OPENCODE_WEB_PORT} --hostname 0.0.0.0 "
             ">/tmp/opencode-web.log 2>&1 &\n"
-            "wait\n"
+            "OPENCODE_PID=$!\n"
+            'wait "$JUPYTER_PID"\n'
+            "JUPYTER_RC=$?\n"
+            'echo "Jupyter exited with code $JUPYTER_RC; stopping container."\n'
+            'kill "$OPENCODE_PID" 2>/dev/null\n'
+            'exit "$JUPYTER_RC"\n'
         )
 
     def _build_startup_script(self, instance_id: str,

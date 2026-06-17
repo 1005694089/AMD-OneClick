@@ -302,6 +302,20 @@ class HuggingFaceEndpointTests(unittest.TestCase):
         self.assertIn('Authorization: Bearer ${HF_TOKEN}', script)
         self.assertIn('download_notebook Qwen3.6-27B.ipynb', script)
 
+    def test_service_launch_waits_on_jupyter_not_all_jobs(self):
+        # Regression: a bare `wait` keeps the pod alive as long as ANY backgrounded job runs,
+        # so a crashed Jupyter is masked by a still-running OpenCode. We must wait on Jupyter's
+        # PID specifically, then tear OpenCode down and exit with Jupyter's code.
+        client = object.__new__(k8s_module.K8sClient)
+        snippet = client._service_launch_snippet("nb-1", "/work")
+
+        self.assertIn("JUPYTER_PID=$!", snippet)
+        self.assertIn('wait "$JUPYTER_PID"', snippet)
+        self.assertIn('kill "$OPENCODE_PID"', snippet)
+        self.assertIn('exit "$JUPYTER_RC"', snippet)
+        # The old unconditional `wait` (no PID) must be gone.
+        self.assertNotIn("\nwait\n", snippet)
+
 
 class FakeAppsV1:
     def __init__(self):
