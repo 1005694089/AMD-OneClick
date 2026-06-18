@@ -64,6 +64,19 @@
         )
       );
     }
+    function opencodeCredentials(username, password) {
+      if (!username || !password) return null;
+      return React.createElement(Alert, {
+        type: 'info',
+        showIcon: true,
+        style: { marginTop: 14 },
+        message: 'OpenCode login',
+        description: React.createElement(Space, { direction: 'vertical', size: 4 },
+          React.createElement(Text, null, 'Username: ', React.createElement(Text, { code: true, copyable: true }, username)),
+          React.createElement(Text, null, 'Password: ', React.createElement(Text, { code: true, copyable: true }, password))
+        )
+      });
+    }
 
     function avatarNode(u, size=48) {
       if (!u || !u.email) return React.createElement(Avatar, { size, style:{ background:'linear-gradient(135deg,#8ea7ff,#b865ff)' } }, '?');
@@ -492,7 +505,8 @@
                   activeInstance.opencode_url && React.createElement(Button, {type:'primary', ghost:true, href:instanceReady === true ? activeInstance.opencode_url : undefined, target:'_blank', disabled: instanceReady !== true, title:'Open in OpenCode'}, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
                   instanceReady === true && hermesButton({}),
                   React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current notebook instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))
-                )
+                ),
+                activeInstance.opencode_url && instanceReady === true && opencodeCredentials(activeInstance.opencode_username, activeInstance.opencode_password)
               ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
             ),
             React.createElement(Modal, {title:'Redeem Credits', open:redeemModalOpen, onCancel:()=>setRedeemModalOpen(false), footer:null, destroyOnClose:true},

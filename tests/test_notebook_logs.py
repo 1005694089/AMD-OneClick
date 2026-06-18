@@ -119,10 +119,9 @@ class CustomImageCapTests(unittest.TestCase):
 
 
 class GithubStatusAuthTests(unittest.TestCase):
-    """GET /api/github/notebook/status embeds credential-bearing URLs (Jupyter ?token= and the
-    OpenCode Basic-auth URL). The instance_id is a low-entropy md5[:8], so the endpoint must
-    only return them for the caller's OWN instance, identified by the httponly
-    `amd_oneclick_gh_instance` cookie set at create time."""
+    """GET /api/github/notebook/status returns credential-bearing fields. The instance_id is
+    a low-entropy md5[:8], so the endpoint must only return them for the caller's OWN instance,
+    identified by the httponly `amd_oneclick_gh_instance` cookie set at create time."""
 
     def setUp(self):
         self.client = TestClient(main_module.app)
@@ -130,7 +129,9 @@ class GithubStatusAuthTests(unittest.TestCase):
         self._orig_status = main_module.k8s_client.get_pod_status
         main_module.k8s_client.get_instance_by_id = lambda iid: {
             "url": "http://h:30000/lab?token=user-visible-tok",
-            "opencode_url": "http://opencode:deadbeef@h:30001/",
+            "opencode_url": "http://h:30001/",
+            "opencode_username": "opencode",
+            "opencode_password": "deadbeef",
             "instance_id": iid,
         }
         main_module.k8s_client.get_pod_status = lambda email, instance_id=None: "ready"
@@ -155,7 +156,9 @@ class GithubStatusAuthTests(unittest.TestCase):
         self.client.cookies.set("amd_oneclick_gh_instance", "gh-deadbeef")
         res = self.client.get("/api/github/notebook/status?instance_id=gh-deadbeef")
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.json()["opencode_url"], "http://opencode:deadbeef@h:30001/")
+        self.assertEqual(res.json()["opencode_url"], "http://h:30001/")
+        self.assertEqual(res.json()["opencode_username"], "opencode")
+        self.assertEqual(res.json()["opencode_password"], "deadbeef")
         self.client.cookies.clear()
 
 

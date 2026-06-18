@@ -425,6 +425,8 @@ def _active_instance_context(user: Optional[dict], request: Optional[Request] = 
         if request else live_instance.get("url")
     )
     active_instance["opencode_url"] = live_instance.get("opencode_url")
+    active_instance["opencode_username"] = live_instance.get("opencode_username")
+    active_instance["opencode_password"] = live_instance.get("opencode_password")
     active_instance["github_path"] = live_instance.get("github_path")
     active_instance["template_id"] = live_instance.get("template_id")
     active_instance["template_title"] = live_instance.get("template_title")
@@ -914,6 +916,8 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             message="Allocating resources for your instance...",
             url=public_url,
             opencode_url=instance.get("opencode_url"),
+            opencode_username=instance.get("opencode_username"),
+            opencode_password=instance.get("opencode_password"),
             email=email
         )
 
@@ -979,6 +983,8 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
             message=message,
             url=_instance_public_url(request, instance["id"], instance.get("github_path")),
             opencode_url=instance.get("opencode_url"),
+            opencode_username=instance.get("opencode_username"),
+            opencode_password=instance.get("opencode_password"),
             email=email
         )
 
@@ -1335,6 +1341,8 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             message="Allocating resources for your notebook template...",
             url=public_url,
             opencode_url=instance.get("opencode_url"),
+            opencode_username=instance.get("opencode_username"),
+            opencode_password=instance.get("opencode_password"),
             email=email,
             instance_id=instance["id"],
         )
@@ -1438,6 +1446,8 @@ async def launch_huggingface_demo_notebook(
             message="Allocating resources for the Hugging Face demo notebook...",
             url=_instance_public_url(request, instance["id"], github_info.get("path")),
             opencode_url=instance.get("opencode_url"),
+            opencode_username=instance.get("opencode_username"),
+            opencode_password=instance.get("opencode_password"),
             email=email,
             instance_id=instance["id"],
         )
@@ -1507,6 +1517,8 @@ async def huggingface_demo_notebook_status(
             message=message,
             url=_instance_public_url(request, instance["id"], instance.get("github_path")),
             opencode_url=instance.get("opencode_url"),
+            opencode_username=instance.get("opencode_username"),
+            opencode_password=instance.get("opencode_password"),
             email=email,
             instance_id=instance["id"],
         )
@@ -1644,6 +1656,8 @@ async def create_github_notebook(
             message="Instance already exists",
             url=existing.get("url"),
             opencode_url=existing.get("opencode_url"),
+            opencode_username=existing.get("opencode_username"),
+            opencode_password=existing.get("opencode_password"),
             instance_id=instance_id
         )
     
@@ -1671,6 +1685,8 @@ async def create_github_notebook(
             message="Allocating resources for your notebook...",
             url=instance.get("url"),
             opencode_url=instance.get("opencode_url"),
+            opencode_username=instance.get("opencode_username"),
+            opencode_password=instance.get("opencode_password"),
             instance_id=instance_id
         )
 
@@ -1726,6 +1742,8 @@ async def check_github_status(
             message=status_messages.get(status, "Checking status..."),
             url=instance.get("url"),
             opencode_url=instance.get("opencode_url"),
+            opencode_username=instance.get("opencode_username"),
+            opencode_password=instance.get("opencode_password"),
             instance_id=instance_id
         )
 

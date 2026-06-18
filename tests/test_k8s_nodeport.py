@@ -310,6 +310,9 @@ class HuggingFaceEndpointTests(unittest.TestCase):
         snippet = client._service_launch_snippet("nb-1", "/work")
 
         self.assertIn("JUPYTER_PID=$!", snippet)
+        self.assertIn("OPENCODE_REQUIRED_VERSION", snippet)
+        self.assertIn('npm i -g "opencode-ai@$OPENCODE_REQUIRED_VERSION"', snippet)
+        self.assertIn("opencode --version", snippet)
         self.assertIn('wait "$JUPYTER_PID"', snippet)
         self.assertIn('kill "$OPENCODE_PID"', snippet)
         self.assertIn('exit "$JUPYTER_RC"', snippet)

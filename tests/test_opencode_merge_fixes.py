@@ -112,9 +112,9 @@ class OpenCodeAuthTests(unittest.TestCase):
         # And it does track the server-only secret.
         self.assertEqual(pw, self._expected_pw("inst-a"))
 
-    def test_pod_env_password_matches_url_password(self):
+    def test_pod_env_password_matches_auth_response_password(self):
         # End-to-end invariant: the password baked into the pod env MUST equal the password
-        # embedded in the owner's URL for the SAME instance, or Basic auth fails at runtime.
+        # returned to the owner for the SAME instance, or Basic auth fails at runtime.
         k8s_module.settings.PUBLIC_BASE_URL = "http://1.2.3.4:8080"
         client = object.__new__(k8s_module.K8sClient)
         client.namespace = "amd-oneclick-radeon-beta"
@@ -126,29 +126,28 @@ class OpenCodeAuthTests(unittest.TestCase):
         env_pw = next(
             e["value"] for e in env if e["name"] == "OPENCODE_SERVER_PASSWORD"
         )
-        url = client._build_opencode_url(31000, "hf-demo")
-        self.assertEqual(url, f"http://opencode:{env_pw}@1.2.3.4:31000/")
+        auth = client._opencode_auth(31000, "hf-demo")
+        self.assertEqual(auth["opencode_password"], env_pw)
+        self.assertEqual(auth["opencode_username"], "opencode")
 
-    def test_opencode_url_embeds_credentials(self):
+    def test_opencode_url_does_not_embed_credentials(self):
         k8s_module.settings.PUBLIC_BASE_URL = "http://1.2.3.4:8080"
         client = object.__new__(k8s_module.K8sClient)
 
         url = client._build_opencode_url(31000, "inst-a")
 
-        self.assertEqual(
-            url, f"http://opencode:{self._expected_pw('inst-a')}@1.2.3.4:31000/"
-        )
+        self.assertEqual(url, "http://1.2.3.4:31000/")
+        self.assertNotIn(self._expected_pw("inst-a"), url)
+        self.assertNotIn("@", url)
 
-    def test_opencode_url_percent_encodes_username(self):
-        # The derived password is hex (URL-safe), but the username may contain reserved chars.
-        k8s_module.settings.PUBLIC_BASE_URL = "http://1.2.3.4:8080"
+    def test_opencode_auth_returns_username_separately(self):
         k8s_module.settings.OPENCODE_WEB_USERNAME = "a/b@c:d"
         client = object.__new__(k8s_module.K8sClient)
 
-        url = client._build_opencode_url(31000, "inst-a")
+        auth = client._opencode_auth(31000, "inst-a")
 
-        self.assertIn("a%2Fb%40c%3Ad:", url)
-        self.assertNotIn("a/b@c:d:", url)
+        self.assertEqual(auth["opencode_username"], "a/b@c:d")
+        self.assertEqual(auth["opencode_password"], self._expected_pw("inst-a"))
 
     def test_opencode_url_none_when_no_port(self):
         client = object.__new__(k8s_module.K8sClient)

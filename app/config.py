@@ -186,6 +186,7 @@ class Settings:
     # OpenCode web (second in-pod service alongside Jupyter). The HTTP basic-auth password is a
     # per-instance HMAC so the web UI is never exposed unauthenticated on a NodePort.
     OPENCODE_WEB_PORT: int = int(os.getenv("OPENCODE_WEB_PORT", "4096"))
+    OPENCODE_VERSION: str = os.getenv("OPENCODE_VERSION", "1.16.2")
     OPENCODE_WEB_USERNAME: str = os.getenv("OPENCODE_WEB_USERNAME", "opencode")
     # HMAC key for deriving per-instance OpenCode passwords. MUST be server-only: NOTEBOOK_TOKEN
     # is unusable here because it is embedded in user-facing Jupyter URLs, so any user could

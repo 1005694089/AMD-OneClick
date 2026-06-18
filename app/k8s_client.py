@@ -326,12 +326,23 @@ findmnt "$mnt"
         base_url = self._jupyter_base_url(instance_id)
         return (
             "set +e\n"
+            "export PATH=\"/usr/local/bin:/usr/bin:/root/.opencode/bin:$PATH\"\n"
+            ": > /tmp/opencode-web.log\n"
+            f"OPENCODE_REQUIRED_VERSION='{settings.OPENCODE_VERSION}'\n"
+            "OPENCODE_CURRENT_VERSION=\"$(opencode --version 2>/dev/null | tr -d '[:space:]' || true)\"\n"
+            "if [ \"$OPENCODE_CURRENT_VERSION\" != \"$OPENCODE_REQUIRED_VERSION\" ]; then\n"
+            "  echo \"Installing OpenCode ${OPENCODE_REQUIRED_VERSION} (current: ${OPENCODE_CURRENT_VERSION:-missing})\" >>/tmp/opencode-web.log\n"
+            "  (curl -fsSL https://opencode.ai/install | bash -s -- --version \"$OPENCODE_REQUIRED_VERSION\" || npm i -g \"opencode-ai@$OPENCODE_REQUIRED_VERSION\") >>/tmp/opencode-web.log 2>&1 || true\n"
+            "  if [ \"$(/usr/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /usr/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
+            "  if [ \"$(/root/.opencode/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
+            "fi\n"
+            "opencode --version >>/tmp/opencode-web.log 2>&1 || true\n"
             f"jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root "
             f"--ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{base_url}' "
             f"--notebook-dir={notebook_dir} &\n"
             "JUPYTER_PID=$!\n"
             f"opencode web --port {settings.OPENCODE_WEB_PORT} --hostname 0.0.0.0 "
-            ">/tmp/opencode-web.log 2>&1 &\n"
+            ">>/tmp/opencode-web.log 2>&1 &\n"
             "OPENCODE_PID=$!\n"
             'wait "$JUPYTER_PID"\n'
             "JUPYTER_RC=$?\n"
@@ -1435,6 +1446,7 @@ findmnt "$mnt"
                 "opencode_node_port": opencode_node_port,
                 "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                 "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
+                **self._opencode_auth(opencode_node_port, instance_id),
             }
         except ApiException as e:
             if e.status == 404:
@@ -1494,16 +1506,20 @@ findmnt "$mnt"
         OpenCode web enforces HTTP Basic auth (OPENCODE_SERVER_USERNAME/PASSWORD injected
         into the pod env), so the NodePort is not exposed unauthenticated. The password is
         per-instance (see _opencode_password) so it cannot be reused against another owner's
-        NodePort. Credentials are embedded in the owner-only URL; browsers honor them on
-        top-level navigation (they are only stripped from cross-origin subresource requests).
-        NOTE: still cleartext HTTP — a manager-side HTTPS proxy with ownership checks is the
-        follow-up; this change removes the shared-secret reuse, not the lack of TLS.
+        NodePort. Do not embed credentials in the URL: OpenCode's current web app can break
+        when loaded as http://user:password@host/.
         """
         if not opencode_node_port:
             return None
-        user = quote(settings.OPENCODE_WEB_USERNAME, safe="")
-        password = quote(self._opencode_password(instance_id), safe="")
-        return f"http://{user}:{password}@{self._opencode_host()}:{opencode_node_port}/"
+        return f"http://{self._opencode_host()}:{opencode_node_port}/"
+
+    def _opencode_auth(self, opencode_node_port: Optional[int], instance_id: str) -> dict:
+        if not opencode_node_port:
+            return {"opencode_username": None, "opencode_password": None}
+        return {
+            "opencode_username": settings.OPENCODE_WEB_USERNAME,
+            "opencode_password": self._opencode_password(instance_id),
+        }
 
     def _extract_node_ports(self, svc) -> tuple:
         """Return (jupyter_node_port, opencode_node_port) from a Service object."""
@@ -1587,6 +1603,7 @@ findmnt "$mnt"
             "opencode_node_port": opencode_node_port,
             "url": self._build_url(node_port, notebook_path, instance_id, use_path_proxy=True),
             "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
+            **self._opencode_auth(opencode_node_port, instance_id),
             "github_info": github_info
         }
     
@@ -1631,6 +1648,7 @@ findmnt "$mnt"
                 "opencode_node_port": opencode_node_port,
                 "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                 "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
+                **self._opencode_auth(opencode_node_port, instance_id),
                 "instance_type": instance_type,
                 "gpu_count": gpu_count,
                 "resource_profile": pod.metadata.annotations.get("amd-oneclick/resource-profile"),
@@ -1739,6 +1757,7 @@ findmnt "$mnt"
                     "opencode_node_port": opencode_node_port,
                     "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                     "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
+                    **self._opencode_auth(opencode_node_port, instance_id),
                     "uptime_minutes": uptime_minutes,
                     "instance_type": instance_type,
                     "gpu_count": gpu_count,

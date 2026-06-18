@@ -70,7 +70,7 @@
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Select, Space, Tag, Typography, message } = antd;
+    const { Alert, Avatar, Button, Card, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Select, Space, Tag, Typography, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const currentUser = {{ user_json | safe }};
@@ -103,6 +103,18 @@
           React.createElement('span', { style: { fontSize: 10, opacity: 0.6 } }, 'soon')
         )
       );
+    }
+    function opencodeCredentials(username, password) {
+      if (!username || !password) return null;
+      return React.createElement(Alert, {
+        type: 'info',
+        showIcon: true,
+        message: 'OpenCode login',
+        description: React.createElement(Space, { direction: 'vertical', size: 4 },
+          React.createElement(Text, null, 'Username: ', React.createElement(Text, { code: true, copyable: true }, username)),
+          React.createElement(Text, null, 'Password: ', React.createElement(Text, { code: true, copyable: true }, password))
+        )
+      });
     }
 
     function avatarNode(user) {
@@ -141,6 +153,8 @@
       const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
       const [readyUrl, setReadyUrl] = React.useState(initialActiveInstance.url || '');
       const [readyOpencodeUrl, setReadyOpencodeUrl] = React.useState(initialActiveInstance.opencode_url || '');
+      const [readyOpencodeUsername, setReadyOpencodeUsername] = React.useState(initialActiveInstance.opencode_username || '');
+      const [readyOpencodePassword, setReadyOpencodePassword] = React.useState(initialActiveInstance.opencode_password || '');
       const [readyTemplateId, setReadyTemplateId] = React.useState(initialActiveInstance.template_id ? Number(initialActiveInstance.template_id) : null);
       const [customImages, setCustomImages] = React.useState(initialCustomImages || []);
       // null = checking, true = active pod ready, false = still starting/pulling image
@@ -264,7 +278,7 @@
       async function launch() {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const values = await form.validateFields();
-        setNotebookLoading(true); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
+        setNotebookLoading(true); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null);
         try {
           const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode' }) });
           const data = await res.json();
@@ -275,7 +289,7 @@
       async function launchTemplate(tpl) {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const gpuCount = form.getFieldValue('gpu_count') || 1;
-        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
+        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null);
         try {
           const res = await fetch(`/api/templates/${tpl.id}/launch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gpu_count: gpuCount }) });
           const data = await res.json();
@@ -287,7 +301,7 @@
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         if (hasActiveInstance) { message.warning('Only one active instance is allowed. Open or destroy it from Profile.'); return; }
         const gpuCount = form.getFieldValue('gpu_count') || 1;
-        setLaunchingTemplateId(`custom-${ci.id}`); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyTemplateId(null);
+        setLaunchingTemplateId(`custom-${ci.id}`); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null);
         try {
           const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: ci.image, gpu_count: gpuCount, resource_profile: 'auto', instance_type: 'opencode' }) });
           const data = await res.json();
@@ -348,6 +362,8 @@
       function pollStatus(initialUrl, target) {
         let url = initialUrl || '';
         let opencodeUrl = '';
+        let opencodeUsername = '';
+        let opencodePassword = '';
         let attempts = 0;
         const timer = setInterval(async () => {
           attempts += 1;
@@ -356,8 +372,10 @@
             const data = await res.json();
             if (data.url) url = data.url;
             if (data.opencode_url) opencodeUrl = data.opencode_url;
+            if (data.opencode_username) opencodeUsername = data.opencode_username;
+            if (data.opencode_password) opencodePassword = data.opencode_password;
             if (data.message) setLaunchMessage(data.message);
-            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLogsOpen(false); setReadyUrl(url); setReadyOpencodeUrl(opencodeUrl); if (target && target.templateId) setReadyTemplateId(target.templateId); message.success('Notebook is ready'); }
+            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLogsOpen(false); setReadyUrl(url); setReadyOpencodeUrl(opencodeUrl); setReadyOpencodeUsername(opencodeUsername); setReadyOpencodePassword(opencodePassword); if (target && target.templateId) setReadyTemplateId(target.templateId); message.success('Notebook is ready'); }
             if (data.status === 'failed') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); message.error(data.message || 'Instance failed'); }
             if (data.status === 'not_found') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLogsOpen(false); message.error(data.message || 'Instance not found'); }
             if (attempts >= 240) { clearInterval(timer); finishPolling(target); setLaunchMessage(''); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
@@ -379,6 +397,7 @@
           ), renderStartupStatus(), readyUrl && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Space, { style: { width: '100%' }, direction: 'vertical' },
             React.createElement(Button, { href: readyUrl, target: '_blank', block: true, title: 'Open Notebook (Jupyter)' }, brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')),
             readyOpencodeUrl && React.createElement(Button, { type: 'primary', ghost: true, href: readyOpencodeUrl, target: '_blank', block: true, title: 'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
+            readyOpencodeUrl && opencodeCredentials(readyOpencodeUsername, readyOpencodePassword),
             hermesButton({ block: true })
           ))
         );

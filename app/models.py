@@ -121,6 +121,8 @@ class NotebookStatus(BaseModel):
     message: str
     url: Optional[str] = None
     opencode_url: Optional[str] = None
+    opencode_username: Optional[str] = None
+    opencode_password: Optional[str] = None
     email: Optional[str] = None
     instance_id: Optional[str] = None
 
