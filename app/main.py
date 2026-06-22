@@ -1444,6 +1444,15 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
     if request.url.query:
         target_url += f"?{request.url.query}"
 
+    # Preserve the public Host + forwarded info so apps (e.g. Gradio) build
+    # correct external URLs instead of using the internal pod IP they receive.
+    fwd_headers = _proxy_headers(request.headers)
+    public_host = request.headers.get("host") or request.url.netloc
+    fwd_headers["host"] = public_host
+    fwd_headers["X-Forwarded-Host"] = public_host
+    fwd_headers["X-Forwarded-Proto"] = request.headers.get("x-forwarded-proto", request.url.scheme)
+    fwd_headers["X-Forwarded-Prefix"] = f"{settings.SPACES_PATH_PREFIX}/{instance_id}/{app_port}"
+
     body = await request.body()
     timeout = httpx.Timeout(3600.0, connect=10.0)
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
@@ -1451,14 +1460,16 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
         client.build_request(
             request.method,
             target_url,
-            headers=_proxy_headers(request.headers),
+            headers=fwd_headers,
             content=body,
         ),
         stream=True,
     )
+    # Keep content-encoding (we stream raw/compressed bytes); drop only hop-by-hop
+    # and length/cookie headers we re-add separately.
     response_headers = {
         k: v for k, v in upstream.headers.items()
-        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length", "set-cookie"}
+        if k.lower() not in {"transfer-encoding", "connection", "content-length", "set-cookie"}
     }
     response = StreamingResponse(
         upstream.aiter_raw(),
