@@ -475,6 +475,28 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
         ]
+        # Auto-configure common app frameworks so they serve under the Spaces
+        # proxy base path and bind 0.0.0.0:<curated port>. This lets a user run
+        # `gradio app.py` / `streamlit run app.py` from the notebook terminal and
+        # get a working forwarded URL with no extra flags.
+        spaces_prefix = settings.SPACES_PATH_PREFIX.rstrip("/")
+        gradio_port = settings.APP_PORTS.get("gradio")
+        streamlit_port = settings.APP_PORTS.get("streamlit")
+        if gradio_port:
+            env += [
+                {"name": "GRADIO_SERVER_NAME", "value": "0.0.0.0"},
+                {"name": "GRADIO_SERVER_PORT", "value": str(gradio_port)},
+                {"name": "GRADIO_ROOT_PATH", "value": f"{spaces_prefix}/{instance_id}/{gradio_port}"},
+            ]
+        if streamlit_port:
+            env += [
+                {"name": "STREAMLIT_SERVER_ADDRESS", "value": "0.0.0.0"},
+                {"name": "STREAMLIT_SERVER_PORT", "value": str(streamlit_port)},
+                {"name": "STREAMLIT_SERVER_BASE_URL_PATH", "value": f"{spaces_prefix}/{instance_id}/{streamlit_port}"},
+                {"name": "STREAMLIT_SERVER_HEADLESS", "value": "true"},
+                {"name": "STREAMLIT_SERVER_ENABLE_CORS", "value": "false"},
+                {"name": "STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION", "value": "false"},
+            ]
         if network_disk_enabled:
             network_disk_mount = {
                 "name": "network-disk",
@@ -550,16 +572,17 @@ findmnt "$mnt"
         if settings.EPHEMERAL_STORAGE_REQUEST.strip():
             container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
 
+        container_ports = [
+            {"containerPort": settings.NOTEBOOK_PORT, "name": "jupyter"}
+        ]
+        for _app_name, _app_port in settings.APP_PORTS.items():
+            container_ports.append({"containerPort": int(_app_port), "name": _app_name[:15]})
+
         notebook_container = {
             "name": "notebook",
             "image": image,
             "imagePullPolicy": "IfNotPresent",
-            "ports": [
-                {
-                    "containerPort": settings.NOTEBOOK_PORT,
-                    "name": "jupyter"
-                }
-            ],
+            "ports": container_ports,
             "resources": {
                 "limits": container_limits,
                 "requests": container_requests,

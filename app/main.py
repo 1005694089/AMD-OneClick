@@ -1404,6 +1404,119 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
 
 
 # =============================================================================
+# Spaces app-port proxy (user apps like Gradio/Streamlit on curated ports)
+# =============================================================================
+
+def _instance_pod_ip(instance_id: str) -> str:
+    try:
+        pod = k8s_client.core_v1.read_namespaced_pod(name=instance_id, namespace=k8s_client.namespace)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Instance pod not found")
+    ip = pod.status.pod_ip if pod and pod.status else None
+    if not ip:
+        raise HTTPException(status_code=503, detail="Instance is still starting")
+    return ip
+
+
+def _validate_app_port(port: str) -> int:
+    try:
+        p = int(port)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid app port")
+    if p not in set(settings.APP_PORTS.values()):
+        raise HTTPException(status_code=403, detail="App port is not in the allowed set")
+    return p
+
+
+@app.get(f"{settings.SPACES_PATH_PREFIX}/{{instance_id}}/{{port}}")
+async def proxy_space_root_redirect(instance_id: str, port: str):
+    _validate_app_port(port)
+    return RedirectResponse(url=f"{settings.SPACES_PATH_PREFIX}/{instance_id}/{port}/")
+
+
+@app.api_route(f"{settings.SPACES_PATH_PREFIX}/{{instance_id}}/{{port}}/{{path:path}}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def proxy_space_http(instance_id: str, port: str, path: str, request: Request):
+    """Proxy HTTP traffic to a user app on a curated port. Path is preserved so a
+    base-path-aware app (Gradio root_path / Streamlit baseUrlPath) resolves correctly."""
+    app_port = _validate_app_port(port)
+    target_base = f"http://{_instance_pod_ip(instance_id)}:{app_port}"
+    target_url = f"{target_base}{request.url.path}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+
+    body = await request.body()
+    timeout = httpx.Timeout(3600.0, connect=10.0)
+    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    upstream = await client.send(
+        client.build_request(
+            request.method,
+            target_url,
+            headers=_proxy_headers(request.headers),
+            content=body,
+        ),
+        stream=True,
+    )
+    response_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length", "set-cookie"}
+    }
+    response = StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        background=BackgroundTask(_close_httpx_stream, upstream, client),
+    )
+    for cookie in upstream.headers.get_list("set-cookie"):
+        response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
+    return response
+
+
+@app.websocket(f"{settings.SPACES_PATH_PREFIX}/{{instance_id}}/{{port}}/{{path:path}}")
+async def proxy_space_websocket(websocket: WebSocket, instance_id: str, port: str, path: str):
+    """Proxy WebSocket traffic for user apps (Gradio/Streamlit live updates)."""
+    await websocket.accept()
+    try:
+        app_port = _validate_app_port(port)
+        target_base = f"http://{_instance_pod_ip(instance_id)}:{app_port}".replace("http://", "ws://")
+        target_url = f"{target_base}{websocket.url.path}"
+        if websocket.url.query:
+            target_url += f"?{websocket.url.query}"
+
+        headers = []
+        if websocket.headers.get("cookie"):
+            headers.append(("cookie", websocket.headers["cookie"]))
+
+        async with websockets.connect(target_url, additional_headers=headers, open_timeout=10, max_size=16 * 1024 * 1024, max_queue=4) as upstream:
+            async def client_to_upstream():
+                while True:
+                    msg = await websocket.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        await upstream.close()
+                        break
+                    if msg.get("text") is not None:
+                        await upstream.send(msg["text"])
+                    elif msg.get("bytes") is not None:
+                        await upstream.send(msg["bytes"])
+
+            async def upstream_to_client():
+                async for msg in upstream:
+                    if isinstance(msg, bytes):
+                        await websocket.send_bytes(msg)
+                    else:
+                        await websocket.send_text(msg)
+
+            await asyncio.gather(client_to_upstream(), upstream_to_client())
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        logger.error(f"Space WS proxy failed for {instance_id}:{port}/{path}: {e}")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
+
+# =============================================================================
 # Admin Endpoints
 # =============================================================================
 

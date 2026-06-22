@@ -74,6 +74,14 @@ class Settings:
     NOTEBOOK_PORT: int = 8888
     NOTEBOOK_LABEL_PREFIX: str = os.getenv("NOTEBOOK_LABEL_PREFIX", "amd-oneclick")
 
+    # Spaces-style user app port forwarding. Each instance also exposes these
+    # curated app ports; the manager proxies https://<host>/spaces/<id>/<port>/...
+    # to the instance pod on that port. Gradio/Streamlit are auto-configured
+    # (via env) to serve under that base path so `gradio app.py` / `streamlit run`
+    # just work like local. Map name -> container port.
+    SPACES_PATH_PREFIX: str = os.getenv("SPACES_PATH_PREFIX", "/spaces")
+    APP_PORTS: dict = {"gradio": 7860, "streamlit": 8501, "app": 8000}
+
     CPU_LIMIT: str = os.getenv("CPU_LIMIT", "16")
     MEMORY_LIMIT: str = os.getenv("MEMORY_LIMIT", "64Gi")
     GPU_LIMIT: str = os.getenv("GPU_LIMIT", "1")
