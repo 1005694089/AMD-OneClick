@@ -418,6 +418,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/template-id"] = github_info.get("template_id", "")
             annotations["amd-oneclick/template-title"] = github_info.get("template_title", "")
 
+        image_defined_command = bool(INSTANCE_TYPES.get(instance_type, {}).get("image_defined_command"))
         startup_script = self._build_startup_script(instance_id, instance_type, github_info)
 
         workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
@@ -549,6 +550,29 @@ findmnt "$mnt"
         if settings.EPHEMERAL_STORAGE_REQUEST.strip():
             container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
 
+        notebook_container = {
+            "name": "notebook",
+            "image": image,
+            "imagePullPolicy": "IfNotPresent",
+            "ports": [
+                {
+                    "containerPort": settings.NOTEBOOK_PORT,
+                    "name": "jupyter"
+                }
+            ],
+            "resources": {
+                "limits": container_limits,
+                "requests": container_requests,
+            },
+            "env": env,
+            "volumeMounts": volume_mounts
+        }
+        # For image-defined instance types the manager does not assemble a start
+        # command; the image's own ENTRYPOINT/CMD runs and must listen on NOTEBOOK_PORT.
+        if not image_defined_command:
+            notebook_container["command"] = ["/bin/bash", "-c"]
+            notebook_container["args"] = [startup_script]
+
         spec = {
             "securityContext": {
                 "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
@@ -575,25 +599,7 @@ findmnt "$mnt"
                 }
             ],
             "containers": [
-                {
-                    "name": "notebook",
-                    "image": image,
-                    "imagePullPolicy": "IfNotPresent",
-                    "command": ["/bin/bash", "-c"],
-                    "args": [startup_script],
-                    "ports": [
-                        {
-                            "containerPort": settings.NOTEBOOK_PORT,
-                            "name": "jupyter"
-                        }
-                    ],
-                    "resources": {
-                        "limits": container_limits,
-                        "requests": container_requests,
-                    },
-                    "env": env,
-                    "volumeMounts": volume_mounts
-                }
+                notebook_container
             ],
             "volumes": volumes,
             "restartPolicy": "Always"

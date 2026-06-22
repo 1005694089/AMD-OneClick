@@ -271,6 +271,11 @@ def _save_notebook_template(
         raise ValueError("GitHub repo URL and notebook path must be provided together, or both left empty for an image-only template")
     if has_repo:
         _github_repo_parts(req.repo_url or "")
+    template_instance_type = (req.instance_type or "").strip() or None
+    if template_instance_type is not None:
+        type_cfg = INSTANCE_TYPES.get(template_instance_type)
+        if not type_cfg or not type_cfg.get("enabled"):
+            raise ValueError("Invalid or disabled instance type for template")
     template = upsert_notebook_template(
         req.title,
         req.slug or "",
@@ -287,6 +292,7 @@ def _save_notebook_template(
         template_id=template_id,
         owner_user_id=owner_user_id,
         upsert_on_slug_conflict=owner_user_id is None,
+        instance_type=template_instance_type,
     )
     if template.get("repo_url") and template.get("notebook_path"):
         ensure_template_preview_cache(template, force=True)
@@ -1056,23 +1062,24 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
     email = user["email"].lower()
     try:
         github_info = _template_github_info(template) if template.get("repo_url") and template.get("notebook_path") else None
+        template_instance_type = (template.get("instance_type") or "").strip() or "opencode"
         instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
         instance = k8s_client.create_instance(
             email,
             template["image"],
-            instance_type="opencode",
+            instance_type=template_instance_type,
             gpu_count=gpu_count,
             github_info=github_info,
             custom_instance_id=instance_id,
             resource_profile="auto",
         )
-        record_instance(user["id"], email, instance["id"], template["image"], "opencode", gpu_count, instance.get("node_port"))
+        record_instance(user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count, instance.get("node_port"))
         record_instance_launch_event(
             user["id"],
             email,
             instance["id"],
             template["image"],
-            "opencode",
+            template_instance_type,
             gpu_count,
             template_id=template["id"],
             template_title=template["title"],
@@ -1082,7 +1089,7 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
         await report_gpu_instance_created_event(
             instance_id=instance["id"],
             user_id=user["id"],
-            instance_type="opencode",
+            instance_type=template_instance_type,
             gpu_count=gpu_count,
             template_id=template["id"],
         )

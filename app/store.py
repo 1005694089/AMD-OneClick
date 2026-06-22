@@ -96,6 +96,7 @@ notebook_templates = Table(
     Column("branch", String(255), nullable=False, default="main"),
     Column("notebook_path", Text, nullable=False),
     Column("cover_url", Text),
+    Column("instance_type", String(64)),
     Column("enabled", Boolean, nullable=False, default=True),
     Column("sort_order", Integer, nullable=False, default=0),
     Column("owner_user_id", Integer, ForeignKey("users.id")),
@@ -245,6 +246,10 @@ def ensure_schema_columns(conn):
     if "billing_session_id" not in usage_columns:
         conn.execute(text("ALTER TABLE usage_charges ADD COLUMN billing_session_id VARCHAR(255)"))
         conn.execute(text("UPDATE usage_charges SET billing_session_id = instance_id WHERE billing_session_id IS NULL"))
+
+    template_columns = {col["name"] for col in inspector.get_columns("notebook_templates")}
+    if "instance_type" not in template_columns:
+        conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN instance_type VARCHAR(64)"))
 
     # New launches reuse the same Kubernetes instance_id, so billing idempotency must be scoped
     # to a launch session instead of the stable instance id.
@@ -581,6 +586,7 @@ def upsert_notebook_template(
     template_id: Optional[int] = None,
     owner_user_id: Optional[int] = None,
     upsert_on_slug_conflict: bool = True,
+    instance_type: Optional[str] = None,
 ) -> dict:
     now = utc_now()
     title = title.strip()
@@ -604,6 +610,8 @@ def upsert_notebook_template(
         sort_order=int(sort_order or 0),
         updated_at=now,
     )
+    if instance_type is not None:
+        values["instance_type"] = (instance_type or "").strip() or None
     if owner_user_id is not None:
         values["owner_user_id"] = owner_user_id
     if not title:

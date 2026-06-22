@@ -30,6 +30,17 @@ INSTANCE_TYPES = {
         "max_lifetime_hours": None,
         "idle_timeout_minutes": None,
     },
+    "custom": {
+        "name": "Custom Image",
+        "description": "Run any image that serves on port 8888 using the image's own start command",
+        "icon": "📦",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        # When true, the manager does NOT inject a start command; the image's own
+        # ENTRYPOINT/CMD runs and is expected to listen on NOTEBOOK_PORT (8888).
+        "image_defined_command": True,
+    },
 }
 
 

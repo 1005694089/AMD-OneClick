@@ -53,6 +53,7 @@ class NotebookTemplateRequest(BaseModel):
     cover_url: Optional[str] = ""
     enabled: bool = True
     sort_order: int = 0
+    instance_type: Optional[str] = ""
 
 
 class TemplateLaunchRequest(BaseModel):
