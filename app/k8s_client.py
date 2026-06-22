@@ -422,6 +422,8 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
 
         workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
         workspace_uses_empty_dir = workspace_volume_type == "emptydir"
+        hf_cache_volume_type = (settings.HF_CACHE_VOLUME_TYPE or "emptyDir").strip().lower()
+        hf_cache_uses_empty_dir = hf_cache_volume_type == "emptydir"
 
         volume_mounts = [
             {"name": "shm", "mountPath": "/dev/shm"},
@@ -436,14 +438,20 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
                     "sizeLimit": "64Gi"
                 }
             },
-            {
+        ]
+        if hf_cache_uses_empty_dir:
+            hf_cache_empty_dir = {}
+            if settings.HF_CACHE_EMPTYDIR_SIZE_LIMIT.strip():
+                hf_cache_empty_dir["sizeLimit"] = settings.HF_CACHE_EMPTYDIR_SIZE_LIMIT.strip()
+            volumes.append({"name": "hf-cache", "emptyDir": hf_cache_empty_dir})
+        else:
+            volumes.append({
                 "name": "hf-cache",
                 "hostPath": {
                     "path": settings.HF_CACHE_HOST_PATH,
                     "type": "DirectoryOrCreate"
                 }
-            },
-        ]
+            })
         if workspace_uses_empty_dir:
             workspace_empty_dir = {}
             if settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
