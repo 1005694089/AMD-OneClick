@@ -416,12 +416,18 @@ if [ ! -e {workspace}/repo ]; then
 fi
 """
             run_dir = f"{settings.WORKSPACE_MOUNT_PATH}/repo"
+        pip_index = settings.PIP_INDEX_URL.strip()
+        pip_flag = f"-i {shlex.quote(pip_index)} " if pip_index else ""
         return f"""
 set -e
 export PATH="/root/.opencode/bin:$PATH"
 mkdir -p {workspace}
 {clone_block}
 cd {shlex.quote(run_dir)} 2>/dev/null || cd {workspace}
+if [ -f requirements.txt ]; then
+    echo "Installing requirements.txt..."
+    pip install {pip_flag}-r requirements.txt || echo "WARN: pip install -r requirements.txt failed"
+fi
 echo "Starting {instance_type} app: {cmd}"
 exec {cmd}
 """
@@ -553,6 +559,8 @@ exec {cmd}
         ]
         if settings.HF_ENDPOINT.strip():
             env.append({"name": "HF_ENDPOINT", "value": settings.HF_ENDPOINT.strip()})
+        if settings.PIP_INDEX_URL.strip():
+            env.append({"name": "PIP_INDEX_URL", "value": settings.PIP_INDEX_URL.strip()})
         # Auto-configure common app frameworks so they serve under the Spaces
         # proxy base path and bind 0.0.0.0:<curated port>. This lets a user run
         # `gradio app.py` / `streamlit run app.py` from the notebook terminal and

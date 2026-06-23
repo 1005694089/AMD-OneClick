@@ -243,15 +243,22 @@ def _template_asset_base_path(template_id: int, notebook_path: str) -> str:
 
 
 def _template_github_info(template: dict) -> dict:
-    if not template.get("repo_url") or not template.get("notebook_path"):
+    # App types (gradio/streamlit/...) clone the repo without needing a notebook
+    # path; notebook types require both repo_url and notebook_path.
+    itype = (template.get("instance_type") or "").strip()
+    is_app = itype in APP_FRAMEWORK_PRESETS
+    if not template.get("repo_url"):
+        return {}
+    if not is_app and not template.get("notebook_path"):
         return {}
     org, repo = _github_repo_parts(template["repo_url"])
+    notebook_path = (template.get("notebook_path") or "").lstrip("/")
     return {
         "org": org,
         "repo": repo,
         "branch": template["branch"],
-        "path": template["notebook_path"].lstrip("/"),
-        "raw_url": _github_raw_url(template["repo_url"], template["branch"], template["notebook_path"]),
+        "path": notebook_path,
+        "raw_url": _github_raw_url(template["repo_url"], template["branch"], template["notebook_path"]) if notebook_path else "",
         "repo_url": _github_clone_url(template["repo_url"]),
         "template_id": str(template["id"]),
         "template_title": template["title"],
@@ -269,7 +276,11 @@ def _save_notebook_template(
         raise ValueError("Template image must be an enabled image catalog entry")
     has_repo = bool((req.repo_url or "").strip())
     has_notebook = bool((req.notebook_path or "").strip())
-    if has_repo != has_notebook:
+    _req_itype = (req.instance_type or "").strip()
+    _is_app_type = _req_itype in APP_FRAMEWORK_PRESETS
+    # App types may provide a repo without a notebook path (the repo is cloned and
+    # the app is started). Notebook types require repo+notebook together (or neither).
+    if not _is_app_type and has_repo != has_notebook:
         raise ValueError("GitHub repo URL and notebook path must be provided together, or both left empty for an image-only template")
     if has_repo:
         _github_repo_parts(req.repo_url or "")
@@ -1124,7 +1135,7 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
 
     email = user["email"].lower()
     try:
-        github_info = _template_github_info(template) if template.get("repo_url") and template.get("notebook_path") else None
+        github_info = _template_github_info(template) or None
         template_instance_type = (template.get("instance_type") or "").strip() or "opencode"
         instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
         instance = k8s_client.create_instance(

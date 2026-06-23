@@ -197,6 +197,8 @@ class Settings:
     HF_HUB_DISABLE_XET: str = os.getenv("HF_HUB_DISABLE_XET", "1")
     # HuggingFace mirror endpoint; pods have no direct egress to huggingface.co.
     HF_ENDPOINT: str = os.getenv("HF_ENDPOINT", "http://134.199.133.77")
+    # PyPI mirror for in-pod pip installs (e.g. app requirements.txt at startup).
+    PIP_INDEX_URL: str = os.getenv("PIP_INDEX_URL", "https://pypi.tuna.tsinghua.edu.cn/simple")
     WORKSPACE_HOST_ROOT: str = os.getenv("WORKSPACE_HOST_ROOT", "/workspace/amd-oneclick")
     WORKSPACE_MOUNT_PATH: str = os.getenv("WORKSPACE_MOUNT_PATH", "/workspace")
     WORKSPACE_VOLUME_TYPE: str = os.getenv("WORKSPACE_VOLUME_TYPE", "hostPath")

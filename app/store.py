@@ -640,8 +640,10 @@ def upsert_notebook_template(
         raise ValueError("template title must not be empty")
     if not image:
         raise ValueError("template image must not be empty")
-    if bool(repo_url) != bool(notebook_path):
-        raise ValueError("repo_url and notebook_path must be provided together, or both left empty for an image-only template")
+    # A notebook path requires a repo; a repo without a notebook path is allowed
+    # (app types clone the repo and start the app).
+    if notebook_path and not repo_url:
+        raise ValueError("notebook path requires a GitHub repo URL")
     if notebook_path and not notebook_path.endswith(".ipynb"):
         raise ValueError("template notebook_path must point to an .ipynb file")
 
