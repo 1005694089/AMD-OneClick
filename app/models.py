@@ -29,6 +29,11 @@ class CreditGrantRequest(BaseModel):
     reason: Optional[str] = "manual admin grant"
 
 
+class EditorGrantRequest(BaseModel):
+    """Request model for granting/revoking editor (template publishing) permission"""
+    is_editor: bool
+
+
 class InstanceBulkDestroyRequest(BaseModel):
     """Request model for bulk destroying instances by email matcher"""
     matcher: str

@@ -142,6 +142,13 @@ function App(){
       message.error(data.detail || 'Failed to grant credits');
     }
   }
+  async function setEditor(user, makeEditor){
+    const res=await fetch(`/api/admin/users/${user.id}/editor`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({is_editor:makeEditor})});
+    if(res.ok){ message.success(makeEditor?'Editor granted':'Editor revoked'); load(); } else {
+      const data = await res.json().catch(()=>({detail:'Failed to update editor'}));
+      message.error(data.detail || 'Failed to update editor');
+    }
+  }
 
   const imageColumns=[
     {title:'Name',dataIndex:'name',width:180},
@@ -179,8 +186,14 @@ function App(){
     {title:'Name',dataIndex:'name',width:180,render:v=>v||'-'},
     {title:'Provider',dataIndex:'provider',width:120,render:v=>React.createElement(Tag,null,v)},
     {title:'Credits',dataIndex:'credits',width:120,sorter:(a,b)=>(a.credits||0)-(b.credits||0)},
+    {title:'Editor',dataIndex:'is_editor',width:90,render:v=>v?React.createElement(Tag,{color:'green'},'Editor'):React.createElement(Tag,null,'No')},
     {title:'Created',dataIndex:'created_at',width:190,render:v=>v?dayjs(v).format('YYYY-MM-DD HH:mm'):'-'},
-    {title:'Actions',width:160,render:(_,r)=>React.createElement(Button,{size:'small',type:'primary',onClick:()=>{setCreditModalUser(r); creditForm.setFieldsValue({amount:1000,reason:'manual admin grant'});}},'Grant Credits')}
+    {title:'Actions',width:280,render:(_,r)=>React.createElement(Space,{size:8},
+      React.createElement(Button,{size:'small',type:'primary',onClick:()=>{setCreditModalUser(r); creditForm.setFieldsValue({amount:1000,reason:'manual admin grant'});}},'Grant Credits'),
+      r.is_editor
+        ? React.createElement(Button,{size:'small',danger:true,onClick:()=>setEditor(r,false)},'Revoke Editor')
+        : React.createElement(Button,{size:'small',onClick:()=>setEditor(r,true)},'Make Editor')
+    )}
   ];
   const filteredUsers = users.filter(user => {
     const keyword = userSearch.trim().toLowerCase();

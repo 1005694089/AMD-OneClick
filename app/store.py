@@ -400,6 +400,16 @@ def list_users() -> list[dict]:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
 
 
+def set_user_editor(user_id: int, is_editor: bool) -> Optional[dict]:
+    now = utc_now()
+    with engine.begin() as conn:
+        user = conn.execute(select(users).where(users.c.id == user_id)).mappings().first()
+        if not user:
+            return None
+        conn.execute(update(users).where(users.c.id == user_id).values(is_editor=bool(is_editor), updated_at=now))
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
 def get_admin_daily_stats() -> dict:
     def day_key(value: str) -> str:
         return datetime.fromisoformat(value).date().isoformat()

@@ -34,6 +34,7 @@ from .models import (
     DestroyResponse,
     ImageRequest,
     CreditGrantRequest,
+    EditorGrantRequest,
     InstanceBulkDestroyRequest,
     CouponRedeemRequest,
     NotebookTemplateRequest,
@@ -62,6 +63,7 @@ from .store import (
     list_images,
     list_notebook_templates,
     list_users,
+    set_user_editor,
     mark_instance_deleted,
     mark_instance_ready_for_billing,
     record_instance,
@@ -1656,6 +1658,14 @@ async def admin_grant_credits(user_id: int, req: CreditGrantRequest, username: s
         raise HTTPException(status_code=400, detail="amount must be positive")
 
     user = grant_user_credits(user_id, req.amount, req.reason or "manual admin grant")
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user": user}
+
+
+@app.post("/api/admin/users/{user_id}/editor")
+async def admin_set_editor(user_id: int, req: EditorGrantRequest, username: str = Depends(verify_admin)):
+    user = set_user_editor(user_id, req.is_editor)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return {"user": user}
