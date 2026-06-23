@@ -1008,9 +1008,29 @@ findmnt "$mnt"
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
 
-        existing = self.get_instance_by_id(instance_id)
-        if existing:
-            return existing
+        # Reuse an existing pod only if it is NOT being deleted. A pod that is
+        # Terminating (deletionTimestamp set) is a stale instance from a prior
+        # launch; reusing it would return the old type/command. Wait for it to
+        # fully disappear so we can create a fresh pod.
+        try:
+            existing_pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+        except ApiException as e:
+            if e.status == 404:
+                existing_pod = None
+            else:
+                raise
+        if existing_pod is not None and existing_pod.metadata.deletion_timestamp is None:
+            return self.get_instance_by_id(instance_id)
+        if existing_pod is not None:
+            logger.info("Pod %s is terminating; waiting for deletion before recreate", instance_id)
+            for _ in range(30):
+                time.sleep(2)
+                try:
+                    self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+                except ApiException as e:
+                    if e.status == 404:
+                        break
+                    raise
 
         workspace_quota_node_name = self._ensure_workspace_quota(instance_id)
         network_disk_claim_name = self._ensure_network_disk(instance_id)

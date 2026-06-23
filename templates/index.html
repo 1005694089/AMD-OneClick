@@ -169,17 +169,33 @@
       const [activeTab, setActiveTab] = React.useState(initialTab);
       const [gallerySearch, setGallerySearch] = React.useState('');
       const [activeTag, setActiveTag] = React.useState('All');
+      const [galleryKind, setGalleryKind] = React.useState('notebook');
+      function templateKind(tpl) {
+        const t = (tpl.instance_type || '').trim();
+        if (['gradio','streamlit'].includes(t)) return 'spaces';
+        if (t === 'comfyui') return 'comfyui';
+        if (['vllm','sglang'].includes(t)) return 'api';
+        if (t === 'custom') return 'custom';
+        return 'notebook';
+      }
+      const galleryKinds = [
+        { key:'notebook', label:'Notebooks' },
+        { key:'spaces', label:'Gradio / Streamlit' },
+        { key:'comfyui', label:'ComfyUI' },
+        { key:'api', label:'Model APIs' },
+        { key:'custom', label:'Custom Images' },
+      ];
       const imageOptions = (images || []).map(img => ({ label: React.createElement('span', { className: 'image-option-label', title: img.image }, img.name ? `${img.name} (${img.image.split('/').pop()})` : img.image.split('/').pop()), value: img.image }));
       const resourceProfileOptions = [
         { value: 'auto', label: 'Auto (recommended by GPU count)' },
         ...Object.entries(resourceProfiles || {}).map(([value, profile]) => ({ value, label: profile.label || value }))
       ];
-      const galleryTags = ['All', ...Array.from(new Set((notebookTemplates || []).flatMap(tpl => [tpl.category, ...(tpl.tags || [])].filter(Boolean))))].slice(0, 12);
+      const kindCounts = (notebookTemplates || []).reduce((acc, tpl) => { const k = templateKind(tpl); acc[k] = (acc[k]||0)+1; return acc; }, {});
       const filteredTemplates = (notebookTemplates || []).filter(tpl => {
         const text = `${tpl.title || ''} ${tpl.description || ''} ${tpl.category || ''} ${(tpl.tags || []).join(' ')}`.toLowerCase();
         const matchesSearch = !gallerySearch.trim() || text.includes(gallerySearch.trim().toLowerCase());
-        const matchesTag = activeTag === 'All' || tpl.category === activeTag || (tpl.tags || []).includes(activeTag);
-        return matchesSearch && matchesTag;
+        const matchesKind = templateKind(tpl) === galleryKind;
+        return matchesSearch && matchesKind;
       });
       const hasNotebook = tpl => !!(tpl && tpl.repo_url && tpl.notebook_path);
       const hasActiveInstance = !!(initialActiveInstance && initialActiveInstance.instance_id);
@@ -449,11 +465,11 @@
         return React.createElement(React.Fragment, null,
           React.createElement('div', { className: 'gallery-bar' },
             React.createElement('div', { className: 'tag-rail' },
-              galleryTags.map(tag => React.createElement('button', { key: tag, className: `tag-pill ${activeTag === tag ? 'active' : ''}`, onClick: () => setActiveTag(tag) }, tag))
+              galleryKinds.map(k => React.createElement('button', { key: k.key, className: `tag-pill ${galleryKind === k.key ? 'active' : ''}`, onClick: () => setGalleryKind(k.key) }, `${k.label}${kindCounts[k.key] ? ' ('+kindCounts[k.key]+')' : ''}`))
             ),
-            React.createElement(Text, { type: 'secondary' }, `${filteredTemplates.length} of ${notebookTemplates.length}`)
+            React.createElement(Text, { type: 'secondary' }, `${filteredTemplates.length} shown`)
           ),
-          filteredTemplates.length === 0 ? React.createElement('div', { className: 'empty-gallery' }, 'No templates match this search or tag.') : React.createElement('div', { className: 'template-grid' },
+          filteredTemplates.length === 0 ? React.createElement('div', { className: 'empty-gallery' }, gallerySearch.trim() ? 'No templates match this search.' : 'No templates in this category yet.') : React.createElement('div', { className: 'template-grid' },
             filteredTemplates.map((tpl) => React.createElement(Card, { key: tpl.id, className: 'template-card' },
               React.createElement('div', { className: 'template-cover', style: tpl.cover_url ? { backgroundImage: `linear-gradient(135deg,rgba(216,237,255,.72),rgba(242,220,255,.72)),url(${tpl.cover_url})`, backgroundSize: 'cover', backgroundPosition: 'center' } : {} },
                 React.createElement(Text, { style: { color: '#5962d6', fontWeight: 800 } }, tpl.category || 'Notebook')
