@@ -348,13 +348,18 @@
       function closeLaunchModal() {
         setLaunchModalOpen(false);
       }
-      function renderApiAccessCard(baseUrl, apiKey) {
-        const curl = `curl ${baseUrl}/chat/completions \\\n  -H "Authorization: Bearer ${apiKey || '<API_KEY>'}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model>","messages":[{"role":"user","content":"Hello"}]}'`;
+      function renderApiAccessCard(baseUrl, apiKey, model) {
+        const modelVal = model || '<model>';
+        const curl = `curl ${baseUrl}/chat/completions \\\n  -H "Authorization: Bearer ${apiKey || '<API_KEY>'}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${modelVal}","messages":[{"role":"user","content":"Hello"}]}'`;
         return React.createElement('div', { className:'api-access-card' },
           React.createElement('div', { className:'api-access-title' }, 'OpenAI-compatible endpoint'),
           React.createElement('div', { className:'api-access-row' },
             React.createElement('span', { className:'api-access-label' }, 'Base URL'),
             React.createElement(Paragraph, { copyable:{ text: baseUrl }, style:{ margin:0 } }, React.createElement('code', null, baseUrl))
+          ),
+          model && React.createElement('div', { className:'api-access-row' },
+            React.createElement('span', { className:'api-access-label' }, 'Model'),
+            React.createElement(Paragraph, { copyable:{ text: model }, style:{ margin:0 } }, React.createElement('code', null, model))
           ),
           apiKey && React.createElement('div', { className:'api-access-row' },
             React.createElement('span', { className:'api-access-label' }, 'API Key'),
@@ -421,7 +426,7 @@
                 detail && React.createElement('div', { className: 'launch-modal-detail' }, detail)
               )
             ),
-            (ready && isApi) && renderApiAccessCard(data.api_base_url, data.api_key),
+            (ready && isApi) && renderApiAccessCard(data.api_base_url, data.api_key, data.api_model),
             (data.detail && data.detail !== detail) && React.createElement('details', { className: 'launch-modal-technical' },
               React.createElement('summary', null, 'Technical details'),
               React.createElement('div', { className: 'launch-modal-technical-body' }, data.detail)

@@ -277,13 +277,18 @@
         )}
       ];
 
-      function renderApiAccessCard(baseUrl, apiKey) {
-        const curl = `curl ${baseUrl}/chat/completions \\\n  -H "Authorization: Bearer ${apiKey || '<API_KEY>'}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model>","messages":[{"role":"user","content":"Hello"}]}'`;
+      function renderApiAccessCard(baseUrl, apiKey, model) {
+        const modelVal = model || '<model>';
+        const curl = `curl ${baseUrl}/chat/completions \\\n  -H "Authorization: Bearer ${apiKey || '<API_KEY>'}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${modelVal}","messages":[{"role":"user","content":"Hello"}]}'`;
         return React.createElement('div', {className:'api-access-card', style:{marginTop:16}},
           React.createElement('div', {style:{fontWeight:800,color:'#273049',marginBottom:10}}, 'OpenAI-compatible endpoint'),
           React.createElement('div', {style:{display:'flex',alignItems:'center',gap:10,marginBottom:8}},
             React.createElement('span', {style:{width:72,color:'#6b758c',fontSize:13,flex:'0 0 auto'}}, 'Base URL'),
             React.createElement(Paragraph, {copyable:{text:baseUrl}, style:{margin:0}}, React.createElement('code', null, baseUrl))
+          ),
+          model && React.createElement('div', {style:{display:'flex',alignItems:'center',gap:10,marginBottom:8}},
+            React.createElement('span', {style:{width:72,color:'#6b758c',fontSize:13,flex:'0 0 auto'}}, 'Model'),
+            React.createElement(Paragraph, {copyable:{text:model}, style:{margin:0}}, React.createElement('code', null, model))
           ),
           apiKey && React.createElement('div', {style:{display:'flex',alignItems:'center',gap:10,marginBottom:8}},
             React.createElement('span', {style:{width:72,color:'#6b758c',fontSize:13,flex:'0 0 auto'}}, 'API Key'),
@@ -381,7 +386,7 @@
                   activeInstance.github_path ? {key:'notebook', label:'Notebook', children:activeInstance.github_path} : null,
                 ].filter(Boolean)}),
                 activeInstance.live_status && activeInstance.live_status !== 'ready' && React.createElement(Alert, {type:activeInstance.live_status === 'failed' ? 'error' : 'info', showIcon:true, style:{marginTop:16}, message:displayInstanceStatus(activeInstance) || 'Instance is not ready yet', description:displayInstanceDetail(activeInstance) || undefined}),
-                activeInstance.api_base_url && renderApiAccessCard(activeInstance.api_base_url, activeInstance.api_key),
+                activeInstance.api_base_url && renderApiAccessCard(activeInstance.api_base_url, activeInstance.api_key, activeInstance.api_model),
                 React.createElement(Space, {style:{marginTop:16}},
                   (activeInstance.url && !activeInstance.api_base_url) && React.createElement(Button, {type:'primary', href:activeInstance.url, target:'_blank'}, ['gradio','streamlit','comfyui'].includes((activeInstance.instance_type||'').trim()) ? 'Open App' : 'Open Notebook'),
                   React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))

@@ -107,6 +107,7 @@ class NotebookStatus(BaseModel):
     app_port: Optional[int] = None
     api_base_url: Optional[str] = None
     api_key: Optional[str] = None
+    api_model: Optional[str] = None
 
 
 class NotebookListItem(BaseModel):
