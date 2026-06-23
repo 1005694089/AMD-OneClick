@@ -551,6 +551,8 @@ exec {cmd}
             {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
         ]
+        if settings.HF_ENDPOINT.strip():
+            env.append({"name": "HF_ENDPOINT", "value": settings.HF_ENDPOINT.strip()})
         # Auto-configure common app frameworks so they serve under the Spaces
         # proxy base path and bind 0.0.0.0:<curated port>. This lets a user run
         # `gradio app.py` / `streamlit run app.py` from the notebook terminal and
