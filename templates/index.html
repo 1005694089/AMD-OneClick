@@ -102,6 +102,8 @@
     const showAdminLogin = {{ admin_login_enabled | tojson }};
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
+    const diskSizeMinGb = {{ disk_size_min_gb | tojson }};
+    const diskSizeMaxByGpu = {{ disk_size_max_by_gpu_json | safe }};
 
     function avatarNode(user) {
       if (!user || !user.email) return null;
@@ -268,7 +270,7 @@
         const values = await form.validateFields();
         setNotebookLoading(true); setReadyUrl(''); setReadyTemplateId(null); setLaunchModalOpen(true); setLaunchStatus({ status: 'allocating', message: 'Allocating resources for your workspace...', target: { type: 'notebook' } });
         try {
-          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode' }) });
+          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode', disk_size_gb: values.disk_size_gb }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           pollStatus(data.url, { type: 'notebook' });
@@ -456,12 +458,16 @@
         const selectedProfile = watchedResourceProfile || 'auto';
         const recommendedProfile = autoResourceProfileByGpu[String(selectedGpuCount)] || autoResourceProfileByGpu[selectedGpuCount] || 'standard';
         const recommendedResource = resourceProfiles && resourceProfiles[recommendedProfile] ? resourceProfiles[recommendedProfile].label : recommendedProfile;
+        const diskMax = diskSizeMaxByGpu[String(selectedGpuCount)] || diskSizeMaxByGpu[selectedGpuCount] || diskSizeMinGb;
+        const diskOptions = [];
+        for (let g = diskSizeMinGb; g <= diskMax; g += 50) diskOptions.push({ value: g, label: `${g} GB` });
         return React.createElement(Card, { className: 'launch-card', title: 'Notebook', extra: React.createElement(Text, { type: 'secondary' }, 'Default: OpenCode') },
           React.createElement(Form, { form, layout: 'vertical', initialValues: { image: defaultImage, gpu_count: 1, resource_profile: 'auto' } },
             React.createElement(Form.Item, { label: 'Account' }, React.createElement(Select, { disabled: true, value: currentUser && currentUser.email ? currentUser.email : 'Login required', options: [{ value: currentUser && currentUser.email ? currentUser.email : 'Login required', label: currentUser && currentUser.email ? currentUser.email : 'Login required' }] })),
             React.createElement(Form.Item, { label: 'Container Image', name: 'image', rules: [{ required: true }] }, React.createElement(Select, { options: imageOptions, className: 'fixed-select', popupMatchSelectWidth: true, style: { width: '100%' }, listHeight: 360 })),
             React.createElement(Form.Item, { label: 'GPU Count', name: 'gpu_count', rules: [{ required: true }] }, React.createElement(Select, { options: [{ value: 1, label: '1 GPU / 1 credit per hour' }, { value: 2, label: '2 GPUs / 2 credits per hour' }, { value: 4, label: '4 GPUs / 4 credits per hour' }] })),
             React.createElement(Form.Item, { label: 'CPU / Memory', name: 'resource_profile', extra: selectedProfile === 'auto' ? `Auto currently uses ${recommendedResource}` : 'Use a larger profile if your workload was OOMKilled.' }, React.createElement(Select, { options: resourceProfileOptions })),
+            React.createElement(Form.Item, { label: 'Disk Size', name: 'disk_size_gb', extra: `Up to ${diskMax} GB for this instance scale.` }, React.createElement(Select, { options: diskOptions, placeholder: `${diskMax} GB` })),
             React.createElement(Button, { type: 'primary', size: 'large', block: true, loading: notebookLoading, onClick: launch }, 'Launch Notebook')
           ),
           (!launchModalOpen && readyUrl && launchStatus && launchStatus.status === 'ready') && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Button, { type:'primary', href: readyUrl, target: '_blank', block: true }, 'Open Notebook'))

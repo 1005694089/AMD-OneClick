@@ -440,7 +440,8 @@ exec {cmd}
                           network_disk_claim_name: Optional[str] = None,
                           workspace_quota_node_name: Optional[str] = None,
                           start_command: Optional[str] = None,
-                          app_port: Optional[int] = None) -> dict:
+                          app_port: Optional[int] = None,
+                          disk_size_gb: Optional[int] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -537,7 +538,9 @@ exec {cmd}
             pass  # no workspace volume; the app lives in the image
         elif workspace_uses_empty_dir:
             workspace_empty_dir = {}
-            if settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
+            if disk_size_gb:
+                workspace_empty_dir["sizeLimit"] = f"{int(disk_size_gb)}Gi"
+            elif settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
                 workspace_empty_dir["sizeLimit"] = settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip()
             volumes.append({"name": "workspace", "emptyDir": workspace_empty_dir})
         else:
@@ -658,10 +661,17 @@ findmnt "$mnt"
             "memory": resources["memory_request"],
             "amd.com/gpu": str(gpu_count)
         }
-        if settings.EPHEMERAL_STORAGE_LIMIT.strip():
-            container_limits["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_LIMIT.strip()
-        if settings.EPHEMERAL_STORAGE_REQUEST.strip():
-            container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
+        if disk_size_gb:
+            # Ephemeral-storage limit must cover the workspace emptyDir plus image
+            # writable layer/logs, so add a small buffer above the chosen disk size.
+            container_limits["ephemeral-storage"] = f"{int(disk_size_gb) + 20}Gi"
+            if settings.EPHEMERAL_STORAGE_REQUEST.strip():
+                container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
+        else:
+            if settings.EPHEMERAL_STORAGE_LIMIT.strip():
+                container_limits["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_LIMIT.strip()
+            if settings.EPHEMERAL_STORAGE_REQUEST.strip():
+                container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
 
         container_ports = [
             {"containerPort": settings.NOTEBOOK_PORT, "name": "jupyter"}
@@ -1011,7 +1021,8 @@ findmnt "$mnt"
                         custom_instance_id: Optional[str] = None,
                         resource_profile: Optional[str] = None,
                         start_command: Optional[str] = None,
-                        app_port: Optional[int] = None) -> dict:
+                        app_port: Optional[int] = None,
+                        disk_size_gb: Optional[int] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -1052,6 +1063,7 @@ findmnt "$mnt"
             workspace_quota_node_name=workspace_quota_node_name,
             start_command=start_command,
             app_port=app_port,
+            disk_size_gb=disk_size_gb,
         )
         for attempt in range(1, 7):
             try:

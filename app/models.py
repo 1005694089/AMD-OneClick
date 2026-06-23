@@ -13,6 +13,7 @@ class NotebookRequest(BaseModel):
     instance_type: str = "jupyter"
     gpu_count: int = 1
     resource_profile: Optional[str] = "auto"
+    disk_size_gb: Optional[int] = None
 
 
 class ImageRequest(BaseModel):

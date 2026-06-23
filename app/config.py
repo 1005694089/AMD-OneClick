@@ -203,6 +203,10 @@ class Settings:
     WORKSPACE_MOUNT_PATH: str = os.getenv("WORKSPACE_MOUNT_PATH", "/workspace")
     WORKSPACE_VOLUME_TYPE: str = os.getenv("WORKSPACE_VOLUME_TYPE", "hostPath")
     WORKSPACE_EMPTYDIR_SIZE_LIMIT: str = os.getenv("WORKSPACE_EMPTYDIR_SIZE_LIMIT", "")
+    # User-selectable workspace disk size (GiB) for the blank notebook launch.
+    # The max scales with instance size; min is always DISK_SIZE_MIN_GB.
+    DISK_SIZE_MIN_GB: int = int(os.getenv("DISK_SIZE_MIN_GB", "100"))
+    DISK_SIZE_MAX_BY_GPU: dict = {1: 100, 2: 150, 4: 200}
     WORKSPACE_QUOTA_ENABLED: bool = os.getenv("WORKSPACE_QUOTA_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     WORKSPACE_QUOTA_SIZE_GI: int = int(os.getenv("WORKSPACE_QUOTA_SIZE_GI", "20"))
     WORKSPACE_QUOTA_NODE_NAME: str = os.getenv("WORKSPACE_QUOTA_NODE_NAME", "")

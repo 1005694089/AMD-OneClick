@@ -616,6 +616,8 @@ async def index(request: Request):
             "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
+            "disk_size_min_gb": settings.DISK_SIZE_MIN_GB,
+            "disk_size_max_by_gpu_json": json.dumps(settings.DISK_SIZE_MAX_BY_GPU),
         },
     )
 
@@ -835,6 +837,11 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
 
+    disk_max = settings.DISK_SIZE_MAX_BY_GPU.get(gpu_count, settings.DISK_SIZE_MIN_GB)
+    disk_size_gb = req.disk_size_gb if req.disk_size_gb else disk_max
+    if disk_size_gb < settings.DISK_SIZE_MIN_GB or disk_size_gb > disk_max:
+        raise HTTPException(status_code=400, detail=f"Disk size must be between {settings.DISK_SIZE_MIN_GB}G and {disk_max}G for this instance scale")
+
     if not get_image_by_value(image):
         raise HTTPException(status_code=400, detail="Invalid image selected")
 
@@ -859,6 +866,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             gpu_count=gpu_count,
             custom_instance_id=instance_id,
             resource_profile=resource_profile,
+            disk_size_gb=disk_size_gb,
         )
         record_instance(
             user["id"], email, instance["id"], image, instance_type, gpu_count, instance.get("node_port")
