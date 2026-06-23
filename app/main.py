@@ -25,7 +25,7 @@ import httpx
 import requests
 import websockets
 
-from .config import settings, INSTANCE_TYPES
+from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
 from .models import (
     NotebookRequest, 
     NotebookStatus, 
@@ -276,6 +276,9 @@ def _save_notebook_template(
         type_cfg = INSTANCE_TYPES.get(template_instance_type)
         if not type_cfg or not type_cfg.get("enabled"):
             raise ValueError("Invalid or disabled instance type for template")
+    template_app_port = req.app_port if req.app_port else None
+    if template_app_port is not None and int(template_app_port) not in set(settings.APP_PORTS.values()):
+        raise ValueError(f"app_port must be one of the curated app ports: {sorted(set(settings.APP_PORTS.values()))}")
     template = upsert_notebook_template(
         req.title,
         req.slug or "",
@@ -293,6 +296,8 @@ def _save_notebook_template(
         owner_user_id=owner_user_id,
         upsert_on_slug_conflict=owner_user_id is None,
         instance_type=template_instance_type,
+        start_command=req.start_command,
+        app_port=template_app_port,
     )
     if template.get("repo_url") and template.get("notebook_path"):
         ensure_template_preview_cache(template, force=True)
@@ -327,6 +332,11 @@ def _instance_public_url(request: Request, instance_id: str, notebook_path: Opti
 def _ready_instance_url(request: Request, instance: Optional[dict], status: Optional[str]) -> Optional[str]:
     if status != "ready" or not instance:
         return None
+    itype = (instance.get("instance_type") or "").strip()
+    if itype in APP_FRAMEWORK_PRESETS:
+        port = instance.get("app_port") or APP_FRAMEWORK_PRESETS[itype].get("port")
+        origin = _request_public_origin(request) if request else (settings.PUBLIC_BASE_URL or "").rstrip("/")
+        return f"{origin}{settings.SPACES_PATH_PREFIX}/{instance['id']}/{port}/"
     return _instance_public_url(request, instance["id"], instance.get("github_path"))
 
 
@@ -1072,6 +1082,8 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             github_info=github_info,
             custom_instance_id=instance_id,
             resource_profile="auto",
+            start_command=template.get("start_command"),
+            app_port=template.get("app_port"),
         )
         record_instance(user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count, instance.get("node_port"))
         record_instance_launch_event(
@@ -1428,6 +1440,31 @@ def _validate_app_port(port: str) -> int:
     return p
 
 
+def _app_port_proxy_mode(app_port: int) -> str:
+    """preserve = keep /spaces/<id>/<port> prefix (base-path-aware apps like Gradio);
+    strip = remove the prefix before forwarding (apps like ComfyUI that can't run
+    under a sub-path)."""
+    from .config import APP_FRAMEWORK_PRESETS
+    for name, preset in APP_FRAMEWORK_PRESETS.items():
+        if int(preset.get("port") or 0) == app_port:
+            return preset.get("proxy_mode", "preserve")
+    return "preserve"
+
+
+def _space_upstream_path(request_or_ws, instance_id: str, app_port: int, mode: str) -> str:
+    """Compute the upstream path. For strip mode use the raw (still-encoded) path
+    so %2F is preserved (ComfyUI workflow saves depend on this)."""
+    prefix = f"{settings.SPACES_PATH_PREFIX}/{instance_id}/{app_port}"
+    if mode == "strip":
+        raw = request_or_ws.scope.get("raw_path") or request_or_ws.url.path.encode()
+        raw_str = raw.decode("latin-1") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        stripped = raw_str[len(prefix):] if raw_str.startswith(prefix) else raw_str
+        if not stripped.startswith("/"):
+            stripped = "/" + stripped
+        return stripped
+    return request_or_ws.url.path
+
+
 @app.get(f"{settings.SPACES_PATH_PREFIX}/{{instance_id}}/{{port}}")
 async def proxy_space_root_redirect(instance_id: str, port: str):
     _validate_app_port(port)
@@ -1439,8 +1476,10 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
     """Proxy HTTP traffic to a user app on a curated port. Path is preserved so a
     base-path-aware app (Gradio root_path / Streamlit baseUrlPath) resolves correctly."""
     app_port = _validate_app_port(port)
+    mode = _app_port_proxy_mode(app_port)
     target_base = f"http://{_instance_pod_ip(instance_id)}:{app_port}"
-    target_url = f"{target_base}{request.url.path}"
+    upstream_path = _space_upstream_path(request, instance_id, app_port, mode)
+    target_url = f"{target_base}{upstream_path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
 
@@ -1488,8 +1527,10 @@ async def proxy_space_websocket(websocket: WebSocket, instance_id: str, port: st
     await websocket.accept()
     try:
         app_port = _validate_app_port(port)
+        mode = _app_port_proxy_mode(app_port)
         target_base = f"http://{_instance_pod_ip(instance_id)}:{app_port}".replace("http://", "ws://")
-        target_url = f"{target_base}{websocket.url.path}"
+        upstream_path = _space_upstream_path(websocket, instance_id, app_port, mode)
+        target_url = f"{target_base}{upstream_path}"
         if websocket.url.query:
             target_url += f"?{websocket.url.query}"
 

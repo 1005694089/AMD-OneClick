@@ -17,7 +17,7 @@ from urllib.parse import quote
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-from .config import settings, INSTANCE_TYPES
+from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
 
 logger = logging.getLogger(__name__)
 
@@ -375,13 +375,65 @@ cd {workspace}
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
 """
 
+    def _resolve_app_command(self, instance_type: str, start_command: Optional[str], app_port: Optional[int]) -> tuple:
+        """Resolve the effective start command + port for an app-type instance.
+        Template override wins; otherwise the framework preset default is used."""
+        preset = APP_FRAMEWORK_PRESETS.get(instance_type, {})
+        cmd = (start_command or "").strip() or preset.get("start_command", "")
+        port = int(app_port) if app_port else int(preset.get("port") or settings.APP_PORTS.get(instance_type) or 8000)
+        return cmd, port
+
+    def _build_app_startup_script(self, instance_id: str, instance_type: str,
+                                  github_info: Optional[dict] = None,
+                                  start_command: Optional[str] = None,
+                                  app_port: Optional[int] = None) -> str:
+        """Build the startup script for an app-type instance (Gradio/Streamlit/ComfyUI).
+        Clones the template repo if provided, then runs the resolved start command.
+        The app must listen on its app port; the manager proxies it under
+        /spaces/<id>/<port>/ (Gradio/Streamlit are base-path-aware via injected env)."""
+        workspace = shlex.quote(settings.WORKSPACE_MOUNT_PATH)
+        cmd, _port = self._resolve_app_command(instance_type, start_command, app_port)
+        clone_block = ""
+        run_dir = settings.WORKSPACE_MOUNT_PATH
+        if github_info and (github_info.get("repo_url") or github_info.get("clone_url")):
+            repo_url = github_info.get("repo_url") or github_info.get("clone_url")
+            branch_q = shlex.quote(github_info.get("branch") or "main")
+            repo_url_q = shlex.quote(repo_url)
+            clone_block = f"""
+if [ ! -e {workspace}/repo ]; then
+    echo "Cloning {repo_url}..."
+    for i in 1 2 3; do
+        rm -rf {workspace}/.repo-tmp
+        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {workspace}/.repo-tmp; then
+            mv {workspace}/.repo-tmp {workspace}/repo
+            echo "Repository cloned"
+            break
+        fi
+        echo "Git clone attempt $i failed, retrying..."
+        sleep $((i * 3))
+    done
+fi
+"""
+            run_dir = f"{settings.WORKSPACE_MOUNT_PATH}/repo"
+        return f"""
+set -e
+export PATH="/root/.opencode/bin:$PATH"
+mkdir -p {workspace}
+{clone_block}
+cd {shlex.quote(run_dir)} 2>/dev/null || cd {workspace}
+echo "Starting {instance_type} app: {cmd}"
+exec {cmd}
+"""
+
     def _get_pod_manifest(self, email: str, instance_id: str, image: str,
                           instance_type: str = "jupyter",
                           gpu_count: int = 1,
                           github_info: Optional[dict] = None,
                           resource_profile: Optional[str] = None,
                           network_disk_claim_name: Optional[str] = None,
-                          workspace_quota_node_name: Optional[str] = None) -> dict:
+                          workspace_quota_node_name: Optional[str] = None,
+                          start_command: Optional[str] = None,
+                          app_port: Optional[int] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -419,7 +471,17 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             annotations["amd-oneclick/template-title"] = github_info.get("template_title", "")
 
         image_defined_command = bool(INSTANCE_TYPES.get(instance_type, {}).get("image_defined_command"))
-        startup_script = self._build_startup_script(instance_id, instance_type, github_info)
+        app_preset = APP_FRAMEWORK_PRESETS.get(instance_type)
+        is_app_type = app_preset is not None
+        if is_app_type:
+            _eff_cmd, _eff_port = self._resolve_app_command(instance_type, start_command, app_port)
+            annotations["amd-oneclick/app-port"] = str(_eff_port)
+            startup_script = self._build_app_startup_script(
+                instance_id, instance_type, github_info,
+                start_command=start_command, app_port=app_port,
+            )
+        else:
+            startup_script = self._build_startup_script(instance_id, instance_type, github_info)
 
         workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
         workspace_uses_empty_dir = workspace_volume_type == "emptydir"
@@ -918,7 +980,9 @@ findmnt "$mnt"
                         gpu_count: int = 1,
                         github_info: Optional[dict] = None,
                         custom_instance_id: Optional[str] = None,
-                        resource_profile: Optional[str] = None) -> dict:
+                        resource_profile: Optional[str] = None,
+                        start_command: Optional[str] = None,
+                        app_port: Optional[int] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -937,6 +1001,8 @@ findmnt "$mnt"
             resource_profile=resource_profile,
             network_disk_claim_name=network_disk_claim_name,
             workspace_quota_node_name=workspace_quota_node_name,
+            start_command=start_command,
+            app_port=app_port,
         )
         for attempt in range(1, 7):
             try:
@@ -1018,6 +1084,7 @@ findmnt "$mnt"
                 "node_port": node_port,
                 "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                 "instance_type": instance_type,
+                "app_port": int(pod.metadata.annotations.get("amd-oneclick/app-port")) if pod.metadata.annotations.get("amd-oneclick/app-port") else None,
                 "gpu_count": gpu_count,
                 "resource_profile": pod.metadata.annotations.get("amd-oneclick/resource-profile"),
                 "cpu_limit": pod.metadata.annotations.get("amd-oneclick/cpu-limit"),
@@ -1185,6 +1252,23 @@ findmnt "$mnt"
             if pod.status.container_statuses:
                 container_status = pod.status.container_statuses[0]
                 if container_status.ready:
+                    # For app-type instances, readiness = the app port answering on the
+                    # pod IP (not Jupyter 8888 on the node port).
+                    annos = pod.metadata.annotations or {}
+                    app_port_anno = annos.get("amd-oneclick/app-port")
+                    if app_port_anno:
+                        pod_ip = pod.status.pod_ip
+                        if pod_ip and self._check_tcp_ready(pod_ip, int(app_port_anno)):
+                            return {
+                                "status": "ready", "phase": phase, "reason": "",
+                                "message": "App is ready", "ready": True,
+                                "pod_scheduled": pod_scheduled, "jupyter_ready": False,
+                            }
+                        return {
+                            "status": "jupyter_starting", "phase": phase, "reason": "AppStarting",
+                            "message": "Container is ready but the app is not responding yet",
+                            "ready": False, "pod_scheduled": pod_scheduled, "jupyter_ready": False,
+                        }
                     # Container is ready, but we need to verify Jupyter is actually responding
                     instance = self.get_instance_by_id(instance_id)
                     if instance and instance.get("node_port"):
@@ -1289,16 +1373,18 @@ findmnt "$mnt"
     
     def _check_jupyter_ready(self, node_port: int, timeout: float = 2.0) -> bool:
         """Check if Jupyter is responding on the given port"""
+        return self._check_tcp_ready(settings.SERVICE_HOST, node_port, timeout)
+
+    def _check_tcp_ready(self, host: str, port: int, timeout: float = 2.0) -> bool:
+        """Check if a TCP port accepts connections on the given host."""
         try:
-            # Try to connect to the Jupyter server
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
-            # Connect to any node in the cluster
-            result = sock.connect_ex((settings.SERVICE_HOST, node_port))
+            result = sock.connect_ex((host, port))
             sock.close()
             return result == 0
         except Exception as e:
-            logger.debug(f"Jupyter health check failed: {e}")
+            logger.debug(f"TCP health check failed for {host}:{port}: {e}")
             return False
     
     def check_pod_activity(self, email: str) -> Optional[datetime]:

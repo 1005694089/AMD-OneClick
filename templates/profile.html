@@ -94,6 +94,17 @@
 
     function App() {
       const [templateForm] = Form.useForm();
+      const tplInstanceType = Form.useWatch('instance_type', templateForm) || 'opencode';
+      const tplAppStartDefaults = { gradio: 'python app.py', streamlit: 'streamlit run app.py', comfyui: 'python main.py --listen 0.0.0.0 --port 8188' };
+      const tplAppPortDefaults = { gradio: 7860, streamlit: 8501, comfyui: 8188 };
+      const tplInstanceTypeOptions = [
+        { value: 'opencode', label: 'Jupyter / OpenCode (default notebook)' },
+        { value: 'gradio', label: 'Gradio App' },
+        { value: 'streamlit', label: 'Streamlit App' },
+        { value: 'comfyui', label: 'ComfyUI' },
+        { value: 'custom', label: 'Custom Image (image-defined start command)' },
+      ];
+      const tplIsAppType = ['gradio','streamlit','comfyui'].includes(tplInstanceType);
       const [redeemForm] = Form.useForm();
       const [editorTemplates, setEditorTemplates] = React.useState([]);
       const [editorImages, setEditorImages] = React.useState([]);
@@ -276,6 +287,12 @@
                 React.createElement(Form.Item, {name:'tags', label:'Tags', style:{flex:1}}, React.createElement(Input, {placeholder:'tutorial, Qwen3, agent'}))
               ),
               React.createElement(Form.Item, {name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}]}, React.createElement(Select, {options:editorImages.map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`}))})),
+              React.createElement(Form.Item, {name:'instance_type', label:'Instance Type', tooltip:'App types launch your app and open at an app URL.'}, React.createElement(Select, {options:tplInstanceTypeOptions, placeholder:'Jupyter / OpenCode (default)'})),
+              tplIsAppType && React.createElement(Space, {style:{width:'100%'}, size:16},
+                React.createElement(Form.Item, {name:'start_command', label:'Start Command', style:{flex:1}, tooltip:'Leave empty to use the framework default.'}, React.createElement(Input, {placeholder: tplAppStartDefaults[tplInstanceType] || ''})),
+                React.createElement(Form.Item, {name:'app_port', label:'App Port', style:{width:140}}, React.createElement(Select, {allowClear:true, placeholder:String(tplAppPortDefaults[tplInstanceType]||''), options:[{value:7860,label:'7860'},{value:8501,label:'8501'},{value:8188,label:'8188'},{value:8000,label:'8000'}]}))
+              ),
+              tplIsAppType && React.createElement(Alert, {type: tplInstanceType==='comfyui'?'warning':'info', showIcon:true, style:{marginBottom:16}, message: tplInstanceType==='comfyui' ? 'ComfyUI image must serve on the app port and have its frontend patched for sub-path use. Opens at /spaces/<id>/8188/.' : 'App runs on the chosen port and opens at /spaces/<id>/'+(tplAppPortDefaults[tplInstanceType]||'')+'/. Gradio/Streamlit base path is auto-configured.'}),
               React.createElement(Form.Item, {name:'repo_url', label:'GitHub Repo URL'}, React.createElement(Input, {placeholder:'optional, e.g. https://github.com/org/repo'})),
               React.createElement(Space, {style:{width:'100%'}, size:16},
                 React.createElement(Form.Item, {name:'branch', label:'Branch', style:{width:180}}, React.createElement(Input, {placeholder:'main'})),

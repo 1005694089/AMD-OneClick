@@ -54,6 +54,8 @@ class NotebookTemplateRequest(BaseModel):
     enabled: bool = True
     sort_order: int = 0
     instance_type: Optional[str] = ""
+    start_command: Optional[str] = ""
+    app_port: Optional[int] = None
 
 
 class TemplateLaunchRequest(BaseModel):

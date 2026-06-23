@@ -41,6 +41,59 @@ INSTANCE_TYPES = {
         # ENTRYPOINT/CMD runs and is expected to listen on NOTEBOOK_PORT (8888).
         "image_defined_command": True,
     },
+    "gradio": {
+        "name": "Gradio App",
+        "description": "Launch a Gradio app from a prepared image; opens at the app URL",
+        "icon": "🎨",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+    },
+    "streamlit": {
+        "name": "Streamlit App",
+        "description": "Launch a Streamlit app from a prepared image; opens at the app URL",
+        "icon": "📊",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+    },
+    "comfyui": {
+        "name": "ComfyUI",
+        "description": "Launch ComfyUI from a prepared image; opens at the app URL",
+        "icon": "🧩",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+    },
+}
+
+# Framework presets for "app" instance types. Each declares the default start
+# command, the port the app listens on, the reverse-proxy mode, and which
+# default app file is expected. Admins can override start_command / app_port
+# per template; everything else is derived from the framework here.
+#   proxy_mode: "preserve" keeps the /spaces/<id>/<port> prefix and the app is
+#     made base-path-aware (Gradio root_path / Streamlit baseUrlPath via env).
+#     "strip" removes the prefix before forwarding (for apps like ComfyUI that
+#     cannot run under a sub-path); requires raw-path forwarding to keep %2F.
+APP_FRAMEWORK_PRESETS = {
+    "gradio": {
+        "port": 7860,
+        "proxy_mode": "preserve",
+        "start_command": "python app.py",
+    },
+    "streamlit": {
+        "port": 8501,
+        "proxy_mode": "preserve",
+        "start_command": "streamlit run app.py",
+    },
+    "comfyui": {
+        "port": 8188,
+        "proxy_mode": "strip",
+        "start_command": "python main.py --listen 0.0.0.0 --port 8188",
+    },
 }
 
 
@@ -80,7 +133,7 @@ class Settings:
     # (via env) to serve under that base path so `gradio app.py` / `streamlit run`
     # just work like local. Map name -> container port.
     SPACES_PATH_PREFIX: str = os.getenv("SPACES_PATH_PREFIX", "/spaces")
-    APP_PORTS: dict = {"gradio": 7860, "streamlit": 8501, "app": 8000}
+    APP_PORTS: dict = {"gradio": 7860, "streamlit": 8501, "comfyui": 8188, "app": 8000}
 
     CPU_LIMIT: str = os.getenv("CPU_LIMIT", "16")
     MEMORY_LIMIT: str = os.getenv("MEMORY_LIMIT", "64Gi")
