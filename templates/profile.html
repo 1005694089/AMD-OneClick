@@ -30,6 +30,9 @@
     const { Avatar, Button, Card, Descriptions, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Select, Space, Statistic, Table, Tag, Typography, Alert, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
+    const __apiCardStyle = document.createElement('style');
+    __apiCardStyle.textContent = '.api-access-card{padding:14px 16px;border:1px solid #d6e4ff;border-radius:14px;background:#f5f9ff}.api-access-card code{background:#eef2fb;padding:2px 8px;border-radius:6px;word-break:break-all;font-size:13px}';
+    document.head.appendChild(__apiCardStyle);
     const user = {{ (user or {}) | tojson }};
     const activeInstance = {{ (active_instance or {}) | tojson }};
     const githubEnabled = {{ github_enabled | tojson }};
@@ -95,16 +98,21 @@
     function App() {
       const [templateForm] = Form.useForm();
       const tplInstanceType = Form.useWatch('instance_type', templateForm) || 'opencode';
-      const tplAppStartDefaults = { gradio: 'python app.py', streamlit: 'streamlit run app.py', comfyui: 'python main.py --listen 0.0.0.0 --port 8188' };
-      const tplAppPortDefaults = { gradio: 7860, streamlit: 8501, comfyui: 8188 };
+      const tplAppStartDefaults = { gradio: 'python app.py', streamlit: 'streamlit run app.py', comfyui: 'python main.py --listen 0.0.0.0 --port 8188', vllm: 'vllm serve <model> --host 0.0.0.0 --port 8000', sglang: 'python -m sglang.launch_server --model <model> --host 0.0.0.0 --port 30000' };
+      const tplAppPortDefaults = { gradio: 7860, streamlit: 8501, comfyui: 8188, vllm: 8000, sglang: 30000 };
       const tplInstanceTypeOptions = [
-        { value: 'opencode', label: 'Jupyter / OpenCode (default notebook)' },
+        { value: 'opencode', label: 'Notebook (Jupyter / OpenCode)' },
         { value: 'gradio', label: 'Gradio App' },
         { value: 'streamlit', label: 'Streamlit App' },
-        { value: 'comfyui', label: 'ComfyUI' },
+        { value: 'comfyui', label: 'ComfyUI (one-click)' },
+        { value: 'vllm', label: 'vLLM Model API' },
+        { value: 'sglang', label: 'SGLang Model API' },
         { value: 'custom', label: 'Custom Image (image-defined start command)' },
       ];
-      const tplIsAppType = ['gradio','streamlit','comfyui'].includes(tplInstanceType);
+      const tplIsApiType = ['vllm','sglang'].includes(tplInstanceType);
+      const tplIsAppType = ['gradio','streamlit','comfyui'].includes(tplInstanceType) || tplIsApiType;
+      const tplIsNotebookType = ['opencode','jupyter'].includes(tplInstanceType);
+      const tplNeedsGithub = ['gradio','streamlit','opencode','jupyter'].includes(tplInstanceType);
       const [redeemForm] = Form.useForm();
       const [editorTemplates, setEditorTemplates] = React.useState([]);
       const [editorImages, setEditorImages] = React.useState([]);
@@ -269,8 +277,26 @@
         )}
       ];
 
+      function renderApiAccessCard(baseUrl, apiKey) {
+        const curl = `curl ${baseUrl}/chat/completions \\\n  -H "Authorization: Bearer ${apiKey || '<API_KEY>'}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"<model>","messages":[{"role":"user","content":"Hello"}]}'`;
+        return React.createElement('div', {className:'api-access-card', style:{marginTop:16}},
+          React.createElement('div', {style:{fontWeight:800,color:'#273049',marginBottom:10}}, 'OpenAI-compatible endpoint'),
+          React.createElement('div', {style:{display:'flex',alignItems:'center',gap:10,marginBottom:8}},
+            React.createElement('span', {style:{width:72,color:'#6b758c',fontSize:13,flex:'0 0 auto'}}, 'Base URL'),
+            React.createElement(Paragraph, {copyable:{text:baseUrl}, style:{margin:0}}, React.createElement('code', null, baseUrl))
+          ),
+          apiKey && React.createElement('div', {style:{display:'flex',alignItems:'center',gap:10,marginBottom:8}},
+            React.createElement('span', {style:{width:72,color:'#6b758c',fontSize:13,flex:'0 0 auto'}}, 'API Key'),
+            React.createElement(Paragraph, {copyable:{text:apiKey}, style:{margin:0}}, React.createElement('code', null, apiKey))
+          ),
+          React.createElement('details', null,
+            React.createElement('summary', {style:{cursor:'pointer',color:'#566175',fontWeight:700,fontSize:13}}, 'Quickstart (curl)'),
+            React.createElement(Paragraph, {copyable:{text:curl}, style:{margin:'8px 0 0'}}, React.createElement('pre', {style:{margin:0,padding:'10px 12px',borderRadius:10,background:'#0f1830',color:'#cdd6f4',overflow:'auto',fontSize:12}}, curl))
+          )
+        );
+      }
       function renderEditorTemplates() {
-        if (!user || !user.email) return null;
+        if (!user || !user.email || !isEditor) return null;
         return React.createElement(Card, {
           className:'editor-panel',
           title:'My Templates',
@@ -287,16 +313,17 @@
                 React.createElement(Form.Item, {name:'tags', label:'Tags', style:{flex:1}}, React.createElement(Input, {placeholder:'tutorial, Qwen3, agent'}))
               ),
               React.createElement(Form.Item, {name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}]}, React.createElement(Select, {options:editorImages.map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`}))})),
-              React.createElement(Form.Item, {name:'instance_type', label:'Instance Type', tooltip:'App types launch your app and open at an app URL.'}, React.createElement(Select, {options:tplInstanceTypeOptions, placeholder:'Jupyter / OpenCode (default)'})),
+              React.createElement(Form.Item, {name:'instance_type', label:'Deploy Type', tooltip:'Notebook opens Jupyter; app types open a web app; API types serve an OpenAI-compatible endpoint.'}, React.createElement(Select, {options:tplInstanceTypeOptions, placeholder:'Notebook (Jupyter / OpenCode)'})),
+              tplIsApiType && React.createElement(Alert, {type:'info', showIcon:true, style:{marginBottom:16}, message:'Model API: set the serve command (including the model). Users get an OpenAI-compatible base URL + API key. Serves at /spaces/<id>/'+(tplAppPortDefaults[tplInstanceType]||'')+'/v1.'}),
+              (tplInstanceType==='comfyui') && React.createElement(Alert, {type:'info', showIcon:true, style:{marginBottom:16}, message:'One-click app: just pick the image. ComfyUI starts automatically and opens at /spaces/<id>/'+(tplAppPortDefaults.comfyui)+'/.'}),
               tplIsAppType && React.createElement(Space, {style:{width:'100%'}, size:16},
-                React.createElement(Form.Item, {name:'start_command', label:'Start Command', style:{flex:1}, tooltip:'Leave empty to use the framework default.'}, React.createElement(Input, {placeholder: tplAppStartDefaults[tplInstanceType] || ''})),
-                React.createElement(Form.Item, {name:'app_port', label:'App Port', style:{width:140}}, React.createElement(Select, {allowClear:true, placeholder:String(tplAppPortDefaults[tplInstanceType]||''), options:[{value:7860,label:'7860'},{value:8501,label:'8501'},{value:8188,label:'8188'},{value:8000,label:'8000'}]}))
+                React.createElement(Form.Item, {name:'start_command', label: tplIsApiType?'Serve Command':'Start Command', style:{flex:1}, rules: tplIsApiType?[{required:true,message:'Serve command (with model) is required'}]:[], tooltip:'Leave empty to use the framework default.'}, React.createElement(Input, {placeholder: tplAppStartDefaults[tplInstanceType] || ''})),
+                React.createElement(Form.Item, {name:'app_port', label:'Port', style:{width:140}}, React.createElement(Select, {allowClear:true, placeholder:String(tplAppPortDefaults[tplInstanceType]||''), options:[{value:7860,label:'7860'},{value:8501,label:'8501'},{value:8188,label:'8188'},{value:8000,label:'8000'},{value:30000,label:'30000'}]}))
               ),
-              tplIsAppType && React.createElement(Alert, {type: tplInstanceType==='comfyui'?'warning':'info', showIcon:true, style:{marginBottom:16}, message: tplInstanceType==='comfyui' ? 'ComfyUI image must serve on the app port and have its frontend patched for sub-path use. Opens at /spaces/<id>/8188/.' : 'App runs on the chosen port and opens at /spaces/<id>/'+(tplAppPortDefaults[tplInstanceType]||'')+'/. Gradio/Streamlit base path is auto-configured.'}),
-              React.createElement(Form.Item, {name:'repo_url', label:'GitHub Repo URL'}, React.createElement(Input, {placeholder:'optional, e.g. https://github.com/org/repo'})),
-              React.createElement(Space, {style:{width:'100%'}, size:16},
+              tplNeedsGithub && React.createElement(Form.Item, {name:'repo_url', label:'GitHub Repo URL', tooltip: tplIsNotebookType?'Optional. Leave empty for a blank workspace.':'Repo containing your app (cloned into the workspace).'}, React.createElement(Input, {placeholder: tplIsNotebookType?'optional, e.g. https://github.com/org/repo':'https://github.com/org/repo'})),
+              tplNeedsGithub && React.createElement(Space, {style:{width:'100%'}, size:16},
                 React.createElement(Form.Item, {name:'branch', label:'Branch', style:{width:180}}, React.createElement(Input, {placeholder:'main'})),
-                React.createElement(Form.Item, {name:'notebook_path', label:'Notebook Path', style:{flex:1}}, React.createElement(Input, {placeholder:'optional, e.g. notebooks/workshop.ipynb'}))
+                tplIsNotebookType && React.createElement(Form.Item, {name:'notebook_path', label:'Notebook Path', style:{flex:1}}, React.createElement(Input, {placeholder:'optional, e.g. notebooks/workshop.ipynb'}))
               ),
               React.createElement(Form.Item, {name:'cover_url', label:'Cover URL'}, React.createElement(Input, {placeholder:'optional'})),
               React.createElement(Button, {type:'primary', htmlType:'submit', block:true}, editingTemplate?'Save Template':'Add Template')
@@ -354,9 +381,10 @@
                   activeInstance.github_path ? {key:'notebook', label:'Notebook', children:activeInstance.github_path} : null,
                 ].filter(Boolean)}),
                 activeInstance.live_status && activeInstance.live_status !== 'ready' && React.createElement(Alert, {type:activeInstance.live_status === 'failed' ? 'error' : 'info', showIcon:true, style:{marginTop:16}, message:displayInstanceStatus(activeInstance) || 'Instance is not ready yet', description:displayInstanceDetail(activeInstance) || undefined}),
+                activeInstance.api_base_url && renderApiAccessCard(activeInstance.api_base_url, activeInstance.api_key),
                 React.createElement(Space, {style:{marginTop:16}},
-                  activeInstance.url && React.createElement(Button, {type:'primary', href:activeInstance.url, target:'_blank'}, 'Open Notebook'),
-                  React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current notebook instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))
+                  (activeInstance.url && !activeInstance.api_base_url) && React.createElement(Button, {type:'primary', href:activeInstance.url, target:'_blank'}, ['gradio','streamlit','comfyui'].includes((activeInstance.instance_type||'').trim()) ? 'Open App' : 'Open Notebook'),
+                  React.createElement(Popconfirm, {title:'Destroy this instance?', description:'This will stop your current instance.', okText:'Destroy', okButtonProps:{danger:true}, onConfirm:destroyCurrentInstance}, React.createElement(Button, {danger:true}, 'Destroy Instance'))
                 )
               ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
             ),

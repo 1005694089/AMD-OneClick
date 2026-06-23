@@ -68,6 +68,26 @@ INSTANCE_TYPES = {
         "idle_timeout_minutes": None,
         "app_kind": True,
     },
+    "vllm": {
+        "name": "vLLM API",
+        "description": "Serve an OpenAI-compatible model API with vLLM",
+        "icon": "🚀",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+        "api_kind": True,
+    },
+    "sglang": {
+        "name": "SGLang API",
+        "description": "Serve an OpenAI-compatible model API with SGLang",
+        "icon": "⚡",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+        "api_kind": True,
+    },
 }
 
 # Framework presets for "app" instance types. Each declares the default start
@@ -95,6 +115,27 @@ APP_FRAMEWORK_PRESETS = {
         # ComfyUI is conventionally installed at /workspace/ComfyUI in prepared
         # images; run it there on the curated app port. Admins can override.
         "start_command": "bash -lc 'cd /workspace/ComfyUI 2>/dev/null || cd \"$WORKSPACE_DIR\"; exec python main.py --listen 0.0.0.0 --port 8188'",
+    },
+    # API (model-serving) kinds. The deliverable is an OpenAI-compatible endpoint,
+    # not a UI: the ready screen shows base_url + api key + curl. The per-instance
+    # API key is injected via api_key_env at launch. proxy_mode "strip" forwards
+    # /spaces/<id>/<port>/v1/... to the server's /v1/... (API clients use the full
+    # base_url we hand them, so there is no browser-absolute-URL problem).
+    "vllm": {
+        "port": 8000,
+        "proxy_mode": "strip",
+        "start_command": "vllm serve --host 0.0.0.0 --port 8000",
+        "api_kind": True,
+        "api_base_suffix": "/v1",
+        "api_key_env": "VLLM_API_KEY",
+    },
+    "sglang": {
+        "port": 30000,
+        "proxy_mode": "strip",
+        "start_command": "python -m sglang.launch_server --host 0.0.0.0 --port 30000",
+        "api_kind": True,
+        "api_base_suffix": "/v1",
+        "api_key_env": "SGLANG_API_KEY",
     },
 }
 
@@ -135,7 +176,7 @@ class Settings:
     # (via env) to serve under that base path so `gradio app.py` / `streamlit run`
     # just work like local. Map name -> container port.
     SPACES_PATH_PREFIX: str = os.getenv("SPACES_PATH_PREFIX", "/spaces")
-    APP_PORTS: dict = {"gradio": 7860, "streamlit": 8501, "comfyui": 8188, "app": 8000}
+    APP_PORTS: dict = {"gradio": 7860, "streamlit": 8501, "comfyui": 8188, "app": 8000, "sglang": 30000}
 
     CPU_LIMIT: str = os.getenv("CPU_LIMIT", "16")
     MEMORY_LIMIT: str = os.getenv("MEMORY_LIMIT", "64Gi")

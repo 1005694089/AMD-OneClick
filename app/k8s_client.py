@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import socket
 import time
@@ -473,9 +474,16 @@ exec {cmd}
         image_defined_command = bool(INSTANCE_TYPES.get(instance_type, {}).get("image_defined_command"))
         app_preset = APP_FRAMEWORK_PRESETS.get(instance_type)
         is_app_type = app_preset is not None
+        api_key_value = None
         if is_app_type:
             _eff_cmd, _eff_port = self._resolve_app_command(instance_type, start_command, app_port)
             annotations["amd-oneclick/app-port"] = str(_eff_port)
+            if app_preset.get("api_kind"):
+                annotations["amd-oneclick/api-kind"] = "true"
+                annotations["amd-oneclick/api-base-suffix"] = app_preset.get("api_base_suffix", "")
+                # Per-instance API key so the exposed model endpoint is not open to anyone.
+                api_key_value = f"sk-{secrets.token_hex(20)}"
+                annotations["amd-oneclick/api-key"] = api_key_value
             startup_script = self._build_app_startup_script(
                 instance_id, instance_type, github_info,
                 start_command=start_command, app_port=app_port,
@@ -488,11 +496,15 @@ exec {cmd}
         hf_cache_volume_type = (settings.HF_CACHE_VOLUME_TYPE or "emptyDir").strip().lower()
         hf_cache_uses_empty_dir = hf_cache_volume_type == "emptydir"
 
+        # App-type images often bake their app under /workspace (e.g. ComfyUI at
+        # /workspace/ComfyUI). Mounting our workspace volume there would hide the
+        # image's files, so app types do not get the /workspace overmount.
         volume_mounts = [
             {"name": "shm", "mountPath": "/dev/shm"},
             {"name": "hf-cache", "mountPath": settings.HF_CACHE_MOUNT_PATH},
-            {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH},
         ]
+        if not is_app_type:
+            volume_mounts.append({"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH})
         volumes = [
             {
                 "name": "shm",
@@ -515,7 +527,9 @@ exec {cmd}
                     "type": "DirectoryOrCreate"
                 }
             })
-        if workspace_uses_empty_dir:
+        if is_app_type:
+            pass  # no workspace volume; the app lives in the image
+        elif workspace_uses_empty_dir:
             workspace_empty_dir = {}
             if settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
                 workspace_empty_dir["sizeLimit"] = settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip()
@@ -559,6 +573,11 @@ exec {cmd}
                 {"name": "STREAMLIT_SERVER_ENABLE_CORS", "value": "false"},
                 {"name": "STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION", "value": "false"},
             ]
+        # API-kind instances: inject the per-instance API key under the framework's
+        # expected env var (e.g. VLLM_API_KEY) so the served endpoint requires it.
+        if api_key_value and app_preset and app_preset.get("api_key_env"):
+            env.append({"name": app_preset["api_key_env"], "value": api_key_value})
+            env.append({"name": "AMD_ONECLICK_API_KEY", "value": api_key_value})
         if network_disk_enabled:
             network_disk_mount = {
                 "name": "network-disk",
@@ -576,7 +595,7 @@ exec {cmd}
             env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
 
         init_containers = []
-        if settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir:
+        if settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir and not is_app_type:
             safe_id = self._safe_storage_segment(instance_id)
             quota_image_path = f"/quota-images/{safe_id}.img"
             init_containers.append({
@@ -1085,6 +1104,9 @@ findmnt "$mnt"
                 "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                 "instance_type": instance_type,
                 "app_port": int(pod.metadata.annotations.get("amd-oneclick/app-port")) if pod.metadata.annotations.get("amd-oneclick/app-port") else None,
+                "api_kind": pod.metadata.annotations.get("amd-oneclick/api-kind") == "true",
+                "api_key": pod.metadata.annotations.get("amd-oneclick/api-key"),
+                "api_base_suffix": pod.metadata.annotations.get("amd-oneclick/api-base-suffix") or "",
                 "gpu_count": gpu_count,
                 "resource_profile": pod.metadata.annotations.get("amd-oneclick/resource-profile"),
                 "cpu_limit": pod.metadata.annotations.get("amd-oneclick/cpu-limit"),

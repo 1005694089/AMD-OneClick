@@ -98,6 +98,10 @@ class NotebookStatus(BaseModel):
     reason: Optional[str] = None
     detail: Optional[str] = None
     ready: bool = False
+    instance_type: Optional[str] = None
+    app_port: Optional[int] = None
+    api_base_url: Optional[str] = None
+    api_key: Optional[str] = None
 
 
 class NotebookListItem(BaseModel):

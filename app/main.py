@@ -340,6 +340,19 @@ def _ready_instance_url(request: Request, instance: Optional[dict], status: Opti
     return _instance_public_url(request, instance["id"], instance.get("github_path"))
 
 
+def _instance_api_info(request: Request, instance: Optional[dict], status: Optional[str]) -> tuple:
+    """For API-kind instances, return (base_url, api_key) once ready, else (None, None).
+    base_url is the OpenAI-compatible base, e.g. .../spaces/<id>/8000/v1"""
+    if status != "ready" or not instance or not instance.get("api_kind"):
+        return None, None
+    itype = (instance.get("instance_type") or "").strip()
+    port = instance.get("app_port") or APP_FRAMEWORK_PRESETS.get(itype, {}).get("port")
+    suffix = instance.get("api_base_suffix") or APP_FRAMEWORK_PRESETS.get(itype, {}).get("api_base_suffix", "")
+    origin = _request_public_origin(request) if request else (settings.PUBLIC_BASE_URL or "").rstrip("/")
+    base = f"{origin}{settings.SPACES_PATH_PREFIX}/{instance['id']}/{port}{suffix}"
+    return base, instance.get("api_key")
+
+
 def _notebook_status_message(status_details: Optional[dict]) -> str:
     status = (status_details or {}).get("status") or "unknown"
     detail = (status_details or {}).get("message") or ""
@@ -399,6 +412,11 @@ def _active_instance_context(user: Optional[dict], request: Optional[Request] = 
     active_instance["github_path"] = live_instance.get("github_path")
     active_instance["template_id"] = live_instance.get("template_id")
     active_instance["template_title"] = live_instance.get("template_title")
+    active_instance["instance_type"] = live_instance.get("instance_type")
+    active_instance["app_port"] = live_instance.get("app_port")
+    api_base_url, api_key = _instance_api_info(request, live_instance, live_status)
+    active_instance["api_base_url"] = api_base_url
+    active_instance["api_key"] = api_key
     return active_instance
 
 
@@ -861,6 +879,7 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
         if status == "ready" and active.get("status") != "running":
             active = mark_instance_ready_for_billing(active["instance_id"]) or active
         
+        api_base_url, api_key = _instance_api_info(request, instance, status)
         return NotebookStatus(
             status=status or "unknown",
             message=_notebook_status_message(status_details),
@@ -871,6 +890,10 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
             reason=status_details.get("reason"),
             detail=status_details.get("message"),
             ready=bool(status_details.get("ready")),
+            instance_type=(instance.get("instance_type") if instance else None),
+            app_port=(instance.get("app_port") if instance else None),
+            api_base_url=api_base_url,
+            api_key=api_key,
         )
         
     except Exception as e:
