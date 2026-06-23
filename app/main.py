@@ -311,6 +311,7 @@ def _save_notebook_template(
         instance_type=template_instance_type,
         start_command=req.start_command,
         app_port=template_app_port,
+        model_source=(req.model_source or "").strip().lower() or None,
     )
     if template.get("repo_url") and template.get("notebook_path"):
         ensure_template_preview_cache(template, force=True)
@@ -1156,6 +1157,7 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             resource_profile="auto",
             start_command=template.get("start_command"),
             app_port=template.get("app_port"),
+            model_source=template.get("model_source"),
         )
         record_instance(user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count, instance.get("node_port"))
         record_instance_launch_event(

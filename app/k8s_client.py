@@ -428,6 +428,10 @@ if [ -f requirements.txt ]; then
     echo "Installing requirements.txt..."
     pip install {pip_flag}-r requirements.txt || echo "WARN: pip install -r requirements.txt failed"
 fi
+if [ -n "$VLLM_USE_MODELSCOPE" ] && ! python -c "import modelscope" 2>/dev/null; then
+    echo "Installing modelscope..."
+    pip install {pip_flag}modelscope || echo "WARN: pip install modelscope failed"
+fi
 echo "Starting {instance_type} app: {cmd}"
 exec {cmd}
 """
@@ -441,7 +445,8 @@ exec {cmd}
                           workspace_quota_node_name: Optional[str] = None,
                           start_command: Optional[str] = None,
                           app_port: Optional[int] = None,
-                          disk_size_gb: Optional[int] = None) -> dict:
+                          disk_size_gb: Optional[int] = None,
+                          model_source: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -560,7 +565,13 @@ exec {cmd}
             {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
         ]
-        if settings.HF_ENDPOINT.strip():
+        use_modelscope = (model_source or "").strip().lower() == "modelscope"
+        if use_modelscope:
+            # vLLM/SGLang download the model from ModelScope instead of HuggingFace.
+            env.append({"name": "VLLM_USE_MODELSCOPE", "value": "True"})
+            env.append({"name": "SGLANG_USE_MODELSCOPE", "value": "True"})
+            env.append({"name": "MODELSCOPE_CACHE", "value": settings.HF_CACHE_MOUNT_PATH})
+        elif settings.HF_ENDPOINT.strip():
             env.append({"name": "HF_ENDPOINT", "value": settings.HF_ENDPOINT.strip()})
         if settings.PIP_INDEX_URL.strip():
             env.append({"name": "PIP_INDEX_URL", "value": settings.PIP_INDEX_URL.strip()})
@@ -1022,7 +1033,8 @@ findmnt "$mnt"
                         resource_profile: Optional[str] = None,
                         start_command: Optional[str] = None,
                         app_port: Optional[int] = None,
-                        disk_size_gb: Optional[int] = None) -> dict:
+                        disk_size_gb: Optional[int] = None,
+                        model_source: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -1064,6 +1076,7 @@ findmnt "$mnt"
             start_command=start_command,
             app_port=app_port,
             disk_size_gb=disk_size_gb,
+            model_source=model_source,
         )
         for attempt in range(1, 7):
             try:

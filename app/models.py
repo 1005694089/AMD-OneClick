@@ -62,6 +62,7 @@ class NotebookTemplateRequest(BaseModel):
     instance_type: Optional[str] = ""
     start_command: Optional[str] = ""
     app_port: Optional[int] = None
+    model_source: Optional[str] = ""
 
 
 class TemplateLaunchRequest(BaseModel):
