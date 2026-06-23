@@ -534,6 +534,28 @@ async def _close_httpx_stream(upstream: httpx.Response, client: httpx.AsyncClien
     await client.aclose()
 
 
+# Shared pooled client for the instance/app (spaces) HTTP proxies. A new client
+# per request (with a 1-hour timeout) leaked connections and overwhelmed
+# single-threaded backends (e.g. ComfyUI aiohttp) under the browser's burst of
+# concurrent asset requests. A bounded shared pool reuses/limits connections.
+_proxy_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_proxy_client() -> httpx.AsyncClient:
+    global _proxy_client
+    if _proxy_client is None or _proxy_client.is_closed:
+        _proxy_client = httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=30.0),
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32, keepalive_expiry=30.0),
+        )
+    return _proxy_client
+
+
+async def _close_upstream_only(upstream: httpx.Response):
+    await upstream.aclose()
+
+
 def _request_with_retries(method: str, url: str, retries: int = 3, **kwargs) -> requests.Response:
     last_error = None
     timeout = kwargs.pop("timeout", 30)
@@ -1416,8 +1438,7 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
         target_url += f"?{request.url.query}"
 
     body = await request.body()
-    timeout = httpx.Timeout(3600.0, connect=10.0)
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    client = _get_proxy_client()
     upstream = await client.send(
         client.build_request(
             request.method,
@@ -1438,7 +1459,7 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
         upstream.aiter_raw(),
         status_code=upstream.status_code,
         headers=response_headers,
-        background=BackgroundTask(_close_httpx_stream, upstream, client),
+        background=BackgroundTask(_close_upstream_only, upstream),
     )
     for cookie in upstream.headers.get_list("set-cookie"):
         response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
@@ -1567,8 +1588,7 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
     fwd_headers["X-Forwarded-Prefix"] = f"{settings.SPACES_PATH_PREFIX}/{instance_id}/{app_port}"
 
     body = await request.body()
-    timeout = httpx.Timeout(3600.0, connect=10.0)
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    client = _get_proxy_client()
     upstream = await client.send(
         client.build_request(
             request.method,
@@ -1588,7 +1608,7 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
         upstream.aiter_raw(),
         status_code=upstream.status_code,
         headers=response_headers,
-        background=BackgroundTask(_close_httpx_stream, upstream, client),
+        background=BackgroundTask(_close_upstream_only, upstream),
     )
     for cookie in upstream.headers.get_list("set-cookie"):
         response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
