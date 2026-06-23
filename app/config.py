@@ -92,7 +92,9 @@ APP_FRAMEWORK_PRESETS = {
     "comfyui": {
         "port": 8188,
         "proxy_mode": "strip",
-        "start_command": "python main.py --listen 0.0.0.0 --port 8188",
+        # ComfyUI is conventionally installed at /workspace/ComfyUI in prepared
+        # images; run it there on the curated app port. Admins can override.
+        "start_command": "bash -lc 'cd /workspace/ComfyUI 2>/dev/null || cd \"$WORKSPACE_DIR\"; exec python main.py --listen 0.0.0.0 --port 8188'",
     },
 }
 
