@@ -26,6 +26,30 @@ secrets.
 
 ---
 
+## 2026-06-24 — Radeon beta oauth-credit-manager merge
+
+**Code commit:** `e7df4328f0dce4ebde449ab7558bb9912c823505`
+("Preserve beta node-local service overrides"), built on top of merge commit
+`4ade5fcd8358c269cf913e6abfbaef31138a9f72`.
+
+| Service / Port | Image (`:tag`) | Digest / ID | Local yaml + sha256 | Snapshot |
+|----------------|----------------|-------------|---------------------|----------|
+| radeon-beta / 30444 | `crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:rb-nodelocal-v2-052512` plus `amd-oneclick-radeon-beta-code-overrides` | registry digest N/A (image unchanged) / runtime image id `sha256:a28ec14b4f4b6f40dee8b6f8a61101ea2a85e97516da7f2cf29540f5138420ac` | generated code-overrides manifest sha256 `2c436b568f2ba0f532652de51940a7d108fd03df36ccef100344fcf708305b55` | `local-deploy-history/radeon-beta/2026-06-24-1710-beta-oauth-merge-code-overrides.local.yaml` |
+
+**Process:** pulled `BETA-test`, merged `origin/feature/oauth-credit-manager`,
+pushed `BETA-test`, then refreshed only
+`amd-oneclick-radeon-beta-code-overrides` and rolled
+`deployment/amd-oneclick-radeon-beta-manager`. Used `kubectl replace` for the
+large ConfigMap to avoid the Kubernetes annotation size limit from
+`kubectl apply`. No Postgres, Secret, builder, or production resources were
+mutated.
+
+**Verification:** rollout `1/1 ready`; `https://radeon-beta.anruicloud.com/health`
+and `http://36.150.116.220:30444/health` returned 200; public homepage returned
+200 and contains merged deploy-type UI; Playwright browser load had no console
+errors or failed critical asset requests; mounted pod file hashes match local
+`e7df432`; builder pod can reach its configured manager URL.
+
 ## 2026-06-24 — image prepull sync fix (IfNotPresent + ref normalization)
 
 **Code commit:** `d8f0cea8ee9f830dda1e243eb1f0eb62198d47af`
