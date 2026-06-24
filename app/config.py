@@ -3,6 +3,7 @@ Configuration settings for AMD OneClick Notebook Manager
 """
 import os
 from typing import Optional
+from urllib.parse import urlparse
 
 
 INSTANCE_TYPES = {
@@ -143,22 +144,28 @@ APP_FRAMEWORK_PRESETS = {
 # Appended to every user-supplied custom Dockerfile (and usable to rebuild the base
 # image) so that OpenCode + Hermes are always present and on PATH. Kept as a module
 # constant so the build-agent and the API share one definition.
+# NOTE: the RUN --mount=type=cache directives below persist package caches (pip wheels, npm
+# cache, and uv's download cache) across builds on the node's buildkit store. Cache mounts are
+# build-time only, so download caches are reused without baking cache directories into the image.
 DOCKERFILE_SUFFIX = """
 # --- AMD OneClick: auto-appended (Jupyter + OpenCode + Hermes) ---
 # JupyterLab provides the Jupyter server + Lab UI the workspace launches with. Try each pip
 # variant in turn, but DO NOT swallow the final failure: the workspace cannot start without
 # Jupyter, so a build that can't install it must fail here rather than be pushed as "ready"
-# and then crash-loop at launch. (Idempotent/harmless if the base image already ships Jupyter.)
-RUN pip3 install --no-cache-dir jupyterlab || pip install --no-cache-dir jupyterlab || python3 -m pip install --no-cache-dir jupyterlab
+# and then crash-loop at launch. Drop --no-cache-dir and mount a persistent pip cache so wheels
+# are reused across builds.
+RUN --mount=type=cache,target=/root/.cache/pip pip3 install jupyterlab || pip install jupyterlab || python3 -m pip install jupyterlab
 # Hard gate: the image is only usable if `jupyter lab` is actually on PATH and runnable.
 # This converts a silently-incomplete base (no working pip, missing deps) into a build failure.
 RUN jupyter lab --version
-# Pin the OpenCode version so the installer skips its "fetch latest version" network call,
-# which intermittently fails in the build sandbox and silently left OpenCode uninstalled.
-# Symlink into /usr/local/bin so `opencode` is on the default PATH (survives login shells).
-RUN curl -fsSL https://opencode.ai/install | bash -s -- --version 1.16.2 || npm i -g opencode-ai@latest || true
-RUN ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode 2>/dev/null || true
-RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash || true
+# Pin OpenCode to the version validated on radeon-beta. Both the curl installer and npm fallback
+# are pinned so a transient installer failure cannot silently pull @latest.
+RUN --mount=type=cache,target=/root/.npm curl -fsSL https://opencode.ai/install | bash -s -- --version 1.4.6 || npm i -g opencode-ai@1.4.6
+RUN [ -x /root/.opencode/bin/opencode ] && ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode || true
+RUN opencode --version
+# Hermes is best-effort. Cache uv's download cache and bound the install so a slow Hermes install
+# cannot consume the whole custom-image build budget.
+RUN --mount=type=cache,target=/root/.cache/uv UV_CACHE_DIR=/root/.cache/uv timeout 1500 sh -c 'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-browser' || true
 ENV PATH="/root/.opencode/bin:/root/.hermes/bin:${PATH}"
 """
 
@@ -319,13 +326,30 @@ class Settings:
     # re-derive every instance's password. Falls back to SESSION_SECRET (also server-only); set a
     # dedicated value in production so it does not share fate with the cookie-signing key.
     OPENCODE_PASSWORD_SECRET: str = os.getenv("OPENCODE_PASSWORD_SECRET") or SESSION_SECRET
+    # Optional HTTPS origin for OpenCode. When set, OpenCode links go through the manager's
+    # reverse proxy with signed handoff/session cookies instead of direct cleartext NodePorts.
+    OPENCODE_PUBLIC_BASE_URL: str = os.getenv("OPENCODE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+    @property
+    def OPENCODE_PUBLIC_HOST(self) -> str:
+        if not self.OPENCODE_PUBLIC_BASE_URL:
+            return ""
+        return urlparse(self.OPENCODE_PUBLIC_BASE_URL).hostname or ""
+
+    @property
+    def OPENCODE_PUBLIC_PORT(self) -> Optional[int]:
+        if not self.OPENCODE_PUBLIC_BASE_URL:
+            return None
+        return urlparse(self.OPENCODE_PUBLIC_BASE_URL).port
     # Appended to every custom-image build. The default uses upstream `curl | bash` installers
     # (opencode.ai, nousresearch.com) — a third-party supply-chain dependency. Operators who
     # want to remove that exposure can set DOCKERFILE_SUFFIX to a vendored, checksum-pinned
     # equivalent (e.g. COPY a verified installer from the build context) via the env var.
     DOCKERFILE_SUFFIX: str = os.getenv("DOCKERFILE_SUFFIX", "").strip() or DOCKERFILE_SUFFIX
 
-    # Custom user image builds (built off-cluster by the R9700 build-agent, pushed to ACR).
+    # Custom user image builds. New beta builds are built on the pinned GPU node directly into
+    # containerd under a node-local tag. CUSTOM_IMAGE_REGISTRY is retained for legacy ACR rows.
+    CUSTOM_IMAGE_LOCAL_TAG_PREFIX: str = os.getenv("CUSTOM_IMAGE_LOCAL_TAG_PREFIX", "amd-oneclick-custom").strip("/")
     CUSTOM_IMAGE_REGISTRY: str = os.getenv(
         "CUSTOM_IMAGE_REGISTRY",
         "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud-user",
@@ -333,11 +357,15 @@ class Settings:
     CUSTOM_IMAGE_MAX_PER_USER: int = int(os.getenv("CUSTOM_IMAGE_MAX_PER_USER", "1"))
     CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS", "1800"))
     CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES: int = int(os.getenv("CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES", "65536"))
-    # Optional registry pull secret referenced by notebook + prepull pods for the custom
-    # registry. Empty means "assume nodes can already pull" (no imagePullSecrets injected).
+    # Optional registry pull secret for legacy custom-registry rows. Node-local images need none.
     CUSTOM_IMAGE_PULL_SECRET_NAME: str = os.getenv("CUSTOM_IMAGE_PULL_SECRET_NAME", "")
-    # Name of the dockerconfigjson secret the R9700 agent uses to push (referenced for docs).
+    # Name of the dockerconfigjson secret the legacy ACR agent used to push (referenced for docs).
     ACR_PUSH_SECRET_NAME: str = os.getenv("ACR_PUSH_SECRET_NAME", "acr-push-secret")
+    CUSTOM_IMAGE_GC_ENABLED: bool = os.getenv("CUSTOM_IMAGE_GC_ENABLED", "true").lower() in {"1", "true", "yes"}
+    CUSTOM_IMAGE_GC_DISK_PATH: str = os.getenv("CUSTOM_IMAGE_GC_DISK_PATH", "/disk/ssd1/containerd")
+    CUSTOM_IMAGE_GC_DISK_THRESHOLD_PERCENT: float = float(os.getenv("CUSTOM_IMAGE_GC_DISK_THRESHOLD_PERCENT", "85"))
+    CUSTOM_IMAGE_GC_INTERVAL_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_INTERVAL_SECONDS", "300"))
+    CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", "21600"))
 
     # Internal build-agent channel (R9700 -> manager). Token guards /api/internal/builds/*.
     BUILD_AGENT_TOKEN: str = os.getenv("BUILD_AGENT_TOKEN", "")

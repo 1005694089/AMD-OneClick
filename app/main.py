@@ -46,6 +46,7 @@ from .models import (
     BuildClaimRequest,
     BuildLogRequest,
     BuildResultRequest,
+    BuildEvictRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .notebook_sources import (
@@ -96,6 +97,11 @@ from .store import (
     update_custom_image_status,
     delete_custom_image,
     get_ready_custom_image_by_value,
+    get_custom_image_by_value,
+    list_gc_candidates,
+    mark_custom_image_evicted,
+    mark_custom_image_launched,
+    requeue_custom_image_build,
 )
 
 # Configure logging
@@ -137,6 +143,26 @@ app = FastAPI(
     lifespan=lifespan
 )
 app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET)
+
+
+@app.middleware("http")
+async def opencode_origin_proxy(request: Request, call_next):
+    """Serve OpenCode through the manager when OPENCODE_PUBLIC_BASE_URL matches this origin."""
+    opencode_host = settings.OPENCODE_PUBLIC_HOST
+    if not opencode_host:
+        return await call_next(request)
+    req_host = (request.headers.get("host") or "").split(":", 1)[0].lower()
+    if req_host != opencode_host.lower():
+        return await call_next(request)
+    opencode_port = settings.OPENCODE_PUBLIC_PORT
+    if opencode_port is not None:
+        try:
+            req_port = int(request.headers.get("x-forwarded-port") or 0)
+        except (TypeError, ValueError):
+            req_port = 0
+        if req_port != opencode_port:
+            return await call_next(request)
+    return await _handle_opencode_request(request)
 
 
 @app.middleware("http")
@@ -558,11 +584,25 @@ def _custom_image_public(record: dict) -> dict:
 
 
 def _resolve_launchable_image(user: dict, image: str) -> bool:
-    """An image is launchable if it is an enabled catalog entry OR the caller's own
-    build-ready custom image. Custom images never enter the global catalog."""
+    """An image is launchable if it is catalog-backed or the caller's own ready/rebuildable image."""
     if get_image_by_value(image):
         return True
-    return bool(get_ready_custom_image_by_value(user["id"], image))
+    if get_ready_custom_image_by_value(user["id"], image):
+        return True
+    row = get_custom_image_by_value(user["id"], image)
+    return bool(row and row["build_status"] == "evicted")
+
+
+def _prepare_custom_image_for_launch(user: dict, image: str) -> Optional[str]:
+    """Ensure a custom image is present for launch, requeueing evicted node-local images."""
+    row = get_custom_image_by_value(user["id"], image)
+    if not row:
+        return None
+    if row["build_status"] == "evicted":
+        requeue_custom_image_build(row["id"], user["id"])
+        return "rebuilding"
+    mark_custom_image_launched(row["id"])
+    return row["build_status"]
 
 
 def verify_build_agent(request: Request):
@@ -629,7 +669,7 @@ def _validate_oauth_state(request: Request, provider: str, state: str):
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
 
-def _instance_service_base(instance_id: str) -> str:
+def _instance_service_base(instance_id: str, port: Optional[int] = None) -> str:
     try:
         svc = k8s_client.core_v1.read_namespaced_service(
             name=f"{instance_id}-svc",
@@ -637,7 +677,7 @@ def _instance_service_base(instance_id: str) -> str:
         )
     except Exception:
         raise HTTPException(status_code=404, detail="Instance service not found")
-    return f"http://{svc.spec.cluster_ip}:{settings.NOTEBOOK_PORT}"
+    return f"http://{svc.spec.cluster_ip}:{port or settings.NOTEBOOK_PORT}"
 
 
 def _proxy_headers(headers) -> dict:
@@ -1005,6 +1045,12 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
 
     if not _resolve_launchable_image(user, image):
         raise HTTPException(status_code=400, detail="Invalid image selected")
+    prep = _prepare_custom_image_for_launch(user, image)
+    if prep == "rebuilding":
+        raise HTTPException(
+            status_code=409,
+            detail="This custom image was reclaimed under disk pressure and is being rebuilt. Retry when its status is ready.",
+        )
 
     type_cfg = INSTANCE_TYPES.get(instance_type)
     if not type_cfg or not type_cfg.get("enabled"):
@@ -1191,7 +1237,7 @@ async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(
             detail=f"Dockerfile exceeds {settings.CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES} bytes",
         )
 
-    image_tag = f"{settings.CUSTOM_IMAGE_REGISTRY}/user-{user['id']}:{name}"
+    image_tag = f"{settings.CUSTOM_IMAGE_LOCAL_TAG_PREFIX}/user-{user['id']}:{name}"
     try:
         record = create_custom_image(
             user["id"], name, image_tag, dockerfile, settings.CUSTOM_IMAGE_MAX_PER_USER
@@ -1255,9 +1301,27 @@ async def report_build_result(image_id: int, req: BuildResultRequest, _agent: bo
     record = update_custom_image_status(image_id, status=status, require_claimed_by=req.agent_id)
     if not record:
         raise HTTPException(status_code=409, detail="Build not claimed by this agent or not building")
-    # Custom user images are NOT prepulled to nodes. The image lives in ACR (pushed by the
-    # build-agent); the notebook pod pulls it lazily on first launch via CUSTOM_IMAGE_PULL_SECRET_NAME.
+    # The node-local builder writes the image straight into the GPU node's containerd `k8s.io`
+    # namespace. Ready means the launch path can use imagePullPolicy=IfNotPresent without pulling.
     return {"ok": True}
+
+
+@app.post("/api/internal/builds/gc-candidates")
+async def build_gc_candidates(req: BuildClaimRequest, _agent: bool = Depends(verify_build_agent)):
+    candidates = [
+        {"id": row["id"], "tag": row["image"], "last_launched_at": row.get("last_launched_at")}
+        for row in list_gc_candidates()
+    ]
+    return {"candidates": candidates}
+
+
+@app.post("/api/internal/builds/evicted")
+async def report_evicted(req: BuildEvictRequest, _agent: bool = Depends(verify_build_agent)):
+    evicted = []
+    for image_id in req.image_ids:
+        if mark_custom_image_evicted(image_id):
+            evicted.append(image_id)
+    return {"evicted": evicted}
 
 
 # =============================================================================
@@ -1414,8 +1478,13 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
     gpu_count = req.gpu_count or 1
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
-    if not get_image_by_value(template["image"]) and not get_ready_custom_image_by_value(user["id"], template["image"]):
+    if not _resolve_launchable_image(user, template["image"]):
         raise HTTPException(status_code=400, detail="Template image is not available (catalog image disabled, or custom image not ready/owned by you)")
+    if _prepare_custom_image_for_launch(user, template["image"]) == "rebuilding":
+        raise HTTPException(
+            status_code=409,
+            detail="This custom image was reclaimed under disk pressure and is being rebuilt. Retry when its status is ready.",
+        )
 
     active = get_active_instance_for_user(user["id"])
     if active:
@@ -1874,6 +1943,103 @@ async def check_github_status(
 # =============================================================================
 # Instance Path Proxy
 # =============================================================================
+
+async def _handle_opencode_request(request: Request) -> Response:
+    from .opencode_proxy import (
+        SESSION_COOKIE_NAME,
+        SESSION_MAX_AGE_SECONDS,
+        mint_session_cookie,
+        verify_handoff_token,
+        verify_session_cookie,
+    )
+
+    if request.url.path == "/__opencode_auth":
+        token = request.query_params.get("token", "")
+        instance_id = verify_handoff_token(token) if token else None
+        if not instance_id:
+            return Response(
+                "Invalid or expired OpenCode link. Reopen it from your dashboard.",
+                status_code=403,
+                media_type="text/plain",
+            )
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            mint_session_cookie(instance_id),
+            max_age=SESSION_MAX_AGE_SECONDS,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
+
+    if request.url.path == "/site.webmanifest" and request.method in {"GET", "HEAD"}:
+        return Response(
+            json.dumps({
+                "name": "OpenCode",
+                "short_name": "OpenCode",
+                "theme_color": "#ffffff",
+                "background_color": "#ffffff",
+                "display": "standalone",
+            }),
+            media_type="application/manifest+json",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    cookie = request.cookies.get(SESSION_COOKIE_NAME, "")
+    instance_id = verify_session_cookie(cookie) if cookie else None
+    if not instance_id:
+        return Response(
+            "OpenCode session expired. Reopen OpenCode from your dashboard.",
+            status_code=401,
+            media_type="text/plain",
+        )
+
+    target_base = _instance_service_base(instance_id, port=settings.OPENCODE_WEB_PORT)
+    target_url = f"{target_base}{request.url.path}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+
+    raw_user = settings.OPENCODE_WEB_USERNAME
+    raw_password = k8s_client._opencode_password(instance_id)
+    basic = base64.b64encode(f"{raw_user}:{raw_password}".encode("utf-8")).decode("ascii")
+    body = await request.body()
+    headers = _proxy_headers(request.headers)
+    headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
+    headers["authorization"] = f"Basic {basic}"
+
+    client = _get_proxy_client()
+    upstream = await client.send(
+        client.build_request(request.method, target_url, headers=headers, content=body),
+        stream=True,
+    )
+    response_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in {
+            "transfer-encoding",
+            "connection",
+            "content-length",
+            "set-cookie",
+            "www-authenticate",
+            "proxy-authenticate",
+        }
+    }
+    response = StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        background=BackgroundTask(_close_upstream_only, upstream),
+    )
+    csp = response.headers.get("content-security-policy", "")
+    theme_script_hash = "'sha256-QI23YWMJrD/tljM6/82tpL8EwqdBoptwZfycFHA9IiQ='"
+    if csp and theme_script_hash not in csp:
+        response.headers["content-security-policy"] = csp.replace(
+            "script-src 'self' 'wasm-unsafe-eval'",
+            f"script-src 'self' 'wasm-unsafe-eval' {theme_script_hash}",
+        )
+    return response
+
 
 @app.api_route("/instances/{instance_id}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_instance_http(instance_id: str, path: str, request: Request):

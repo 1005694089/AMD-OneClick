@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -23,6 +23,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     inspect,
+    or_,
     select,
     text,
     update,
@@ -241,11 +242,12 @@ custom_images = Table(
     Column("claimed_at", String(64)),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
+    Column("last_launched_at", String(64)),
     UniqueConstraint("user_id", "name", name="uq_custom_image_user_name"),
 )
 
 # Build queue states that count against a user's quota and block re-use of a name.
-CUSTOM_IMAGE_ACTIVE_STATUSES = ("pending", "building", "ready")
+CUSTOM_IMAGE_ACTIVE_STATUSES = ("pending", "building", "ready", "evicted")
 CUSTOM_IMAGE_LOG_MAX_CHARS = 60000
 
 
@@ -308,6 +310,11 @@ def ensure_schema_columns(conn):
     template_columns = {col["name"] for col in inspector.get_columns("notebook_templates")}
     if "owner_user_id" not in template_columns:
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN owner_user_id INTEGER"))
+
+    if inspector.has_table("custom_images"):
+        custom_image_columns = {col["name"] for col in inspector.get_columns("custom_images")}
+        if "last_launched_at" not in custom_image_columns:
+            conn.execute(text("ALTER TABLE custom_images ADD COLUMN last_launched_at VARCHAR(64)"))
 
     # Backward-compatible creation for databases initialized before these tables.
     metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions, instance_launch_events, custom_images])
@@ -1312,6 +1319,105 @@ def get_ready_custom_image_by_value(user_id: int, image: str) -> Optional[dict]:
                     custom_images.c.build_status == "ready",
                 )
             ).mappings().first()
+        )
+
+
+def get_custom_image_by_value(user_id: int, image: str) -> Optional[dict]:
+    """Resolve a user-owned custom image by its full image string, in any build state."""
+    with engine.begin() as conn:
+        return row_to_dict(
+            conn.execute(
+                select(custom_images).where(
+                    custom_images.c.user_id == user_id,
+                    custom_images.c.image == image,
+                )
+            ).mappings().first()
+        )
+
+
+def mark_custom_image_launched(image_id: int) -> None:
+    """Stamp launch time so disk-pressure GC can evict the coldest node-local images first."""
+    now = utc_now()
+    with engine.begin() as conn:
+        conn.execute(
+            update(custom_images)
+            .where(custom_images.c.id == image_id)
+            .values(last_launched_at=now, updated_at=now)
+        )
+
+
+def requeue_custom_image_build(image_id: int, user_id: int) -> Optional[dict]:
+    """Re-enqueue an evicted or failed custom image from its stored Dockerfile."""
+    now = utc_now()
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(custom_images).where(
+                custom_images.c.id == image_id,
+                custom_images.c.user_id == user_id,
+            )
+        ).mappings().first()
+        if not row:
+            return None
+        if row["build_status"] in ("evicted", "failed"):
+            conn.execute(
+                update(custom_images)
+                .where(
+                    custom_images.c.id == image_id,
+                    custom_images.c.build_status.in_(("evicted", "failed")),
+                )
+                .values(build_status="pending", claimed_by=None, claimed_at=None, build_log="", updated_at=now)
+            )
+            return row_to_dict(
+                conn.execute(select(custom_images).where(custom_images.c.id == image_id)).mappings().first()
+            )
+        return dict(row)
+
+
+def list_gc_candidates() -> list[dict]:
+    """Ready node-local custom images ordered coldest first for builder-side disk GC."""
+    prefix = (settings.CUSTOM_IMAGE_LOCAL_TAG_PREFIX or "").strip("/")
+    grace = int(getattr(settings, "CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", 0) or 0)
+    cutoff_iso = None
+    if grace > 0:
+        cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=grace)).isoformat()
+
+    with engine.begin() as conn:
+        conditions = [
+            custom_images.c.build_status == "ready",
+            custom_images.c.image.like(f"{prefix}/%"),
+        ]
+        if cutoff_iso is not None:
+            conditions.append(
+                or_(
+                    custom_images.c.last_launched_at.is_(None),
+                    custom_images.c.last_launched_at < cutoff_iso,
+                )
+            )
+        rows = conn.execute(
+            select(custom_images)
+            .where(*conditions)
+            .order_by(
+                custom_images.c.last_launched_at.is_(None).desc(),
+                custom_images.c.last_launched_at.asc(),
+                custom_images.c.id.asc(),
+            )
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+
+def mark_custom_image_evicted(image_id: int) -> Optional[dict]:
+    """Mark ready node-local image content as evicted while retaining the Dockerfile row."""
+    now = utc_now()
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(custom_images)
+            .where(custom_images.c.id == image_id, custom_images.c.build_status == "ready")
+            .values(build_status="evicted", updated_at=now)
+        )
+        if result.rowcount == 0:
+            return None
+        return row_to_dict(
+            conn.execute(select(custom_images).where(custom_images.c.id == image_id)).mappings().first()
         )
 
 

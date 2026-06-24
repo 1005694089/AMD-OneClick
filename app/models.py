@@ -101,6 +101,12 @@ class BuildResultRequest(BaseModel):
     status: str  # ready | failed
 
 
+class BuildEvictRequest(BaseModel):
+    """Build-agent notification that node-local image content was reclaimed."""
+    agent_id: str
+    image_ids: list[int] = []
+
+
 class GitHubNotebookInfo(BaseModel):
     """GitHub notebook information"""
     org: str

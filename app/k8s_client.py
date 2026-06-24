@@ -1684,10 +1684,15 @@ findmnt "$mnt"
         """
         if not opencode_node_port:
             return None
+        if settings.OPENCODE_PUBLIC_BASE_URL:
+            from .opencode_proxy import mint_handoff_token
+
+            token = mint_handoff_token(instance_id)
+            return f"{settings.OPENCODE_PUBLIC_BASE_URL}/__opencode_auth?token={quote(token, safe='')}"
         return f"http://{self._opencode_host()}:{opencode_node_port}/"
 
     def _opencode_auth(self, opencode_node_port: Optional[int], instance_id: str) -> dict:
-        if not opencode_node_port:
+        if not opencode_node_port or settings.OPENCODE_PUBLIC_BASE_URL:
             return {"opencode_username": None, "opencode_password": None}
         return {
             "opencode_username": settings.OPENCODE_WEB_USERNAME,
