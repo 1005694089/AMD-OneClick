@@ -839,6 +839,33 @@ findmnt "$mnt"
                     raise
         raise RuntimeError("Unable to allocate NodePort for service")
 
+    @staticmethod
+    def _normalize_image_ref(ref: str) -> str:
+        """Canonicalize a docker image reference for reliable comparison.
+
+        kubelet reports container status images in fully-qualified form
+        (e.g. ``docker.io/library/nginx:latest``) while the catalog may store
+        short names (e.g. ``nginx`` or ``rocm/atom-dev:tag``). Normalize both
+        sides so the sync counter matches regardless of how it was entered.
+        """
+        if not ref:
+            return ref
+        ref = ref.strip()
+        # Separate digest if present (keep it as-is, it is already canonical).
+        digest = ""
+        if "@" in ref:
+            ref, digest = ref.split("@", 1)
+            digest = "@" + digest
+        first = ref.split("/", 1)[0]
+        has_registry = "." in first or ":" in first or first == "localhost"
+        if not has_registry:
+            if "/" not in ref:
+                ref = "library/" + ref
+            ref = "docker.io/" + ref
+        if not digest and ":" not in ref.rsplit("/", 1)[-1]:
+            ref = ref + ":latest"
+        return ref + digest
+
     def _prepull_name(self, image_id: int) -> str:
         return f"image-prepull-catalog-{image_id}"
 
@@ -900,7 +927,7 @@ findmnt "$mnt"
                             {
                                 "name": "pull",
                                 "image": image,
-                                "imagePullPolicy": "Always",
+                                "imagePullPolicy": "IfNotPresent",
                                 "command": [
                                     "sh",
                                     "-c",
@@ -928,6 +955,7 @@ findmnt "$mnt"
             desired = len(eligible_nodes) or (ds.status.desired_number_scheduled or 0)
             ds_uid = ds.metadata.uid
             image = ds.spec.template.spec.containers[0].image
+            image_norm = self._normalize_image_ref(image)
             pulled_nodes = set()
             pods = self.core_v1.list_namespaced_pod(
                 namespace=self.namespace,
@@ -942,7 +970,7 @@ findmnt "$mnt"
                 if not statuses:
                     continue
                 status = statuses[0]
-                if status.image == image and status.image_id:
+                if status.image_id and self._normalize_image_ref(status.image) == image_norm:
                     pulled_nodes.add(pod.spec.node_name)
 
             effective_pulled_nodes = pulled_nodes & eligible_nodes if eligible_nodes else pulled_nodes
