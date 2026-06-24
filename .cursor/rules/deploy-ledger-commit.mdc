@@ -1,0 +1,39 @@
+---
+description: Deploy ledger and commit/push discipline for manager deployments
+alwaysApply: true
+---
+
+# Deploy Ledger & Commit Discipline
+
+Every manager deploy (v2 prod 30088, v2 test 30288, pr1-zijun 30392, etc.) MUST
+leave a committed, pushed paper trail. Do not skip this even under time pressure.
+
+## Required for every deploy
+
+1. **Commit & push the deployed code FIRST.** The image must be built from a
+   committed, pushed commit. Record that exact git SHA. Never deploy an image
+   built from uncommitted working-tree changes without committing them.
+2. **Add a ledger entry** in `docs/ops/deploy-ledger.md` (this file IS tracked and
+   MUST be committed & pushed). Each entry strictly records, per service:
+   - code commit SHA (+ short message)
+   - image full ref `:tag`, registry digest `sha256:…`, and image id `sha256:…`
+   - local yaml file applied **and its `sha256`**
+   - snapshot path under `local-deploy-history/`
+   - verification result (health + key checks)
+3. **Snapshot** the applied manifest into `local-deploy-history/<service>/<ts>-<slug>.local.yaml`.
+4. **Commit & push** the ledger + any rule/doc/code changes before considering the
+   deploy done.
+
+## Never commit secrets
+
+`*.local.yaml`, `cluster.yaml`, and `local-deploy-history/` are git-ignored on
+purpose — some embed raw Secrets (`GITHUB_CLIENT_SECRET`, private keys). Keep them
+ignored. Capture the local yaml *version* in the ledger via `sha256` instead of
+committing the file. If you ever need the raw manifest tracked, strip secrets into
+a separate (ignored) Secret manifest first.
+
+## Verify before apply
+
+Run `kubectl --kubeconfig=cluster.yaml diff -f <manifest>` and confirm the only
+intended change (usually the image tag) — never blindly apply a stale local
+manifest, as local files may lag behind live config.

@@ -27,7 +27,7 @@ import requests
 import websockets
 from kubernetes.client.rest import ApiException
 
-from .config import settings, INSTANCE_TYPES
+from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
 from .models import (
     NotebookRequest, 
     NotebookStatus, 
@@ -36,6 +36,7 @@ from .models import (
     DestroyResponse,
     ImageRequest,
     CreditGrantRequest,
+    EditorGrantRequest,
     InstanceBulkDestroyRequest,
     CouponRedeemRequest,
     NotebookTemplateRequest,
@@ -77,7 +78,9 @@ from .store import (
     list_images,
     list_notebook_templates,
     list_users,
+    set_user_editor,
     mark_instance_deleted,
+    mark_instance_ready_for_billing,
     record_instance,
     record_instance_launch_event,
     redeem_user_coupon,
@@ -307,15 +310,22 @@ def _template_asset_base_path(template_id: int, notebook_path: str) -> str:
 
 
 def _template_github_info(template: dict) -> dict:
-    if not template.get("repo_url") or not template.get("notebook_path"):
+    # App types (gradio/streamlit/...) clone the repo without needing a notebook
+    # path; notebook types require both repo_url and notebook_path.
+    itype = (template.get("instance_type") or "").strip()
+    is_app = itype in APP_FRAMEWORK_PRESETS
+    if not template.get("repo_url"):
+        return {}
+    if not is_app and not template.get("notebook_path"):
         return {}
     org, repo = _github_repo_parts(template["repo_url"])
+    notebook_path = (template.get("notebook_path") or "").lstrip("/")
     return {
         "org": org,
         "repo": repo,
         "branch": template["branch"],
-        "path": template["notebook_path"].lstrip("/"),
-        "raw_url": _github_raw_url(template["repo_url"], template["branch"], template["notebook_path"]),
+        "path": notebook_path,
+        "raw_url": _github_raw_url(template["repo_url"], template["branch"], template["notebook_path"]) if notebook_path else "",
         "repo_url": _github_clone_url(template["repo_url"]),
         "template_id": str(template["id"]),
         "template_title": template["title"],
@@ -340,10 +350,22 @@ def _save_notebook_template(
         enabled_override = False
     has_repo = bool((req.repo_url or "").strip())
     has_notebook = bool((req.notebook_path or "").strip())
-    if has_repo != has_notebook:
+    _req_itype = (req.instance_type or "").strip()
+    _is_app_type = _req_itype in APP_FRAMEWORK_PRESETS
+    # App types may provide a repo without a notebook path (the repo is cloned and
+    # the app is started). Notebook types require repo+notebook together (or neither).
+    if not _is_app_type and has_repo != has_notebook:
         raise ValueError("GitHub repo URL and notebook path must be provided together, or both left empty for an image-only template")
     if has_repo:
         _github_repo_parts(req.repo_url or "")
+    template_instance_type = (req.instance_type or "").strip() or None
+    if template_instance_type is not None:
+        type_cfg = INSTANCE_TYPES.get(template_instance_type)
+        if not type_cfg or not type_cfg.get("enabled"):
+            raise ValueError("Invalid or disabled instance type for template")
+    template_app_port = req.app_port if req.app_port else None
+    if template_app_port is not None and int(template_app_port) not in set(settings.APP_PORTS.values()):
+        raise ValueError(f"app_port must be one of the curated app ports: {sorted(set(settings.APP_PORTS.values()))}")
     template = upsert_notebook_template(
         req.title,
         req.slug or "",
@@ -360,6 +382,10 @@ def _save_notebook_template(
         template_id=template_id,
         owner_user_id=owner_user_id,
         upsert_on_slug_conflict=owner_user_id is None,
+        instance_type=template_instance_type,
+        start_command=req.start_command,
+        app_port=template_app_port,
+        model_source=(req.model_source or "").strip().lower() or None,
     )
     if template.get("repo_url") and template.get("notebook_path"):
         ensure_template_preview_cache(template, force=True)
@@ -391,6 +417,74 @@ def _instance_public_url(request: Request, instance_id: str, notebook_path: Opti
     return f"{_request_public_origin(request)}{path}?token={settings.NOTEBOOK_TOKEN}"
 
 
+def _ready_instance_url(request: Request, instance: Optional[dict], status: Optional[str]) -> Optional[str]:
+    if status != "ready" or not instance:
+        return None
+    itype = (instance.get("instance_type") or "").strip()
+    if itype in APP_FRAMEWORK_PRESETS:
+        port = instance.get("app_port") or APP_FRAMEWORK_PRESETS[itype].get("port")
+        origin = _request_public_origin(request) if request else (settings.PUBLIC_BASE_URL or "").rstrip("/")
+        return f"{origin}{settings.SPACES_PATH_PREFIX}/{instance['id']}/{port}/"
+    return _instance_public_url(request, instance["id"], instance.get("github_path"))
+
+
+def _fetch_api_model(instance: dict, port: int, suffix: str) -> Optional[str]:
+    """Best-effort: query the running OpenAI-compatible endpoint for its served
+    model id so the UI can show a real value in the curl example."""
+    try:
+        pod_ip = None
+        try:
+            pod = k8s_client.core_v1.read_namespaced_pod(name=instance["id"], namespace=k8s_client.namespace)
+            pod_ip = pod.status.pod_ip if pod and pod.status else None
+        except Exception:
+            return None
+        if not pod_ip:
+            return None
+        headers = {}
+        if instance.get("api_key"):
+            headers["Authorization"] = f"Bearer {instance['api_key']}"
+        resp = requests.get(f"http://{pod_ip}:{port}{suffix}/models", headers=headers, timeout=2)
+        if resp.status_code == 200:
+            data = resp.json().get("data") or []
+            if data:
+                return data[0].get("id")
+    except Exception:
+        return None
+    return None
+
+
+def _instance_api_info(request: Request, instance: Optional[dict], status: Optional[str]) -> tuple:
+    """For API-kind instances, return (base_url, api_key, model) once ready, else (None, None, None).
+    base_url is the OpenAI-compatible base, e.g. .../spaces/<id>/8000/v1"""
+    if status != "ready" or not instance or not instance.get("api_kind"):
+        return None, None, None
+    itype = (instance.get("instance_type") or "").strip()
+    port = instance.get("app_port") or APP_FRAMEWORK_PRESETS.get(itype, {}).get("port")
+    suffix = instance.get("api_base_suffix") or APP_FRAMEWORK_PRESETS.get(itype, {}).get("api_base_suffix", "")
+    origin = _request_public_origin(request) if request else (settings.PUBLIC_BASE_URL or "").rstrip("/")
+    base = f"{origin}{settings.SPACES_PATH_PREFIX}/{instance['id']}/{port}{suffix}"
+    model = _fetch_api_model(instance, port, suffix)
+    return base, instance.get("api_key"), model
+
+
+def _notebook_status_message(status_details: Optional[dict]) -> str:
+    status = (status_details or {}).get("status") or "unknown"
+    detail = (status_details or {}).get("message") or ""
+    defaults = {
+        "ready": "Your notebook is ready!",
+        "running": "Container is running, waiting for readiness...",
+        "jupyter_starting": "Jupyter is starting up...",
+        "pending": "Waiting for resources...",
+        "initializing": "Initializing notebook environment...",
+        "loading": "Loading notebook image...",
+        "failed": "Notebook creation failed",
+        "unknown": "Checking status...",
+    }
+    if detail and status != "ready":
+        return detail
+    return defaults.get(status, "Checking status...")
+
+
 def _validate_resource_profile(profile: Optional[str]) -> str:
     value = (profile or "auto").strip().lower()
     if value == "auto" or value in RESOURCE_PROFILES:
@@ -411,25 +505,37 @@ def _active_instance_context(user: Optional[dict], request: Optional[Request] = 
         mark_instance_deleted(active_instance["instance_id"])
         return None
 
+    status_details = k8s_client.get_pod_status_details(user["email"].lower(), instance_id=active_instance["instance_id"]) or {}
+    live_status = status_details.get("status")
+    if live_status == "ready" and active_instance.get("status") != "running":
+        active_instance = mark_instance_ready_for_billing(active_instance["instance_id"]) or active_instance
+
     created_at = datetime.fromisoformat(active_instance["created_at"])
     now = datetime.now(timezone.utc)
-    runtime_seconds = max(0, int((now - created_at).total_seconds()))
+    runtime_seconds = max(0, int((now - created_at).total_seconds())) if active_instance.get("status") == "running" else 0
     active_instance["runtime_minutes"] = runtime_seconds // 60
     active_instance["runtime_hours_display"] = round(runtime_seconds / 3600, 2)
     active_instance["credits_consumed"] = get_charged_credits_for_instance(
         active_instance["instance_id"],
         active_instance.get("billing_session_id"),
     )
-    active_instance["url"] = (
-        _instance_public_url(request, live_instance["id"], live_instance.get("github_path"))
-        if request else live_instance.get("url")
-    )
-    active_instance["opencode_url"] = live_instance.get("opencode_url")
-    active_instance["opencode_username"] = live_instance.get("opencode_username")
-    active_instance["opencode_password"] = live_instance.get("opencode_password")
+    active_instance["live_status"] = live_status or "unknown"
+    active_instance["live_reason"] = status_details.get("reason")
+    active_instance["live_message"] = status_details.get("message")
+    active_instance["url"] = _ready_instance_url(request, live_instance, "ready") if request else live_instance.get("url")
+    notebook_like = (live_instance.get("instance_type") or "").strip() in {"jupyter", "opencode"}
+    active_instance["opencode_url"] = live_instance.get("opencode_url") if notebook_like else None
+    active_instance["opencode_username"] = live_instance.get("opencode_username") if notebook_like else None
+    active_instance["opencode_password"] = live_instance.get("opencode_password") if notebook_like else None
     active_instance["github_path"] = live_instance.get("github_path")
     active_instance["template_id"] = live_instance.get("template_id")
     active_instance["template_title"] = live_instance.get("template_title")
+    active_instance["instance_type"] = live_instance.get("instance_type")
+    active_instance["app_port"] = live_instance.get("app_port")
+    api_base_url, api_key, api_model = _instance_api_info(request, live_instance, live_status)
+    active_instance["api_base_url"] = api_base_url
+    active_instance["api_key"] = api_key
+    active_instance["api_model"] = api_model
     return active_instance
 
 
@@ -556,6 +662,28 @@ async def _close_httpx_stream(upstream: httpx.Response, client: httpx.AsyncClien
     await client.aclose()
 
 
+# Shared pooled client for the instance/app (spaces) HTTP proxies. A new client
+# per request (with a 1-hour timeout) leaked connections and overwhelmed
+# single-threaded backends (e.g. ComfyUI aiohttp) under the browser's burst of
+# concurrent asset requests. A bounded shared pool reuses/limits connections.
+_proxy_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_proxy_client() -> httpx.AsyncClient:
+    global _proxy_client
+    if _proxy_client is None or _proxy_client.is_closed:
+        _proxy_client = httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=30.0),
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32, keepalive_expiry=30.0),
+        )
+    return _proxy_client
+
+
+async def _close_upstream_only(upstream: httpx.Response):
+    await upstream.aclose()
+
+
 def _request_with_retries(method: str, url: str, retries: int = 3, **kwargs) -> requests.Response:
     last_error = None
     timeout = kwargs.pop("timeout", 30)
@@ -649,6 +777,8 @@ async def index(request: Request):
             "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
+            "disk_size_min_gb": settings.DISK_SIZE_MIN_GB,
+            "disk_size_max_by_gpu_json": json.dumps(settings.DISK_SIZE_MAX_BY_GPU),
         },
     )
 
@@ -868,6 +998,11 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
 
+    disk_max = settings.DISK_SIZE_MAX_BY_GPU.get(gpu_count, settings.DISK_SIZE_MIN_GB)
+    disk_size_gb = req.disk_size_gb if req.disk_size_gb else disk_max
+    if disk_size_gb < settings.DISK_SIZE_MIN_GB or disk_size_gb > disk_max:
+        raise HTTPException(status_code=400, detail=f"Disk size must be between {settings.DISK_SIZE_MIN_GB}G and {disk_max}G for this instance scale")
+
     if not _resolve_launchable_image(user, image):
         raise HTTPException(status_code=400, detail="Invalid image selected")
 
@@ -892,6 +1027,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             gpu_count=gpu_count,
             custom_instance_id=instance_id,
             resource_profile=resource_profile,
+            disk_size_gb=disk_size_gb,
         )
         record_instance(
             user["id"], email, instance["id"], image, instance_type, gpu_count,
@@ -907,17 +1043,10 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             gpu_count=gpu_count,
         )
 
-        public_url = _instance_public_url(request, instance["id"])
-        if public_url:
-            send_notebook_url_email(email, public_url)
-
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your instance...",
-            url=public_url,
-            opencode_url=instance.get("opencode_url"),
-            opencode_username=instance.get("opencode_username"),
-            opencode_password=instance.get("opencode_password"),
+            url=None,
             email=email
         )
 
@@ -955,37 +1084,39 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
                 email=email
             )
         
-        status = k8s_client.get_pod_status(email, instance_id=active["instance_id"])
+        status_details = k8s_client.get_pod_status_details(email, instance_id=active["instance_id"]) or {}
+        status = status_details.get("status")
+        if status == "ready" and active.get("status") != "running":
+            active = mark_instance_ready_for_billing(active["instance_id"]) or active
         
-        status_messages = {
-            "ready": "Your notebook is ready!",
-            "running": "Container is running, starting Jupyter...",
-            "jupyter_starting": "Jupyter is starting up...",
-            "pending": "Waiting for resources...",
-            "initializing": "Initializing notebook environment...",
-            "loading": "Loading notebook image...",
-            "failed": "Notebook creation failed",
-            "unknown": "Checking status..."
-        }
-        
-        message = status_messages.get(status, "Checking status...")
-        if status not in ("ready", "failed"):
+        if status not in ("ready", "failed") and not status_details.get("message"):
             try:
                 detail = k8s_client.get_startup_detail(active["instance_id"])
             except Exception as e:
                 logger.debug("get_startup_detail failed for %s: %s", active["instance_id"], e)
                 detail = None
             if detail:
-                message = detail
+                status_details["message"] = detail
 
+        api_base_url, api_key, api_model = _instance_api_info(request, instance, status)
         return NotebookStatus(
             status=status or "unknown",
-            message=message,
-            url=_instance_public_url(request, instance["id"], instance.get("github_path")),
-            opencode_url=instance.get("opencode_url"),
-            opencode_username=instance.get("opencode_username"),
-            opencode_password=instance.get("opencode_password"),
-            email=email
+            message=_notebook_status_message(status_details),
+            url=_ready_instance_url(request, instance, status),
+            opencode_url=instance.get("opencode_url") if status == "ready" else None,
+            opencode_username=instance.get("opencode_username") if status == "ready" else None,
+            opencode_password=instance.get("opencode_password") if status == "ready" else None,
+            email=email,
+            instance_id=active["instance_id"],
+            phase=status_details.get("phase"),
+            reason=status_details.get("reason"),
+            detail=status_details.get("message"),
+            ready=bool(status_details.get("ready")),
+            instance_type=(instance.get("instance_type") if instance else None),
+            app_port=(instance.get("app_port") if instance else None),
+            api_base_url=api_base_url,
+            api_key=api_key,
+            api_model=api_model,
         )
 
     except Exception as e:
@@ -1297,21 +1428,25 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
 
     email = user["email"].lower()
     try:
-        github_info = _template_github_info(template) if template.get("repo_url") and template.get("notebook_path") else None
+        github_info = _template_github_info(template) or None
+        template_instance_type = (template.get("instance_type") or "").strip() or "opencode"
         instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
         instance = k8s_client.create_instance(
             email,
             template["image"],
-            instance_type="opencode",
+            instance_type=template_instance_type,
             gpu_count=gpu_count,
             github_info=github_info,
             custom_instance_id=instance_id,
             resource_profile="auto",
             template_id=str(template["id"]),
             template_title=template["title"],
+            start_command=template.get("start_command"),
+            app_port=template.get("app_port"),
+            model_source=template.get("model_source"),
         )
         record_instance(
-            user["id"], email, instance["id"], template["image"], "opencode", gpu_count,
+            user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count,
             instance.get("node_port"), instance.get("opencode_node_port"),
         )
         record_instance_launch_event(
@@ -1319,7 +1454,7 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             email,
             instance["id"],
             template["image"],
-            "opencode",
+            template_instance_type,
             gpu_count,
             template_id=template["id"],
             template_title=template["title"],
@@ -1329,20 +1464,14 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
         await report_gpu_instance_created_event(
             instance_id=instance["id"],
             user_id=user["id"],
-            instance_type="opencode",
+            instance_type=template_instance_type,
             gpu_count=gpu_count,
             template_id=template["id"],
         )
-        public_url = _instance_public_url(request, instance["id"], github_info.get("path") if github_info else None)
-        if public_url:
-            send_notebook_url_email(email, public_url)
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your notebook template...",
-            url=public_url,
-            opencode_url=instance.get("opencode_url"),
-            opencode_username=instance.get("opencode_username"),
-            opencode_password=instance.get("opencode_password"),
+            url=None,
             email=email,
             instance_id=instance["id"],
         )
@@ -1654,10 +1783,7 @@ async def create_github_notebook(
         return NotebookStatus(
             status="exists",
             message="Instance already exists",
-            url=existing.get("url"),
-            opencode_url=existing.get("opencode_url"),
-            opencode_username=existing.get("opencode_username"),
-            opencode_password=existing.get("opencode_password"),
+            url=None,
             instance_id=instance_id
         )
     
@@ -1683,10 +1809,7 @@ async def create_github_notebook(
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your notebook...",
-            url=instance.get("url"),
-            opencode_url=instance.get("opencode_url"),
-            opencode_username=instance.get("opencode_username"),
-            opencode_password=instance.get("opencode_password"),
+            url=None,
             instance_id=instance_id
         )
 
@@ -1721,30 +1844,26 @@ async def check_github_status(
                 instance_id=instance_id
             )
         
-        status = k8s_client.get_pod_status("", instance_id=instance_id)
+        status_details = k8s_client.get_pod_status_details("", instance_id=instance_id) or {}
+        status = status_details.get("status")
         
         # Normalize status for frontend - 'ready' means 'running' and ready to use
+        ready = status == "ready"
         if status == "ready":
             status = "running"
         
-        status_messages = {
-            "running": "Your notebook is ready!",
-            "jupyter_starting": "Jupyter is starting up...",
-            "pending": "Waiting for resources...",
-            "initializing": "Initializing notebook environment...",
-            "loading": "Loading notebook image...",
-            "failed": "Notebook creation failed",
-            "unknown": "Checking status..."
-        }
-        
         return NotebookStatus(
             status=status or "unknown",
-            message=status_messages.get(status, "Checking status..."),
-            url=instance.get("url"),
-            opencode_url=instance.get("opencode_url"),
-            opencode_username=instance.get("opencode_username"),
-            opencode_password=instance.get("opencode_password"),
-            instance_id=instance_id
+            message="Your notebook is ready!" if ready else _notebook_status_message(status_details),
+            url=instance.get("url") if ready else None,
+            opencode_url=instance.get("opencode_url") if ready else None,
+            opencode_username=instance.get("opencode_username") if ready else None,
+            opencode_password=instance.get("opencode_password") if ready else None,
+            instance_id=instance_id,
+            phase=status_details.get("phase"),
+            reason=status_details.get("reason"),
+            detail=status_details.get("message"),
+            ready=ready,
         )
 
     except Exception as e:
@@ -1765,8 +1884,7 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
         target_url += f"?{request.url.query}"
 
     body = await request.body()
-    timeout = httpx.Timeout(3600.0, connect=10.0)
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    client = _get_proxy_client()
     upstream = await client.send(
         client.build_request(
             request.method,
@@ -1787,7 +1905,7 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
         upstream.aiter_raw(),
         status_code=upstream.status_code,
         headers=response_headers,
-        background=BackgroundTask(_close_httpx_stream, upstream, client),
+        background=BackgroundTask(_close_upstream_only, upstream),
     )
     for cookie in upstream.headers.get_list("set-cookie"):
         response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
@@ -1832,6 +1950,158 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
         return
     except Exception as e:
         logger.error(f"WebSocket proxy failed for {instance_id}/{path}: {e}")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+
+
+# =============================================================================
+# Spaces app-port proxy (user apps like Gradio/Streamlit on curated ports)
+# =============================================================================
+
+def _instance_pod_ip(instance_id: str) -> str:
+    try:
+        pod = k8s_client.core_v1.read_namespaced_pod(name=instance_id, namespace=k8s_client.namespace)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Instance pod not found")
+    ip = pod.status.pod_ip if pod and pod.status else None
+    if not ip:
+        raise HTTPException(status_code=503, detail="Instance is still starting")
+    return ip
+
+
+def _validate_app_port(port: str) -> int:
+    try:
+        p = int(port)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid app port")
+    if p not in set(settings.APP_PORTS.values()):
+        raise HTTPException(status_code=403, detail="App port is not in the allowed set")
+    return p
+
+
+def _app_port_proxy_mode(app_port: int) -> str:
+    """preserve = keep /spaces/<id>/<port> prefix (base-path-aware apps like Gradio);
+    strip = remove the prefix before forwarding (apps like ComfyUI that can't run
+    under a sub-path)."""
+    from .config import APP_FRAMEWORK_PRESETS
+    for name, preset in APP_FRAMEWORK_PRESETS.items():
+        if int(preset.get("port") or 0) == app_port:
+            return preset.get("proxy_mode", "preserve")
+    return "preserve"
+
+
+def _space_upstream_path(request_or_ws, instance_id: str, app_port: int, mode: str) -> str:
+    """Compute the upstream path. For strip mode use the raw (still-encoded) path
+    so %2F is preserved (ComfyUI workflow saves depend on this)."""
+    prefix = f"{settings.SPACES_PATH_PREFIX}/{instance_id}/{app_port}"
+    if mode == "strip":
+        raw = request_or_ws.scope.get("raw_path") or request_or_ws.url.path.encode()
+        raw_str = raw.decode("latin-1") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        stripped = raw_str[len(prefix):] if raw_str.startswith(prefix) else raw_str
+        if not stripped.startswith("/"):
+            stripped = "/" + stripped
+        return stripped
+    return request_or_ws.url.path
+
+
+@app.get(f"{settings.SPACES_PATH_PREFIX}/{{instance_id}}/{{port}}")
+async def proxy_space_root_redirect(instance_id: str, port: str):
+    _validate_app_port(port)
+    return RedirectResponse(url=f"{settings.SPACES_PATH_PREFIX}/{instance_id}/{port}/")
+
+
+@app.api_route(f"{settings.SPACES_PATH_PREFIX}/{{instance_id}}/{{port}}/{{path:path}}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+async def proxy_space_http(instance_id: str, port: str, path: str, request: Request):
+    """Proxy HTTP traffic to a user app on a curated port. Path is preserved so a
+    base-path-aware app (Gradio root_path / Streamlit baseUrlPath) resolves correctly."""
+    app_port = _validate_app_port(port)
+    mode = _app_port_proxy_mode(app_port)
+    target_base = f"http://{_instance_pod_ip(instance_id)}:{app_port}"
+    upstream_path = _space_upstream_path(request, instance_id, app_port, mode)
+    target_url = f"{target_base}{upstream_path}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+
+    # Preserve the public Host + forwarded info so apps (e.g. Gradio) build
+    # correct external URLs instead of using the internal pod IP they receive.
+    fwd_headers = _proxy_headers(request.headers)
+    public_host = request.headers.get("host") or request.url.netloc
+    fwd_headers["host"] = public_host
+    fwd_headers["X-Forwarded-Host"] = public_host
+    fwd_headers["X-Forwarded-Proto"] = request.headers.get("x-forwarded-proto", request.url.scheme)
+    fwd_headers["X-Forwarded-Prefix"] = f"{settings.SPACES_PATH_PREFIX}/{instance_id}/{app_port}"
+
+    body = await request.body()
+    client = _get_proxy_client()
+    upstream = await client.send(
+        client.build_request(
+            request.method,
+            target_url,
+            headers=fwd_headers,
+            content=body,
+        ),
+        stream=True,
+    )
+    # Keep content-encoding (we stream raw/compressed bytes); drop only hop-by-hop
+    # and length/cookie headers we re-add separately.
+    response_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in {"transfer-encoding", "connection", "content-length", "set-cookie"}
+    }
+    response = StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        background=BackgroundTask(_close_upstream_only, upstream),
+    )
+    for cookie in upstream.headers.get_list("set-cookie"):
+        response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
+    return response
+
+
+@app.websocket(f"{settings.SPACES_PATH_PREFIX}/{{instance_id}}/{{port}}/{{path:path}}")
+async def proxy_space_websocket(websocket: WebSocket, instance_id: str, port: str, path: str):
+    """Proxy WebSocket traffic for user apps (Gradio/Streamlit live updates)."""
+    await websocket.accept()
+    try:
+        app_port = _validate_app_port(port)
+        mode = _app_port_proxy_mode(app_port)
+        target_base = f"http://{_instance_pod_ip(instance_id)}:{app_port}".replace("http://", "ws://")
+        upstream_path = _space_upstream_path(websocket, instance_id, app_port, mode)
+        target_url = f"{target_base}{upstream_path}"
+        if websocket.url.query:
+            target_url += f"?{websocket.url.query}"
+
+        headers = []
+        if websocket.headers.get("cookie"):
+            headers.append(("cookie", websocket.headers["cookie"]))
+
+        async with websockets.connect(target_url, additional_headers=headers, open_timeout=10, max_size=16 * 1024 * 1024, max_queue=4) as upstream:
+            async def client_to_upstream():
+                while True:
+                    msg = await websocket.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        await upstream.close()
+                        break
+                    if msg.get("text") is not None:
+                        await upstream.send(msg["text"])
+                    elif msg.get("bytes") is not None:
+                        await upstream.send(msg["bytes"])
+
+            async def upstream_to_client():
+                async for msg in upstream:
+                    if isinstance(msg, bytes):
+                        await websocket.send_bytes(msg)
+                    else:
+                        await websocket.send_text(msg)
+
+            await asyncio.gather(client_to_upstream(), upstream_to_client())
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        logger.error(f"Space WS proxy failed for {instance_id}:{port}/{path}: {e}")
         try:
             await websocket.close(code=1011)
         except Exception:
@@ -1906,6 +2176,14 @@ async def admin_grant_credits(user_id: int, req: CreditGrantRequest, username: s
         raise HTTPException(status_code=400, detail="amount must be positive")
 
     user = grant_user_credits(user_id, req.amount, req.reason or "manual admin grant")
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user": user}
+
+
+@app.post("/api/admin/users/{user_id}/editor")
+async def admin_set_editor(user_id: int, req: EditorGrantRequest, username: str = Depends(verify_admin)):
+    user = set_user_editor(user_id, req.is_editor)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return {"user": user}

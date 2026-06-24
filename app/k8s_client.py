@@ -6,6 +6,7 @@ import hmac
 import logging
 import os
 import re
+import secrets
 import shlex
 import socket
 import time
@@ -18,7 +19,7 @@ from urllib.parse import quote, urlparse, urlunparse
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-from .config import settings, INSTANCE_TYPES
+from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
 
 logger = logging.getLogger(__name__)
 
@@ -474,6 +475,66 @@ cd {workspace}
             parsed.fragment,
         ))
 
+    def _resolve_app_command(self, instance_type: str, start_command: Optional[str], app_port: Optional[int]) -> tuple:
+        """Resolve the effective start command + port for an app-type instance.
+        Template override wins; otherwise the framework preset default is used."""
+        preset = APP_FRAMEWORK_PRESETS.get(instance_type, {})
+        cmd = (start_command or "").strip() or preset.get("start_command", "")
+        port = int(app_port) if app_port else int(preset.get("port") or settings.APP_PORTS.get(instance_type) or 8000)
+        return cmd, port
+
+    def _build_app_startup_script(self, instance_id: str, instance_type: str,
+                                  github_info: Optional[dict] = None,
+                                  start_command: Optional[str] = None,
+                                  app_port: Optional[int] = None) -> str:
+        """Build the startup script for an app-type instance (Gradio/Streamlit/ComfyUI).
+        Clones the template repo if provided, then runs the resolved start command.
+        The app must listen on its app port; the manager proxies it under
+        /spaces/<id>/<port>/ (Gradio/Streamlit are base-path-aware via injected env)."""
+        workspace = shlex.quote(settings.WORKSPACE_MOUNT_PATH)
+        cmd, _port = self._resolve_app_command(instance_type, start_command, app_port)
+        clone_block = ""
+        run_dir = settings.WORKSPACE_MOUNT_PATH
+        if github_info and (github_info.get("repo_url") or github_info.get("clone_url")):
+            repo_url = github_info.get("repo_url") or github_info.get("clone_url")
+            branch_q = shlex.quote(github_info.get("branch") or "main")
+            repo_url_q = shlex.quote(repo_url)
+            clone_block = f"""
+if [ ! -e {workspace}/repo ]; then
+    echo "Cloning {repo_url}..."
+    for i in 1 2 3; do
+        rm -rf {workspace}/.repo-tmp
+        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {workspace}/.repo-tmp; then
+            mv {workspace}/.repo-tmp {workspace}/repo
+            echo "Repository cloned"
+            break
+        fi
+        echo "Git clone attempt $i failed, retrying..."
+        sleep $((i * 3))
+    done
+fi
+"""
+            run_dir = f"{settings.WORKSPACE_MOUNT_PATH}/repo"
+        pip_index = settings.PIP_INDEX_URL.strip()
+        pip_flag = f"-i {shlex.quote(pip_index)} " if pip_index else ""
+        return f"""
+set -e
+export PATH="/root/.opencode/bin:$PATH"
+mkdir -p {workspace}
+{clone_block}
+cd {shlex.quote(run_dir)} 2>/dev/null || cd {workspace}
+if [ -f requirements.txt ]; then
+    echo "Installing requirements.txt..."
+    pip install {pip_flag}-r requirements.txt || echo "WARN: pip install -r requirements.txt failed"
+fi
+if [ -n "$VLLM_USE_MODELSCOPE" ] && ! python -c "import modelscope" 2>/dev/null; then
+    echo "Installing modelscope..."
+    pip install {pip_flag}modelscope || echo "WARN: pip install modelscope failed"
+fi
+echo "Starting {instance_type} app: {cmd}"
+exec {cmd}
+"""
+
     def _get_pod_manifest(self, email: str, instance_id: str, image: str,
                           instance_type: str = "jupyter",
                           gpu_count: int = 1,
@@ -483,7 +544,11 @@ cd {workspace}
                           workspace_quota_node_name: Optional[str] = None,
                           notebook_node_name: Optional[str] = None,
                           template_id: Optional[str] = None,
-                          template_title: Optional[str] = None) -> dict:
+                          template_title: Optional[str] = None,
+                          start_command: Optional[str] = None,
+                          app_port: Optional[int] = None,
+                          disk_size_gb: Optional[int] = None,
+                          model_source: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -530,16 +595,40 @@ cd {workspace}
         if template_title:
             annotations["amd-oneclick/template-title"] = template_title
 
-        startup_script = self._build_startup_script(instance_id, instance_type, github_info)
+        image_defined_command = bool(INSTANCE_TYPES.get(instance_type, {}).get("image_defined_command"))
+        app_preset = APP_FRAMEWORK_PRESETS.get(instance_type)
+        is_app_type = app_preset is not None
+        api_key_value = None
+        if is_app_type:
+            _eff_cmd, _eff_port = self._resolve_app_command(instance_type, start_command, app_port)
+            annotations["amd-oneclick/app-port"] = str(_eff_port)
+            if app_preset.get("api_kind"):
+                annotations["amd-oneclick/api-kind"] = "true"
+                annotations["amd-oneclick/api-base-suffix"] = app_preset.get("api_base_suffix", "")
+                # Per-instance API key so the exposed model endpoint is not open to anyone.
+                api_key_value = f"sk-{secrets.token_hex(20)}"
+                annotations["amd-oneclick/api-key"] = api_key_value
+            startup_script = self._build_app_startup_script(
+                instance_id, instance_type, github_info,
+                start_command=start_command, app_port=app_port,
+            )
+        else:
+            startup_script = self._build_startup_script(instance_id, instance_type, github_info)
 
         workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
         workspace_uses_empty_dir = workspace_volume_type == "emptydir"
+        hf_cache_volume_type = (settings.HF_CACHE_VOLUME_TYPE or "emptyDir").strip().lower()
+        hf_cache_uses_empty_dir = hf_cache_volume_type == "emptydir"
 
+        # App-type images often bake their app under /workspace (e.g. ComfyUI at
+        # /workspace/ComfyUI). Mounting our workspace volume there would hide the
+        # image's files, so app types do not get the /workspace overmount.
         volume_mounts = [
             {"name": "shm", "mountPath": "/dev/shm"},
             {"name": "hf-cache", "mountPath": settings.HF_CACHE_MOUNT_PATH},
-            {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH},
         ]
+        if not is_app_type:
+            volume_mounts.append({"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH})
         volumes = [
             {
                 "name": "shm",
@@ -548,17 +637,27 @@ cd {workspace}
                     "sizeLimit": "64Gi"
                 }
             },
-            {
+        ]
+        if hf_cache_uses_empty_dir:
+            hf_cache_empty_dir = {}
+            if settings.HF_CACHE_EMPTYDIR_SIZE_LIMIT.strip():
+                hf_cache_empty_dir["sizeLimit"] = settings.HF_CACHE_EMPTYDIR_SIZE_LIMIT.strip()
+            volumes.append({"name": "hf-cache", "emptyDir": hf_cache_empty_dir})
+        else:
+            volumes.append({
                 "name": "hf-cache",
                 "hostPath": {
                     "path": settings.HF_CACHE_HOST_PATH,
                     "type": "DirectoryOrCreate"
                 }
-            },
-        ]
-        if workspace_uses_empty_dir:
+            })
+        if is_app_type:
+            pass  # no workspace volume; the app lives in the image
+        elif workspace_uses_empty_dir:
             workspace_empty_dir = {}
-            if settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
+            if disk_size_gb:
+                workspace_empty_dir["sizeLimit"] = f"{int(disk_size_gb)}Gi"
+            elif settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
                 workspace_empty_dir["sizeLimit"] = settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip()
             volumes.append({"name": "workspace", "emptyDir": workspace_empty_dir})
         else:
@@ -585,7 +684,13 @@ cd {workspace}
             {"name": "OPENCODE_SERVER_USERNAME", "value": settings.OPENCODE_WEB_USERNAME},
             {"name": "OPENCODE_SERVER_PASSWORD", "value": self._opencode_password(instance_id)},
         ]
-        if settings.HF_ENDPOINT.strip():
+        use_modelscope = (model_source or "").strip().lower() == "modelscope"
+        if use_modelscope:
+            # vLLM/SGLang download the model from ModelScope instead of HuggingFace.
+            env.append({"name": "VLLM_USE_MODELSCOPE", "value": "True"})
+            env.append({"name": "SGLANG_USE_MODELSCOPE", "value": "True"})
+            env.append({"name": "MODELSCOPE_CACHE", "value": settings.HF_CACHE_MOUNT_PATH})
+        elif settings.HF_ENDPOINT.strip():
             env.append({"name": "HF_ENDPOINT", "value": settings.HF_ENDPOINT.strip()})
         hf_token_secret_name = settings.HF_TOKEN_SECRET_NAME.strip()
         if hf_token_secret_name:
@@ -601,6 +706,35 @@ cd {workspace}
             })
         elif settings.HF_TOKEN.strip():
             env.append({"name": "HF_TOKEN", "value": settings.HF_TOKEN.strip()})
+        if settings.PIP_INDEX_URL.strip():
+            env.append({"name": "PIP_INDEX_URL", "value": settings.PIP_INDEX_URL.strip()})
+        # Auto-configure common app frameworks so they serve under the Spaces
+        # proxy base path and bind 0.0.0.0:<curated port>. This lets a user run
+        # `gradio app.py` / `streamlit run app.py` from the notebook terminal and
+        # get a working forwarded URL with no extra flags.
+        spaces_prefix = settings.SPACES_PATH_PREFIX.rstrip("/")
+        gradio_port = settings.APP_PORTS.get("gradio")
+        streamlit_port = settings.APP_PORTS.get("streamlit")
+        if gradio_port:
+            env += [
+                {"name": "GRADIO_SERVER_NAME", "value": "0.0.0.0"},
+                {"name": "GRADIO_SERVER_PORT", "value": str(gradio_port)},
+                {"name": "GRADIO_ROOT_PATH", "value": f"{spaces_prefix}/{instance_id}/{gradio_port}"},
+            ]
+        if streamlit_port:
+            env += [
+                {"name": "STREAMLIT_SERVER_ADDRESS", "value": "0.0.0.0"},
+                {"name": "STREAMLIT_SERVER_PORT", "value": str(streamlit_port)},
+                {"name": "STREAMLIT_SERVER_BASE_URL_PATH", "value": f"{spaces_prefix}/{instance_id}/{streamlit_port}"},
+                {"name": "STREAMLIT_SERVER_HEADLESS", "value": "true"},
+                {"name": "STREAMLIT_SERVER_ENABLE_CORS", "value": "false"},
+                {"name": "STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION", "value": "false"},
+            ]
+        # API-kind instances: inject the per-instance API key under the framework's
+        # expected env var (e.g. VLLM_API_KEY) so the served endpoint requires it.
+        if api_key_value and app_preset and app_preset.get("api_key_env"):
+            env.append({"name": app_preset["api_key_env"], "value": api_key_value})
+            env.append({"name": "AMD_ONECLICK_API_KEY", "value": api_key_value})
         if network_disk_enabled:
             network_disk_mount = {
                 "name": "network-disk",
@@ -618,7 +752,7 @@ cd {workspace}
             env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
 
         init_containers = []
-        if settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir:
+        if settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir and not is_app_type:
             safe_id = self._safe_storage_segment(instance_id)
             quota_image_path = f"/quota-images/{safe_id}.img"
             init_containers.append({
@@ -671,10 +805,42 @@ findmnt "$mnt"
             "memory": resources["memory_request"],
             "amd.com/gpu": str(gpu_count)
         }
-        if settings.EPHEMERAL_STORAGE_LIMIT.strip():
-            container_limits["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_LIMIT.strip()
-        if settings.EPHEMERAL_STORAGE_REQUEST.strip():
-            container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
+        if disk_size_gb:
+            # Ephemeral-storage limit must cover the workspace emptyDir plus image
+            # writable layer/logs, so add a small buffer above the chosen disk size.
+            container_limits["ephemeral-storage"] = f"{int(disk_size_gb) + 20}Gi"
+            if settings.EPHEMERAL_STORAGE_REQUEST.strip():
+                container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
+        else:
+            if settings.EPHEMERAL_STORAGE_LIMIT.strip():
+                container_limits["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_LIMIT.strip()
+            if settings.EPHEMERAL_STORAGE_REQUEST.strip():
+                container_requests["ephemeral-storage"] = settings.EPHEMERAL_STORAGE_REQUEST.strip()
+
+        container_ports = [
+            {"containerPort": settings.NOTEBOOK_PORT, "name": "jupyter"},
+            {"containerPort": settings.OPENCODE_WEB_PORT, "name": "opencode"},
+        ]
+        for _app_name, _app_port in settings.APP_PORTS.items():
+            container_ports.append({"containerPort": int(_app_port), "name": _app_name[:15]})
+
+        notebook_container = {
+            "name": "notebook",
+            "image": image,
+            "imagePullPolicy": "IfNotPresent",
+            "ports": container_ports,
+            "resources": {
+                "limits": container_limits,
+                "requests": container_requests,
+            },
+            "env": env,
+            "volumeMounts": volume_mounts
+        }
+        # For image-defined instance types the manager does not assemble a start
+        # command; the image's own ENTRYPOINT/CMD runs and must listen on NOTEBOOK_PORT.
+        if not image_defined_command:
+            notebook_container["command"] = ["/bin/bash", "-c"]
+            notebook_container["args"] = [startup_script]
 
         # Custom images reuse the tag user-{id}:{name} across rebuilds, so IfNotPresent could
         # launch a stale cached layer on the node after a delete+rebuild. Force Always for the
@@ -683,6 +849,7 @@ findmnt "$mnt"
             settings.CUSTOM_IMAGE_REGISTRY and image.startswith(settings.CUSTOM_IMAGE_REGISTRY)
         )
         notebook_pull_policy = "Always" if is_custom_image else "IfNotPresent"
+        notebook_container["imagePullPolicy"] = notebook_pull_policy
 
         spec = {
             "securityContext": {
@@ -707,29 +874,7 @@ findmnt "$mnt"
             ],
             "tolerations": self._notebook_tolerations(),
             "containers": [
-                {
-                    "name": "notebook",
-                    "image": image,
-                    "imagePullPolicy": notebook_pull_policy,
-                    "command": ["/bin/bash", "-c"],
-                    "args": [startup_script],
-                    "ports": [
-                        {
-                            "containerPort": settings.NOTEBOOK_PORT,
-                            "name": "jupyter"
-                        },
-                        {
-                            "containerPort": settings.OPENCODE_WEB_PORT,
-                            "name": "opencode"
-                        }
-                    ],
-                    "resources": {
-                        "limits": container_limits,
-                        "requests": container_requests,
-                    },
-                    "env": env,
-                    "volumeMounts": volume_mounts
-                }
+                notebook_container
             ],
             "volumes": volumes,
             "restartPolicy": "Always"
@@ -884,6 +1029,33 @@ findmnt "$mnt"
                         continue
                     raise
         raise RuntimeError("Unable to allocate NodePort for service")
+
+    @staticmethod
+    def _normalize_image_ref(ref: str) -> str:
+        """Canonicalize a docker image reference for reliable comparison.
+
+        kubelet reports container status images in fully-qualified form
+        (e.g. ``docker.io/library/nginx:latest``) while the catalog may store
+        short names (e.g. ``nginx`` or ``rocm/atom-dev:tag``). Normalize both
+        sides so the sync counter matches regardless of how it was entered.
+        """
+        if not ref:
+            return ref
+        ref = ref.strip()
+        # Separate digest if present (keep it as-is, it is already canonical).
+        digest = ""
+        if "@" in ref:
+            ref, digest = ref.split("@", 1)
+            digest = "@" + digest
+        first = ref.split("/", 1)[0]
+        has_registry = "." in first or ":" in first or first == "localhost"
+        if not has_registry:
+            if "/" not in ref:
+                ref = "library/" + ref
+            ref = "docker.io/" + ref
+        if not digest and ":" not in ref.rsplit("/", 1)[-1]:
+            ref = ref + ":latest"
+        return ref + digest
 
     def _prepull_name(self, image_id: int) -> str:
         return f"image-prepull-catalog-{image_id}"
@@ -1181,7 +1353,7 @@ findmnt "$mnt"
                             {
                                 "name": "pull",
                                 "image": image,
-                                "imagePullPolicy": "Always",
+                                "imagePullPolicy": "IfNotPresent",
                                 "command": [
                                     "sh",
                                     "-c",
@@ -1351,6 +1523,7 @@ findmnt "$mnt"
             desired = len(eligible_nodes) or (ds.status.desired_number_scheduled or 0)
             ds_uid = ds.metadata.uid
             image = ds.spec.template.spec.containers[0].image
+            image_norm = self._normalize_image_ref(image)
             pulled_nodes = set()
             pods = self.core_v1.list_namespaced_pod(
                 namespace=self.namespace,
@@ -1365,7 +1538,7 @@ findmnt "$mnt"
                 if not statuses:
                     continue
                 status = statuses[0]
-                if status.image == image and status.image_id:
+                if status.image_id and self._normalize_image_ref(status.image) == image_norm:
                     pulled_nodes.add(pod.spec.node_name)
 
             effective_pulled_nodes = pulled_nodes & eligible_nodes if eligible_nodes else pulled_nodes
@@ -1539,14 +1712,38 @@ findmnt "$mnt"
                         custom_instance_id: Optional[str] = None,
                         resource_profile: Optional[str] = None,
                         template_id: Optional[str] = None,
-                        template_title: Optional[str] = None) -> dict:
+                        template_title: Optional[str] = None,
+                        start_command: Optional[str] = None,
+                        app_port: Optional[int] = None,
+                        disk_size_gb: Optional[int] = None,
+                        model_source: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
 
-        existing = self.get_instance_by_id(instance_id)
-        if existing:
-            return existing
+        # Reuse an existing pod only if it is NOT being deleted. A pod that is
+        # Terminating (deletionTimestamp set) is a stale instance from a prior
+        # launch; reusing it would return the old type/command. Wait for it to
+        # fully disappear so we can create a fresh pod.
+        try:
+            existing_pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+        except ApiException as e:
+            if e.status == 404:
+                existing_pod = None
+            else:
+                raise
+        if existing_pod is not None and existing_pod.metadata.deletion_timestamp is None:
+            return self.get_instance_by_id(instance_id)
+        if existing_pod is not None:
+            logger.info("Pod %s is terminating; waiting for deletion before recreate", instance_id)
+            for _ in range(30):
+                time.sleep(2)
+                try:
+                    self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+                except ApiException as e:
+                    if e.status == 404:
+                        break
+                    raise
 
         workspace_quota_node_name = self._ensure_workspace_quota(instance_id)
         notebook_node_name = self._resolve_notebook_node_name(workspace_quota_node_name)
@@ -1562,6 +1759,10 @@ findmnt "$mnt"
             notebook_node_name=notebook_node_name,
             template_id=template_id,
             template_title=template_title,
+            start_command=start_command,
+            app_port=app_port,
+            disk_size_gb=disk_size_gb,
+            model_source=model_source,
         )
         for attempt in range(1, 7):
             try:
@@ -1650,6 +1851,10 @@ findmnt "$mnt"
                 "opencode_url": self._build_opencode_url(opencode_node_port, instance_id),
                 **self._opencode_auth(opencode_node_port, instance_id),
                 "instance_type": instance_type,
+                "app_port": int(pod.metadata.annotations.get("amd-oneclick/app-port")) if pod.metadata.annotations.get("amd-oneclick/app-port") else None,
+                "api_kind": pod.metadata.annotations.get("amd-oneclick/api-kind") == "true",
+                "api_key": pod.metadata.annotations.get("amd-oneclick/api-key"),
+                "api_base_suffix": pod.metadata.annotations.get("amd-oneclick/api-base-suffix") or "",
                 "gpu_count": gpu_count,
                 "resource_profile": pod.metadata.annotations.get("amd-oneclick/resource-profile"),
                 "cpu_limit": pod.metadata.annotations.get("amd-oneclick/cpu-limit"),
@@ -1783,6 +1988,11 @@ findmnt "$mnt"
     
     def get_pod_status(self, email: str, instance_id: Optional[str] = None) -> Optional[str]:
         """Get the current status of a pod"""
+        details = self.get_pod_status_details(email, instance_id=instance_id)
+        return details.get("status") if details else None
+
+    def get_pod_status_details(self, email: str, instance_id: Optional[str] = None) -> Optional[dict]:
+        """Return structured pod readiness and failure details for UI and billing gates."""
         if not instance_id:
             instance_id = self._generate_instance_id(email)
         
@@ -1793,31 +2003,143 @@ findmnt "$mnt"
             )
             
             phase = pod.status.phase.lower() if pod.status.phase else "unknown"
+            reason = pod.status.reason or ""
+            message = pod.status.message or ""
+            pod_scheduled = True
+
+            for condition in pod.status.conditions or []:
+                if condition.type == "PodScheduled" and condition.status != "True":
+                    pod_scheduled = False
+                    reason = condition.reason or reason or "Unschedulable"
+                    message = condition.message or message or "Pod is not scheduled"
+                    return {
+                        "status": "pending",
+                        "phase": phase,
+                        "reason": reason,
+                        "message": message,
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
             
             # Check container statuses for more detail
             if pod.status.container_statuses:
                 container_status = pod.status.container_statuses[0]
                 if container_status.ready:
+                    # For app-type instances, readiness = the app port answering on the
+                    # pod IP (not Jupyter 8888 on the node port).
+                    annos = pod.metadata.annotations or {}
+                    app_port_anno = annos.get("amd-oneclick/app-port")
+                    if app_port_anno:
+                        pod_ip = pod.status.pod_ip
+                        if pod_ip and self._check_tcp_ready(pod_ip, int(app_port_anno)):
+                            return {
+                                "status": "ready", "phase": phase, "reason": "",
+                                "message": "App is ready", "ready": True,
+                                "pod_scheduled": pod_scheduled, "jupyter_ready": False,
+                            }
+                        return {
+                            "status": "jupyter_starting", "phase": phase, "reason": "AppStarting",
+                            "message": "Container is ready but the app is not responding yet",
+                            "ready": False, "pod_scheduled": pod_scheduled, "jupyter_ready": False,
+                        }
                     # Container is ready, but we need to verify Jupyter is actually responding
                     instance = self.get_instance_by_id(instance_id)
                     if instance and instance.get("node_port"):
                         if self._check_jupyter_ready(instance["node_port"]):
-                            return "ready"
+                            return {
+                                "status": "ready",
+                                "phase": phase,
+                                "reason": "",
+                                "message": "Notebook is ready",
+                                "ready": True,
+                                "pod_scheduled": pod_scheduled,
+                                "jupyter_ready": True,
+                            }
                         else:
-                            return "jupyter_starting"
-                    return "running"
+                            return {
+                                "status": "jupyter_starting",
+                                "phase": phase,
+                                "reason": "JupyterStarting",
+                                "message": "Container is ready but Jupyter is not responding yet",
+                                "ready": False,
+                                "pod_scheduled": pod_scheduled,
+                                "jupyter_ready": False,
+                            }
+                    return {
+                        "status": "running",
+                        "phase": phase,
+                        "reason": "ServicePending",
+                        "message": "Container is ready but service endpoint is not available yet",
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
                 elif container_status.state.waiting:
                     reason = container_status.state.waiting.reason or "waiting"
-                    if reason in ["ContainerCreating", "PodInitializing"]:
-                        return "initializing"
-                    elif reason == "ImagePullBackOff":
-                        return "failed"
-                    return "loading"
+                    message = container_status.state.waiting.message or ""
+                    failed_reasons = {
+                        "ImagePullBackOff",
+                        "ErrImagePull",
+                        "CrashLoopBackOff",
+                        "CreateContainerConfigError",
+                        "CreateContainerError",
+                        "InvalidImageName",
+                    }
+                    status = "failed" if reason in failed_reasons else ("initializing" if reason in ["ContainerCreating", "PodInitializing"] else "loading")
+                    return {
+                        "status": status,
+                        "phase": phase,
+                        "reason": reason,
+                        "message": message or reason,
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
+                elif container_status.state.terminated:
+                    reason = container_status.state.terminated.reason or "Terminated"
+                    message = container_status.state.terminated.message or reason
+                    return {
+                        "status": "failed",
+                        "phase": phase,
+                        "reason": reason,
+                        "message": message,
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
                 elif container_status.state.running:
                     # Container is running but not ready yet
-                    return "running"
+                    return {
+                        "status": "running",
+                        "phase": phase,
+                        "reason": "ContainerNotReady",
+                        "message": "Container is running but readiness probe has not passed",
+                        "ready": False,
+                        "pod_scheduled": pod_scheduled,
+                        "jupyter_ready": False,
+                    }
             
-            return phase
+            if phase == "failed":
+                return {
+                    "status": "failed",
+                    "phase": phase,
+                    "reason": reason or "PodFailed",
+                    "message": message or "Pod failed",
+                    "ready": False,
+                    "pod_scheduled": pod_scheduled,
+                    "jupyter_ready": False,
+                }
+
+            return {
+                "status": phase,
+                "phase": phase,
+                "reason": reason or phase,
+                "message": message or f"Pod phase is {phase}",
+                "ready": False,
+                "pod_scheduled": pod_scheduled,
+                "jupyter_ready": False,
+            }
         except ApiException as e:
             if e.status == 404:
                 return None
@@ -1988,16 +2310,18 @@ findmnt "$mnt"
 
     def _check_jupyter_ready(self, node_port: int, timeout: float = 2.0) -> bool:
         """Check if Jupyter is responding on the given port"""
+        return self._check_tcp_ready(settings.SERVICE_HOST, node_port, timeout)
+
+    def _check_tcp_ready(self, host: str, port: int, timeout: float = 2.0) -> bool:
+        """Check if a TCP port accepts connections on the given host."""
         try:
-            # Try to connect to the Jupyter server
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
-            # Connect to any node in the cluster
-            result = sock.connect_ex((settings.SERVICE_HOST, node_port))
+            result = sock.connect_ex((host, port))
             sock.close()
             return result == 0
         except Exception as e:
-            logger.debug(f"Jupyter health check failed: {e}")
+            logger.debug(f"TCP health check failed for {host}:{port}: {e}")
             return False
     
     def check_pod_activity(self, email: str) -> Optional[datetime]:

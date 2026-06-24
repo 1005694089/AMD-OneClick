@@ -13,6 +13,7 @@ class NotebookRequest(BaseModel):
     instance_type: str = "jupyter"
     gpu_count: int = 1
     resource_profile: Optional[str] = "auto"
+    disk_size_gb: Optional[int] = None
 
 
 class ImageRequest(BaseModel):
@@ -27,6 +28,11 @@ class CreditGrantRequest(BaseModel):
     """Request model for manually granting credits to a user"""
     amount: int
     reason: Optional[str] = "manual admin grant"
+
+
+class EditorGrantRequest(BaseModel):
+    """Request model for granting/revoking editor (template publishing) permission"""
+    is_editor: bool
 
 
 class InstanceBulkDestroyRequest(BaseModel):
@@ -53,6 +59,10 @@ class NotebookTemplateRequest(BaseModel):
     cover_url: Optional[str] = ""
     enabled: bool = True
     sort_order: int = 0
+    instance_type: Optional[str] = ""
+    start_command: Optional[str] = ""
+    app_port: Optional[int] = None
+    model_source: Optional[str] = ""
 
 
 class TemplateLaunchRequest(BaseModel):
@@ -125,6 +135,15 @@ class NotebookStatus(BaseModel):
     opencode_password: Optional[str] = None
     email: Optional[str] = None
     instance_id: Optional[str] = None
+    phase: Optional[str] = None
+    reason: Optional[str] = None
+    detail: Optional[str] = None
+    ready: bool = False
+    instance_type: Optional[str] = None
+    app_port: Optional[int] = None
+    api_base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    api_model: Optional[str] = None
 
 
 class NotebookListItem(BaseModel):

@@ -10,6 +10,7 @@
   <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
   <style>
+    html { scrollbar-gutter: stable; }
     body { margin: 0; background: #f5f6fb; }
     #root { min-height: 100vh; }
     .app-header { height: 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; background: #fff; border-bottom: 1px solid #edf0f5; position: sticky; top: 0; z-index: 20; }
@@ -61,6 +62,26 @@
     .template-actions .ant-btn { min-width:0; flex:0 1 auto; }
     .template-actions .ant-btn > span { overflow:hidden; text-overflow:ellipsis; }
     .empty-gallery { padding:46px; text-align:center; background:#fff; border:1px dashed #d9e0ef; border-radius:18px; color:#747b8c; }
+    .launch-modal-body { padding:8px 4px 4px; }
+    .launch-modal-progress { margin-bottom:20px; }
+    .launch-modal-stage { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; font-weight:700; color:#3a4256; }
+    .launch-modal-pct { color:#8a93a6; font-weight:600; font-size:13px; }
+    .launch-modal-status { display:flex; align-items:flex-start; gap:0; padding:16px; border-radius:14px; background:#f6f8fd; border:1px solid #eaeefb; }
+    .launch-modal-status.ready { background:#f3fbf5; border-color:#cdeed5; }
+    .launch-modal-status.failed { background:#fff7f7; border-color:#ffd9d9; }
+    .launch-modal-title { font-weight:800; color:#273049; font-size:15px; }
+    .launch-modal-detail { margin-top:6px; color:#6b758c; line-height:1.5; font-size:13px; }
+    .launch-modal-technical { margin-top:14px; color:#6b758c; font-size:13px; }
+    .launch-modal-technical summary { cursor:pointer; color:#566175; font-weight:700; }
+    .launch-modal-technical-body { margin-top:8px; padding:10px 12px; border-radius:10px; background:#f5f6fa; white-space:pre-wrap; word-break:break-word; color:#7b8496; }
+    .api-access-card { margin-top:16px; padding:14px 16px; border:1px solid #d6e4ff; border-radius:14px; background:#f5f9ff; }
+    .api-access-title { font-weight:800; color:#273049; margin-bottom:10px; }
+    .api-access-row { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+    .api-access-label { width:72px; color:#6b758c; font-size:13px; flex:0 0 auto; }
+    .api-access-row code { background:#eef2fb; padding:2px 8px; border-radius:6px; word-break:break-all; font-size:13px; }
+    .api-access-curl summary { cursor:pointer; color:#566175; font-weight:700; font-size:13px; margin-top:4px; }
+    .api-access-pre { margin:0; padding:10px 12px; border-radius:10px; background:#0f1830; color:#cdd6f4; overflow:auto; font-size:12px; white-space:pre; }
+    .launch-card .ant-steps { margin-top:8px; }
     @media (max-width: 1120px) { .template-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } .gallery-hero-inner { grid-template-columns:1fr; } .gallery-art { display:none; } }
     @media (max-width: 900px) { .gallery-bar { align-items:flex-start; flex-direction:column; } .template-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
     @media (max-width: 680px) { .template-grid { grid-template-columns: 1fr; } }
@@ -70,7 +91,7 @@
 <body>
   <div id="root"></div>
   <script>
-    const { Alert, Avatar, Button, Card, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Select, Space, Tag, Typography, message } = antd;
+    const { Alert, Avatar, Button, Card, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Progress, Select, Space, Spin, Tag, Typography, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const currentUser = {{ user_json | safe }};
@@ -83,6 +104,8 @@
     const showAdminLogin = {{ admin_login_enabled | tojson }};
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
+    const diskSizeMinGb = {{ disk_size_min_gb | tojson }};
+    const diskSizeMaxByGpu = {{ disk_size_max_by_gpu_json | safe }};
 
     const JUPYTER_LOGO = 'https://cdn.jsdelivr.net/npm/simple-icons@13/icons/jupyter.svg';
     const OPENCODE_LOGO = 'https://opencode.ai/favicon.svg';
@@ -149,6 +172,23 @@
       const watchedGpuCount = Form.useWatch('gpu_count', form) || 1;
       const watchedResourceProfile = Form.useWatch('resource_profile', form) || 'auto';
       const [createForm] = Form.useForm();
+      const createInstanceType = Form.useWatch('instance_type', createForm) || 'opencode';
+      const appPortDefaults = { gradio: 7860, streamlit: 8501, comfyui: 8188, vllm: 8000, sglang: 30000 };
+      const appStartDefaults = { gradio: 'python app.py', streamlit: 'streamlit run app.py', comfyui: 'python main.py --listen 0.0.0.0 --port 8188', vllm: 'vllm serve <model> --host 0.0.0.0 --port 8000', sglang: 'python -m sglang.launch_server --model <model> --host 0.0.0.0 --port 30000' };
+      const instanceTypeOptions = [
+        { value: 'opencode', label: 'Notebook (Jupyter / OpenCode)' },
+        { value: 'gradio', label: 'Gradio App' },
+        { value: 'streamlit', label: 'Streamlit App' },
+        { value: 'comfyui', label: 'ComfyUI (one-click)' },
+        { value: 'vllm', label: 'vLLM Model API' },
+        { value: 'sglang', label: 'SGLang Model API' },
+        { value: 'custom', label: 'Custom Image (image-defined start command)' },
+      ];
+      const appTypeLabels = { gradio: 'Gradio', streamlit: 'Streamlit', comfyui: 'ComfyUI', vllm: 'vLLM API', sglang: 'SGLang API' };
+      const isApiType = ['vllm','sglang'].includes(createInstanceType);
+      const isAppType = ['gradio','streamlit','comfyui'].includes(createInstanceType) || isApiType;
+      const isNotebookType = ['opencode','jupyter'].includes(createInstanceType);
+      const needsGithub = ['gradio','streamlit','opencode','jupyter'].includes(createInstanceType);
       const [notebookLoading, setNotebookLoading] = React.useState(false);
       const [launchingTemplateId, setLaunchingTemplateId] = React.useState(null);
       const [readyUrl, setReadyUrl] = React.useState(initialActiveInstance.url || '');
@@ -165,6 +205,8 @@
       const [logsLoading, setLogsLoading] = React.useState(false);
       const [createModalOpen, setCreateModalOpen] = React.useState(false);
       const [createLoading, setCreateLoading] = React.useState(false);
+      const [launchStatus, setLaunchStatus] = React.useState(null);
+      const [launchModalOpen, setLaunchModalOpen] = React.useState(false);
       const [workshopLoginOpen, setWorkshopLoginOpen] = React.useState(false);
       const [workshopLoginLoading, setWorkshopLoginLoading] = React.useState(false);
       const [workshopForm] = Form.useForm();
@@ -175,6 +217,22 @@
       const [activeTab, setActiveTab] = React.useState(initialTab);
       const [gallerySearch, setGallerySearch] = React.useState('');
       const [activeTag, setActiveTag] = React.useState('All');
+      const [galleryKind, setGalleryKind] = React.useState('notebook');
+      function templateKind(tpl) {
+        const t = (tpl.instance_type || '').trim();
+        if (['gradio','streamlit'].includes(t)) return 'spaces';
+        if (t === 'comfyui') return 'comfyui';
+        if (['vllm','sglang'].includes(t)) return 'api';
+        if (t === 'custom') return 'custom';
+        return 'notebook';
+      }
+      const galleryKinds = [
+        { key:'notebook', label:'Notebooks' },
+        { key:'spaces', label:'Gradio / Streamlit' },
+        { key:'comfyui', label:'ComfyUI' },
+        { key:'api', label:'Model APIs' },
+        { key:'custom', label:'Custom Images' },
+      ];
       const imageOptions = (images || []).map(img => ({ label: React.createElement('span', { className: 'image-option-label', title: img.image }, img.name ? `${img.name} (${img.image.split('/').pop()})` : img.image.split('/').pop()), value: img.image }));
       const templateImageOptions = [
         ...imageOptions,
@@ -184,12 +242,12 @@
         { value: 'auto', label: 'Auto (recommended by GPU count)' },
         ...Object.entries(resourceProfiles || {}).map(([value, profile]) => ({ value, label: profile.label || value }))
       ];
-      const galleryTags = ['All', ...Array.from(new Set((notebookTemplates || []).flatMap(tpl => [tpl.category, ...(tpl.tags || [])].filter(Boolean))))].slice(0, 12);
+      const kindCounts = (notebookTemplates || []).reduce((acc, tpl) => { const k = templateKind(tpl); acc[k] = (acc[k]||0)+1; return acc; }, {});
       const filteredTemplates = (notebookTemplates || []).filter(tpl => {
         const text = `${tpl.title || ''} ${tpl.description || ''} ${tpl.category || ''} ${(tpl.tags || []).join(' ')}`.toLowerCase();
         const matchesSearch = !gallerySearch.trim() || text.includes(gallerySearch.trim().toLowerCase());
-        const matchesTag = activeTag === 'All' || tpl.category === activeTag || (tpl.tags || []).includes(activeTag);
-        return matchesSearch && matchesTag;
+        const matchesKind = templateKind(tpl) === galleryKind;
+        return matchesSearch && matchesKind;
       });
       const hasNotebook = tpl => !!(tpl && tpl.repo_url && tpl.notebook_path);
       const hasActiveInstance = !!(initialActiveInstance && initialActiveInstance.instance_id);
@@ -278,36 +336,42 @@
       async function launch() {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const values = await form.validateFields();
-        setNotebookLoading(true); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null);
+        setNotebookLoading(true); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null); setLaunchModalOpen(true); setLaunchStatus({ status: 'allocating', message: 'Allocating resources for your workspace...', target: { type: 'notebook' } });
         try {
-          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode' }) });
+          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode', disk_size_gb: values.disk_size_gb }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
-          pollStatus(data.url, { type: 'notebook' }); message.success('Instance requested');
-        } catch (err) { setNotebookLoading(false); message.error(err.message); }
+          pollStatus(data.url, { type: 'notebook' });
+        } catch (err) {
+          setNotebookLoading(false);
+          setLaunchStatus({ status:'failed', message:err.message || 'Launch failed', target: { type: 'notebook' } });
+        }
       }
       async function launchTemplate(tpl) {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         const gpuCount = form.getFieldValue('gpu_count') || 1;
-        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null);
+        setLaunchingTemplateId(tpl.id); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null); setLaunchModalOpen(true); setLaunchStatus({ status: 'allocating', message: `Allocating resources for ${tpl.title}`, target: { type: 'template', templateId: tpl.id } });
         try {
           const res = await fetch(`/api/templates/${tpl.id}/launch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gpu_count: gpuCount }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
-          pollStatus(data.url, { type: 'template', templateId: tpl.id }); message.success(`Launching ${tpl.title}`);
-        } catch (err) { setLaunchingTemplateId(null); message.error(err.message); }
+          pollStatus(data.url, { type: 'template', templateId: tpl.id });
+        } catch (err) {
+          setLaunchingTemplateId(null);
+          setLaunchStatus({ status:'failed', message:err.message || 'Launch failed', target: { type: 'template', templateId: tpl.id } });
+        }
       }
       async function launchCustomImage(ci) {
         if (!currentUser || !currentUser.email) { message.warning('Please login first'); return; }
         if (hasActiveInstance) { message.warning('Only one active instance is allowed. Open or destroy it from Profile.'); return; }
         const gpuCount = form.getFieldValue('gpu_count') || 1;
-        setLaunchingTemplateId(`custom-${ci.id}`); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null);
+        setLaunchingTemplateId(`custom-${ci.id}`); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null); setLaunchModalOpen(true); setLaunchStatus({ status: 'allocating', message: `Allocating resources for ${ci.name}`, target: { type: 'template', templateId: `custom-${ci.id}` } });
         try {
           const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: ci.image, gpu_count: gpuCount, resource_profile: 'auto', instance_type: 'opencode' }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           pollStatus(data.url, { type: 'template', templateId: `custom-${ci.id}` }); message.success(`Launching ${ci.name}`);
-        } catch (err) { setLaunchingTemplateId(null); message.error(err.message); }
+        } catch (err) { setLaunchingTemplateId(null); setLaunchStatus({ status:'failed', message:err.message || 'Launch failed', target: { type: 'template', templateId: `custom-${ci.id}` } }); message.error(err.message); }
       }
       function finishPolling(target) {
         if (target && target.type === 'template') setLaunchingTemplateId(null);
@@ -359,6 +423,155 @@
             container || (logsLoading ? 'Loading…' : 'Container has not produced output yet (still pulling image or pending).'))
         );
       }
+
+      const launchStepItems = [
+        { title: 'Requested' },
+        { title: 'Scheduling' },
+        { title: 'Preparing' },
+        { title: 'Starting' },
+        { title: 'Ready' },
+      ];
+      function launchStepIndex(data) {
+        if (!data) return 0;
+        if (data.status === 'ready') return 4;
+        if (data.status === 'jupyter_starting' || data.status === 'running') return 3;
+        if (data.status === 'initializing' || data.status === 'loading') return 2;
+        if (data.status === 'pending') return 1;
+        return 0;
+      }
+      function displayStatusMessage(data) {
+        if (!data) return 'Checking instance status...';
+        if (data.reason === 'Unschedulable') return 'Waiting for available GPU resources';
+        if (data.reason === 'ImagePullBackOff' || data.reason === 'ErrImagePull') return 'Image pull failed';
+        if (data.reason === 'ContainerCreating') return 'Preparing your workspace';
+        if (data.reason === 'JupyterStarting') return 'Jupyter is starting';
+        if (data.status === 'ready') return 'Workspace is ready';
+        if (data.status === 'failed') return data.message || 'Instance failed';
+        if (data.status === 'not_found') return data.message || 'Instance not found';
+        if (data.status === 'pending') return 'Waiting for resources';
+        return data.message || 'Checking instance status...';
+      }
+      function displayStatusDetail(data) {
+        if (!data) return '';
+        if (data.reason === 'Unschedulable') return 'The cluster has not found a suitable GPU node yet. You can keep waiting or destroy and retry later.';
+        if (data.status === 'failed') return data.detail || data.reason || '';
+        if (data.status === 'ready') return 'Your workspace is ready to open.';
+        return data.reason && data.reason !== data.message ? data.reason : '';
+      }
+      async function cancelLaunch() {
+        try {
+          const res = await fetch('/api/notebook/current', { method: 'DELETE' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Cancel failed');
+          setLaunchStatus(null);
+          setNotebookLoading(false);
+          setLaunchingTemplateId(null);
+          setReadyUrl('');
+          setReadyOpencodeUrl('');
+          setReadyOpencodeUsername('');
+          setReadyOpencodePassword('');
+          setReadyTemplateId(null);
+          setLaunchModalOpen(false);
+          message.success(data.message || 'Launch cancelled');
+        } catch (err) {
+          message.error(err.message || 'Cancel failed');
+        }
+      }
+      function closeLaunchModal() {
+        setLaunchModalOpen(false);
+      }
+      function renderApiAccessCard(baseUrl, apiKey, model) {
+        const modelVal = model || '<model>';
+        const curl = `curl ${baseUrl}/chat/completions \\\n  -H "Authorization: Bearer ${apiKey || '<API_KEY>'}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${modelVal}","messages":[{"role":"user","content":"Hello"}]}'`;
+        return React.createElement('div', { className:'api-access-card' },
+          React.createElement('div', { className:'api-access-title' }, 'OpenAI-compatible endpoint'),
+          React.createElement('div', { className:'api-access-row' },
+            React.createElement('span', { className:'api-access-label' }, 'Base URL'),
+            React.createElement(Paragraph, { copyable:{ text: baseUrl }, style:{ margin:0 } }, React.createElement('code', null, baseUrl))
+          ),
+          model && React.createElement('div', { className:'api-access-row' },
+            React.createElement('span', { className:'api-access-label' }, 'Model'),
+            React.createElement(Paragraph, { copyable:{ text: model }, style:{ margin:0 } }, React.createElement('code', null, model))
+          ),
+          apiKey && React.createElement('div', { className:'api-access-row' },
+            React.createElement('span', { className:'api-access-label' }, 'API Key'),
+            React.createElement(Paragraph, { copyable:{ text: apiKey }, style:{ margin:0 } }, React.createElement('code', null, apiKey))
+          ),
+          React.createElement('details', { className:'api-access-curl' },
+            React.createElement('summary', null, 'Quickstart (curl)'),
+            React.createElement(Paragraph, { copyable:{ text: curl }, style:{ margin:'8px 0 0' } }, React.createElement('pre', { className:'api-access-pre' }, curl))
+          )
+        );
+      }
+      function renderLaunchModal() {
+        const data = launchStatus || {};
+        const failed = data.status === 'failed' || data.status === 'not_found';
+        const ready = data.status === 'ready' && (data.url || readyUrl || data.api_base_url);
+        const current = launchStepIndex(data);
+        const detail = displayStatusDetail(data);
+        const openUrl = data.url || readyUrl;
+        const opencodeUrl = data.opencode_url || readyOpencodeUrl;
+        const opencodeUsername = data.opencode_username || readyOpencodeUsername;
+        const opencodePassword = data.opencode_password || readyOpencodePassword;
+        const itype = (data.instance_type || '').trim();
+        const isApi = !!data.api_base_url;
+        const isApp = ['gradio','streamlit','comfyui'].includes(itype);
+        const kindNoun = isApi ? 'API' : (isApp ? 'app' : 'workspace');
+        const openLabel = isApp ? 'Open App' : 'Open Notebook';
+        const title = ready ? (isApi ? 'Your API is ready' : (isApp ? 'Your app is ready' : 'Your workspace is ready')) : displayStatusMessage(data);
+        const footer = ready
+          ? (isApi
+              ? [ React.createElement(Button, { key:'close', type:'primary', onClick:closeLaunchModal }, 'Done') ]
+              : [
+                  React.createElement(Button, { key:'close', onClick:closeLaunchModal }, 'Close'),
+                  openUrl && React.createElement(Button, { key:'open', type:'primary', href:openUrl, target:'_blank', onClick:closeLaunchModal }, openLabel),
+                  opencodeUrl && !isApp && React.createElement(Button, { key:'opencode', type:'primary', ghost:true, href:opencodeUrl, target:'_blank', onClick:closeLaunchModal }, 'OpenCode')
+                ].filter(Boolean))
+          : failed
+            ? [ React.createElement(Button, { key:'close', type:'primary', onClick:()=>{ setLaunchStatus(null); closeLaunchModal(); } }, 'Close') ]
+            : [
+                React.createElement(Button, { key:'logs', onClick:openLogs }, 'View logs'),
+                React.createElement(Button, { key:'bg', onClick:closeLaunchModal }, 'Continue in background'),
+                React.createElement(Button, { key:'cancel', danger:true, onClick:cancelLaunch }, 'Cancel launch')
+              ];
+        return React.createElement(Modal, {
+            open: launchModalOpen,
+            title: 'Starting your ' + kindNoun,
+            width: 560,
+            maskClosable: false,
+            keyboard: false,
+            onCancel: ready || failed ? closeLaunchModal : undefined,
+            closable: ready || failed,
+            footer
+          },
+          React.createElement('div', { className: 'launch-modal-body' },
+            React.createElement('div', { className: 'launch-modal-progress' },
+              React.createElement('div', { className: 'launch-modal-stage' },
+                React.createElement('span', null, failed ? 'Failed' : (ready ? 'Ready' : ((launchStepItems[current] && launchStepItems[current].title) || 'Requested'))),
+                React.createElement('span', { className: 'launch-modal-pct' }, failed ? '' : `${[12, 34, 58, 82, 100][current] || 0}%`)
+              ),
+              React.createElement(Progress, {
+                percent: failed ? 100 : ([12, 34, 58, 82, 100][current] || 0),
+                status: failed ? 'exception' : (ready ? 'success' : 'active'),
+                showInfo: false
+              })
+            ),
+            React.createElement('div', { className: `launch-modal-status ${failed ? 'failed' : (ready ? 'ready' : '')}` },
+              (!ready && !failed) && React.createElement(Spin, { size: 'small', style: { marginRight: 10 } }),
+              React.createElement('div', null,
+                React.createElement('div', { className: 'launch-modal-title' }, title),
+                detail && React.createElement('div', { className: 'launch-modal-detail' }, detail)
+              )
+            ),
+            (ready && isApi) && renderApiAccessCard(data.api_base_url, data.api_key, data.api_model),
+            (ready && opencodeUrl && !isApp) && opencodeCredentials(opencodeUsername, opencodePassword),
+            (data.detail && data.detail !== detail) && React.createElement('details', { className: 'launch-modal-technical' },
+              React.createElement('summary', null, 'Technical details'),
+              React.createElement('div', { className: 'launch-modal-technical-body' }, data.detail)
+            )
+          )
+        );
+      }
       function pollStatus(initialUrl, target) {
         let url = initialUrl || '';
         let opencodeUrl = '';
@@ -375,10 +588,11 @@
             if (data.opencode_username) opencodeUsername = data.opencode_username;
             if (data.opencode_password) opencodePassword = data.opencode_password;
             if (data.message) setLaunchMessage(data.message);
-            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLogsOpen(false); setReadyUrl(url); setReadyOpencodeUrl(opencodeUrl); setReadyOpencodeUsername(opencodeUsername); setReadyOpencodePassword(opencodePassword); if (target && target.templateId) setReadyTemplateId(target.templateId); message.success('Notebook is ready'); }
-            if (data.status === 'failed') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); message.error(data.message || 'Instance failed'); }
+            setLaunchStatus(Object.assign({}, data, { target }));
+            if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLogsOpen(false); setReadyUrl(url); setReadyOpencodeUrl(opencodeUrl); setReadyOpencodeUsername(opencodeUsername); setReadyOpencodePassword(opencodePassword); if (target && target.templateId) setReadyTemplateId(target.templateId); setLaunchStatus(Object.assign({}, data, { url, opencode_url: opencodeUrl, opencode_username: opencodeUsername, opencode_password: opencodePassword, target })); message.success('Workspace is ready'); }
+            if (data.status === 'failed') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); message.error(displayStatusMessage(data)); }
             if (data.status === 'not_found') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLogsOpen(false); message.error(data.message || 'Instance not found'); }
-            if (attempts >= 240) { clearInterval(timer); finishPolling(target); setLaunchMessage(''); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
+            if (attempts >= 240) { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLaunchStatus({ status:'pending', reason:'LongRunning', message:'Launch is taking longer than expected. You can keep waiting from Profile.', target }); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
           } catch (e) {}
         }, 3000);
       }
@@ -387,14 +601,18 @@
         const selectedProfile = watchedResourceProfile || 'auto';
         const recommendedProfile = autoResourceProfileByGpu[String(selectedGpuCount)] || autoResourceProfileByGpu[selectedGpuCount] || 'standard';
         const recommendedResource = resourceProfiles && resourceProfiles[recommendedProfile] ? resourceProfiles[recommendedProfile].label : recommendedProfile;
+        const diskMax = diskSizeMaxByGpu[String(selectedGpuCount)] || diskSizeMaxByGpu[selectedGpuCount] || diskSizeMinGb;
+        const diskOptions = [];
+        for (let g = diskSizeMinGb; g <= diskMax; g += 50) diskOptions.push({ value: g, label: `${g} GB` });
         return React.createElement(Card, { className: 'launch-card', title: 'Notebook', extra: React.createElement(Text, { type: 'secondary' }, 'Default: OpenCode') },
           React.createElement(Form, { form, layout: 'vertical', initialValues: { image: defaultImage, gpu_count: 1, resource_profile: 'auto' } },
             React.createElement(Form.Item, { label: 'Account' }, React.createElement(Select, { disabled: true, value: currentUser && currentUser.email ? currentUser.email : 'Login required', options: [{ value: currentUser && currentUser.email ? currentUser.email : 'Login required', label: currentUser && currentUser.email ? currentUser.email : 'Login required' }] })),
             React.createElement(Form.Item, { label: 'Container Image', name: 'image', rules: [{ required: true }] }, React.createElement(Select, { options: imageOptions, className: 'fixed-select', popupMatchSelectWidth: true, style: { width: '100%' }, listHeight: 360 })),
             React.createElement(Form.Item, { label: 'GPU Count', name: 'gpu_count', rules: [{ required: true }] }, React.createElement(Select, { options: [{ value: 1, label: '1 GPU / 1 credit per hour' }, { value: 2, label: '2 GPUs / 2 credits per hour' }, { value: 4, label: '4 GPUs / 4 credits per hour' }] })),
             React.createElement(Form.Item, { label: 'CPU / Memory', name: 'resource_profile', extra: selectedProfile === 'auto' ? `Auto currently uses ${recommendedResource}` : 'Use a larger profile if your workload was OOMKilled.' }, React.createElement(Select, { options: resourceProfileOptions })),
+            React.createElement(Form.Item, { label: 'Disk Size', name: 'disk_size_gb', extra: `Up to ${diskMax} GB for this instance scale.` }, React.createElement(Select, { options: diskOptions, placeholder: `${diskMax} GB` })),
             React.createElement(Button, { type: 'primary', size: 'large', block: true, loading: notebookLoading, onClick: launch }, 'Launch Notebook')
-          ), renderStartupStatus(), readyUrl && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Space, { style: { width: '100%' }, direction: 'vertical' },
+          ), (!launchModalOpen && readyUrl && launchStatus && launchStatus.status === 'ready') && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Space, { style: { width: '100%' }, direction: 'vertical' },
             React.createElement(Button, { href: readyUrl, target: '_blank', block: true, title: 'Open Notebook (Jupyter)' }, brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')),
             readyOpencodeUrl && React.createElement(Button, { type: 'primary', ghost: true, href: readyOpencodeUrl, target: '_blank', block: true, title: 'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
             readyOpencodeUrl && opencodeCredentials(readyOpencodeUsername, readyOpencodePassword),
@@ -480,30 +698,43 @@
           React.createElement('div', { className: 'template-grid' }, [...imageCards, ...templateCards])
         );
       }
+      function renderTemplateLaunchAction(tpl) {
+        const itype = (tpl.instance_type || '').trim();
+        const isApi = ['vllm','sglang'].includes(itype);
+        const isApp = ['gradio','streamlit','comfyui'].includes(itype);
+        if (!launchModalOpen && readyTemplateId === tpl.id && (readyUrl || isApi)) {
+          if (isApi) return React.createElement(Button, { type:'primary', href:'/profile', target:'_blank' }, 'View Endpoint');
+          return React.createElement(React.Fragment, null,
+            React.createElement(Button, { type:'primary', href: readyUrl, target: '_blank', title: isApp ? 'Open App' : 'Open Notebook' }, isApp ? 'Open App' : brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')),
+            (!isApp && readyOpencodeUrl) && React.createElement(Button, { type:'primary', ghost:true, href: readyOpencodeUrl, target:'_blank', title:'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
+            (!isApp && readyUrl) && hermesButton({})
+          );
+        }
+        return React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch');
+      }
       function renderGallery() {
         return React.createElement(React.Fragment, null,
           renderCustomImages(),
           React.createElement('div', { className: 'gallery-bar' },
             React.createElement('div', { className: 'tag-rail' },
-              galleryTags.map(tag => React.createElement('button', { key: tag, className: `tag-pill ${activeTag === tag ? 'active' : ''}`, onClick: () => setActiveTag(tag) }, tag))
+              galleryKinds.map(k => React.createElement('button', { key: k.key, className: `tag-pill ${galleryKind === k.key ? 'active' : ''}`, onClick: () => setGalleryKind(k.key) }, `${k.label}${kindCounts[k.key] ? ' ('+kindCounts[k.key]+')' : ''}`))
             ),
-            React.createElement(Text, { type: 'secondary' }, `${filteredTemplates.length} of ${notebookTemplates.length}`)
+            React.createElement(Text, { type: 'secondary' }, `${filteredTemplates.length} shown`)
           ),
-          filteredTemplates.length === 0 ? React.createElement('div', { className: 'empty-gallery' }, 'No templates match this search or tag.') : React.createElement('div', { className: 'template-grid' },
+          filteredTemplates.length === 0 ? React.createElement('div', { className: 'empty-gallery' }, gallerySearch.trim() ? 'No templates match this search.' : 'No templates in this category yet.') : React.createElement('div', { className: 'template-grid' },
             filteredTemplates.map((tpl) => React.createElement(Card, { key: tpl.id, className: 'template-card' },
               React.createElement('div', { className: 'template-cover', style: tpl.cover_url ? { backgroundImage: `linear-gradient(135deg,rgba(216,237,255,.72),rgba(242,220,255,.72)),url(${tpl.cover_url})`, backgroundSize: 'cover', backgroundPosition: 'center' } : {} },
                 React.createElement(Text, { style: { color: '#5962d6', fontWeight: 800 } }, tpl.category || 'Notebook')
               ),
               React.createElement('span', { className: 'template-title' }, tpl.title),
               React.createElement('div', { className: 'template-desc' }, tpl.description || (hasNotebook(tpl) ? `${tpl.repo_url} · ${tpl.notebook_path}` : `${tpl.image.split('/').pop()} workspace`)),
-              React.createElement('div', { className: 'template-meta' }, (tpl.tags || []).slice(0, 3).map(tag => React.createElement(Tag, { key: tag }, tag))),
+              React.createElement('div', { className: 'template-meta' },
+                appTypeLabels[(tpl.instance_type||'').trim()] && React.createElement(Tag, { key:'__apptype', color: ['vllm','sglang'].includes(tpl.instance_type)?'geekblue':'purple' }, appTypeLabels[tpl.instance_type]),
+                (tpl.tags || []).slice(0, 3).map(tag => React.createElement(Tag, { key: tag }, tag))
+              ),
               React.createElement('div', { className: 'template-actions' },
                 hasNotebook(tpl) && React.createElement(Button, { href: `/templates/${tpl.id}/preview`, target: '_blank' }, 'Preview'),
-                readyTemplateId === tpl.id && readyUrl
-                  ? React.createElement(Button, { type:'primary', ghost: true, href: readyUrl, target: '_blank', title: 'Open Notebook (Jupyter)' }, brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter'))
-                  : React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch'),
-                readyTemplateId === tpl.id && readyOpencodeUrl && React.createElement(Button, { type: 'primary', ghost: true, href: readyOpencodeUrl, target: '_blank', title: 'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
-                readyTemplateId === tpl.id && readyUrl && hermesButton({})
+                renderTemplateLaunchAction(tpl)
               )
             ))
           )
@@ -524,7 +755,7 @@
               React.createElement('p', null, 'Choose a prepared notebook or workspace, then launch it on AMD GPUs.'),
               React.createElement('div', { className: 'gallery-search' },
                 React.createElement(Input.Search, { size: 'large', allowClear: true, placeholder: 'Search notebooks, tags, or topics', value: gallerySearch, onChange: e => setGallerySearch(e.target.value), onSearch: value => setGallerySearch(value) }),
-                React.createElement(Button, { size: 'large', type: 'primary', onClick: openCreateModal }, 'Create Template')
+                (currentUser && currentUser.is_editor) && React.createElement(Button, { size: 'large', type: 'primary', onClick: openCreateModal }, 'Publish Template')
               )
             ),
             React.createElement('div', { className: 'gallery-art' },
@@ -540,7 +771,8 @@
           activeTab === 'gallery' ? renderGallery() : renderNotebookLaunch()
         ),
         renderLogsModal(),
-        React.createElement(Modal, { title:'Create Template', open:createModalOpen, onCancel:()=>setCreateModalOpen(false), footer:null, destroyOnClose:true, width:760 },
+        renderLaunchModal(),
+        React.createElement(Modal, { title:'Publish Template', open:createModalOpen, onCancel:()=>setCreateModalOpen(false), footer:null, destroyOnClose:true, width:760 },
           currentUser && currentUser.email ? React.createElement(Form, { form:createForm, layout:'vertical', onFinish:createTemplate },
             React.createElement(Form.Item, { name:'title', label:'Title', rules:[{required:true,message:'Title is required'}] }, React.createElement(Input, { placeholder:'Blank OpenCode Workspace' })),
             React.createElement(Form.Item, { name:'description', label:'Description' }, React.createElement(Input.TextArea, { autoSize:true, placeholder:'Short description shown on the Gallery card' })),
@@ -549,10 +781,16 @@
               React.createElement(Form.Item, { name:'tags', label:'Tags', style:{flex:1} }, React.createElement(Input, { placeholder:'workspace, opencode' }))
             ),
             React.createElement(Form.Item, { name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}] }, React.createElement(Select, { options:templateImageOptions, className:'fixed-select', popupMatchSelectWidth:true, listHeight:360 })),
-            React.createElement(Form.Item, { name:'repo_url', label:'GitHub Repo URL' }, React.createElement(Input, { placeholder:'Optional. Leave empty for an image-only workspace.' })),
-            React.createElement(Space, { style:{width:'100%'}, size:16 },
+            React.createElement(Form.Item, { name:'instance_type', label:'Deploy Type', tooltip:'What this template deploys. Notebook opens Jupyter; app types open a web app; API types serve an OpenAI-compatible endpoint.' }, React.createElement(Select, { options:instanceTypeOptions, placeholder:'Notebook (Jupyter / OpenCode)' })),
+            isApiType && React.createElement(Form.Item, { name:'model_source', label:'Model Source', tooltip:'Where the model weights are downloaded from. ModelScope is usually faster in China.' }, React.createElement(Select, { options:[{value:'huggingface',label:'HuggingFace (mirror)'},{value:'modelscope',label:'ModelScope'}], placeholder:'HuggingFace (mirror)' })),
+            isApiType && React.createElement(Alert, { type:'info', showIcon:true, style:{marginBottom:16}, message: 'Model API: set the serve command (including the model). Users get an OpenAI-compatible base URL + API key. Serves at /spaces/<id>/'+(appPortDefaults[createInstanceType]||'')+'/v1.' }),
+            (createInstanceType==='comfyui') && React.createElement(Alert, { type:'info', showIcon:true, style:{marginBottom:16}, message: 'One-click app: just pick the image. ComfyUI starts automatically and opens at /spaces/<id>/'+(appPortDefaults.comfyui)+'/.' }),
+            isAppType && React.createElement(Form.Item, { name:'start_command', label: isApiType?'Serve Command':'Start Command', rules: isApiType?[{required:true,message:'Serve command (with model) is required'}]:[], tooltip:'Leave empty to use the framework default.' }, React.createElement(Input.TextArea, { autoSize:{ minRows:1, maxRows:4 }, placeholder: appStartDefaults[createInstanceType] || '' })),
+            isAppType && React.createElement(Form.Item, { name:'app_port', label:'Port', style:{maxWidth:180}, tooltip:'Port the process listens on.' }, React.createElement(Select, { allowClear:true, placeholder: String(appPortDefaults[createInstanceType] || ''), options:[{value:7860,label:'7860'},{value:8501,label:'8501'},{value:8188,label:'8188'},{value:8000,label:'8000'},{value:30000,label:'30000'}] })),
+            needsGithub && React.createElement(Form.Item, { name:'repo_url', label:'GitHub Repo URL', tooltip: isNotebookType?'Optional. Leave empty for a blank workspace.':'Repo containing your app (cloned into the workspace).' }, React.createElement(Input, { placeholder: isNotebookType?'Optional. Leave empty for an image-only workspace.':'https://github.com/org/repo' })),
+            needsGithub && React.createElement(Space, { style:{width:'100%'}, size:16 },
               React.createElement(Form.Item, { name:'branch', label:'Branch', style:{width:180} }, React.createElement(Input, { placeholder:'main' })),
-              React.createElement(Form.Item, { name:'notebook_path', label:'Notebook Path', style:{flex:1} }, React.createElement(Input, { placeholder:'Optional, e.g. notebooks/workshop.ipynb' }))
+              isNotebookType && React.createElement(Form.Item, { name:'notebook_path', label:'Notebook Path', style:{flex:1} }, React.createElement(Input, { placeholder:'Optional, e.g. notebooks/workshop.ipynb' }))
             ),
             React.createElement(Form.Item, { name:'cover_url', label:'Cover URL' }, React.createElement(Input, { placeholder:'Optional image URL' })),
             React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:createLoading }, 'Create Template')

@@ -30,6 +30,113 @@ INSTANCE_TYPES = {
         "max_lifetime_hours": None,
         "idle_timeout_minutes": None,
     },
+    "custom": {
+        "name": "Custom Image",
+        "description": "Run any image that serves on port 8888 using the image's own start command",
+        "icon": "📦",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        # When true, the manager does NOT inject a start command; the image's own
+        # ENTRYPOINT/CMD runs and is expected to listen on NOTEBOOK_PORT (8888).
+        "image_defined_command": True,
+    },
+    "gradio": {
+        "name": "Gradio App",
+        "description": "Launch a Gradio app from a prepared image; opens at the app URL",
+        "icon": "🎨",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+    },
+    "streamlit": {
+        "name": "Streamlit App",
+        "description": "Launch a Streamlit app from a prepared image; opens at the app URL",
+        "icon": "📊",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+    },
+    "comfyui": {
+        "name": "ComfyUI",
+        "description": "Launch ComfyUI from a prepared image; opens at the app URL",
+        "icon": "🧩",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+    },
+    "vllm": {
+        "name": "vLLM API",
+        "description": "Serve an OpenAI-compatible model API with vLLM",
+        "icon": "🚀",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+        "api_kind": True,
+    },
+    "sglang": {
+        "name": "SGLang API",
+        "description": "Serve an OpenAI-compatible model API with SGLang",
+        "icon": "⚡",
+        "enabled": True,
+        "max_lifetime_hours": None,
+        "idle_timeout_minutes": None,
+        "app_kind": True,
+        "api_kind": True,
+    },
+}
+
+# Framework presets for "app" instance types. Each declares the default start
+# command, the port the app listens on, the reverse-proxy mode, and which
+# default app file is expected. Admins can override start_command / app_port
+# per template; everything else is derived from the framework here.
+#   proxy_mode: "preserve" keeps the /spaces/<id>/<port> prefix and the app is
+#     made base-path-aware (Gradio root_path / Streamlit baseUrlPath via env).
+#     "strip" removes the prefix before forwarding (for apps like ComfyUI that
+#     cannot run under a sub-path); requires raw-path forwarding to keep %2F.
+APP_FRAMEWORK_PRESETS = {
+    "gradio": {
+        "port": 7860,
+        "proxy_mode": "preserve",
+        "start_command": "python app.py",
+    },
+    "streamlit": {
+        "port": 8501,
+        "proxy_mode": "preserve",
+        "start_command": "streamlit run app.py",
+    },
+    "comfyui": {
+        "port": 8188,
+        "proxy_mode": "strip",
+        # ComfyUI is conventionally installed at /workspace/ComfyUI in prepared
+        # images; run it there on the curated app port. Admins can override.
+        "start_command": "bash -lc 'cd /workspace/ComfyUI 2>/dev/null || cd \"$WORKSPACE_DIR\"; exec python main.py --listen 0.0.0.0 --port 8188'",
+    },
+    # API (model-serving) kinds. The deliverable is an OpenAI-compatible endpoint,
+    # not a UI: the ready screen shows base_url + api key + curl. The per-instance
+    # API key is injected via api_key_env at launch. proxy_mode "strip" forwards
+    # /spaces/<id>/<port>/v1/... to the server's /v1/... (API clients use the full
+    # base_url we hand them, so there is no browser-absolute-URL problem).
+    "vllm": {
+        "port": 8000,
+        "proxy_mode": "strip",
+        "start_command": "vllm serve --host 0.0.0.0 --port 8000",
+        "api_kind": True,
+        "api_base_suffix": "/v1",
+        "api_key_env": "VLLM_API_KEY",
+    },
+    "sglang": {
+        "port": 30000,
+        "proxy_mode": "strip",
+        "start_command": "python -m sglang.launch_server --host 0.0.0.0 --port 30000",
+        "api_kind": True,
+        "api_base_suffix": "/v1",
+        "api_key_env": "SGLANG_API_KEY",
+    },
 }
 
 
@@ -91,6 +198,14 @@ class Settings:
     NOTEBOOK_TOLERATION_VALUE: str = os.getenv("NOTEBOOK_TOLERATION_VALUE", "")
     NOTEBOOK_TOLERATION_EFFECT: str = os.getenv("NOTEBOOK_TOLERATION_EFFECT", "NoSchedule")
 
+    # Spaces-style user app port forwarding. Each instance also exposes these
+    # curated app ports; the manager proxies https://<host>/spaces/<id>/<port>/...
+    # to the instance pod on that port. Gradio/Streamlit are auto-configured
+    # (via env) to serve under that base path so `gradio app.py` / `streamlit run`
+    # just work like local. Map name -> container port.
+    SPACES_PATH_PREFIX: str = os.getenv("SPACES_PATH_PREFIX", "/spaces")
+    APP_PORTS: dict = {"gradio": 7860, "streamlit": 8501, "comfyui": 8188, "app": 8000, "sglang": 30000}
+
     CPU_LIMIT: str = os.getenv("CPU_LIMIT", "16")
     MEMORY_LIMIT: str = os.getenv("MEMORY_LIMIT", "64Gi")
     GPU_LIMIT: str = os.getenv("GPU_LIMIT", "1")
@@ -103,11 +218,18 @@ class Settings:
     # Host-level Hugging Face cache shared by model-sync jobs and notebook instances.
     HF_CACHE_HOST_PATH: str = os.getenv("HF_CACHE_HOST_PATH", "/var/lib/amd-oneclick/hf-cache")
     HF_CACHE_MOUNT_PATH: str = os.getenv("HF_CACHE_MOUNT_PATH", "/root/.cache/huggingface")
-    HF_ENDPOINT: str = os.getenv("HF_ENDPOINT", "")
+    # "emptyDir" (per-instance, reclaimed on pod deletion) or "hostPath" (shared node-local cache, persists).
+    # Default emptyDir so the HF cache no longer leaks onto node local disk after instances are deleted.
+    HF_CACHE_VOLUME_TYPE: str = os.getenv("HF_CACHE_VOLUME_TYPE", "emptyDir")
+    HF_CACHE_EMPTYDIR_SIZE_LIMIT: str = os.getenv("HF_CACHE_EMPTYDIR_SIZE_LIMIT", "")
+    HF_HUB_DISABLE_XET: str = os.getenv("HF_HUB_DISABLE_XET", "1")
+    # HuggingFace mirror endpoint; pods have no direct egress to huggingface.co.
+    HF_ENDPOINT: str = os.getenv("HF_ENDPOINT", "http://134.199.133.77")
     HF_TOKEN: str = os.getenv("HF_TOKEN", "")
     HF_TOKEN_SECRET_NAME: str = os.getenv("HF_TOKEN_SECRET_NAME", "")
     HF_TOKEN_SECRET_KEY: str = os.getenv("HF_TOKEN_SECRET_KEY", "HF_TOKEN")
-    HF_HUB_DISABLE_XET: str = os.getenv("HF_HUB_DISABLE_XET", "1")
+    # PyPI mirror for in-pod pip installs (e.g. app requirements.txt at startup).
+    PIP_INDEX_URL: str = os.getenv("PIP_INDEX_URL", "https://pypi.tuna.tsinghua.edu.cn/simple")
     IMAGE_PREPULL_ENABLED: bool = os.getenv("IMAGE_PREPULL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     IMAGE_PULL_PROBE_ENABLED: bool = os.getenv("IMAGE_PULL_PROBE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     IMAGE_PULL_PROBE_DEADLINE_SECONDS: int = int(os.getenv("IMAGE_PULL_PROBE_DEADLINE_SECONDS", "7200"))
@@ -115,6 +237,10 @@ class Settings:
     WORKSPACE_MOUNT_PATH: str = os.getenv("WORKSPACE_MOUNT_PATH", "/workspace")
     WORKSPACE_VOLUME_TYPE: str = os.getenv("WORKSPACE_VOLUME_TYPE", "hostPath")
     WORKSPACE_EMPTYDIR_SIZE_LIMIT: str = os.getenv("WORKSPACE_EMPTYDIR_SIZE_LIMIT", "")
+    # User-selectable workspace disk size (GiB) for the blank notebook launch.
+    # The max scales with instance size; min is always DISK_SIZE_MIN_GB.
+    DISK_SIZE_MIN_GB: int = int(os.getenv("DISK_SIZE_MIN_GB", "100"))
+    DISK_SIZE_MAX_BY_GPU: dict = {1: 100, 2: 150, 4: 200}
     WORKSPACE_QUOTA_ENABLED: bool = os.getenv("WORKSPACE_QUOTA_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     WORKSPACE_QUOTA_SIZE_GI: int = int(os.getenv("WORKSPACE_QUOTA_SIZE_GI", "20"))
     WORKSPACE_QUOTA_NODE_NAME: str = os.getenv("WORKSPACE_QUOTA_NODE_NAME", "")

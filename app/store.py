@@ -106,6 +106,10 @@ notebook_templates = Table(
     Column("branch", String(255), nullable=False, default="main"),
     Column("notebook_path", Text, nullable=False),
     Column("cover_url", Text),
+    Column("instance_type", String(64)),
+    Column("start_command", Text),
+    Column("app_port", Integer),
+    Column("model_source", String(32)),
     Column("enabled", Boolean, nullable=False, default=True),
     Column("sort_order", Integer, nullable=False, default=0),
     Column("owner_user_id", Integer, ForeignKey("users.id")),
@@ -161,6 +165,8 @@ instance_records = Table(
     Column("created_at", String(64), nullable=False),
     Column("last_charged_at", String(64), nullable=False),
     Column("billing_session_id", String(255), nullable=False),
+    Column("ready_at", String(64)),
+    Column("billing_started_at", String(64)),
     Column("deleted_at", String(64)),
 )
 
@@ -271,11 +277,25 @@ def ensure_schema_columns(conn):
         conn.execute(text("UPDATE instance_records SET billing_session_id = instance_id WHERE billing_session_id IS NULL"))
     if "opencode_node_port" not in instance_columns:
         conn.execute(text("ALTER TABLE instance_records ADD COLUMN opencode_node_port INTEGER"))
+    if "ready_at" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN ready_at VARCHAR(64)"))
+    if "billing_started_at" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN billing_started_at VARCHAR(64)"))
 
     usage_columns = {col["name"] for col in inspector.get_columns("usage_charges")}
     if "billing_session_id" not in usage_columns:
         conn.execute(text("ALTER TABLE usage_charges ADD COLUMN billing_session_id VARCHAR(255)"))
         conn.execute(text("UPDATE usage_charges SET billing_session_id = instance_id WHERE billing_session_id IS NULL"))
+
+    template_columns = {col["name"] for col in inspector.get_columns("notebook_templates")}
+    if "instance_type" not in template_columns:
+        conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN instance_type VARCHAR(64)"))
+    if "start_command" not in template_columns:
+        conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN start_command TEXT"))
+    if "app_port" not in template_columns:
+        conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN app_port INTEGER"))
+    if "model_source" not in template_columns:
+        conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN model_source VARCHAR(32)"))
 
     # New launches reuse the same Kubernetes instance_id, so billing idempotency must be scoped
     # to a launch session instead of the stable instance id.
@@ -478,6 +498,16 @@ def list_users() -> list[dict]:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
 
 
+def set_user_editor(user_id: int, is_editor: bool) -> Optional[dict]:
+    now = utc_now()
+    with engine.begin() as conn:
+        user = conn.execute(select(users).where(users.c.id == user_id)).mappings().first()
+        if not user:
+            return None
+        conn.execute(update(users).where(users.c.id == user_id).values(is_editor=bool(is_editor), updated_at=now))
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
 def get_admin_daily_stats() -> dict:
     def day_key(value: str) -> str:
         return datetime.fromisoformat(value).date().isoformat()
@@ -672,6 +702,10 @@ def upsert_notebook_template(
     template_id: Optional[int] = None,
     owner_user_id: Optional[int] = None,
     upsert_on_slug_conflict: bool = True,
+    instance_type: Optional[str] = None,
+    start_command: Optional[str] = None,
+    app_port: Optional[int] = None,
+    model_source: Optional[str] = None,
 ) -> dict:
     now = utc_now()
     title = title.strip()
@@ -695,14 +729,24 @@ def upsert_notebook_template(
         sort_order=int(sort_order or 0),
         updated_at=now,
     )
+    if instance_type is not None:
+        values["instance_type"] = (instance_type or "").strip() or None
+    if start_command is not None:
+        values["start_command"] = (start_command or "").strip() or None
+    if app_port is not None:
+        values["app_port"] = int(app_port) if app_port else None
+    if model_source is not None:
+        values["model_source"] = (model_source or "").strip() or None
     if owner_user_id is not None:
         values["owner_user_id"] = owner_user_id
     if not title:
         raise ValueError("template title must not be empty")
     if not image:
         raise ValueError("template image must not be empty")
-    if bool(repo_url) != bool(notebook_path):
-        raise ValueError("repo_url and notebook_path must be provided together, or both left empty for an image-only template")
+    # A notebook path requires a repo; a repo without a notebook path is allowed
+    # (app types clone the repo and start the app).
+    if notebook_path and not repo_url:
+        raise ValueError("notebook path requires a GitHub repo URL")
     if notebook_path and not notebook_path.endswith(".ipynb"):
         raise ValueError("template notebook_path must point to an .ipynb file")
 
@@ -1309,7 +1353,7 @@ def get_active_instance_for_user(user_id: int) -> Optional[dict]:
                 .where(
                     instance_records.c.user_id == user_id,
                     instance_records.c.deleted_at.is_(None),
-                    instance_records.c.status == "running",
+                    instance_records.c.status.in_(["pending", "running"]),
                 )
                 .order_by(instance_records.c.id.desc())
                 .limit(1)
@@ -1332,10 +1376,12 @@ def record_instance(user_id: int, email: str, instance_id: str, image: str, inst
             gpu_count=gpu_count,
             node_port=node_port,
             opencode_node_port=opencode_node_port,
-            status="running",
+            status="pending",
             created_at=now,
             last_charged_at=now,
             billing_session_id=billing_session_id,
+            ready_at=None,
+            billing_started_at=None,
             deleted_at=None,
         )
         if existing:
@@ -1377,6 +1423,26 @@ def mark_instance_deleted(instance_id: str):
             .where(instance_records.c.instance_id == instance_id, instance_records.c.deleted_at.is_(None))
             .values(status="deleted", deleted_at=utc_now())
         )
+
+
+def mark_instance_ready_for_billing(instance_id: str) -> Optional[dict]:
+    """Transition an instance to billable running state exactly when it is truly ready."""
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(
+            select(instance_records)
+            .where(instance_records.c.instance_id == instance_id, instance_records.c.deleted_at.is_(None))
+            .with_for_update()
+        ).mappings().first()
+        if not current:
+            return None
+        if current["status"] != "running":
+            conn.execute(
+                update(instance_records)
+                .where(instance_records.c.id == current["id"])
+                .values(status="running", ready_at=now, billing_started_at=now, last_charged_at=now)
+            )
+        return row_to_dict(conn.execute(select(instance_records).where(instance_records.c.id == current["id"])).mappings().first())
 
 
 def charge_user(user_id: int, amount: int, reason: str, instance_id: str):
@@ -1450,7 +1516,7 @@ def list_active_instances() -> list[dict]:
     stmt = (
         select(instance_records, users.c.credits)
         .join(users, users.c.id == instance_records.c.user_id)
-        .where(instance_records.c.deleted_at.is_(None), instance_records.c.status == "running")
+        .where(instance_records.c.deleted_at.is_(None), instance_records.c.status.in_(["pending", "running"]))
     )
     with engine.begin() as conn:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
