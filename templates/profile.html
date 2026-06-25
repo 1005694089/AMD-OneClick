@@ -441,7 +441,7 @@
         );
       }
       function renderEditorTemplates() {
-        if (!user || !user.email) return null;
+        if (!user || !user.email || !isEditor) return null;
         return React.createElement(Card, {
           className:'editor-panel',
           title:'My Templates',
