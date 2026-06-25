@@ -1231,13 +1231,65 @@ findmnt "$mnt"
             eligible.add(node.metadata.name)
         return eligible
 
+    def _node_belongs_to_service(self, node) -> bool:
+        """True if `node` belongs to THIS manager's service (taint-wise).
+
+        The `amd-oneclick-prepull=enabled` label is shared cluster-wide (production +
+        every beta), so it alone is too broad a target set for a single service. A
+        service is identified by the dedicated taint its notebooks carry as a toleration
+        (NOTEBOOK_TOLERATION_KEY/VALUE, e.g. amd-oneclick/beta=radeon). Membership is
+        SYMMETRIC, not mere tolerance:
+          - A scoped service (toleration key set) targets ONLY nodes that carry that
+            exact key=value taint — so beta never lands on production/other-beta nodes
+            even though its pods would *tolerate* an untainted node.
+          - The default service (no toleration key) targets ONLY nodes with no
+            service taint (it must still tolerate infra taints like amd.com/gpu).
+        In both cases every NoSchedule/NoExecute taint on the node must be covered by
+        this manager's notebook tolerations (else the pod couldn't schedule there)."""
+        tolerations = self._notebook_tolerations()
+        service_key = settings.NOTEBOOK_TOLERATION_KEY.strip()
+        service_value = settings.NOTEBOOK_TOLERATION_VALUE.strip()
+
+        def _tolerated(taint) -> bool:
+            for tol in tolerations:
+                if tol.get("effect") and tol["effect"] != taint.effect:
+                    continue
+                op = tol.get("operator", "Equal")
+                if op == "Exists":
+                    if not tol.get("key") or tol["key"] == taint.key:
+                        return True
+                else:
+                    if tol.get("key") == taint.key and tol.get("value", "") == (taint.value or ""):
+                        return True
+            return False
+
+        node_taints = node.spec.taints or []
+        # Every blocking taint must be tolerated (necessary for the pod to schedule).
+        for taint in node_taints:
+            if taint.effect in ("NoSchedule", "NoExecute") and not _tolerated(taint):
+                return False
+        # Symmetric membership: a scoped service requires its taint be present; the
+        # default service requires NO foreign service taint be present.
+        has_service_taint = any(
+            t.key == service_key and (t.value or "") == service_value
+            for t in node_taints
+        ) if service_key else False
+        if service_key:
+            return has_service_taint
+        # Default service: reject nodes carrying any non-infra (service) taint.
+        for taint in node_taints:
+            if taint.effect in ("NoSchedule", "NoExecute") and taint.key != "amd.com/gpu":
+                return False
+        return True
+
     def _eligible_target_nodes(self) -> list[dict]:
         """Nodes the Image Service should distribute images to.
 
-        Same predicate as `_eligible_prepull_nodes` (label, schedulable, Ready,
-        no DiskPressure) but resolves each node's InternalIP and excludes the
-        Image-Service host itself (it carries the prepull label). Nodes without
-        an InternalIP are skipped (the daemon reaches nodes over that IP)."""
+        Predicate: prepull label, schedulable, Ready, no DiskPressure, AND the node's
+        taints are tolerated by this manager's notebook pods (so a service only targets
+        its own nodes — see `_node_tolerated_by_notebooks`). Resolves each node's
+        InternalIP and excludes the Image-Service host itself (it carries the prepull
+        label). Nodes without an InternalIP are skipped (the daemon reaches them over it)."""
         targets: list[dict] = []
         image_service_node = settings.IMAGE_SERVICE_NODE_NAME.strip()
         try:
@@ -1260,6 +1312,8 @@ findmnt "$mnt"
             if conditions.get("Ready") != "True":
                 continue
             if conditions.get("DiskPressure") == "True":
+                continue
+            if not self._node_belongs_to_service(node):
                 continue
             internal_ip = next(
                 (addr.address for addr in (node.status.addresses or []) if addr.type == "InternalIP"),
