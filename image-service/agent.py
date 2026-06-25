@@ -4,7 +4,7 @@ AMD OneClick image-service agent.
 
 Polls the manager for pending image jobs and executes them on a dedicated,
 cordoned CPU cluster member (e.g. wx-ms-w7900d-0042) that has a large image
-volume mounted at /images and direct routed SSH access to every GPU node's
+volume mounted at /disk/ssd2 and direct routed SSH access to every GPU node's
 InternalIP. One multi-verb daemon replaces the single-verb build-agent:
 
   build        build an image locally from a Dockerfile (clean context)
@@ -26,7 +26,7 @@ closed unless BUILD_NETWORK is explicitly chosen.
 Hardening expectations (enforced by the systemd unit / host setup, not this script):
   - dedicated low-privilege user (no docker group); rootless docker/podman recommended
   - ProtectHome=true so /home is not readable
-  - DISTRIB_SSH_KEY lives outside $HOME (under /images/.ssh) so ProtectHome keeps it
+  - DISTRIB_SSH_KEY lives outside $HOME (under /disk/ssd2/.ssh) so ProtectHome keeps it
   - DOCKER_CONFIG points outside $HOME so registry creds survive ProtectHome
   - optional restricted docker network for build-time egress control
 
@@ -72,7 +72,7 @@ BUILD_NETWORK_REQUIRED = _env("BUILD_NETWORK_REQUIRED", "1") not in {"0", "false
 MIN_FREE_DISK_GB = float(_env("MIN_FREE_DISK_GB", "50"))
 # Free space required on a target node's containerd root before we distribute to it.
 IMAGE_NODE_MIN_FREE_DISK_GB = float(_env("IMAGE_NODE_MIN_FREE_DISK_GB", "50"))
-IMAGE_WORK_DIR = _env("IMAGE_WORK_DIR", "/images")
+IMAGE_WORK_DIR = _env("IMAGE_WORK_DIR", "/disk/ssd2")
 DISK_CHECK_PATH = _env("DISK_CHECK_PATH", IMAGE_WORK_DIR)
 LOG_FLUSH_SECONDS = float(_env("LOG_FLUSH_SECONDS", "3"))
 # Classic builder honors --memory/--cpuset/--network for RUN steps; default to it so

@@ -6,3 +6,6 @@ cluster.yaml
 external-url-dump.txt
 app/__pycache__/
 *.pyc
+
+# operator runbook (local notes, not source)
+image-service-node-0042-setup.md

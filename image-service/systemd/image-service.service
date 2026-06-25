@@ -19,9 +19,12 @@ RestartSec=5
 # --- Hardening ---
 # ProtectHome hides /home so a compromised daemon (or build escape) cannot read user
 # kubeconfigs. The DISTRIB_SSH_KEY (root-on-every-node) therefore lives OUTSIDE $HOME under
-# /images/.ssh and is exposed read-only via ReadOnlyPaths. ACR Enterprise credentials live
+# /disk/ssd2/.ssh and is exposed read-only via ReadOnlyPaths. ACR Enterprise credentials live
 # outside $HOME via DOCKER_CONFIG (set in the EnvironmentFile, e.g. /etc/amd-oneclick/docker),
-# exposed via ReadWritePaths. Build scratch, pulled layers and save tarballs land under /images.
+# exposed via ReadWritePaths. Build scratch, pulled layers and save tarballs land under /disk/ssd2.
+# NOTE: setup.sh rewrites ReadWritePaths/ReadOnlyPaths to the operator's IMAGE_WORK_DIR and
+# DISTRIB_SSH_KEY dir at install time; the paths below are only defaults. With ProtectSystem=strict
+# the work dir MUST be listed in ReadWritePaths or the daemon cannot write builds/tarballs.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -29,9 +32,8 @@ ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
 RestrictSUIDSGID=true
-ReadWritePaths=/etc/amd-oneclick/docker /images
-# setup.sh rewrites this to the actual directory of DISTRIB_SSH_KEY at install time.
-ReadOnlyPaths=/images/.ssh
+ReadWritePaths=/etc/amd-oneclick/docker /disk/ssd2
+ReadOnlyPaths=/disk/ssd2/.ssh
 
 [Install]
 WantedBy=multi-user.target

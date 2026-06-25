@@ -11,7 +11,8 @@
 #        BUILD_AGENT_TOKEN=xxxxxxxx \
 #        IMAGE_SERVICE_NODE_NAME=wx-ms-w7900d-0042 \
 #        CONTAINER_CLI=nerdctl \
-#        DISTRIB_SSH_KEY=/images/.ssh/id_distrib \
+#        DISTRIB_SSH_KEY=/disk/ssd2/.ssh/id_distrib \
+#        IMAGE_WORK_DIR=/disk/ssd2 \
 #        ACR_ENTERPRISE_REGISTRY=<acr-enterprise-host> \
 #        bash image-service/setup.sh
 set -euo pipefail
@@ -37,8 +38,8 @@ CONTAINER_CLI="${CONTAINER_CLI:-docker}"
 ACR_ENTERPRISE_REGISTRY="${ACR_ENTERPRISE_REGISTRY:-}"
 CTR_NAMESPACE="${CTR_NAMESPACE:-k8s.io}"
 NODE_SSH_USER="${NODE_SSH_USER:-root}"
-DISTRIB_SSH_KEY="${DISTRIB_SSH_KEY:-/images/.ssh/id_distrib}"
-IMAGE_WORK_DIR="${IMAGE_WORK_DIR:-/images}"
+DISTRIB_SSH_KEY="${DISTRIB_SSH_KEY:-/disk/ssd2/.ssh/id_distrib}"
+IMAGE_WORK_DIR="${IMAGE_WORK_DIR:-/disk/ssd2}"
 MIN_FREE_DISK_GB="${MIN_FREE_DISK_GB:-50}"
 IMAGE_NODE_MIN_FREE_DISK_GB="${IMAGE_NODE_MIN_FREE_DISK_GB:-50}"
 DISTRIBUTE_CONCURRENCY="${DISTRIBUTE_CONCURRENCY:-2}"
@@ -105,13 +106,15 @@ POLL_INTERVAL_SECONDS=10
 EOF
 chmod 600 "${ENV_FILE}"
 
-echo "==> Installing systemd unit (User/Group set to '${AGENT_USER}', ReadOnlyPaths=${SSH_KEY_DIR})"
-# The shipped unit hard-codes User=imagesvc/Group=imagesvc and a placeholder ssh-key dir.
-# If the operator overrode AGENT_USER/DISTRIB_SSH_KEY, the installed copy must reflect that —
-# otherwise the service runs as the wrong account or cannot read the distribution key.
+echo "==> Installing systemd unit (User/Group='${AGENT_USER}', ReadWritePaths includes ${IMAGE_WORK_DIR}, ReadOnlyPaths=${SSH_KEY_DIR})"
+# The shipped unit hard-codes User=imagesvc/Group=imagesvc, a default work dir, and a placeholder
+# ssh-key dir. If the operator overrode AGENT_USER/IMAGE_WORK_DIR/DISTRIB_SSH_KEY, the installed
+# copy must reflect that — otherwise the service runs as the wrong account, or (with
+# ProtectSystem=strict) cannot write builds/tarballs to the work dir, or cannot read the key.
 # Substitute into the installed copy rather than shipping a templated unit.
 sed -e "s/^User=.*/User=${AGENT_USER}/" \
     -e "s/^Group=.*/Group=${AGENT_USER}/" \
+    -e "s|^ReadWritePaths=.*|ReadWritePaths=${DOCKER_CONFIG_DIR} ${IMAGE_WORK_DIR}|" \
     -e "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${SSH_KEY_DIR}|" \
     "${SRC_DIR}/systemd/image-service.service" > /etc/systemd/system/image-service.service
 chmod 0644 /etc/systemd/system/image-service.service

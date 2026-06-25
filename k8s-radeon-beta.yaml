@@ -90,7 +90,13 @@ data:
   HF_TOKEN_SECRET_NAME: "amd-oneclick-radeon-beta-secrets"
   HF_TOKEN_SECRET_KEY: "HF_TOKEN"
   HF_HUB_DISABLE_XET: "1"
-  IMAGE_PULL_PROBE_ENABLED: "true"
+  # Image Service owns preloading when IMAGE_SERVICE_ENABLED=true; the legacy pull probe
+  # (which requires a single pinned NOTEBOOK_NODE_NAME) is mutually exclusive with auto-spread.
+  IMAGE_PULL_PROBE_ENABLED: "false"
+  # Distribute images itself to GPU nodes (save | ssh ctr import) instead of node-side ACR
+  # pulls. Requires the image-service daemon running on node 0042. Keep "false" until that
+  # daemon is up and 0043+0044 are labeled amd-oneclick-prepull=enabled (see runbook).
+  IMAGE_SERVICE_ENABLED: "true"
   WORKSPACE_HOST_ROOT: "/workspace/amd-oneclick-radeon-beta"
   WORKSPACE_MOUNT_PATH: "/workspace"
   WORKSPACE_VOLUME_TYPE: "emptyDir"
@@ -106,7 +112,10 @@ data:
   NODE_PORT_CLUSTER_SCAN_ENABLED: "false"
   NOTEBOOK_TOKEN: "amd-oneclick"
   NOTEBOOK_LABEL_PREFIX: "amd-oneclick-radeon-beta"
-  NOTEBOOK_NODE_NAME: "wx-ms-w7900d-0044"
+  # Empty = let the Image Service auto-spread notebooks across all eligible GPU nodes
+  # (0043 + 0044) by free GPU capacity; it then preloads the image onto whichever node
+  # the instance lands on. Set to a single node name to pin (and disable auto-spread).
+  NOTEBOOK_NODE_NAME: ""
   NOTEBOOK_TOLERATION_KEY: "amd-oneclick/beta"
   NOTEBOOK_TOLERATION_VALUE: "radeon"
   NOTEBOOK_TOLERATION_EFFECT: "NoSchedule"
