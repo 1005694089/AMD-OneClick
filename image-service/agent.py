@@ -25,7 +25,7 @@ closed unless BUILD_NETWORK is explicitly chosen.
 
 Hardening expectations (enforced by the systemd unit / host setup, not this script):
   - dedicated low-privilege user (no docker group); rootless docker/podman recommended
-  - ProtectHome=true so /home is not readable
+  - ProtectHome=tmpfs so real /home is not readable (BindPaths re-exposes /run/user)
   - DISTRIB_SSH_KEY lives outside $HOME (under /disk/ssd2/.ssh) so ProtectHome keeps it
   - DOCKER_CONFIG points outside $HOME so registry creds survive ProtectHome
   - optional restricted docker network for build-time egress control
@@ -58,7 +58,11 @@ BUILD_AGENT_TOKEN = _env("BUILD_AGENT_TOKEN", required=True)
 AGENT_ID = _env("AGENT_ID", "image-service-1")
 POLL_INTERVAL = float(_env("POLL_INTERVAL_SECONDS", "10"))
 # Generalized DOCKER_BIN -> CONTAINER_CLI: docker | nerdctl. build/pull/push/save map 1:1.
-CONTAINER_CLI = _env("CONTAINER_CLI", "docker")
+# Default to rootless nerdctl: 0042 runs nerdctl as a CLIENT of the imagesvc-owned rootless
+# containerd+buildkit user services (no sudo, no docker group). Defaulting to "docker" here would
+# be a landmine — a missing CONTAINER_CLI in the env file would silently fall back to the root-
+# equivalent system docker daemon and defeat the rootless design.
+CONTAINER_CLI = _env("CONTAINER_CLI", "nerdctl")
 BUILD_TIMEOUT = int(_env("BUILD_TIMEOUT_SECONDS", "1800"))
 BUILD_MEMORY = _env("BUILD_MEMORY", "8g")
 BUILD_CPUSET = _env("BUILD_CPUSET", "")            # e.g. "0-3"; empty = no pin
@@ -75,10 +79,17 @@ IMAGE_NODE_MIN_FREE_DISK_GB = float(_env("IMAGE_NODE_MIN_FREE_DISK_GB", "50"))
 IMAGE_WORK_DIR = _env("IMAGE_WORK_DIR", "/disk/ssd2")
 DISK_CHECK_PATH = _env("DISK_CHECK_PATH", IMAGE_WORK_DIR)
 LOG_FLUSH_SECONDS = float(_env("LOG_FLUSH_SECONDS", "3"))
-# Classic builder honors --memory/--cpuset/--network for RUN steps; default to it so
-# our resource + egress limits actually apply. Override to "1" only if you front this
-# with buildx + a resource-limited builder.
+# docker's classic builder honors --memory/--cpuset/--network for RUN steps; default to it so
+# our resource + egress limits actually apply. Override to "1" only if you front this with
+# buildx + a resource-limited builder.
+# NOTE: this is a DOCKER-ONLY knob. Rootless nerdctl has no classic builder — `nerdctl build`
+# always drives rootless buildkitd and ignores DOCKER_BUILDKIT, and it does NOT accept --memory
+# or --cpuset-cpus (those are run-time flags). When CONTAINER_CLI=nerdctl we therefore omit
+# DOCKER_BUILDKIT and the two resource flags from the build command (see run_build); impose
+# RUN-step resource limits on the rootless buildkitd --user service (cgroup limits) instead.
 DOCKER_BUILDKIT = _env("DOCKER_BUILDKIT", "0")
+# True when driving rootless buildkit via nerdctl (no classic builder; no --memory/--cpuset-cpus).
+_IS_NERDCTL = os.path.basename(CONTAINER_CLI) == "nerdctl"
 
 # Which job kinds this daemon will claim. CSV; default = all.
 ALL_KINDS = ["build", "pull", "acr_backup", "distribute", "evict"]
@@ -151,7 +162,10 @@ def free_disk_gb(path):
 
 def _build_env():
     env = dict(os.environ)
-    env["DOCKER_BUILDKIT"] = DOCKER_BUILDKIT
+    # DOCKER_BUILDKIT is a docker-only selector; rootless `nerdctl build` ignores it. Only set it
+    # for docker so we don't leave a misleading no-op var in nerdctl's environment.
+    if not _IS_NERDCTL:
+        env["DOCKER_BUILDKIT"] = DOCKER_BUILDKIT
     return env
 
 
@@ -275,12 +289,17 @@ def run_build(job):
         build_cmd = [
             CONTAINER_CLI, "build",
             "--tag", ref,
-            "--memory", BUILD_MEMORY,
             "--label", "amd-oneclick-custom=1",
             "--force-rm",
         ]
-        if BUILD_CPUSET:
-            build_cmd += ["--cpuset-cpus", BUILD_CPUSET]
+        # --memory / --cpuset-cpus are docker classic-builder RUN-step limits. `nerdctl build`
+        # rejects them (it drives buildkitd, which takes no per-build resource flags). Under
+        # rootless nerdctl, RUN-step limits are enforced via cgroup limits on the buildkitd
+        # --user service instead (see runbook). Only pass them to docker.
+        if not _IS_NERDCTL:
+            build_cmd += ["--memory", BUILD_MEMORY]
+            if BUILD_CPUSET:
+                build_cmd += ["--cpuset-cpus", BUILD_CPUSET]
         if BUILD_NETWORK:
             build_cmd += ["--network", BUILD_NETWORK]
         else:
