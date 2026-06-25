@@ -222,7 +222,7 @@ spec:
             value: "5"
       containers:
         - name: manager
-          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-pull-probe-20260616-1959
+          image: crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-image-service-20260625
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
