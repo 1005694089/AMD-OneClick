@@ -114,6 +114,21 @@ async def reap_stale_builds_job():
         logger.error(f"Stale build reaper failed: {e}")
 
 
+async def reap_stale_image_jobs_job():
+    """Requeue (or fail) image_jobs whose agent lease has expired (daemon died/stalled).
+
+    Harmless when RUN_SCHEDULER is off: the image-service daemon also reaps stale jobs.
+    """
+    from .store import reap_stale_image_jobs
+
+    try:
+        reaped = reap_stale_image_jobs(settings.JOB_LEASE_TIMEOUT_SECONDS)
+        if reaped:
+            logger.warning("Reaped %s stale image job(s)", reaped)
+    except Exception as e:
+        logger.error(f"Stale image job reaper failed: {e}")
+
+
 def start_scheduler():
     """Start the background scheduler"""
     scheduler.add_job(
@@ -135,6 +150,13 @@ def start_scheduler():
         trigger=IntervalTrigger(minutes=5),
         id="reap_stale_builds_job",
         name="Reap stale custom image builds",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        reap_stale_image_jobs_job,
+        trigger=IntervalTrigger(minutes=5),
+        id="reap_stale_image_jobs_job",
+        name="Reap stale image jobs",
         replace_existing=True,
     )
     scheduler.start()

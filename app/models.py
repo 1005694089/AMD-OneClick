@@ -22,6 +22,8 @@ class ImageRequest(BaseModel):
     image: str
     description: Optional[str] = ""
     enabled: bool = True
+    source_type: Optional[str] = None
+    github_url: Optional[str] = None
 
 
 class CreditGrantRequest(BaseModel):
@@ -81,7 +83,9 @@ class HuggingFaceNotebookLaunchRequest(BaseModel):
 class CustomImageBuildRequest(BaseModel):
     """Request model for enqueuing a custom image build"""
     name: str
-    dockerfile: str
+    dockerfile: Optional[str] = None
+    source_type: str = "dockerfile"
+    github_url: Optional[str] = None
 
 
 class BuildClaimRequest(BaseModel):
@@ -105,6 +109,25 @@ class BuildEvictRequest(BaseModel):
     """Build-agent notification that node-local image content was reclaimed."""
     agent_id: str
     image_ids: list[int] = []
+
+
+class ImageJobClaimRequest(BaseModel):
+    """Image-service request to lease the next pending job, optionally filtered by kind."""
+    agent_id: str
+    kinds: Optional[list[str]] = None
+
+
+class ImageJobLogRequest(BaseModel):
+    """Image-service log chunk for a job"""
+    agent_id: str
+    log: str
+
+
+class ImageJobResultRequest(BaseModel):
+    """Image-service terminal result for a job"""
+    agent_id: str
+    status: str  # succeeded | failed
+    result: Optional[dict] = None
 
 
 class GitHubNotebookInfo(BaseModel):

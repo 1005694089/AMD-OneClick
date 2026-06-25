@@ -1,0 +1,37 @@
+[Unit]
+Description=AMD OneClick image-service daemon (multi-verb: build/pull/acr_backup/distribute/evict)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated low-privilege user. NOT in the host `docker` group (which would be
+# root-equivalent); use rootless docker/podman or nerdctl against containerd. See setup.sh.
+# NOTE: setup.sh rewrites these two lines to the operator's AGENT_USER at install time;
+# 'imagesvc' is only the default. Edit AGENT_USER (or these lines) — not just one.
+User=imagesvc
+Group=imagesvc
+EnvironmentFile=/etc/amd-oneclick-image-service.env
+ExecStart=/usr/bin/python3 /opt/amd-oneclick/image-service/agent.py
+Restart=always
+RestartSec=5
+
+# --- Hardening ---
+# ProtectHome hides /home so a compromised daemon (or build escape) cannot read user
+# kubeconfigs. The DISTRIB_SSH_KEY (root-on-every-node) therefore lives OUTSIDE $HOME under
+# /images/.ssh and is exposed read-only via ReadOnlyPaths. ACR Enterprise credentials live
+# outside $HOME via DOCKER_CONFIG (set in the EnvironmentFile, e.g. /etc/amd-oneclick/docker),
+# exposed via ReadWritePaths. Build scratch, pulled layers and save tarballs land under /images.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+ReadWritePaths=/etc/amd-oneclick/docker /images
+# setup.sh rewrites this to the actual directory of DISTRIB_SSH_KEY at install time.
+ReadOnlyPaths=/images/.ssh
+
+[Install]
+WantedBy=multi-user.target

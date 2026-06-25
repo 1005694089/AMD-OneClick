@@ -19,6 +19,7 @@ from urllib.parse import quote, urlparse, urlunparse
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+from . import store
 from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
 
 logger = logging.getLogger(__name__)
@@ -842,13 +843,25 @@ findmnt "$mnt"
             notebook_container["command"] = ["/bin/bash", "-c"]
             notebook_container["args"] = [startup_script]
 
+        # When the Image Service has already imported this ref into containerd on the
+        # resolved target node, the image is present locally with no registry behind it:
+        # pull IfNotPresent and drop the registry pull secrets entirely.
+        image_preloaded = bool(
+            settings.IMAGE_SERVICE_ENABLED
+            and notebook_node_name
+            and store.image_loaded_on_node(image, notebook_node_name)
+        )
+
         # Custom images reuse the tag user-{id}:{name} across rebuilds, so IfNotPresent could
         # launch a stale cached layer on the node after a delete+rebuild. Force Always for the
         # custom registry so the freshly pushed image is always pulled.
         is_custom_image = bool(
             settings.CUSTOM_IMAGE_REGISTRY and image.startswith(settings.CUSTOM_IMAGE_REGISTRY)
         )
-        notebook_pull_policy = "Always" if is_custom_image else "IfNotPresent"
+        if image_preloaded:
+            notebook_pull_policy = "IfNotPresent"
+        else:
+            notebook_pull_policy = "Always" if is_custom_image else "IfNotPresent"
         notebook_container["imagePullPolicy"] = notebook_pull_policy
 
         spec = {
@@ -884,16 +897,20 @@ findmnt "$mnt"
         if notebook_node_name:
             spec["nodeName"] = notebook_node_name
 
-        image_pull_secrets = []
-        image_pull_secret_name = settings.IMAGE_PULL_SECRET_NAME.strip()
-        if image_pull_secret_name:
-            image_pull_secrets.append({"name": image_pull_secret_name})
-        # Additionally attach the custom-registry pull secret for images from the custom
-        # registry, when one is configured. Other images keep relying on node-level credentials.
-        if settings.CUSTOM_IMAGE_PULL_SECRET_NAME and image.startswith(settings.CUSTOM_IMAGE_REGISTRY):
-            image_pull_secrets.append({"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME})
-        if image_pull_secrets:
-            spec["imagePullSecrets"] = image_pull_secrets
+        # A preloaded ref is served from the node's local containerd store, so no
+        # registry credentials are needed (and attaching them is wrong — the ref has
+        # no registry). Only attach pull secrets when a registry pull may happen.
+        if not image_preloaded:
+            image_pull_secrets = []
+            image_pull_secret_name = settings.IMAGE_PULL_SECRET_NAME.strip()
+            if image_pull_secret_name:
+                image_pull_secrets.append({"name": image_pull_secret_name})
+            # Additionally attach the custom-registry pull secret for images from the custom
+            # registry, when one is configured. Other images keep relying on node-level credentials.
+            if settings.CUSTOM_IMAGE_PULL_SECRET_NAME and image.startswith(settings.CUSTOM_IMAGE_REGISTRY):
+                image_pull_secrets.append({"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME})
+            if image_pull_secrets:
+                spec["imagePullSecrets"] = image_pull_secrets
 
         return {
             "apiVersion": "v1",
@@ -1214,6 +1231,95 @@ findmnt "$mnt"
             eligible.add(node.metadata.name)
         return eligible
 
+    def _eligible_target_nodes(self) -> list[dict]:
+        """Nodes the Image Service should distribute images to.
+
+        Same predicate as `_eligible_prepull_nodes` (label, schedulable, Ready,
+        no DiskPressure) but resolves each node's InternalIP and excludes the
+        Image-Service host itself (it carries the prepull label). Nodes without
+        an InternalIP are skipped (the daemon reaches nodes over that IP)."""
+        targets: list[dict] = []
+        image_service_node = settings.IMAGE_SERVICE_NODE_NAME.strip()
+        try:
+            nodes = self.core_v1.list_node()
+        except ApiException as e:
+            if e.status == 403:
+                logger.warning("Cannot list nodes for image distribution; returning best-effort targets")
+                return targets
+            raise
+        for node in nodes.items:
+            name = node.metadata.name
+            if image_service_node and name == image_service_node:
+                continue
+            labels = node.metadata.labels or {}
+            conditions = {cond.type: cond.status for cond in node.status.conditions or []}
+            if labels.get("amd-oneclick-prepull") != "enabled":
+                continue
+            if getattr(node.spec, "unschedulable", False):
+                continue
+            if conditions.get("Ready") != "True":
+                continue
+            if conditions.get("DiskPressure") == "True":
+                continue
+            internal_ip = next(
+                (addr.address for addr in (node.status.addresses or []) if addr.type == "InternalIP"),
+                None,
+            )
+            if not internal_ip:
+                continue
+            targets.append({"node": name, "ip": internal_ip})
+        return targets
+
+    def resolve_node_targets(self, node_names: Optional[list[str]] = None) -> list[dict]:
+        """Resolve distribute/evict targets ({"node","ip"}) for the daemon.
+
+        The Manager owns target resolution (it has kubectl; the daemon does not). Returns
+        every eligible target when node_names is None, else the eligible targets whose node
+        name is in node_names (silently dropping names that are not eligible/resolvable)."""
+        targets = self._eligible_target_nodes()
+        if node_names is None:
+            return targets
+        wanted = {n for n in node_names if n}
+        return [t for t in targets if t["node"] in wanted]
+
+    def _select_target_gpu_node(self, gpu_count: int = 1) -> Optional[str]:
+        """Pick an eligible node with enough free GPUs for a node-pinned launch.
+
+        Reads each node's LIVE `amd.com/gpu` allocatable and subtracts the GPUs
+        already committed by non-terminal pods on that node. Returns the first
+        node with `allocatable - committed >= gpu_count`, else None."""
+        for target in self._eligible_target_nodes():
+            name = target["node"]
+            try:
+                node = self.core_v1.read_node(name=name)
+            except ApiException:
+                continue
+            allocatable = node.status.allocatable or {}
+            try:
+                node_gpus = int(allocatable.get("amd.com/gpu", 0))
+            except (TypeError, ValueError):
+                continue
+            if node_gpus < gpu_count:
+                continue
+            try:
+                pods = self.core_v1.list_namespaced_pod(
+                    namespace=self.namespace,
+                    field_selector=f"spec.nodeName={name},status.phase!=Succeeded,status.phase!=Failed",
+                )
+            except ApiException:
+                continue
+            committed = 0
+            for pod in pods.items:
+                for container in pod.spec.containers or []:
+                    requests = getattr(container.resources, "requests", None) or {}
+                    try:
+                        committed += int(requests.get("amd.com/gpu", 0))
+                    except (TypeError, ValueError):
+                        continue
+            if node_gpus - committed >= gpu_count:
+                return name
+        return None
+
     def _configured_notebook_node_count(self) -> int:
         """Return the configured runtime node count when pre-pull is intentionally off."""
         return 1 if settings.NOTEBOOK_NODE_NAME else 0
@@ -1315,7 +1421,25 @@ findmnt "$mnt"
         return self.get_image_sync_status(image_id, image)
 
     def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
-        """Create or replace a DaemonSet that pulls the image on every node."""
+        """Distribute a catalog image to every eligible GPU node.
+
+        With the Image Service enabled this enqueues a `distribute` job (the
+        out-of-cluster daemon does the actual `save | ssh ctr import`) and
+        synthesizes status from `image_nodes`. With it disabled the legacy
+        prepull-DaemonSet / pull-probe path is used unchanged."""
+        if settings.IMAGE_SERVICE_ENABLED:
+            image = image.strip()
+            if not image:
+                raise ValueError("image must not be empty")
+            targets = self._eligible_target_nodes()
+            store.enqueue_image_job(
+                kind="distribute",
+                ref=image,
+                image_id=image_id,
+                payload={"targets": targets, "concurrency": 2},
+            )
+            return self.get_image_sync_status(image_id, image)
+
         if not settings.IMAGE_PREPULL_ENABLED:
             if self._image_pull_probe_enabled():
                 return self._sync_image_pull_probe(image_id, image)
@@ -1503,7 +1627,28 @@ findmnt "$mnt"
         return self._pull_probe_status("pulling", 0, self._with_elapsed(pod, f"{node_name} probe phase {phase}"), False)
 
     def get_image_sync_status(self, image_id: int, image: Optional[str] = None) -> dict:
-        """Return DaemonSet sync status for an image catalog entry."""
+        """Return distribution status for an image catalog entry."""
+        if settings.IMAGE_SERVICE_ENABLED:
+            ref = (image or "").strip()
+            targets = self._eligible_target_nodes()
+            target_names = {t["node"] for t in targets}
+            desired = len(target_names)
+            loaded_nodes = set(store.list_nodes_for_image(ref)) if ref else set()
+            ready = len(loaded_nodes & target_names) if target_names else len(loaded_nodes)
+            if desired > 0 and ready >= desired:
+                status = "ready"
+            elif desired == 0:
+                status = "pending"
+            else:
+                status = "pulling"
+            return {
+                "status": status,
+                "desired_count": desired,
+                "ready_count": ready,
+                "message": f"{ready}/{desired} nodes loaded",
+                "completed": status == "ready",
+            }
+
         if not settings.IMAGE_PREPULL_ENABLED:
             if self._image_pull_probe_enabled():
                 return self._get_image_pull_probe_status(image_id, image)
@@ -1565,6 +1710,11 @@ findmnt "$mnt"
             raise
 
     def delete_image_sync(self, image_id: int):
+        # With the Image Service enabled there is no prepull DaemonSet/probe to tear
+        # down; node eviction (image_nodes cleanup + ssh ctr rm) is orchestrated by
+        # the DELETE handler via an `evict` job. Keep the legacy cleanup for off.
+        if settings.IMAGE_SERVICE_ENABLED:
+            return
         try:
             self.apps_v1.delete_namespaced_daemon_set(name=self._prepull_name(image_id), namespace=self.namespace)
         except ApiException as e:
@@ -1752,6 +1902,10 @@ findmnt "$mnt"
 
         workspace_quota_node_name = self._ensure_workspace_quota(instance_id)
         notebook_node_name = self._resolve_notebook_node_name(workspace_quota_node_name)
+        # When no node is pinned by config/quota, let the Image Service pick a GPU node
+        # with free capacity so its image can be preloaded onto that same node.
+        if not notebook_node_name and settings.IMAGE_SERVICE_ENABLED:
+            notebook_node_name = self._select_target_gpu_node(gpu_count)
         network_disk_claim_name = self._ensure_network_disk(instance_id)
         pod_manifest = self._get_pod_manifest(
             email, instance_id, image,

@@ -47,6 +47,9 @@ from .models import (
     BuildLogRequest,
     BuildResultRequest,
     BuildEvictRequest,
+    ImageJobClaimRequest,
+    ImageJobLogRequest,
+    ImageJobResultRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .notebook_sources import (
@@ -54,6 +57,7 @@ from .notebook_sources import (
     parse_huggingface_demo_notebook_path,
     parse_huggingface_notebook_url,
 )
+from . import store
 from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
 from .template_sync import sync_template_preview
@@ -102,6 +106,15 @@ from .store import (
     mark_custom_image_evicted,
     mark_custom_image_launched,
     requeue_custom_image_build,
+    enqueue_image_job,
+    claim_next_image_job,
+    append_image_job_log,
+    finish_image_job,
+    upsert_image_node,
+    image_loaded_on_node,
+    clear_image_node,
+    touch_image_node,
+    list_outdated_images,
 )
 
 # Configure logging
@@ -501,6 +514,7 @@ def _notebook_status_message(status_details: Optional[dict]) -> str:
         "running": "Container is running, waiting for readiness...",
         "jupyter_starting": "Jupyter is starting up...",
         "pending": "Waiting for resources...",
+        "distributing": "Loading image onto the GPU node…",
         "initializing": "Initializing notebook environment...",
         "loading": "Loading notebook image...",
         "failed": "Notebook creation failed",
@@ -603,6 +617,121 @@ def _prepare_custom_image_for_launch(user: dict, image: str) -> Optional[str]:
         return "rebuilding"
     mark_custom_image_launched(row["id"])
     return row["build_status"]
+
+
+def _stamp_launch(user: dict, image: str, node_name: Optional[str]) -> None:
+    """Record a launch against an image so neither catalog nor custom rows are wrongly reaped.
+
+    Custom images stamp last_launched_at via mark_custom_image_launched (used by GC). Every image
+    (catalog or custom) refreshes its image_nodes row so a freshly-launched ref on a node is not
+    evicted by the outdated reaper. Best-effort: a stamping failure must never fail a launch.
+    """
+    try:
+        row = get_custom_image_by_value(user["id"], image)
+        if row:
+            mark_custom_image_launched(row["id"])
+        if node_name:
+            touch_image_node(image, node_name)
+    except Exception as e:
+        logger.warning("Failed to stamp launch for image %s on node %s: %s", image, node_name, e)
+
+
+def _ensure_image_on_node(image: str, gpu_count: int) -> Optional[str]:
+    """Resolve the GPU node a launch will land on, distributing the image first if needed.
+
+    Return contract:
+      - a node name: the image is already loaded on that node; launch may proceed (pinned there).
+      - None: distribution was enqueued; the caller must return a 'distributing' status instead of
+        calling create_instance — the off-cluster daemon never runs inside the request handler
+        (the single uvicorn worker would block all clients).
+      - "" (empty string): no gating — proceed on the normal scheduling path. Returned when
+        IMAGE_SERVICE_ENABLED is off (legacy DaemonSet/ACR path untouched) or no target node could
+        be resolved.
+    """
+    if not settings.IMAGE_SERVICE_ENABLED:
+        return ""
+    node = k8s_client._select_target_gpu_node(gpu_count)
+    if not node:
+        return ""
+    if image_loaded_on_node(image, node):
+        return node
+    # The Manager resolves the single node's target now; the daemon never expands scope.
+    targets = k8s_client.resolve_node_targets([node])
+    enqueue_image_job(
+        kind="distribute",
+        ref=image,
+        payload={"scope": f"node:{node}", "targets": targets},
+    )
+    return None
+
+
+def _normalize_github_raw_url(url: str) -> str:
+    """Normalize a github.com/<o>/<r>/blob/<ref>/<path> URL to its raw.githubusercontent.com form."""
+    parsed = urlparse(url)
+    if parsed.hostname in ("github.com", "www.github.com"):
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 5 and parts[2] == "blob":
+            owner, repo, _, ref = parts[0], parts[1], parts[2], parts[3]
+            path = "/".join(parts[4:])
+            return f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+    return url
+
+
+def _fetch_github_dockerfile(url: str) -> str:
+    """Fetch a single raw Dockerfile from an allowlisted GitHub host with an SSRF guard.
+
+    Hardening: https only; host must be in GITHUB_RAW_ALLOWED_HOSTS; every resolved IP is rejected
+    if it is private/loopback/link-local/reserved (blocks DNS rebinding); redirects are treated as
+    errors (follow_redirects=False) so a 3xx can't bounce us to an internal host; the response is
+    capped at CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES. Any failure raises HTTPException(400).
+    """
+    import ipaddress
+    import socket
+
+    raw_url = _normalize_github_raw_url((url or "").strip())
+    parsed = urlparse(raw_url)
+    if parsed.scheme != "https":
+        raise HTTPException(status_code=400, detail="Dockerfile URL must use https")
+    host = parsed.hostname or ""
+    if host not in settings.GITHUB_RAW_ALLOWED_HOSTS:
+        raise HTTPException(
+            status_code=400,
+            detail="Dockerfile URL host is not allowed; use a raw.githubusercontent.com URL",
+        )
+    port = parsed.port or 443
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not resolve Dockerfile URL host")
+    if not infos:
+        raise HTTPException(status_code=400, detail="Could not resolve Dockerfile URL host")
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Could not resolve Dockerfile URL host")
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
+            raise HTTPException(status_code=400, detail="Dockerfile URL resolves to a disallowed address")
+
+    max_bytes = settings.CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES
+    try:
+        with httpx.Client(
+            follow_redirects=False,
+            timeout=settings.GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS,
+        ) as client:
+            resp = client.get(raw_url)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to fetch Dockerfile")
+    if resp.status_code >= 300:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch Dockerfile (HTTP {resp.status_code})")
+    content = resp.content[: max_bytes + 1]
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"Dockerfile exceeds {max_bytes} bytes")
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Dockerfile is not valid UTF-8 text")
 
 
 def verify_build_agent(request: Request):
@@ -1065,6 +1194,15 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     if int(user["credits"]) < gpu_count:
         raise HTTPException(status_code=400, detail="Insufficient credits")
 
+    target_node = _ensure_image_on_node(image, gpu_count)
+    if target_node is None:
+        return NotebookStatus(
+            status="distributing",
+            message="Loading image onto the GPU node…",
+            url=None,
+            email=email,
+        )
+
     try:
         instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
         instance = k8s_client.create_instance(
@@ -1075,6 +1213,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             resource_profile=resource_profile,
             disk_size_gb=disk_size_gb,
         )
+        _stamp_launch(user, image, target_node or None)
         record_instance(
             user["id"], email, instance["id"], image, instance_type, gpu_count,
             instance.get("node_port"), instance.get("opencode_node_port"),
@@ -1229,6 +1368,9 @@ async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(
             detail="Name must be 1-39 chars: lowercase letters, digits, hyphens; must start with a letter or digit.",
         )
     dockerfile = req.dockerfile or ""
+    github_url = (getattr(req, "github_url", None) or "").strip()
+    if github_url and not dockerfile.strip():
+        dockerfile = _fetch_github_dockerfile(github_url)
     if not dockerfile.strip():
         raise HTTPException(status_code=400, detail="Dockerfile must not be empty")
     if len(dockerfile.encode("utf-8")) > settings.CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES:
@@ -1322,6 +1464,175 @@ async def report_evicted(req: BuildEvictRequest, _agent: bool = Depends(verify_b
         if mark_custom_image_evicted(image_id):
             evicted.append(image_id)
     return {"evicted": evicted}
+
+
+# =============================================================================
+# Internal Image-Service Job API (off-cluster daemon; token-guarded)
+# =============================================================================
+
+def _resolve_chain_targets(scope: str) -> list[dict]:
+    """Resolve distribute targets for a chain step from its scope. The Manager owns target
+    resolution (the daemon has no kubectl): scope 'all' -> every eligible node; 'node:<name>'
+    -> just that node; anything else -> empty (daemon will fail fast on no_targets)."""
+    scope = (scope or "").strip()
+    if scope == "node:" or scope.startswith("node:"):
+        node_name = scope.split(":", 1)[1].strip()
+        return k8s_client.resolve_node_targets([node_name]) if node_name else []
+    if scope == "all":
+        return k8s_client.resolve_node_targets(None)
+    return k8s_client.resolve_node_targets(None)
+
+
+def _enqueue_next_chain_step(job: dict, payload: dict) -> None:
+    """Manager-driven chaining: pop the next kind off payload['chain'] and enqueue it, carrying
+    the remaining chain forward. Targets for a 'distribute' step are resolved NOW (the daemon
+    never resolves node IPs); 'acr_backup' carries acr_target_ref."""
+    chain = list(payload.get("chain") or [])
+    if not chain:
+        return
+    next_kind = chain.pop(0)
+    ref = job.get("ref")
+    next_payload: dict = {"chain": chain}
+    if payload.get("scope"):
+        next_payload["scope"] = payload["scope"]
+    if next_kind == "distribute":
+        next_payload["targets"] = _resolve_chain_targets(payload.get("scope") or "all")
+    elif next_kind == "acr_backup":
+        acr_target_ref = payload.get("acr_target_ref")
+        if acr_target_ref:
+            next_payload["acr_target_ref"] = acr_target_ref
+    enqueue_image_job(
+        kind=next_kind,
+        ref=ref,
+        image_id=job.get("image_id"),
+        custom_image_id=job.get("custom_image_id"),
+        payload=next_payload,
+    )
+
+
+def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
+    """Apply a succeeded job's effect to the linked image/node lifecycle tables."""
+    kind = job.get("kind")
+    ref = job.get("ref")
+    result = result or {}
+    payload = job.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload) if payload else {}
+        except (ValueError, TypeError):
+            payload = {}
+    payload = payload or {}
+
+    if kind == "build":
+        custom_image_id = job.get("custom_image_id")
+        claimed_by = job.get("claimed_by")
+        if custom_image_id:
+            update_custom_image_status(custom_image_id, status="ready", require_claimed_by=claimed_by)
+    elif kind in ("pull",):
+        # Source bytes now exist on the Image-Service host; distribution follows as its own job.
+        pass
+    elif kind == "distribute":
+        for node in result.get("nodes", []) or []:
+            node_name = node.get("node") if isinstance(node, dict) else node
+            if node and (not isinstance(node, dict) or node.get("loaded")):
+                if node_name:
+                    upsert_image_node(node_name=node_name, image_ref=ref, status="loaded", size_bytes=(node.get("size_bytes") if isinstance(node, dict) else None))
+    elif kind == "evict":
+        for node in result.get("nodes", []) or []:
+            node_name = node.get("node") if isinstance(node, dict) else node
+            if node and (not isinstance(node, dict) or node.get("removed")):
+                if node_name:
+                    clear_image_node(ref, node_name)
+        custom_image_id = job.get("custom_image_id")
+        if custom_image_id:
+            mark_custom_image_evicted(custom_image_id)
+    elif kind == "acr_backup":
+        image_id = job.get("image_id")
+        if image_id is not None:
+            store.set_image_acr_backup(image_id, result.get("acr_backup_ref") or ref, "ok")
+
+    # Manager-driven chaining: any successful job carrying a non-empty chain enqueues the next
+    # step, resolving distribute targets here (the daemon has no kubectl).
+    _enqueue_next_chain_step(job, payload)
+
+
+@app.post("/api/internal/jobs/claim")
+async def claim_image_job(req: ImageJobClaimRequest, _agent: bool = Depends(verify_build_agent)):
+    job = claim_next_image_job(req.agent_id, kinds=req.kinds)
+    if not job:
+        return {"job": None}
+    payload = job.get("payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload) if payload else {}
+        except (ValueError, TypeError):
+            payload = {}
+    payload = payload or {}
+    # A build job always builds with OpenCode + Hermes appended, exactly as claim_build does.
+    if job.get("kind") == "build" and payload.get("dockerfile"):
+        payload["dockerfile"] = payload["dockerfile"] + "\n" + settings.DOCKERFILE_SUFFIX
+    return {
+        "job": {
+            "id": job["id"],
+            "kind": job.get("kind"),
+            "ref": job.get("ref"),
+            "image_id": job.get("image_id"),
+            "custom_image_id": job.get("custom_image_id"),
+            "payload": payload,
+        }
+    }
+
+
+@app.post("/api/internal/jobs/{job_id}/log")
+async def push_image_job_log(job_id: int, req: ImageJobLogRequest, _agent: bool = Depends(verify_build_agent)):
+    if not append_image_job_log(job_id, req.log or "", agent_id=req.agent_id):
+        raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
+    return {"ok": True}
+
+
+@app.post("/api/internal/jobs/{job_id}/result")
+async def report_image_job_result(job_id: int, req: ImageJobResultRequest, _agent: bool = Depends(verify_build_agent)):
+    status = (req.status or "").strip().lower()
+    if status not in ("succeeded", "failed"):
+        raise HTTPException(status_code=400, detail="status must be 'succeeded' or 'failed'")
+    result_json = json.dumps(req.result) if req.result is not None else None
+    job = finish_image_job(job_id, status, agent_id=req.agent_id, result=result_json)
+    if not job:
+        raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
+    if status == "succeeded":
+        try:
+            _sync_image_job_lifecycle(job, req.result)
+        except Exception as e:
+            logger.error("Failed to sync lifecycle for image job %s (%s): %s", job_id, job.get("kind"), e)
+    return {"ok": True}
+
+
+@app.post("/api/internal/images/outdated")
+async def list_outdated_image_targets(req: ImageJobClaimRequest, _agent: bool = Depends(verify_build_agent)):
+    """Compute outdated (ref,node) pairs and enqueue one evict job per ref server-side.
+
+    The daemon only triggers this pass; the Manager resolves targets (it has kubectl) and
+    enqueues. enqueue_image_job's non-terminal (kind, ref) guard dedupes repeated polls.
+    """
+    outdated = list_outdated_images()
+    by_ref: dict[str, list[str]] = {}
+    for row in outdated:
+        ref = row.get("image_ref")
+        node = row.get("node_name")
+        if not ref or not node:
+            continue
+        by_ref.setdefault(ref, []).append(node)
+    enqueued = 0
+    for ref, node_names in by_ref.items():
+        targets = k8s_client.resolve_node_targets(node_names)
+        job = enqueue_image_job(
+            kind="evict",
+            ref=ref,
+            payload={"targets": targets, "scope": "outdated"},
+        )
+        if job:
+            enqueued += 1
+    return {"images": outdated, "enqueued": enqueued}
 
 
 # =============================================================================
@@ -1496,6 +1807,14 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
         raise HTTPException(status_code=400, detail="Insufficient credits")
 
     email = user["email"].lower()
+    target_node = _ensure_image_on_node(template["image"], gpu_count)
+    if target_node is None:
+        return NotebookStatus(
+            status="distributing",
+            message="Loading image onto the GPU node…",
+            url=None,
+            email=email,
+        )
     try:
         github_info = _template_github_info(template) or None
         template_instance_type = (template.get("instance_type") or "").strip() or "opencode"
@@ -1514,6 +1833,7 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             app_port=template.get("app_port"),
             model_source=template.get("model_source"),
         )
+        _stamp_launch(user, template["image"], target_node or None)
         record_instance(
             user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count,
             instance.get("node_port"), instance.get("opencode_node_port"),
@@ -1627,6 +1947,7 @@ async def launch_huggingface_demo_notebook(
             custom_instance_id=instance_id,
             resource_profile="auto",
         )
+        _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,
                         instance.get("node_port"), instance.get("opencode_node_port"))
         record_instance_launch_event(user["id"], email, instance["id"], image, "jupyter", gpu_count)
@@ -1866,7 +2187,14 @@ async def create_github_notebook(
             github_info=github_info,
             custom_instance_id=instance_id
         )
-        
+        if settings.IMAGE_SERVICE_ENABLED:
+            try:
+                node_name = k8s_client._select_target_gpu_node()
+                if node_name:
+                    touch_image_node(settings.DEFAULT_IMAGE, node_name)
+            except Exception as e:
+                logger.warning("Failed to stamp launch for github notebook image: %s", e)
+
         # Set cookie to remember this instance
         response.set_cookie(
             key="amd_oneclick_gh_instance",
@@ -2425,8 +2753,76 @@ async def admin_list_images(username: str = Depends(verify_admin)):
     return {"images": list_images(enabled_only=False)}
 
 
+# Admin source types map to the head verb of the distribution chain.
+_ADMIN_SOURCE_HEAD_KIND = {
+    "acr_pull": "pull",
+    "dockerhub_pull": "pull",
+    "github_build": "build",
+}
+
+
+def _upsert_image_with_source(name, image, description, enabled, image_id, source_type, source_ref):
+    """upsert_image carrying source_type/source_ref so the admin flow persists the source columns."""
+    return upsert_image(
+        name, image, description, enabled, image_id=image_id,
+        source_type=source_type, source_ref=source_ref,
+    )
+
+
+def _acr_backup_target_ref(ref: str) -> Optional[str]:
+    """Compute the ACR Enterprise backup ref for a catalog image: <registry>/<repo:tag>.
+
+    Returns None when ACR_ENTERPRISE_REGISTRY is unset (the acr_backup job then fails fast)."""
+    registry = (settings.ACR_ENTERPRISE_REGISTRY or "").strip().rstrip("/")
+    if not registry:
+        return None
+    # Strip any existing registry host from the ref so we re-home it under the backup registry.
+    repo = ref.strip()
+    first = repo.split("/", 1)[0]
+    if "." in first or ":" in first or first == "localhost":
+        repo = repo.split("/", 1)[1] if "/" in repo else repo
+    return f"{registry}/{repo}"
+
+
+def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: str) -> None:
+    """Enqueue the non-blocking distribution chain for a source_type-backed admin image.
+
+    Head verb: pull (acr_pull/dockerhub_pull) or build (github_build, Dockerfile fetched
+    server-side). The chain then runs acr_backup and finally distribute scope=all. The chain is
+    sequenced by the off-cluster daemon from the head job's payload `chain`; the Manager only
+    enqueues the head and returns immediately so the single uvicorn worker never blocks.
+    """
+    head_kind = _ADMIN_SOURCE_HEAD_KIND[source_type]
+    ref = image_row["image"]
+    payload = {
+        "image_id": image_row["id"],
+        "acr_target_ref": _acr_backup_target_ref(ref),
+        "chain": ["acr_backup", "distribute"],
+        "scope": "all",
+    }
+    if head_kind == "build":
+        payload["dockerfile"] = _fetch_github_dockerfile(source_ref)
+    else:
+        payload["source_ref"] = source_ref
+    enqueue_image_job(kind=head_kind, ref=ref, image_id=image_row["id"], payload=payload)
+
+
 @app.post("/api/admin/images")
 async def admin_create_image(req: ImageRequest, username: str = Depends(verify_admin)):
+    source_type = (getattr(req, "source_type", None) or "").strip()
+    if source_type and settings.IMAGE_SERVICE_ENABLED:
+        if source_type not in _ADMIN_SOURCE_HEAD_KIND:
+            raise HTTPException(status_code=400, detail="Invalid source_type")
+        source_ref = (getattr(req, "source_ref", None) or req.image or "").strip()
+        if not source_ref:
+            raise HTTPException(status_code=400, detail="source_ref is required")
+        image = _upsert_image_with_source(
+            req.name, req.image or source_ref, req.description or "", req.enabled, None,
+            source_type, source_ref,
+        )
+        _enqueue_admin_image_chain(image, source_type, source_ref)
+        return update_image_sync_status(image["id"], "distributing", 0, 0, "Distribution enqueued", False)
+
     image = upsert_image(req.name, req.image, req.description or "", req.enabled)
     try:
         sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
@@ -2446,6 +2842,22 @@ async def admin_create_image(req: ImageRequest, username: str = Depends(verify_a
 
 @app.put("/api/admin/images/{image_id}")
 async def admin_update_image(image_id: int, req: ImageRequest, username: str = Depends(verify_admin)):
+    source_type = (getattr(req, "source_type", None) or "").strip()
+    if source_type and settings.IMAGE_SERVICE_ENABLED:
+        if source_type not in _ADMIN_SOURCE_HEAD_KIND:
+            raise HTTPException(status_code=400, detail="Invalid source_type")
+        source_ref = (getattr(req, "source_ref", None) or req.image or "").strip()
+        if not source_ref:
+            raise HTTPException(status_code=400, detail="source_ref is required")
+        image = _upsert_image_with_source(
+            req.name, req.image or source_ref, req.description or "", req.enabled, image_id,
+            source_type, source_ref,
+        )
+        if not image:
+            raise HTTPException(status_code=404, detail="Image not found")
+        _enqueue_admin_image_chain(image, source_type, source_ref)
+        return update_image_sync_status(image["id"], "distributing", 0, 0, "Distribution enqueued", False)
+
     image = upsert_image(req.name, req.image, req.description or "", req.enabled, image_id=image_id)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
@@ -2488,6 +2900,28 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
 
 @app.delete("/api/admin/images/{image_id}")
 async def admin_delete_image(image_id: int, username: str = Depends(verify_admin)):
+    if settings.IMAGE_SERVICE_ENABLED:
+        existing = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Image not found")
+        # The Manager resolves evict targets now (the daemon has no kubectl). Prefer the nodes
+        # currently recorded as holding this ref; fall back to all eligible nodes when none.
+        recorded = store.list_nodes_for_image(existing["image"])
+        targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
+        enqueue_image_job(
+            kind="evict",
+            ref=existing["image"],
+            image_id=image_id,
+            payload={"scope": "all", "targets": targets},
+        )
+        try:
+            k8s_client.delete_image_sync(image_id)
+        except Exception as e:
+            logger.warning("delete_image_sync failed for image %s: %s", image_id, e)
+        if not delete_image(image_id):
+            raise HTTPException(status_code=404, detail="Image not found")
+        return {"success": True}
+
     try:
         k8s_client.delete_image_sync(image_id)
     except ApiException as e:

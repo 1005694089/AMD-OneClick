@@ -56,6 +56,7 @@ function App(){
   const [bulkDestroyLoading,setBulkDestroyLoading]=React.useState(false);
   const [editingTemplate,setEditingTemplate]=React.useState(null);
   const [creditModalUser,setCreditModalUser]=React.useState(null);
+  const imageSourceType = Form.useWatch('source_type', form) || 'registry';
 
   async function load(){
     setLoading(true);
@@ -83,7 +84,7 @@ function App(){
     }catch(e){ /* silent -- stale data is fine for a poll */ }
   }
   React.useEffect(()=>{
-    const hasActivePull = images.some(img => ['pulling','queued','pending'].includes(img.sync_status));
+    const hasActivePull = images.some(img => ['pulling','queued','pending','distributing'].includes(img.sync_status));
     if(!hasActivePull) return;
     const interval = setInterval(refreshImages, 15000);
     return ()=>clearInterval(interval);
@@ -122,7 +123,7 @@ function App(){
   }
   async function addImage(values){
     if(!(await confirmLargeImage())) return;
-    const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...values, enabled:true})});
+    const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:values.name, description:values.description, source_type:values.source_type||'registry', source_ref:values.source_ref, enabled:true})});
     if(res.ok){ message.success('Image added; pull started'); form.resetFields(); setImageModalOpen(false); load(); } else {
       const data = await res.json().catch(()=>({detail:'Failed to add image'}));
       message.error(data.detail || 'Failed to add image');
@@ -197,12 +198,17 @@ function App(){
     if(status === 'ready') return 'green';
     if(status === 'failed') return 'red';
     if(status === 'skipped') return 'blue';
+    if(status === 'distributing') return 'cyan';
     if(status === 'queued') return 'gold';
     return 'gold';
   }
   function imageStatusLabel(r){
-    const count = r.desired_count ? ` (${r.ready_count}/${r.desired_count})` : '';
-    return `${r.sync_status}${count}`;
+    const count = r.desired_count ? ` (${r.ready_count != null ? r.ready_count : 0}/${r.desired_count} nodes)` : '';
+    let acr = '';
+    if(r.acr_backup_status === 'ready' || r.acr_backup_status === 'succeeded') acr = ' · ACR✓';
+    else if(r.acr_backup_status === 'pending' || r.acr_backup_status === 'pulling' || r.acr_backup_status === 'distributing') acr = ' · ACR…';
+    else if(r.acr_backup_status === 'failed') acr = ' · ACR✗';
+    return `${r.sync_status}${count}${acr}`;
   }
   const imageColumns=[
     {title:'Name',dataIndex:'name',width:180},
@@ -280,9 +286,10 @@ function App(){
         React.createElement(Card,{title:'Instances'},React.createElement(Table,{rowKey:'id',columns:instColumns,dataSource:instances,loading,pagination:false,scroll:{x:900},size:'middle'}))
       ),
       React.createElement(Modal,{title:'Add Image',open:imageModalOpen,onCancel:()=>setImageModalOpen(false),footer:null,destroyOnClose:true},
-        React.createElement(Form,{form,layout:'vertical',onFinish:addImage},
+        React.createElement(Form,{form,layout:'vertical',onFinish:addImage,initialValues:{source_type:'registry'}},
           React.createElement(Form.Item,{name:'name',label:'Display name',rules:[{required:true}]},React.createElement(Input,{placeholder:'amd-geis'})),
-          React.createElement(Form.Item,{name:'image',label:'Image reference',rules:[{required:true}]},React.createElement(Input.TextArea,{autoSize:true,placeholder:'registry/repo/image:tag'})),
+          React.createElement(Form.Item,{name:'source_type',label:'Source',rules:[{required:true}]},React.createElement(Select,{options:[{value:'registry',label:'Registry link (pull from ACR / Docker Hub)'},{value:'github',label:'GitHub Dockerfile URL (build)'}]})),
+          React.createElement(Form.Item,{name:'source_ref',label:imageSourceType==='github'?'GitHub Dockerfile URL':'Image reference',rules:[{required:true}]},React.createElement(Input.TextArea,{autoSize:true,placeholder:imageSourceType==='github'?'https://github.com/org/repo/blob/main/Dockerfile':'registry/repo/image:tag'})),
           React.createElement(Form.Item,{name:'description',label:'Description'},React.createElement(Input,{placeholder:'optional'})),
           React.createElement(Button,{type:'primary',htmlType:'submit',block:true},'Add and Sync')
         )

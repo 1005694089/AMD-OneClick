@@ -377,5 +377,28 @@ class Settings:
         os.getenv("CUSTOM_IMAGE_BUILD_LEASE_TIMEOUT_SECONDS", "3600")
     )
 
+    # Isolated Image Service. When enabled, image distribution goes through the image_jobs queue
+    # consumed by the off-cluster daemon (save | ssh ctr import) instead of the prepull DaemonSet/
+    # ACR-pull path. When false, the legacy DaemonSet/ACR path is used unchanged.
+    IMAGE_SERVICE_ENABLED: bool = os.getenv("IMAGE_SERVICE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # The Image-Service host is itself a labelled prepull node; node-target resolution must drop it
+    # so it never receives distributions. Must exactly match its `kubectl get nodes` name.
+    IMAGE_SERVICE_NODE_NAME: str = os.getenv("IMAGE_SERVICE_NODE_NAME", "")
+    # ACR Enterprise registry used as the admin-image backup source of truth.
+    ACR_ENTERPRISE_REGISTRY: str = os.getenv("ACR_ENTERPRISE_REGISTRY", "")
+    # Optional Docker Hub pull secret for dockerhub_pull source images.
+    DOCKERHUB_PULL_SECRET_NAME: str = os.getenv("DOCKERHUB_PULL_SECRET_NAME", "")
+    # Hosts the server may fetch a raw Dockerfile from for github_build sources (SSRF allowlist).
+    GITHUB_RAW_ALLOWED_HOSTS: set = {
+        h.strip() for h in os.getenv("GITHUB_RAW_ALLOWED_HOSTS", "raw.githubusercontent.com").split(",") if h.strip()
+    }
+    GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS: int = int(os.getenv("GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS", "10"))
+    # An image is considered outdated (eligible for node eviction) this many days after its last launch.
+    IMAGE_OUTDATED_DAYS: int = int(os.getenv("IMAGE_OUTDATED_DAYS", "5"))
+    # image_jobs whose lease is older than this are reaped back to pending (or failed) by the scheduler.
+    JOB_LEASE_TIMEOUT_SECONDS: int = int(os.getenv("JOB_LEASE_TIMEOUT_SECONDS", "3600"))
+    # The daemon refuses a distribute job when the target node's containerd-root free space is below this.
+    IMAGE_NODE_MIN_FREE_DISK_GB: int = int(os.getenv("IMAGE_NODE_MIN_FREE_DISK_GB", "50"))
+
 
 settings = Settings()

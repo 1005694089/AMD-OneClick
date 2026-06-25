@@ -39,14 +39,6 @@
     const modelscopeEnabled = {{ modelscope_enabled | tojson }};
     const couponRedeemEnabled = {{ coupon_redeem_enabled | tojson }};
     const couponRedeemDisabledMessage = {{ coupon_redeem_disabled_message | tojson }};
-    const DEFAULT_DOCKERFILE = [
-      '# Start from the AMD ROCm base (recommended) or any public image.',
-      'FROM crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416',
-      '',
-      '# Add your packages. Jupyter, OpenCode and Hermes are appended automatically.',
-      'RUN pip install --no-cache-dir transformers datasets',
-      ''
-    ].join('\n');
     const JUPYTER_LOGO = 'https://cdn.jsdelivr.net/npm/simple-icons@13/icons/jupyter.svg';
     const OPENCODE_LOGO = 'https://opencode.ai/favicon.svg';
     const HERMES_LOGO = 'https://hermes-agent.nousresearch.com/favicon.ico';
@@ -93,6 +85,7 @@
       if (inst.live_reason === 'ImagePullBackOff' || inst.live_reason === 'ErrImagePull') return 'Image pull failed';
       if (inst.live_reason === 'ContainerCreating') return 'Preparing workspace';
       if (inst.live_reason === 'JupyterStarting') return 'Jupyter is starting';
+      if (inst.live_status === 'distributing') return 'Loading image onto the GPU node';
       if (inst.live_status === 'ready') return 'Ready';
       return inst.live_message || inst.live_status;
     }
@@ -100,6 +93,7 @@
     function displayInstanceDetail(inst) {
       if (!inst || !inst.live_status || inst.live_status === 'ready') return '';
       if (inst.live_reason === 'Unschedulable') return 'No suitable GPU node is available yet. You can keep waiting or destroy and retry later.';
+      if (inst.live_status === 'distributing') return 'The image is being copied to the GPU node before your workspace starts.';
       return inst.live_reason || '';
     }
 
@@ -214,7 +208,7 @@
 
       // Auto-refresh while any build is in progress.
       React.useEffect(() => {
-        const inProgress = (customImages || []).some(ci => ci.build_status === 'pending' || ci.build_status === 'building');
+        const inProgress = (customImages || []).some(ci => ci.build_status === 'pending' || ci.build_status === 'building' || ci.build_status === 'distributing');
         if (!inProgress) return;
         const timer = setInterval(loadCustomImages, 5000);
         return () => clearInterval(timer);
@@ -247,7 +241,7 @@
       async function buildCustomImage(values) {
         setBuildLoading(true);
         try {
-          const res = await fetch('/api/custom-images/build', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ name: values.name, dockerfile: values.dockerfile }) });
+          const res = await fetch('/api/custom-images/build', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ name: values.name, github_url: values.github_url }) });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Build failed to start');
           message.success('Build queued');
@@ -286,7 +280,7 @@
       }
 
       function openBuildModal() {
-        buildForm.setFieldsValue({ name: '', dockerfile: DEFAULT_DOCKERFILE });
+        buildForm.setFieldsValue({ name: '', github_url: '' });
         setBuildModalOpen(true);
       }
 
@@ -484,7 +478,7 @@
 
       function renderCustomImages() {
         if (!user || !user.email) return null;
-        const statusColor = { ready:'green', building:'blue', pending:'gold', failed:'red' };
+        const statusColor = { ready:'green', building:'blue', distributing:'cyan', pending:'gold', failed:'red' };
         const activeCount = (customImages || []).filter(ci => ['pending','building','ready'].includes(ci.build_status)).length;
         const atLimit = activeCount >= customMax;
         const columns = [
@@ -507,7 +501,7 @@
           React.createElement(Modal, {title:'Build Custom Image', open:buildModalOpen, onCancel:()=>{setBuildModalOpen(false); buildForm.resetFields();}, footer:null, destroyOnClose:true, width:760},
             React.createElement(Form, {form:buildForm, layout:'vertical', onFinish:buildCustomImage},
               React.createElement(Form.Item, {name:'name', label:'Image Name', rules:[{required:true,message:'Name is required'},{pattern:/^[a-z0-9][a-z0-9-]{0,38}$/,message:'1-39 chars: lowercase letters, digits, hyphens; start with letter or digit'}]}, React.createElement(Input, {placeholder:'my-workspace', addonBefore:'user-{id}:'})),
-              React.createElement(Form.Item, {name:'dockerfile', label:'Dockerfile', rules:[{required:true,message:'Dockerfile is required'}]}, React.createElement(Input.TextArea, {autoSize:{minRows:10,maxRows:24}, style:{fontFamily:'monospace'}, placeholder:'FROM ...'})),
+              React.createElement(Form.Item, {name:'github_url', label:'GitHub Repository URL', rules:[{required:true,message:'GitHub repository URL is required'},{pattern:/^https:\/\/github\.com\/[^\s]+/,message:'Enter a valid GitHub URL (https://github.com/...)'}]}, React.createElement(Input, {placeholder:'https://github.com/org/repo/blob/main/Dockerfile'})),
               React.createElement(Button, {type:'primary', htmlType:'submit', block:true, loading:buildLoading}, 'Queue Build')
             )
           ),

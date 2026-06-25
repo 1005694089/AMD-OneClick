@@ -435,7 +435,7 @@
         if (!data) return 0;
         if (data.status === 'ready') return 4;
         if (data.status === 'jupyter_starting' || data.status === 'running') return 3;
-        if (data.status === 'initializing' || data.status === 'loading') return 2;
+        if (data.status === 'initializing' || data.status === 'loading' || data.status === 'distributing') return 2;
         if (data.status === 'pending') return 1;
         return 0;
       }
@@ -445,6 +445,7 @@
         if (data.reason === 'ImagePullBackOff' || data.reason === 'ErrImagePull') return 'Image pull failed';
         if (data.reason === 'ContainerCreating') return 'Preparing your workspace';
         if (data.reason === 'JupyterStarting') return 'Jupyter is starting';
+        if (data.status === 'distributing') return 'Loading image onto the GPU node';
         if (data.status === 'ready') return 'Workspace is ready';
         if (data.status === 'failed') return data.message || 'Instance failed';
         if (data.status === 'not_found') return data.message || 'Instance not found';
@@ -454,6 +455,7 @@
       function displayStatusDetail(data) {
         if (!data) return '';
         if (data.reason === 'Unschedulable') return 'The cluster has not found a suitable GPU node yet. You can keep waiting or destroy and retry later.';
+        if (data.status === 'distributing') return 'The image is being copied to the GPU node before your workspace starts.';
         if (data.status === 'failed') return data.detail || data.reason || '';
         if (data.status === 'ready') return 'Your workspace is ready to open.';
         return data.reason && data.reason !== data.message ? data.reason : '';
@@ -592,7 +594,7 @@
             if (data.status === 'ready') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLogsOpen(false); setReadyUrl(url); setReadyOpencodeUrl(opencodeUrl); setReadyOpencodeUsername(opencodeUsername); setReadyOpencodePassword(opencodePassword); if (target && target.templateId) setReadyTemplateId(target.templateId); setLaunchStatus(Object.assign({}, data, { url, opencode_url: opencodeUrl, opencode_username: opencodeUsername, opencode_password: opencodePassword, target })); message.success('Workspace is ready'); }
             if (data.status === 'failed') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); message.error(displayStatusMessage(data)); }
             if (data.status === 'not_found') { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLogsOpen(false); message.error(data.message || 'Instance not found'); }
-            if (attempts >= 240) { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLaunchStatus({ status:'pending', reason:'LongRunning', message:'Launch is taking longer than expected. You can keep waiting from Profile.', target }); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
+            if (attempts >= 360) { clearInterval(timer); finishPolling(target); setLaunchMessage(''); setLaunchStatus({ status:'pending', reason:'LongRunning', message:'Launch is taking longer than expected. You can keep waiting from Profile.', target }); message.warning('Launch is taking longer than expected. Please check Profile or refresh later.'); }
           } catch (e) {}
         }, 3000);
       }
@@ -625,7 +627,7 @@
         const customImageValues = new Set((customImages || []).map(ci => ci.image));
         const customTemplates = (notebookTemplates || []).filter(t => currentUser.id && t.owner_user_id === currentUser.id && customImageValues.has(t.image));
         if ((customImages || []).length === 0 && customTemplates.length === 0) return null;
-        const statusColor = { ready: 'green', building: 'blue', pending: 'gold', failed: 'red' };
+        const statusColor = { ready: 'green', building: 'blue', distributing: 'cyan', pending: 'gold', failed: 'red' };
         const activeTemplateId = (initialActiveInstance && initialActiveInstance.template_id) ? Number(initialActiveInstance.template_id) : null;
         const aTemplateJustLaunched = (typeof readyTemplateId === 'number');
 

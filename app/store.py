@@ -3,6 +3,7 @@ Persistent store for users, image catalog, and credit accounting.
 
 Uses PostgreSQL when DATABASE_URL is set; falls back to local SQLite for dev.
 """
+import json
 import os
 import re
 import threading
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     MetaData,
@@ -89,6 +91,11 @@ images = Table(
     Column("sync_message", Text),
     Column("sync_started_at", String(64)),
     Column("sync_completed_at", String(64)),
+    Column("source_type", String(32), nullable=False, server_default="manual"),
+    Column("source_ref", Text),
+    Column("acr_backup_ref", Text),
+    Column("acr_backup_status", String(32)),
+    Column("last_launched_at", String(64)),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
 )
@@ -236,6 +243,8 @@ custom_images = Table(
     Column("name", String(64), nullable=False),
     Column("image", Text, nullable=False),
     Column("dockerfile", Text, nullable=False),
+    Column("source_type", String(32), nullable=False, server_default="dockerfile"),
+    Column("github_url", Text),
     Column("build_status", String(32), nullable=False, default="pending"),
     Column("build_log", Text),
     Column("claimed_by", String(128)),
@@ -249,6 +258,47 @@ custom_images = Table(
 # Build queue states that count against a user's quota and block re-use of a name.
 CUSTOM_IMAGE_ACTIVE_STATUSES = ("pending", "building", "ready", "evicted")
 CUSTOM_IMAGE_LOG_MAX_CHARS = 60000
+
+# Tracks which image ref is loaded on which GPU node (distribute/evict bookkeeping).
+image_nodes = Table(
+    "image_nodes",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("image_ref", Text, nullable=False, index=True),
+    Column("node_name", String(255), nullable=False),
+    Column("status", String(32), nullable=False, server_default="loaded"),
+    Column("size_bytes", Integer),
+    Column("loaded_at", String(64)),
+    Column("last_seen_at", String(64)),
+    Column("created_at", String(64), nullable=False),
+    Column("updated_at", String(64), nullable=False),
+    UniqueConstraint("image_ref", "node_name", name="uq_image_node"),
+)
+
+# Generalized job queue consumed by the isolated image-service daemon.
+image_jobs = Table(
+    "image_jobs",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("kind", String(32), nullable=False),
+    Column("status", String(32), nullable=False, server_default="pending"),
+    Column("image_id", Integer, ForeignKey("images.id")),
+    Column("custom_image_id", Integer, ForeignKey("custom_images.id")),
+    Column("ref", Text),
+    Column("payload", Text),
+    Column("log", Text),
+    Column("result", Text),
+    Column("claimed_by", String(128)),
+    Column("claimed_at", String(64)),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("max_attempts", Integer, nullable=False, default=3),
+    Column("created_at", String(64), nullable=False),
+    Column("updated_at", String(64), nullable=False),
+    Index("ix_image_jobs_status_kind", "status", "kind"),
+)
+
+IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "distribute", "evict")
+IMAGE_JOB_TERMINAL = ("succeeded", "failed")
 
 
 def utc_now() -> str:
@@ -311,13 +361,29 @@ def ensure_schema_columns(conn):
     if "owner_user_id" not in template_columns:
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN owner_user_id INTEGER"))
 
+    image_columns = {col["name"] for col in inspector.get_columns("images")}
+    if "source_type" not in image_columns:
+        conn.execute(text("ALTER TABLE images ADD COLUMN source_type VARCHAR(32) NOT NULL DEFAULT 'manual'"))
+    if "source_ref" not in image_columns:
+        conn.execute(text("ALTER TABLE images ADD COLUMN source_ref TEXT"))
+    if "acr_backup_ref" not in image_columns:
+        conn.execute(text("ALTER TABLE images ADD COLUMN acr_backup_ref TEXT"))
+    if "acr_backup_status" not in image_columns:
+        conn.execute(text("ALTER TABLE images ADD COLUMN acr_backup_status VARCHAR(32)"))
+    if "last_launched_at" not in image_columns:
+        conn.execute(text("ALTER TABLE images ADD COLUMN last_launched_at VARCHAR(64)"))
+
     if inspector.has_table("custom_images"):
         custom_image_columns = {col["name"] for col in inspector.get_columns("custom_images")}
         if "last_launched_at" not in custom_image_columns:
             conn.execute(text("ALTER TABLE custom_images ADD COLUMN last_launched_at VARCHAR(64)"))
+        if "source_type" not in custom_image_columns:
+            conn.execute(text("ALTER TABLE custom_images ADD COLUMN source_type VARCHAR(32) NOT NULL DEFAULT 'dockerfile'"))
+        if "github_url" not in custom_image_columns:
+            conn.execute(text("ALTER TABLE custom_images ADD COLUMN github_url TEXT"))
 
     # Backward-compatible creation for databases initialized before these tables.
-    metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions, instance_launch_events, custom_images])
+    metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions, instance_launch_events, custom_images, image_nodes, image_jobs])
 
 
 def ensure_default_image(conn):
@@ -1014,7 +1080,8 @@ def get_template_preview_asset(template_id: int, asset_path: str) -> Optional[di
         )
 
 
-def upsert_image(name: str, image: str, description: str = "", enabled: bool = True, image_id: Optional[int] = None) -> dict:
+def upsert_image(name: str, image: str, description: str = "", enabled: bool = True, image_id: Optional[int] = None,
+                 source_type: Optional[str] = None, source_ref: Optional[str] = None) -> dict:
     name = name.strip()
     image = image.strip()
     description = (description or "").strip()
@@ -1038,6 +1105,12 @@ def upsert_image(name: str, image: str, description: str = "", enabled: bool = T
             sync_completed_at=None,
             updated_at=now,
         )
+        # Only write the source columns when provided so legacy positional callers leave the
+        # server_default (and any existing value) untouched.
+        if source_type is not None:
+            values["source_type"] = source_type
+        if source_ref is not None:
+            values["source_ref"] = source_ref
         if image_id:
             conn.execute(update(images).where(images.c.id == image_id).values(**values))
             return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
@@ -1078,6 +1151,21 @@ def update_image_sync_status(
                 sync_completed_at=now if completed else current.get("sync_completed_at"),
                 updated_at=now,
             )
+        )
+        return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
+
+
+def set_image_acr_backup(image_id: int, ref: Optional[str], status: str) -> Optional[dict]:
+    """Record the ACR Enterprise backup ref/status for a catalog image (guarded UPDATE)."""
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(select(images.c.id).where(images.c.id == image_id)).first()
+        if not current:
+            return None
+        conn.execute(
+            update(images)
+            .where(images.c.id == image_id)
+            .values(acr_backup_ref=ref, acr_backup_status=status, updated_at=now)
         )
         return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
 
@@ -1449,6 +1537,352 @@ def reap_stale_builds(timeout_seconds: int) -> int:
                 if result.rowcount > 0:
                     reaped += 1
     return reaped
+
+
+# =============================================================================
+# Image jobs (generalized queue) + node tracking
+# =============================================================================
+
+def enqueue_image_job(
+    kind: str,
+    ref: str,
+    image_id: Optional[int] = None,
+    custom_image_id: Optional[int] = None,
+    payload: Optional[str] = None,
+    max_attempts: int = 3,
+) -> Optional[dict]:
+    """Insert a pending job. Dedupes: skips if a non-terminal (kind, ref) row exists.
+
+    Returns the inserted row, or the existing non-terminal row when deduped. This stops the
+    periodic reaper from piling up duplicate evict/distribute jobs for the same ref.
+
+    payload is always stored as a JSON string: callers may pass either a dict (serialized here)
+    or a pre-serialized JSON string.
+    """
+    if isinstance(payload, dict):
+        payload = json.dumps(payload)
+    now = utc_now()
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(image_jobs)
+            .where(
+                image_jobs.c.kind == kind,
+                image_jobs.c.ref == ref,
+                image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL),
+            )
+            .order_by(image_jobs.c.id.desc())
+            .limit(1)
+        ).mappings().first()
+        if existing:
+            return dict(existing)
+        result = conn.execute(
+            image_jobs.insert().values(
+                kind=kind,
+                status="pending",
+                image_id=image_id,
+                custom_image_id=custom_image_id,
+                ref=ref,
+                payload=payload,
+                log="",
+                result=None,
+                claimed_by=None,
+                claimed_at=None,
+                attempts=0,
+                max_attempts=int(max_attempts),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        new_id = result.inserted_primary_key[0]
+        return row_to_dict(conn.execute(select(image_jobs).where(image_jobs.c.id == new_id)).mappings().first())
+
+
+def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Optional[dict]:
+    """Atomically lease the oldest pending job for the agent.
+
+    Walks pending rows in id order, optionally filtered by kind, and conditionally claims
+    pending->claimed (attempts+1). Retries the next row when it loses the claim race so it
+    returns None only when no claimable work remains.
+    """
+    with engine.begin() as conn:
+        tried: list[int] = []
+        while True:
+            query = select(image_jobs).where(image_jobs.c.status == "pending")
+            if kinds:
+                query = query.where(image_jobs.c.kind.in_(kinds))
+            if tried:
+                query = query.where(image_jobs.c.id.notin_(tried))
+            pending = conn.execute(query.order_by(image_jobs.c.id).limit(1)).mappings().first()
+            if not pending:
+                return None
+            tried.append(pending["id"])
+            now = utc_now()
+            result = conn.execute(
+                update(image_jobs)
+                .where(image_jobs.c.id == pending["id"], image_jobs.c.status == "pending")
+                .values(
+                    status="claimed",
+                    claimed_by=agent_id,
+                    claimed_at=now,
+                    attempts=image_jobs.c.attempts + 1,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount == 0:
+                continue  # lost the race for this row; try the next pending one
+            return row_to_dict(conn.execute(select(image_jobs).where(image_jobs.c.id == pending["id"])).mappings().first())
+
+
+def append_image_job_log(job_id: int, chunk: str, agent_id: Optional[str] = None) -> bool:
+    """Append a log chunk to a job. Returns True if applied.
+
+    When agent_id is given, the write only applies to a job claimed by that same agent and
+    still in a non-terminal (claimed/running) state, so a token-holder cannot scribble on
+    jobs it did not lease or on already-finished jobs.
+    """
+    if not chunk:
+        return False
+    now = utc_now()
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(image_jobs.c.log, image_jobs.c.status, image_jobs.c.claimed_by)
+            .where(image_jobs.c.id == job_id)
+        ).first()
+        if not row:
+            return False
+        if agent_id is not None and (row[1] in IMAGE_JOB_TERMINAL or row[2] != agent_id):
+            return False
+        combined = (row[0] or "") + chunk
+        if len(combined) > CUSTOM_IMAGE_LOG_MAX_CHARS:
+            combined = combined[-CUSTOM_IMAGE_LOG_MAX_CHARS:]
+        conditions = [image_jobs.c.id == job_id]
+        if agent_id is not None:
+            conditions.append(image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL))
+            conditions.append(image_jobs.c.claimed_by == agent_id)
+        result = conn.execute(
+            update(image_jobs).where(*conditions).values(log=combined, updated_at=now)
+        )
+        return result.rowcount > 0
+
+
+def mark_image_job_running(job_id: int, agent_id: str) -> Optional[dict]:
+    """Transition a claimed job to running. Guarded on ownership + claimed state."""
+    now = utc_now()
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(image_jobs)
+            .where(
+                image_jobs.c.id == job_id,
+                image_jobs.c.claimed_by == agent_id,
+                image_jobs.c.status == "claimed",
+            )
+            .values(status="running", updated_at=now)
+        )
+        if result.rowcount == 0:
+            return None
+        return row_to_dict(conn.execute(select(image_jobs).where(image_jobs.c.id == job_id)).mappings().first())
+
+
+def finish_image_job(job_id: int, status: str, agent_id: str, result: Optional[str] = None) -> Optional[dict]:
+    """Finalize a job to succeeded|failed. Guarded on ownership + non-terminal state.
+
+    The ownership and status guard live in the UPDATE's WHERE clause so the check and write
+    are a single atomic statement (the reaper may flip status concurrently). rowcount==0
+    means the guard (or the row) did not match.
+    """
+    if status not in IMAGE_JOB_TERMINAL:
+        raise ValueError("status must be one of 'succeeded' or 'failed'")
+    if isinstance(result, dict):
+        result = json.dumps(result)
+    now = utc_now()
+    with engine.begin() as conn:
+        applied = conn.execute(
+            update(image_jobs)
+            .where(
+                image_jobs.c.id == job_id,
+                image_jobs.c.claimed_by == agent_id,
+                image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL),
+            )
+            .values(status=status, result=result, updated_at=now)
+        )
+        if applied.rowcount == 0:
+            return None
+        return row_to_dict(conn.execute(select(image_jobs).where(image_jobs.c.id == job_id)).mappings().first())
+
+
+def reap_stale_image_jobs(timeout_seconds: int) -> int:
+    """Requeue or fail jobs whose lease is older than timeout_seconds. Returns count reaped.
+
+    Claimed/running leases past the timeout return to 'pending' (attempts<max_attempts), else
+    are failed. Mirrors reap_stale_builds; guards on the original status in the WHERE clause so
+    a concurrently-finalized job is not clobbered.
+    """
+    now = datetime.now(timezone.utc)
+    reaped = 0
+    with engine.begin() as conn:
+        leased = conn.execute(
+            select(
+                image_jobs.c.id,
+                image_jobs.c.claimed_at,
+                image_jobs.c.status,
+                image_jobs.c.attempts,
+                image_jobs.c.max_attempts,
+            ).where(image_jobs.c.status.in_(("claimed", "running")))
+        ).all()
+        for row in leased:
+            claimed_at = row[1]
+            stale = True
+            if claimed_at:
+                try:
+                    stale = (now - datetime.fromisoformat(claimed_at)).total_seconds() > timeout_seconds
+                except ValueError:
+                    stale = True
+            if not stale:
+                continue
+            if int(row[3]) < int(row[4]):
+                values = dict(status="pending", claimed_by=None, claimed_at=None, updated_at=utc_now())
+            else:
+                values = dict(status="failed", updated_at=utc_now())
+            result = conn.execute(
+                update(image_jobs)
+                .where(image_jobs.c.id == row[0], image_jobs.c.status == row[2])
+                .values(**values)
+            )
+            if result.rowcount > 0:
+                reaped += 1
+    return reaped
+
+
+def upsert_image_node(node_name: str, image_ref: str, status: str = "loaded", size_bytes: Optional[int] = None) -> dict:
+    """Record that image_ref is loaded on node_name, upserting on (image_ref, node_name)."""
+    now = utc_now()
+    with engine.begin() as conn:
+        values = dict(
+            status=status,
+            size_bytes=size_bytes,
+            loaded_at=now,
+            last_seen_at=now,
+            updated_at=now,
+        )
+        try:
+            result = conn.execute(
+                image_nodes.insert().values(
+                    image_ref=image_ref,
+                    node_name=node_name,
+                    created_at=now,
+                    **values,
+                )
+            )
+            new_id = result.inserted_primary_key[0]
+        except IntegrityError:
+            conn.execute(
+                update(image_nodes)
+                .where(image_nodes.c.image_ref == image_ref, image_nodes.c.node_name == node_name)
+                .values(**values)
+            )
+            existing = conn.execute(
+                select(image_nodes.c.id).where(
+                    image_nodes.c.image_ref == image_ref,
+                    image_nodes.c.node_name == node_name,
+                )
+            ).first()
+            new_id = existing[0]
+        return row_to_dict(conn.execute(select(image_nodes).where(image_nodes.c.id == new_id)).mappings().first())
+
+
+def image_loaded_on_node(image_ref: str, node_name: str) -> bool:
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(image_nodes.c.id).where(
+                image_nodes.c.image_ref == image_ref,
+                image_nodes.c.node_name == node_name,
+                image_nodes.c.status == "loaded",
+            )
+        ).first()
+        return row is not None
+
+
+def list_nodes_for_image(image_ref: str) -> list[str]:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(image_nodes.c.node_name).where(
+                image_nodes.c.image_ref == image_ref,
+                image_nodes.c.status == "loaded",
+            )
+        ).all()
+        return [r[0] for r in rows]
+
+
+def clear_image_node(image_ref: str, node_name: str) -> bool:
+    with engine.begin() as conn:
+        result = conn.execute(
+            image_nodes.delete().where(
+                image_nodes.c.image_ref == image_ref,
+                image_nodes.c.node_name == node_name,
+            )
+        )
+        return result.rowcount > 0
+
+
+def touch_image_node(image_ref: str, node_name: str) -> None:
+    """Refresh last_seen_at/loaded_at so a recently-launched image isn't reaped as outdated."""
+    now = utc_now()
+    with engine.begin() as conn:
+        conn.execute(
+            update(image_nodes)
+            .where(image_nodes.c.image_ref == image_ref, image_nodes.c.node_name == node_name)
+            .values(last_seen_at=now, loaded_at=now, updated_at=now)
+        )
+
+
+def list_outdated_images() -> list[dict]:
+    """Refs whose tarball should be evicted from GPU nodes (idle past the grace window).
+
+    Two sources:
+      - node-local custom images via the list_gc_candidates policy (ready + node-local tag +
+        last_launched_at past grace) — reported for each node currently holding the ref.
+      - image_nodes rows whose loaded_at is past the IMAGE_OUTDATED_DAYS grace AND whose ref
+        is no longer an enabled/current catalog image.
+
+    Returns [{image_ref, node_name, reason}].
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    grace_days = int(getattr(settings, "IMAGE_OUTDATED_DAYS", 5) or 0)
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=grace_days)).isoformat()
+
+    for candidate in list_gc_candidates():
+        ref = candidate["image"]
+        for node_name in list_nodes_for_image(ref):
+            key = (ref, node_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"image_ref": ref, "node_name": node_name, "reason": "custom_idle"})
+
+    with engine.begin() as conn:
+        enabled_refs = {
+            r[0]
+            for r in conn.execute(
+                select(images.c.image).where(images.c.enabled == True)  # noqa: E712
+            ).all()
+        }
+        rows = conn.execute(
+            select(image_nodes.c.image_ref, image_nodes.c.node_name, image_nodes.c.loaded_at)
+            .where(image_nodes.c.status == "loaded")
+        ).all()
+    for image_ref, node_name, loaded_at in rows:
+        key = (image_ref, node_name)
+        if key in seen:
+            continue
+        if image_ref in enabled_refs:
+            continue
+        if loaded_at and loaded_at >= cutoff_iso:
+            continue
+        seen.add(key)
+        out.append({"image_ref": image_ref, "node_name": node_name, "reason": "catalog_outdated"})
+    return out
 
 
 def get_active_instance_for_user(user_id: int) -> Optional[dict]:
