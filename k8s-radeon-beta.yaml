@@ -97,6 +97,12 @@ data:
   # pulls. Requires the image-service daemon running on node 0042. Keep "false" until that
   # daemon is up and 0043+0044 are labeled amd-oneclick-prepull=enabled (see runbook).
   IMAGE_SERVICE_ENABLED: "true"
+  # Custom-image local tag MUST be registry-qualified (host with a dot before the first "/"),
+  # or nerdctl/containerd normalize the ref to docker.io/... and the distribute save|ctr-import
+  # fails ("not found" / "unrecognized image format"). Image stays node-local (never pushed);
+  # the host prefix only defeats docker.io normalization. Keep the prefix under this registry.
+  CUSTOM_IMAGE_REGISTRY: "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud"
+  CUSTOM_IMAGE_LOCAL_TAG_PREFIX: "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick-custom"
   WORKSPACE_HOST_ROOT: "/workspace/amd-oneclick-radeon-beta"
   WORKSPACE_MOUNT_PATH: "/workspace"
   WORKSPACE_VOLUME_TYPE: "emptyDir"
