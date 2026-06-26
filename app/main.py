@@ -1431,6 +1431,12 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
 
 @app.post("/api/internal/builds/claim")
 async def claim_build(req: BuildClaimRequest, _agent: bool = Depends(verify_build_agent)):
+    # When the image-service is on, custom builds are owned by the new kind=build image_job path
+    # (which exports a distributable tarball). The legacy node-local build-agent must NOT also claim
+    # the same pending custom_images row — that double-build marks the row 'ready' with no tarball,
+    # so launch-time distribute fails. Starve the legacy claimer in image-service mode.
+    if settings.IMAGE_SERVICE_ENABLED:
+        return {"job": None}
     job = claim_next_build(req.agent_id)
     if not job:
         return {"job": None}
