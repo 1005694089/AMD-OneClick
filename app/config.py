@@ -344,13 +344,22 @@ class Settings:
     # equivalent (e.g. COPY a verified installer from the build context) via the env var.
     DOCKERFILE_SUFFIX: str = os.getenv("DOCKERFILE_SUFFIX", "").strip() or DOCKERFILE_SUFFIX
 
-    # Custom user image builds. New beta builds are built on the pinned GPU node directly into
-    # containerd under a node-local tag. CUSTOM_IMAGE_REGISTRY is retained for legacy ACR rows.
-    CUSTOM_IMAGE_LOCAL_TAG_PREFIX: str = os.getenv("CUSTOM_IMAGE_LOCAL_TAG_PREFIX", "amd-oneclick-custom").strip("/")
+    # Custom user image builds. Built on 0042 into containerd, then distributed to the GPU node.
     CUSTOM_IMAGE_REGISTRY: str = os.getenv(
         "CUSTOM_IMAGE_REGISTRY",
         "crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud-user",
     )
+    # The local tag prefix MUST be registry-qualified (host with a dot/port before the first "/").
+    # A bare prefix like "amd-oneclick-custom" makes nerdctl/containerd normalize the ref to
+    # docker.io/amd-oneclick-custom/...; `nerdctl save` then can't find the locally-built image
+    # ("docker.io/...: not found") and the piped `ctr import` fails ("unrecognized image format").
+    # Anchoring it under CUSTOM_IMAGE_REGISTRY (ACR host) keeps build/save/import/launch on one
+    # exact, un-normalized ref. The image is node-local (never pushed to ACR); the host prefix is
+    # only there to defeat docker.io normalization.
+    CUSTOM_IMAGE_LOCAL_TAG_PREFIX: str = os.getenv(
+        "CUSTOM_IMAGE_LOCAL_TAG_PREFIX",
+        f"{CUSTOM_IMAGE_REGISTRY}/amd-oneclick-custom",
+    ).strip("/")
     CUSTOM_IMAGE_MAX_PER_USER: int = int(os.getenv("CUSTOM_IMAGE_MAX_PER_USER", "1"))
     CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_BUILD_TIMEOUT_SECONDS", "1800"))
     CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES: int = int(os.getenv("CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES", "65536"))
