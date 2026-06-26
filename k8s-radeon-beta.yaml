@@ -113,11 +113,12 @@ data:
   MAX_LIFETIME_HOURS: "6"
   SERVICE_HOST: "36.150.116.220"
   PUBLIC_BASE_URL: "https://radeon-beta.anruicloud.com"
-  # OpenCode is served directly on its per-instance NodePort via SERVICE_HOST (the edge that
-  # forwards raw NodePorts, same as Jupyter). The public domain is fronted by Azure Front Door
-  # (443 only), which cannot reach the tls-proxy NodePort :30450 — so OPENCODE_PUBLIC_BASE_URL
-  # MUST stay empty here (a non-empty AFD :30450 value makes OpenCode links time out).
-  OPENCODE_PUBLIC_BASE_URL: ""
+  # OpenCode is served through the tls-proxy handoff flow (manager injects per-instance Basic
+  # auth so the user never sees a password prompt). The URL host MUST be a name that (a) resolves
+  # to the DIRECT cluster edge (radeon.anruicloud.com -> 36.150.116.200, NOT the Azure Front Door
+  # domain radeon-beta.anruicloud.com which only serves 443) AND (b) is covered by the proxy cert
+  # (*.anruicloud.com). :30450 is the tls-proxy NodePort, reachable on that edge.
+  OPENCODE_PUBLIC_BASE_URL: "https://radeon.anruicloud.com:30450"
   NODE_PORT_BASE: "32500"
   NODE_PORT_MAX: "32699"
   NODE_PORT_CLUSTER_SCAN_ENABLED: "false"
