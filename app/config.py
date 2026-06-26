@@ -167,8 +167,10 @@ RUN jupyter lab --version
 # timeouts + retries, an OUTER `timeout` ceiling per branch, real fallthrough to the npm mirror
 # (Cloudflare, reachable), then a no-op so a transient outage degrades to "image without OpenCode"
 # rather than failing the whole build. Version stays pinned on both paths.
-RUN --mount=type=cache,target=/root/.npm set -o pipefail; \
-      ( timeout 300 bash -c 'curl -4 -fsSL --connect-timeout 10 --max-time 180 --retry 3 --retry-connrefused --retry-delay 2 -o /tmp/opencode-install.sh https://opencode.ai/install \
+# Note: Dockerfile RUN uses /bin/sh (dash), which lacks bash pipefail — we download the
+# installer to a file (no pipe) so dash plain and/or chaining is sufficient and correct.
+RUN --mount=type=cache,target=/root/.npm \
+      ( timeout 300 sh -c 'curl -4 -fsSL --connect-timeout 10 --max-time 180 --retry 3 --retry-connrefused --retry-delay 2 -o /tmp/opencode-install.sh https://opencode.ai/install \
           && bash /tmp/opencode-install.sh --version 1.4.6' ) \
       || timeout 300 npm i -g opencode-ai@1.4.6 \
       || echo 'WARNING: OpenCode install failed; image will ship without it.'
