@@ -1544,9 +1544,13 @@ def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
 
     if kind == "build":
         custom_image_id = job.get("custom_image_id")
-        claimed_by = job.get("claimed_by")
         if custom_image_id:
-            update_custom_image_status(custom_image_id, status="ready", require_claimed_by=claimed_by)
+            # Flip the custom image to ready unconditionally. In IMAGE_SERVICE_ENABLED mode the
+            # custom_images row is never 'building'/claimed (the kind=build image_job owns the
+            # lifecycle; the legacy claim_build path that set 'building' is starved), so guarding on
+            # require_claimed_by=<job agent> would match 0 rows and leave it stuck 'pending'.
+            # finish_image_job already verified the image_job's own ownership before we get here.
+            update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
     elif kind in ("pull",):
         # Source bytes now exist on the Image-Service host; distribution follows as its own job.
         pass
