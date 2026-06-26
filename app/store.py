@@ -1389,6 +1389,13 @@ def delete_custom_image(image_id: int, user_id: int) -> Optional[dict]:
             return None
         if row["build_status"] in ("pending", "building"):
             raise ValueError("Cannot delete a build that is still pending or building; wait for it to finish or fail")
+        # image_jobs.custom_image_id -> custom_images.id is a plain FK (NO ACTION on PostgreSQL),
+        # so leaving child job rows makes the custom_images DELETE raise ForeignKeyViolation and
+        # roll back — which made user "Delete" silently fail. Detach the job history first (keep
+        # the rows for audit; only the link is cleared), then delete the custom image.
+        conn.execute(
+            update(image_jobs).where(image_jobs.c.custom_image_id == image_id).values(custom_image_id=None)
+        )
         # Guard the DELETE on the same non-in-flight statuses so a build that gets claimed
         # between the SELECT and the DELETE (PostgreSQL READ COMMITTED) is not removed mid-flight.
         result = conn.execute(
