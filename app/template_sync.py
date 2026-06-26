@@ -14,6 +14,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from .config import settings
 from .store import (
     ensure_template_preview_cache,
     get_notebook_template,
@@ -50,12 +51,17 @@ def _github_raw_url_candidates(repo_url: str, branch: str, path: str) -> list[st
     clean_path = quote(path.lstrip("/"), safe="/")
     clean_branch = quote(branch or "main", safe="")
     raw_url = f"https://raw.githubusercontent.com/{org}/{repo}/{clean_branch}/{clean_path}"
-    return [
+    # Prefer the configured GitHub web base (proxy mirrors the /raw/ path form) so
+    # template preview works on nodes without direct github.com egress.
+    candidates = [
+        f"{settings.GITHUB_WEB_BASE}/{org}/{repo}/raw/{clean_branch}/{clean_path}",
         f"https://gh-proxy.org/{raw_url}",
         raw_url,
         f"https://github.com/{org}/{repo}/raw/{clean_branch}/{clean_path}",
         f"http://github.com/{org}/{repo}/raw/{clean_branch}/{clean_path}",
     ]
+    seen = set()
+    return [u for u in candidates if not (u in seen or seen.add(u))]
 
 
 def _next_sync(minutes: int) -> str:

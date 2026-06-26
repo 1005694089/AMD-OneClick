@@ -59,6 +59,7 @@ users = Table(
     Column("avatar_url", Text),
     Column("credits", Integer, nullable=False, default=100),
     Column("is_editor", Boolean, nullable=False, default=False),
+    Column("ssh_public_key", Text),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
     UniqueConstraint("provider", "provider_id", name="uq_users_provider_id"),
@@ -100,6 +101,7 @@ notebook_templates = Table(
     Column("start_command", Text),
     Column("app_port", Integer),
     Column("model_source", String(32)),
+    Column("ssh_enabled", Boolean, nullable=False, default=False),
     Column("enabled", Boolean, nullable=False, default=True),
     Column("sort_order", Integer, nullable=False, default=0),
     Column("owner_user_id", Integer, ForeignKey("users.id")),
@@ -235,6 +237,8 @@ def ensure_schema_columns(conn):
     user_columns = {col["name"] for col in inspector.get_columns("users")}
     if "is_editor" not in user_columns:
         conn.execute(text("ALTER TABLE users ADD COLUMN is_editor BOOLEAN NOT NULL DEFAULT FALSE"))
+    if "ssh_public_key" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN ssh_public_key TEXT"))
 
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
     if "billing_session_id" not in instance_columns:
@@ -259,6 +263,8 @@ def ensure_schema_columns(conn):
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN app_port INTEGER"))
     if "model_source" not in template_columns:
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN model_source VARCHAR(32)"))
+    if "ssh_enabled" not in template_columns:
+        conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN ssh_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
 
     # New launches reuse the same Kubernetes instance_id, so billing idempotency must be scoped
     # to a launch session instead of the stable instance id.
@@ -410,6 +416,17 @@ def set_user_editor(user_id: int, is_editor: bool) -> Optional[dict]:
         if not user:
             return None
         conn.execute(update(users).where(users.c.id == user_id).values(is_editor=bool(is_editor), updated_at=now))
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
+def set_user_ssh_public_key(user_id: int, ssh_public_key: str) -> Optional[dict]:
+    now = utc_now()
+    value = (ssh_public_key or "").strip() or None
+    with engine.begin() as conn:
+        user = conn.execute(select(users).where(users.c.id == user_id)).mappings().first()
+        if not user:
+            return None
+        conn.execute(update(users).where(users.c.id == user_id).values(ssh_public_key=value, updated_at=now))
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
 
 
@@ -609,6 +626,7 @@ def upsert_notebook_template(
     start_command: Optional[str] = None,
     app_port: Optional[int] = None,
     model_source: Optional[str] = None,
+    ssh_enabled: Optional[bool] = None,
 ) -> dict:
     now = utc_now()
     title = title.strip()
@@ -640,6 +658,8 @@ def upsert_notebook_template(
         values["app_port"] = int(app_port) if app_port else None
     if model_source is not None:
         values["model_source"] = (model_source or "").strip() or None
+    if ssh_enabled is not None:
+        values["ssh_enabled"] = bool(ssh_enabled)
     if owner_user_id is not None:
         values["owner_user_id"] = owner_user_id
     if not title:

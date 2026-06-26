@@ -35,6 +35,7 @@ from .models import (
     ImageRequest,
     CreditGrantRequest,
     EditorGrantRequest,
+    SshPublicKeyRequest,
     InstanceBulkDestroyRequest,
     CouponRedeemRequest,
     NotebookTemplateRequest,
@@ -64,6 +65,7 @@ from .store import (
     list_notebook_templates,
     list_users,
     set_user_editor,
+    set_user_ssh_public_key,
     mark_instance_deleted,
     mark_instance_ready_for_billing,
     record_instance,
@@ -214,24 +216,55 @@ def _github_repo_parts(repo_url: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+_GITHUB_DEFAULT_BASES = ("https://github.com", "http://github.com")
+
+
+def _github_is_proxy_base() -> bool:
+    """True when GITHUB_WEB_BASE points at a real proxy (not plain github.com)."""
+    return settings.GITHUB_WEB_BASE not in _GITHUB_DEFAULT_BASES
+
+
 def _github_clone_url(repo_url: str) -> str:
+    """Clone URL used INSIDE instance pods (git).
+
+    For github.com the pod reaches it via the `github.com -> 36.151.243.83`
+    hostAlias; that IP only serves git correctly over plain HTTP (its HTTPS does
+    not present a valid github.com cert, so an HTTPS clone fails verification).
+    Use HTTP for github.com (the long-standing working behaviour). When a real
+    proxy with a valid TLS cert is configured (e.g. gh-test), use it as-is over
+    HTTPS — that path is proven on the test manager.
+    """
     org, repo = _github_repo_parts(repo_url)
+    if _github_is_proxy_base():
+        return f"{settings.GITHUB_WEB_BASE}/{org}/{repo}.git"
     return f"http://github.com/{org}/{repo}.git"
 
 
 def _github_raw_url(repo_url: str, branch: str, notebook_path: str) -> str:
+    """Raw download URL used INSIDE instance pods (curl, which has the system CA).
+
+    For github.com keep the original raw.githubusercontent.com (HTTPS) form; for
+    a proxy base use its mirrored /raw/ path.
+    """
     org, repo = _github_repo_parts(repo_url)
-    return f"https://raw.githubusercontent.com/{org}/{repo}/{branch}/{notebook_path.lstrip('/')}"
+    path = notebook_path.lstrip("/")
+    if _github_is_proxy_base():
+        return f"{settings.GITHUB_WEB_BASE}/{org}/{repo}/raw/{branch}/{path}"
+    return f"https://raw.githubusercontent.com/{org}/{repo}/{branch}/{path}"
 
 
 def _github_raw_url_candidates(repo_url: str, branch: str, notebook_path: str) -> list[str]:
     org, repo = _github_repo_parts(repo_url)
     path = notebook_path.lstrip("/")
-    return [
+    candidates = [
+        f"{settings.GITHUB_WEB_BASE}/{org}/{repo}/raw/{branch}/{path}",
         f"https://raw.githubusercontent.com/{org}/{repo}/{branch}/{path}",
         f"https://github.com/{org}/{repo}/raw/{branch}/{path}",
         f"http://github.com/{org}/{repo}/raw/{branch}/{path}",
     ]
+    # De-dupe while preserving order (proxy base may equal github.com by default).
+    seen = set()
+    return [u for u in candidates if not (u in seen or seen.add(u))]
 
 
 def _template_asset_base_path(template_id: int, notebook_path: str) -> str:
@@ -312,6 +345,7 @@ def _save_notebook_template(
         start_command=req.start_command,
         app_port=template_app_port,
         model_source=(req.model_source or "").strip().lower() or None,
+        ssh_enabled=bool(getattr(req, "ssh_enabled", False)),
     )
     if template.get("repo_url") and template.get("notebook_path"):
         ensure_template_preview_cache(template, force=True)
@@ -458,6 +492,14 @@ def _active_instance_context(user: Optional[dict], request: Optional[Request] = 
     active_instance["api_base_url"] = api_base_url
     active_instance["api_key"] = api_key
     active_instance["api_model"] = api_model
+    # SSH is reachable as soon as the pod is Running (sshd boots with the pod),
+    # independent of app readiness. Only surface it once the pod is Running.
+    # get_pod_status_details lowercases the phase, so compare against "running".
+    pod_running = (status_details.get("phase") or "").lower() == "running"
+    active_instance["ssh_host"] = live_instance.get("ssh_host") if pod_running else None
+    active_instance["ssh_port"] = live_instance.get("ssh_port") if pod_running else None
+    active_instance["ssh_username"] = live_instance.get("ssh_username") if pod_running else None
+    active_instance["ssh_command"] = live_instance.get("ssh_command") if pod_running else None
     return active_instance
 
 
@@ -674,7 +716,7 @@ async def github_login(request: Request):
         "scope": "read:user user:email",
         "state": _oauth_state(request, "github"),
     }
-    return RedirectResponse("https://github.com/login/oauth/authorize?" + urlencode(params))
+    return RedirectResponse(f"{settings.GITHUB_AUTHORIZE_BASE}/login/oauth/authorize?" + urlencode(params))
 
 
 @app.get("/auth/github/callback", name="github_callback")
@@ -683,7 +725,7 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
     try:
         async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
             token_resp = await client.post(
-                "https://github.com/login/oauth/access_token",
+                f"{settings.GITHUB_WEB_BASE}/login/oauth/access_token",
                 headers={"Accept": "application/json"},
                 data={
                     "client_id": settings.GITHUB_CLIENT_ID,
@@ -697,8 +739,8 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
                 raise HTTPException(status_code=400, detail="GitHub OAuth token exchange failed")
             headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
             profile_resp, emails_resp = await asyncio.gather(
-                client.get("https://api.github.com/user", headers=headers),
-                client.get("https://api.github.com/user/emails", headers=headers),
+                client.get(f"{settings.GITHUB_API_BASE}/user", headers=headers),
+                client.get(f"{settings.GITHUB_API_BASE}/user/emails", headers=headers),
             )
     except httpx.RequestError as e:
         logger.error("GitHub OAuth request failed: %s", e)
@@ -951,6 +993,7 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
             active = mark_instance_ready_for_billing(active["instance_id"]) or active
         
         api_base_url, api_key, api_model = _instance_api_info(request, instance, status)
+        _pod_running = (status_details.get("phase") or "").lower() == "running"
         return NotebookStatus(
             status=status or "unknown",
             message=_notebook_status_message(status_details),
@@ -966,6 +1009,10 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
             api_base_url=api_base_url,
             api_key=api_key,
             api_model=api_model,
+            ssh_host=(instance.get("ssh_host") if (instance and _pod_running) else None),
+            ssh_port=(instance.get("ssh_port") if (instance and _pod_running) else None),
+            ssh_username=(instance.get("ssh_username") if (instance and _pod_running) else None),
+            ssh_command=(instance.get("ssh_command") if (instance and _pod_running) else None),
         )
         
     except Exception as e:
@@ -1007,6 +1054,33 @@ async def list_public_templates():
     return {"templates": list_notebook_templates(enabled_only=True)}
 
 
+def _validate_ssh_public_key(value: str) -> str:
+    """Lightly validate an SSH public key (single line, known type prefix)."""
+    key = (value or "").strip()
+    if not key:
+        return ""
+    if "\n" in key or "\r" in key:
+        raise ValueError("SSH public key must be a single line")
+    if not key.startswith(("ssh-rsa ", "ssh-ed25519 ", "ecdsa-sha2-", "ssh-dss ", "sk-ssh-ed25519@", "sk-ecdsa-sha2-")):
+        raise ValueError("Not a valid SSH public key (expected e.g. 'ssh-ed25519 AAAA... comment')")
+    if len(key) > 8192:
+        raise ValueError("SSH public key is too long")
+    return key
+
+
+@app.post("/api/profile/ssh-key")
+async def profile_set_ssh_key(req: SshPublicKeyRequest, user: dict = Depends(current_user)):
+    """Save (or clear) the user's SSH public key used for key-based pod access."""
+    try:
+        key = _validate_ssh_public_key(req.ssh_public_key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    updated = set_user_ssh_public_key(user["id"], key)
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ssh_public_key": updated.get("ssh_public_key") or ""}
+
+
 @app.get("/api/profile/templates")
 @app.get("/api/editor/templates")
 async def profile_list_templates(user: dict = Depends(current_user)):
@@ -1020,7 +1094,10 @@ async def profile_list_templates(user: dict = Depends(current_user)):
 @app.post("/api/editor/templates")
 async def profile_create_template(req: NotebookTemplateRequest, user: dict = Depends(current_user)):
     try:
-        return _save_notebook_template(req, owner_user_id=user["id"], sort_order=0, enabled_override=bool(user.get("is_editor")))
+        # Editors choose Public/Private (default Private via the form); everyone
+        # else can only create Private (Profile-only) templates.
+        enabled_override = (bool(req.enabled) if user.get("is_editor") else False)
+        return _save_notebook_template(req, owner_user_id=user["id"], sort_order=0, enabled_override=enabled_override)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1180,6 +1257,8 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             start_command=template.get("start_command"),
             app_port=template.get("app_port"),
             model_source=template.get("model_source"),
+            ssh_enabled=bool(template.get("ssh_enabled")),
+            ssh_public_key=user.get("ssh_public_key"),
         )
         record_instance(user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count, instance.get("node_port"))
         record_instance_launch_event(
@@ -1242,8 +1321,8 @@ def _parse_github_path(full_path: str) -> dict:
     branch = parts[3]
     path = "/".join(parts[4:])
     
-    # Construct raw GitHub URL
-    raw_url = f"https://raw.githubusercontent.com/{org}/{repo}/{branch}/{path}"
+    # In-pod download (proxy-aware; http for github.com — see _github_pod_base).
+    raw_url = f"{_github_pod_base()}/{org}/{repo}/raw/{branch}/{path}"
     
     return {
         "org": org,
@@ -1332,7 +1411,7 @@ async def create_github_notebook(
         "repo": repo,
         "branch": branch,
         "path": path,
-        "raw_url": f"https://raw.githubusercontent.com/{org}/{repo}/{branch}/{path}"
+        "raw_url": f"{_github_pod_base()}/{org}/{repo}/raw/{branch}/{path}"
     }
     
     # Use user session to generate unique instance ID per user

@@ -9,13 +9,25 @@
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
+  <script src="/static/template_form.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
   <style>
+    /* Always reserve scrollbar space so switching between short and tall tabs
+       never changes viewport width and shifts the centered layout. */
+    html { overflow-y: scroll; scrollbar-gutter: stable; }
     body { margin:0; background:#f5f6fb; }
+    /* Even, stable tab bar: each tab takes equal width and the bar fills the row,
+       so labels of different lengths don't produce uneven gaps. */
+    .content > .ant-tabs > .ant-tabs-nav .ant-tabs-nav-list { width:100%; }
+    .content > .ant-tabs > .ant-tabs-nav .ant-tabs-tab { flex:1; justify-content:center; margin:0 !important; }
+    .content > .ant-tabs > .ant-tabs-nav { margin-bottom:20px; }
     .header { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:12px 28px; background:#fff; border-bottom:1px solid #edf0f5; }
     .brand { display:flex; align-items:center; gap:12px; font-size:20px; font-weight:800; min-width:0; }
     .brand img { width:40px; height:40px; object-fit:contain; flex:0 0 40px; }
-    .content { max-width:1440px; margin:0 auto; padding:32px 32px 64px; }
+    /* width:100% is required because .content is a flex child of .ant-layout;
+       with margin:0 auto alone the auto margins disable flex stretch and the
+       box collapses to its content width, so the layout shifts between tabs. */
+    .content { width:100%; max-width:1440px; margin:0 auto; padding:32px 32px 64px; }
     .toolbar { display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:18px; }
     .toolbar-actions, .header-actions { display:flex; gap:8px; flex-wrap:wrap; }
     .table-code { display:block; max-width:100%; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -34,7 +46,7 @@
 <body>
 <div id="root"></div>
 <script>
-const { Button, Card, Form, Input, InputNumber, Layout, Menu, Modal, Select, Space, Statistic, Table, Tag, Typography, Popconfirm, message } = antd;
+const { Button, Card, Form, Input, InputNumber, Layout, Menu, Modal, Select, Space, Statistic, Switch, Table, Tabs, Tag, Typography, Popconfirm, message } = antd;
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
 
@@ -44,8 +56,14 @@ function App(){
   const [users,setUsers]=React.useState([]);
   const [templates,setTemplates]=React.useState([]);
   const [stats,setStats]=React.useState({days:[],daily_users:[],daily_instance_launches:[],daily_active_users:[],total_instance_launches:0,total_active_users:0,total_users:0});
-  const [loading,setLoading]=React.useState(false);
+  const [loaded,setLoaded]=React.useState({});
+  const [sectionLoading,setSectionLoading]=React.useState({});
+  const [activeTab,setActiveTab]=React.useState('overview');
   const [userSearch,setUserSearch]=React.useState('');
+  const [templateSearch,setTemplateSearch]=React.useState('');
+  const [templateEnabled,setTemplateEnabled]=React.useState('all');
+  const [imageSearch,setImageSearch]=React.useState('');
+  const [instanceSearch,setInstanceSearch]=React.useState('');
   const [form]=Form.useForm();
   const [templateForm]=Form.useForm();
   const [creditForm]=Form.useForm();
@@ -57,25 +75,28 @@ function App(){
   const [editingTemplate,setEditingTemplate]=React.useState(null);
   const [creditModalUser,setCreditModalUser]=React.useState(null);
 
-  async function load(){
-    setLoading(true);
+  // Each admin section loads its own (potentially expensive) endpoint on demand,
+  // so the page opens fast instead of fetching everything up front.
+  const SECTION_EP={users:'/api/admin/users',templates:'/api/admin/templates',images:'/api/admin/images',instances:'/api/admin/instances',stats:'/api/admin/stats'};
+  const SECTION_SET={users:setUsers,templates:setTemplates,images:setImages,instances:setInstances};
+  async function loadSection(name,force){
+    if(!name) return;
+    if(!force && loaded[name]) return;
+    setSectionLoading(s=>({...s,[name]:true}));
     try{
-      const [imgRes, instRes, userRes, tplRes, statsRes] = await Promise.all([fetch('/api/admin/images'), fetch('/api/admin/instances'), fetch('/api/admin/users'), fetch('/api/admin/templates'), fetch('/api/admin/stats')]);
-      const imgData = await imgRes.json();
-      const instData = await instRes.json();
-      const userData = await userRes.json();
-      const tplData = await tplRes.json();
-      const statsData = await statsRes.json();
-      setImages(imgData.images||[]);
-      setInstances(instData.instances||[]);
-      setUsers(userData.users||[]);
-      setTemplates(tplData.templates||[]);
-      setStats(statsData||{});
-    }catch(e){ message.error('Failed to load admin data'); }
-    setLoading(false);
+      const res=await fetch(SECTION_EP[name]);
+      const data=await res.json();
+      if(name==='stats') setStats(data||{}); else SECTION_SET[name]((data&&data[name])||[]);
+      setLoaded(l=>({...l,[name]:true}));
+    }catch(e){ message.error('Failed to load '+name); }
+    setSectionLoading(s=>({...s,[name]:false}));
   }
-  React.useEffect(()=>{ load(); },[]);
+  const tabSection=key=>key==='overview'?'stats':key;
+  function onTabChange(key){ setActiveTab(key); loadSection(tabSection(key)); }
+  function refreshActive(){ loadSection(tabSection(activeTab),true); }
+  React.useEffect(()=>{ loadSection('stats'); },[]);
   React.useEffect(()=>{
+    if(activeTab!=='overview') return;
     const node=document.getElementById('adminDailyStatsChart');
     if(!node || !window.echarts) return;
     const chart=echarts.init(node);
@@ -93,18 +114,27 @@ function App(){
     });
     const resize=()=>chart.resize();
     window.addEventListener('resize',resize);
-    return()=>{window.removeEventListener('resize',resize); chart.dispose();};
-  },[stats]);
+    // The Overview pane is display:none while another tab is active, so its
+    // width is 0; on switching back echarts would init/keep that squished width
+    // mid tab-transition. Observe the container and resize whenever it changes,
+    // plus force a resize after the antd tab slide settles.
+    let ro;
+    if(window.ResizeObserver){ ro=new ResizeObserver(()=>chart.resize()); ro.observe(node); }
+    requestAnimationFrame(resize);
+    const t=setTimeout(resize,350);
+    return()=>{window.removeEventListener('resize',resize); if(ro)ro.disconnect(); clearTimeout(t); chart.dispose();};
+  },[stats,activeTab]);
 
   async function addImage(values){
     const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...values, enabled:true})});
-    if(res.ok){ message.success('Image added and sync started'); form.resetFields(); setImageModalOpen(false); load(); } else message.error('Failed to add image');
+    if(res.ok){ message.success('Image added and sync started'); form.resetFields(); setImageModalOpen(false); loadSection('images',true); } else message.error('Failed to add image');
   }
-  async function syncImage(id){ const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Sync started':'Sync failed'); load(); }
-  async function deleteImage(id){ const r=await fetch(`/api/admin/images/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Deleted':'Delete failed'); load(); }
-  async function deleteInstance(id){ const r=await fetch(`/api/admin/instance/${encodeURIComponent(id)}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Destroyed':'Destroy failed'); load(); }
+  async function syncImage(id){ const r=await fetch(`/api/admin/images/${id}/sync`,{method:'POST'}); message[r.ok?'success':'error'](r.ok?'Sync started':'Sync failed'); loadSection('images',true); }
+  async function deleteImage(id){ const r=await fetch(`/api/admin/images/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Deleted':'Delete failed'); loadSection('images',true); }
+  async function deleteInstance(id){ const r=await fetch(`/api/admin/instance/${encodeURIComponent(id)}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Destroyed':'Destroy failed'); loadSection('instances',true); }
   function openTemplateModal(record){
     setEditingTemplate(record||null);
+    loadSection('images');
     templateForm.setFieldsValue(record ? {...record, tags:(record.tags||[]).join(', ')} : {branch:'main', enabled:true, sort_order:0});
     setTemplateModalOpen(true);
   }
@@ -112,12 +142,12 @@ function App(){
     const payload = {...values, enabled: values.enabled !== false, tags: values.tags || ''};
     const url = editingTemplate ? `/api/admin/templates/${editingTemplate.id}` : '/api/admin/templates';
     const res = await fetch(url,{method:editingTemplate?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    if(res.ok){ message.success(editingTemplate?'Template updated':'Template added'); templateForm.resetFields(); setEditingTemplate(null); setTemplateModalOpen(false); load(); } else {
+    if(res.ok){ message.success(editingTemplate?'Template updated':'Template added'); templateForm.resetFields(); setEditingTemplate(null); setTemplateModalOpen(false); loadSection('templates',true); } else {
       const data = await res.json().catch(()=>({detail:'Template save failed'}));
       message.error(data.detail || 'Template save failed');
     }
   }
-  async function deleteTemplate(id){ const r=await fetch(`/api/admin/templates/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Template deleted':'Delete failed'); load(); }
+  async function deleteTemplate(id){ const r=await fetch(`/api/admin/templates/${id}`,{method:'DELETE'}); message[r.ok?'success':'error'](r.ok?'Template deleted':'Delete failed'); loadSection('templates',true); }
   async function bulkDestroyInstances(values){
     setBulkDestroyLoading(true);
     try{
@@ -127,7 +157,7 @@ function App(){
       message[data.failed_count?'warning':'success'](`Destroyed ${data.destroyed_count || 0}/${data.matched_count || 0} matched instances`);
       bulkDestroyForm.resetFields();
       setBulkDestroyModalOpen(false);
-      load();
+      loadSection('instances',true);
     }catch(e){
       message.error(e.message || 'Bulk destroy failed');
     }finally{
@@ -137,14 +167,14 @@ function App(){
   async function grantCredits(values){
     if(!creditModalUser) return;
     const res=await fetch(`/api/admin/users/${creditModalUser.id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
-    if(res.ok){ message.success('Credits granted'); creditForm.resetFields(); setCreditModalUser(null); load(); } else {
+    if(res.ok){ message.success('Credits granted'); creditForm.resetFields(); setCreditModalUser(null); loadSection('users',true); } else {
       const data = await res.json().catch(()=>({detail:'Failed to grant credits'}));
       message.error(data.detail || 'Failed to grant credits');
     }
   }
   async function setEditor(user, makeEditor){
     const res=await fetch(`/api/admin/users/${user.id}/editor`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({is_editor:makeEditor})});
-    if(res.ok){ message.success(makeEditor?'Editor granted':'Editor revoked'); load(); } else {
+    if(res.ok){ message.success(makeEditor?'Editor granted':'Editor revoked'); loadSection('users',true); } else {
       const data = await res.json().catch(()=>({detail:'Failed to update editor'}));
       message.error(data.detail || 'Failed to update editor');
     }
@@ -202,29 +232,54 @@ function App(){
       .filter(Boolean)
       .some(value => String(value).toLowerCase().includes(keyword));
   });
+  const filteredTemplates = templates.filter(t => {
+    if(templateEnabled==='enabled' && !t.enabled) return false;
+    if(templateEnabled==='disabled' && t.enabled) return false;
+    const kw = templateSearch.trim().toLowerCase();
+    if(!kw) return true;
+    return [t.title,t.slug,t.category,(t.tags||[]).join(' ')].filter(Boolean).some(v=>String(v).toLowerCase().includes(kw));
+  });
+  const filteredImages = images.filter(i => {
+    const kw = imageSearch.trim().toLowerCase();
+    if(!kw) return true;
+    return [i.name,i.image,i.description].filter(Boolean).some(v=>String(v).toLowerCase().includes(kw));
+  });
+  const filteredInstances = instances.filter(i => {
+    const kw = instanceSearch.trim().toLowerCase();
+    if(!kw) return true;
+    return [i.email,i.instance_type,i.status,i.id].filter(Boolean).some(v=>String(v).toLowerCase().includes(kw));
+  });
+  const tablePagination = total => ({pageSize:10,showSizeChanger:true,pageSizeOptions:['10','20','50','100'],showTotal:(t,r)=>`${r[0]}-${r[1]} of ${t}`});
 
   return React.createElement(Layout,null,
     React.createElement(Header,{className:'header'},
       React.createElement('div',{className:'brand'},React.createElement('img',{src:'https://amd-ai-academy.com/static/image.png'}),React.createElement('span',null,'Radeon Cloud Admin')),
-      React.createElement('div',{className:'header-actions'},React.createElement(Button,{href:'/'},'Notebook'),React.createElement(Button,{onClick:load},'Refresh'))
+      React.createElement('div',{className:'header-actions'},React.createElement(Button,{href:'/'},'Notebook'),React.createElement(Button,{onClick:refreshActive,loading:!!sectionLoading[tabSection(activeTab)]},'Refresh'))
     ),
     React.createElement(Content,{className:'content'},
       React.createElement('div',{className:'toolbar'},
-        React.createElement('div',null,React.createElement(Title,{level:2,style:{margin:0}},'Admin Console'),React.createElement(Text,{type:'secondary'},'Manage images and running instances')),
-        React.createElement('div',{className:'toolbar-actions'},
-          React.createElement(Button,{onClick:()=>openTemplateModal(null)},'Add Template'),
-          React.createElement(Button,{type:'primary',onClick:()=>setImageModalOpen(true)},'Add Image'),
-          React.createElement(Button,{danger:true,onClick:()=>setBulkDestroyModalOpen(true)},'Remove Instances')
-        )
+        React.createElement('div',null,React.createElement(Title,{level:2,style:{margin:0}},'Admin Console'),React.createElement(Text,{type:'secondary'},'Sections load on demand — switch tabs to fetch data'))
       ),
-      React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
-        React.createElement(Card,null,React.createElement('div',{className:'admin-metrics'},React.createElement(Statistic,{title:'Users',value:users.length}),React.createElement(Statistic,{title:'Templates',value:templates.length}),React.createElement(Statistic,{title:'Images',value:images.length}),React.createElement(Statistic,{title:'Running Instances',value:instances.length}),React.createElement(Statistic,{title:'Total Launches',value:stats.total_instance_launches||0}),React.createElement(Statistic,{title:'Active Users',value:stats.total_active_users||0}),React.createElement(Statistic,{title:'Ready Images',value:images.filter(i=>i.sync_status==='ready').length}))),
-        React.createElement(Card,{title:'Daily Activity',extra:stats.tracking_started_at?React.createElement(Text,{type:'secondary'},`Launch tracking since ${dayjs(stats.tracking_started_at).format('YYYY-MM-DD HH:mm')}`):React.createElement(Text,{type:'secondary'},'Launch tracking starts after this update')},React.createElement('div',{id:'adminDailyStatsChart',className:'stats-chart'})),
-        React.createElement(Card,{title:'Users',extra:React.createElement(Input.Search,{className:'user-search',allowClear:true,placeholder:'Search email, name, provider, or ID',value:userSearch,onChange:e=>setUserSearch(e.target.value),onSearch:setUserSearch})},React.createElement(Table,{rowKey:'id',columns:userColumns,dataSource:filteredUsers,loading,pagination:{pageSize:10,showSizeChanger:true},scroll:{x:'max-content'},size:'middle'})),
-        React.createElement(Card,{title:'Notebook Templates'},React.createElement(Table,{rowKey:'id',columns:templateColumns,dataSource:templates,loading,pagination:{pageSize:10,showSizeChanger:true,pageSizeOptions:['10','20','50'],showTotal:(total,range)=>`${range[0]}-${range[1]} of ${total} templates`},scroll:{x:1400},size:'middle'})),
-        React.createElement(Card,{title:'Image Catalog'},React.createElement(Table,{rowKey:'id',columns:imageColumns,dataSource:images,loading,pagination:false,scroll:{x:1100},size:'middle'})),
-        React.createElement(Card,{title:'Instances'},React.createElement(Table,{rowKey:'id',columns:instColumns,dataSource:instances,loading,pagination:false,scroll:{x:900},size:'middle'}))
-      ),
+      React.createElement(Tabs,{activeKey:activeTab,onChange:onTabChange,destroyInactiveTabPane:false,items:[
+        {key:'overview',label:'Overview',children:React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
+          React.createElement(Card,{loading:!loaded.stats},React.createElement('div',{className:'admin-metrics'},React.createElement(Statistic,{title:'Total Users',value:stats.total_users||0}),React.createElement(Statistic,{title:'Total Launches',value:stats.total_instance_launches||0}),React.createElement(Statistic,{title:'Active Users',value:stats.total_active_users||0}))),
+          React.createElement(Card,{title:'Daily Activity',extra:stats.tracking_started_at?React.createElement(Text,{type:'secondary'},`Launch tracking since ${dayjs(stats.tracking_started_at).format('YYYY-MM-DD HH:mm')}`):React.createElement(Text,{type:'secondary'},'Launch tracking starts after this update')},React.createElement('div',{id:'adminDailyStatsChart',className:'stats-chart'}))
+        )},
+        {key:'users',label:'Users',children:React.createElement(Card,{title:'Users',extra:React.createElement(Input.Search,{className:'user-search',allowClear:true,placeholder:'Search email, name, provider, or ID',value:userSearch,onChange:e=>setUserSearch(e.target.value),onSearch:setUserSearch})},React.createElement(Table,{rowKey:'id',columns:userColumns,dataSource:filteredUsers,loading:!!sectionLoading.users,pagination:tablePagination(),scroll:{x:'max-content'},size:'middle'}))},
+        {key:'templates',label:'Templates',children:React.createElement(Card,{title:'Notebook Templates',extra:React.createElement(Space,{wrap:true},
+            React.createElement(Select,{value:templateEnabled,onChange:setTemplateEnabled,style:{width:130},options:[{value:'all',label:'All status'},{value:'enabled',label:'Enabled'},{value:'disabled',label:'Disabled'}]}),
+            React.createElement(Input.Search,{allowClear:true,placeholder:'Search title, slug, tags',style:{width:'min(280px,100%)'},value:templateSearch,onChange:e=>setTemplateSearch(e.target.value),onSearch:setTemplateSearch}),
+            React.createElement(Button,{onClick:()=>openTemplateModal(null)},'Add Template')
+          )},React.createElement(Table,{rowKey:'id',columns:templateColumns,dataSource:filteredTemplates,loading:!!sectionLoading.templates,pagination:tablePagination(),scroll:{x:1400},size:'middle'}))},
+        {key:'images',label:'Images',children:React.createElement(Card,{title:'Image Catalog',extra:React.createElement(Space,{wrap:true},
+            React.createElement(Input.Search,{allowClear:true,placeholder:'Search name or image',style:{width:'min(280px,100%)'},value:imageSearch,onChange:e=>setImageSearch(e.target.value),onSearch:setImageSearch}),
+            React.createElement(Button,{type:'primary',onClick:()=>setImageModalOpen(true)},'Add Image')
+          )},React.createElement(Table,{rowKey:'id',columns:imageColumns,dataSource:filteredImages,loading:!!sectionLoading.images,pagination:tablePagination(),scroll:{x:1100},size:'middle'}))},
+        {key:'instances',label:'Instances',children:React.createElement(Card,{title:'Instances',extra:React.createElement(Space,{wrap:true},
+            React.createElement(Input.Search,{allowClear:true,placeholder:'Search email, type, status',style:{width:'min(280px,100%)'},value:instanceSearch,onChange:e=>setInstanceSearch(e.target.value),onSearch:setInstanceSearch}),
+            React.createElement(Button,{danger:true,onClick:()=>setBulkDestroyModalOpen(true)},'Remove Instances')
+          )},React.createElement(Table,{rowKey:'id',columns:instColumns,dataSource:filteredInstances,loading:!!sectionLoading.instances,pagination:tablePagination(),scroll:{x:900},size:'middle'}))}
+      ]}),
       React.createElement(Modal,{title:'Add Image',open:imageModalOpen,onCancel:()=>setImageModalOpen(false),footer:null,destroyOnClose:true},
         React.createElement(Form,{form,layout:'vertical',onFinish:addImage},
           React.createElement(Form.Item,{name:'name',label:'Display name',rules:[{required:true}]},React.createElement(Input,{placeholder:'amd-geis'})),
@@ -235,24 +290,7 @@ function App(){
       ),
       React.createElement(Modal,{title:editingTemplate?'Edit Template':'Add Template',open:templateModalOpen,onCancel:()=>{setTemplateModalOpen(false);setEditingTemplate(null);},footer:null,destroyOnClose:true,width:'min(760px, calc(100vw - 32px))'},
         React.createElement(Form,{form:templateForm,layout:'vertical',onFinish:saveTemplate},
-          React.createElement('div',{className:'form-row'},
-            React.createElement(Form.Item,{name:'title',label:'Title',rules:[{required:true}]},React.createElement(Input,{placeholder:'10-minute Skill Agent'})),
-            React.createElement(Form.Item,{name:'slug',label:'Slug',rules:[{required:true}]},React.createElement(Input,{placeholder:'skill-agent'}))
-          ),
-          React.createElement(Form.Item,{name:'description',label:'Description'},React.createElement(Input.TextArea,{autoSize:true,placeholder:'Short user-facing description'})),
-          React.createElement('div',{className:'form-row three'},
-            React.createElement(Form.Item,{name:'category',label:'Category'},React.createElement(Input,{placeholder:'LLM'})),
-            React.createElement(Form.Item,{name:'tags',label:'Tags'},React.createElement(Input,{placeholder:'tutorial, Qwen3, agent'})),
-            React.createElement(Form.Item,{name:'sort_order',label:'Sort'},React.createElement(InputNumber,{style:{width:'100%'},precision:0}))
-          ),
-          React.createElement(Form.Item,{name:'image',label:'Container Image',rules:[{required:true}]},React.createElement(Select,{options:images.filter(i=>i.enabled).map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`}))})),
-          React.createElement(Form.Item,{name:'repo_url',label:'GitHub Repo URL'},React.createElement(Input,{placeholder:'optional, e.g. https://github.com/org/repo'})),
-          React.createElement('div',{className:'form-row notebook'},
-            React.createElement(Form.Item,{name:'branch',label:'Branch'},React.createElement(Input,{placeholder:'main'})),
-            React.createElement(Form.Item,{name:'notebook_path',label:'Notebook Path'},React.createElement(Input,{placeholder:'optional, e.g. notebooks/workshop.ipynb'}))
-          ),
-          React.createElement(Form.Item,{name:'cover_url',label:'Cover URL'},React.createElement(Input,{placeholder:'optional'})),
-          React.createElement(Form.Item,{name:'enabled',label:'Enabled'},React.createElement(Select,{options:[{value:true,label:'Enabled'},{value:false,label:'Disabled'}]})),
+          React.createElement(window.TemplateFormFields,{form:templateForm,imageOptions:images.filter(i=>i.enabled).map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`})),isAdmin:true}),
           React.createElement(Button,{type:'primary',htmlType:'submit',block:true},editingTemplate?'Save Template':'Add Template')
         )
       ),

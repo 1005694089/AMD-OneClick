@@ -63,6 +63,12 @@ class NotebookTemplateRequest(BaseModel):
     start_command: Optional[str] = ""
     app_port: Optional[int] = None
     model_source: Optional[str] = ""
+    ssh_enabled: bool = False
+
+
+class SshPublicKeyRequest(BaseModel):
+    """Request model for saving the user's SSH public key (Profile)."""
+    ssh_public_key: str = ""
 
 
 class TemplateLaunchRequest(BaseModel):
@@ -110,6 +116,10 @@ class NotebookStatus(BaseModel):
     api_base_url: Optional[str] = None
     api_key: Optional[str] = None
     api_model: Optional[str] = None
+    ssh_host: Optional[str] = None
+    ssh_port: Optional[int] = None
+    ssh_username: Optional[str] = None
+    ssh_command: Optional[str] = None
 
 
 class NotebookListItem(BaseModel):

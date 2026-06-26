@@ -295,6 +295,17 @@ if [ -d {shlex.quote(settings.HF_CACHE_MOUNT_PATH)}/Qwen3-8B ] && [ ! -e {worksp
     ln -s {shlex.quote(settings.HF_CACHE_MOUNT_PATH)}/Qwen3-8B {workspace}/Qwen3-8B
 fi
 """
+        # Notebook-type images don't always ship Jupyter. Detect it and, if
+        # missing, install jupyterlab from the Tsinghua PyPI mirror so the
+        # Notebook deploy type works on any image instead of failing at launch.
+        jupyter_ensure = f"""
+if ! command -v jupyter >/dev/null 2>&1; then
+    echo "[oneclick] Jupyter not found in image; installing jupyterlab via Tsinghua mirror..."
+    pip install --no-cache-dir -i {settings.PIP_INDEX_URL} --trusted-host {settings.PYPI_HOST} jupyterlab 2>&1 | tail -8 || pip3 install --no-cache-dir -i {settings.PIP_INDEX_URL} --trusted-host {settings.PYPI_HOST} jupyterlab 2>&1 | tail -8
+    export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+    hash -r 2>/dev/null || true
+fi
+"""
         if github_info:
             notebook_path = github_info["path"].lstrip("/")
             notebook_filename = notebook_path.split("/")[-1]
@@ -330,7 +341,7 @@ if [ ! -f {notebook_path_q} ]; then
     echo "Notebook not found: {notebook_path}"
     find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
 fi
-
+{jupyter_ensure}
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/repo
 """
             return f"""
@@ -356,7 +367,7 @@ fi
 if [ ! -f {shlex.quote(notebook_filename)} ]; then
     echo "Warning: Failed to download notebook, starting with empty directory"
 fi
-
+{jupyter_ensure}
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/notebooks
 """
 
@@ -365,6 +376,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 cd {workspace}
+{jupyter_ensure}
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
 """
 
@@ -373,6 +385,7 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 cd {workspace}
+{jupyter_ensure}
 jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}
 """
 
@@ -446,7 +459,9 @@ exec {cmd}
                           start_command: Optional[str] = None,
                           app_port: Optional[int] = None,
                           disk_size_gb: Optional[int] = None,
-                          model_source: Optional[str] = None) -> dict:
+                          model_source: Optional[str] = None,
+                          ssh_enabled: bool = False,
+                          ssh_public_key: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -502,6 +517,10 @@ exec {cmd}
             )
         else:
             startup_script = self._build_startup_script(instance_id, instance_type, github_info)
+
+        ssh_enabled = bool(ssh_enabled)
+        if ssh_enabled:
+            annotations["amd-oneclick/ssh-enabled"] = "true"
 
         workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
         workspace_uses_empty_dir = workspace_volume_type == "emptydir"
@@ -689,6 +708,9 @@ findmnt "$mnt"
         ]
         for _app_name, _app_port in settings.APP_PORTS.items():
             container_ports.append({"containerPort": int(_app_port), "name": _app_name[:15]})
+        if ssh_enabled:
+            container_ports.append({"containerPort": int(settings.SSH_PORT), "name": "ssh"})
+            env = list(env) + [{"name": "ONECLICK_SSH_PUBLIC_KEY", "value": (ssh_public_key or "").strip()}]
 
         notebook_container = {
             "name": "notebook",
@@ -707,6 +729,15 @@ findmnt "$mnt"
         if not image_defined_command:
             notebook_container["command"] = ["/bin/bash", "-c"]
             notebook_container["args"] = [startup_script]
+
+        # Opt-in SSH: inject the launching user's public key and force key-only
+        # auth via a postStart hook. This runs regardless of the container's main
+        # command (works for custom image-defined types too) so the image's sshd
+        # accepts the user's key and never a password.
+        if ssh_enabled:
+            notebook_container["lifecycle"] = {
+                "postStart": {"exec": {"command": ["/bin/sh", "-c", self._ssh_poststart_script()]}}
+            }
 
         spec = {
             "securityContext": {
@@ -756,10 +787,26 @@ findmnt "$mnt"
             "spec": spec
         }
     
-    def _get_service_manifest(self, email: str, instance_id: str, node_port: int) -> dict:
+    def _get_service_manifest(self, email: str, instance_id: str, node_port: int, ssh_node_port: Optional[int] = None) -> dict:
         """Generate Service manifest"""
         labels = self._get_labels(email, instance_id)
-        
+
+        ports = [
+            {
+                "name": "jupyter",
+                "port": settings.NOTEBOOK_PORT,
+                "targetPort": settings.NOTEBOOK_PORT,
+                "nodePort": node_port
+            }
+        ]
+        if ssh_node_port:
+            ports.append({
+                "name": "ssh",
+                "port": int(settings.SSH_PORT),
+                "targetPort": int(settings.SSH_PORT),
+                "nodePort": int(ssh_node_port)
+            })
+
         return {
             "apiVersion": "v1",
             "kind": "Service",
@@ -771,15 +818,66 @@ findmnt "$mnt"
             "spec": {
                 "selector": labels,
                 "type": "NodePort",
-                "ports": [
-                    {
-                        "name": "jupyter",
-                        "port": settings.NOTEBOOK_PORT,
-                        "targetPort": settings.NOTEBOOK_PORT,
-                        "nodePort": node_port
-                    }
-                ]
+                "ports": ports
             }
+        }
+
+    @staticmethod
+    def _svc_node_ports_by_name(svc) -> dict:
+        """Map service port name -> nodePort for a Service object."""
+        result: dict = {}
+        for p in (svc.spec.ports or []):
+            if p.node_port:
+                result[p.name] = int(p.node_port)
+        return result
+
+    @staticmethod
+    def _ssh_poststart_script() -> str:
+        """postStart hook: install the user's public key, force key-only auth.
+
+        Runs after the container starts regardless of its main command. Writes
+        $ONECLICK_SSH_PUBLIC_KEY to root's authorized_keys, disables password
+        login (drop-in + main config + locks the account password), ensures host
+        keys exist, and (re)starts/reloads sshd if the image ships one. Every
+        step is best-effort so it never crashes the container.
+        """
+        return r"""
+set +e
+KEY="${ONECLICK_SSH_PUBLIC_KEY:-}"
+if [ -n "$KEY" ]; then
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  printf '%s\n' "$KEY" > /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+fi
+# Force key-only auth (drop-in wins if Include is present; also patch main config).
+mkdir -p /etc/ssh/sshd_config.d 2>/dev/null
+printf 'PasswordAuthentication no\nPermitRootLogin prohibit-password\nPubkeyAuthentication yes\n' > /etc/ssh/sshd_config.d/00-oneclick.conf 2>/dev/null
+if [ -f /etc/ssh/sshd_config ]; then
+  sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config 2>/dev/null
+  sed -i 's/^[#[:space:]]*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config 2>/dev/null
+fi
+# Lock any baked-in root password so only the injected key can log in.
+passwd -l root 2>/dev/null
+# Ensure host keys + (re)start/reload sshd if the image provides it.
+if command -v sshd >/dev/null 2>&1 || [ -x /usr/sbin/sshd ]; then
+  mkdir -p /run/sshd 2>/dev/null
+  ssh-keygen -A 2>/dev/null
+  service ssh reload 2>/dev/null || /usr/sbin/sshd 2>/dev/null || sshd 2>/dev/null
+fi
+exit 0
+"""
+
+    def _ssh_access(self, ssh_node_port: Optional[int]) -> dict:
+        """Build the SSH access info surfaced to the user, when SSH is enabled."""
+        if not ssh_node_port:
+            return {}
+        host = settings.SSH_HOST or settings.SERVICE_HOST
+        user = settings.SSH_USERNAME
+        return {
+            "ssh_host": host,
+            "ssh_port": int(ssh_node_port),
+            "ssh_username": user,
+            "ssh_command": f"ssh {user}@{host} -p {ssh_node_port}",
         }
     
     def _used_node_ports(self) -> set[int]:
@@ -804,37 +902,49 @@ findmnt "$mnt"
                 return port
         raise RuntimeError("No available NodePort in configured range")
 
-    def _create_service_with_nodeport_retry(self, email: str, instance_id: str) -> tuple[int, bool]:
+    def _create_service_with_nodeport_retry(self, email: str, instance_id: str, ssh_enabled: bool = False) -> tuple[int, Optional[int], bool]:
+        """Create the instance Service. Returns (jupyter_node_port, ssh_node_port, created).
+
+        When ssh_enabled the Service exposes a second NodePort -> pod:22 so the
+        user can SSH into the pod. Both ports are (re)allocated together on conflict.
+        """
         try:
             existing = self.core_v1.read_namespaced_service(name=f"{instance_id}-svc", namespace=self.namespace)
-            node_port = existing.spec.ports[0].node_port if existing.spec.ports else None
+            by_name = self._svc_node_ports_by_name(existing)
+            node_port = by_name.get("jupyter") or (existing.spec.ports[0].node_port if existing.spec.ports else None)
             if node_port:
-                return int(node_port), False
+                return int(node_port), by_name.get("ssh"), False
         except ApiException as e:
             if e.status != 404:
                 raise
 
         with _node_port_lock:
-            used_ports = self._used_node_ports()
-            start = settings.NODE_PORT_BASE + random.randint(0, min(200, max(0, NODE_PORT_MAX - settings.NODE_PORT_BASE)))
-            node_port = self._allocate_node_port(used_ports, start_port=start)
             for _ in range(512):
+                used_ports = self._used_node_ports()
+                start = settings.NODE_PORT_BASE + random.randint(0, min(200, max(0, NODE_PORT_MAX - settings.NODE_PORT_BASE)))
+                node_port = self._allocate_node_port(used_ports, start_port=start)
+                ssh_node_port = None
+                if ssh_enabled:
+                    ssh_node_port = self._allocate_node_port(used_ports | {node_port}, start_port=node_port + 1)
                 try:
-                    self.core_v1.create_namespaced_service(namespace=self.namespace, body=self._get_service_manifest(email, instance_id, node_port))
-                    logger.info("Created service %s-svc with NodePort %s", instance_id, node_port)
-                    return node_port, True
+                    self.core_v1.create_namespaced_service(
+                        namespace=self.namespace,
+                        body=self._get_service_manifest(email, instance_id, node_port, ssh_node_port),
+                    )
+                    logger.info("Created service %s-svc with NodePort %s (ssh %s)", instance_id, node_port, ssh_node_port)
+                    return node_port, ssh_node_port, True
                 except ApiException as e:
                     message = str(e)
                     if e.status == 409:
                         existing = self.core_v1.read_namespaced_service(name=f"{instance_id}-svc", namespace=self.namespace)
-                        existing_port = existing.spec.ports[0].node_port if existing.spec.ports else None
+                        by_name = self._svc_node_ports_by_name(existing)
+                        existing_port = by_name.get("jupyter") or (existing.spec.ports[0].node_port if existing.spec.ports else None)
                         if existing_port:
-                            return int(existing_port), False
+                            return int(existing_port), by_name.get("ssh"), False
                         raise
                     if e.status == 422 and ("provided port is already allocated" in message or "invalid" in message.lower()):
-                        used_ports = self._used_node_ports()
-                        used_ports.add(node_port)
-                        node_port = self._allocate_node_port(used_ports, start_port=node_port + 1)
+                        # A port collided with a concurrently-created service; retry
+                        # the loop, which re-reads used ports and reallocates both.
                         continue
                     raise
         raise RuntimeError("Unable to allocate NodePort for service")
@@ -1014,12 +1124,15 @@ findmnt "$mnt"
             )
             
             # Get associated service
+            ssh_node_port = None
             try:
                 svc = self.core_v1.read_namespaced_service(
                     name=f"{instance_id}-svc",
                     namespace=self.namespace
                 )
-                node_port = svc.spec.ports[0].node_port if svc.spec.ports else None
+                by_name = self._svc_node_ports_by_name(svc)
+                node_port = by_name.get("jupyter") or (svc.spec.ports[0].node_port if svc.spec.ports else None)
+                ssh_node_port = by_name.get("ssh")
             except ApiException:
                 node_port = None
             
@@ -1032,7 +1145,9 @@ findmnt "$mnt"
                 "status": pod.status.phase.lower(),
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
-                "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None
+                "ssh_node_port": ssh_node_port,
+                "url": self._build_url(node_port, instance_id=instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
+                **self._ssh_access(ssh_node_port),
             }
         except ApiException as e:
             if e.status == 404:
@@ -1062,7 +1177,9 @@ findmnt "$mnt"
                         start_command: Optional[str] = None,
                         app_port: Optional[int] = None,
                         disk_size_gb: Optional[int] = None,
-                        model_source: Optional[str] = None) -> dict:
+                        model_source: Optional[str] = None,
+                        ssh_enabled: bool = False,
+                        ssh_public_key: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -1105,6 +1222,8 @@ findmnt "$mnt"
             app_port=app_port,
             disk_size_gb=disk_size_gb,
             model_source=model_source,
+            ssh_enabled=ssh_enabled,
+            ssh_public_key=ssh_public_key,
         )
         for attempt in range(1, 7):
             try:
@@ -1123,7 +1242,7 @@ findmnt "$mnt"
                 raise
 
         try:
-            node_port, service_created = self._create_service_with_nodeport_retry(email, instance_id)
+            node_port, ssh_node_port, service_created = self._create_service_with_nodeport_retry(email, instance_id, ssh_enabled=ssh_enabled)
         except Exception as e:
             logger.error("Failed to create service for %s: %s", instance_id, e)
             self.delete_instance_by_id(instance_id)
@@ -1143,8 +1262,10 @@ findmnt "$mnt"
             "status": "pending",
             "created_at": datetime.now(timezone.utc),
             "node_port": node_port,
+            "ssh_node_port": ssh_node_port,
             "url": self._build_url(node_port, notebook_path, instance_id, use_path_proxy=True),
-            "github_info": github_info
+            "github_info": github_info,
+            **self._ssh_access(ssh_node_port),
         }
     
     def get_instance_by_id(self, instance_id: str) -> Optional[dict]:
@@ -1157,12 +1278,15 @@ findmnt "$mnt"
             if pod.metadata.deletion_timestamp:
                 return None
 
+            ssh_node_port = None
             try:
                 svc = self.core_v1.read_namespaced_service(
                     name=f"{instance_id}-svc",
                     namespace=self.namespace
                 )
-                node_port = svc.spec.ports[0].node_port if svc.spec.ports else None
+                by_name = self._svc_node_ports_by_name(svc)
+                node_port = by_name.get("jupyter") or (svc.spec.ports[0].node_port if svc.spec.ports else None)
+                ssh_node_port = by_name.get("ssh")
             except ApiException:
                 node_port = None
 
@@ -1184,6 +1308,8 @@ findmnt "$mnt"
                 "status": pod.status.phase.lower(),
                 "created_at": pod.metadata.creation_timestamp,
                 "node_port": node_port,
+                "ssh_node_port": ssh_node_port,
+                **self._ssh_access(ssh_node_port),
                 "url": self._build_url(node_port, github_path, instance_id, use_path_proxy=pod.metadata.annotations.get("amd-oneclick/path-proxy") == "true") if node_port else None,
                 "instance_type": instance_type,
                 "app_port": int(pod.metadata.annotations.get("amd-oneclick/app-port")) if pod.metadata.annotations.get("amd-oneclick/app-port") else None,
@@ -1374,29 +1500,44 @@ findmnt "$mnt"
                             "message": "Container is ready but the app is not responding yet",
                             "ready": False, "pod_scheduled": pod_scheduled, "jupyter_ready": False,
                         }
-                    # Container is ready, but we need to verify Jupyter is actually responding
+                    # Container is ready. Decide readiness by the relevant signal:
+                    #  - notebook (jupyter/opencode): Jupyter answering on 8888
+                    #  - SSH-enabled: sshd answering on the SSH port
+                    #  - custom (image-defined command): the image may serve
+                    #    something other than Jupyter, so a Running container is ready
                     instance = self.get_instance_by_id(instance_id)
+                    inst_type = annos.get("amd-oneclick/instance-type", "jupyter")
+                    is_custom = bool(INSTANCE_TYPES.get(inst_type, {}).get("image_defined_command"))
+                    ssh_enabled = (annos.get("amd-oneclick/ssh-enabled") == "true")
+                    pod_ip = pod.status.pod_ip
+                    if instance and instance.get("node_port") and self._check_jupyter_ready(instance["node_port"]):
+                        return {
+                            "status": "ready", "phase": phase, "reason": "",
+                            "message": "Notebook is ready", "ready": True,
+                            "pod_scheduled": pod_scheduled, "jupyter_ready": True,
+                        }
+                    if ssh_enabled and pod_ip and self._check_tcp_ready(pod_ip, int(settings.SSH_PORT)):
+                        return {
+                            "status": "ready", "phase": phase, "reason": "",
+                            "message": "SSH is ready", "ready": True,
+                            "pod_scheduled": pod_scheduled, "jupyter_ready": False,
+                        }
+                    if is_custom:
+                        return {
+                            "status": "ready", "phase": phase, "reason": "",
+                            "message": "Container is ready", "ready": True,
+                            "pod_scheduled": pod_scheduled, "jupyter_ready": False,
+                        }
                     if instance and instance.get("node_port"):
-                        if self._check_jupyter_ready(instance["node_port"]):
-                            return {
-                                "status": "ready",
-                                "phase": phase,
-                                "reason": "",
-                                "message": "Notebook is ready",
-                                "ready": True,
-                                "pod_scheduled": pod_scheduled,
-                                "jupyter_ready": True,
-                            }
-                        else:
-                            return {
-                                "status": "jupyter_starting",
-                                "phase": phase,
-                                "reason": "JupyterStarting",
-                                "message": "Container is ready but Jupyter is not responding yet",
-                                "ready": False,
-                                "pod_scheduled": pod_scheduled,
-                                "jupyter_ready": False,
-                            }
+                        return {
+                            "status": "jupyter_starting",
+                            "phase": phase,
+                            "reason": "JupyterStarting",
+                            "message": "Container is ready but Jupyter is not responding yet",
+                            "ready": False,
+                            "pod_scheduled": pod_scheduled,
+                            "jupyter_ready": False,
+                        }
                     return {
                         "status": "running",
                         "phase": phase,
