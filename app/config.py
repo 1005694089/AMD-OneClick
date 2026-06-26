@@ -142,13 +142,13 @@ APP_FRAMEWORK_PRESETS = {
 
 
 # Appended to every user-supplied custom Dockerfile (and usable to rebuild the base
-# image) so that OpenCode + Hermes are always present and on PATH. Kept as a module
+# image) so that Jupyter + OpenCode are always present and on PATH. Kept as a module
 # constant so the build-agent and the API share one definition.
-# NOTE: the RUN --mount=type=cache directives below persist package caches (pip wheels, npm
-# cache, and uv's download cache) across builds on the node's buildkit store. Cache mounts are
-# build-time only, so download caches are reused without baking cache directories into the image.
+# NOTE: the RUN --mount=type=cache directives below persist package caches (pip wheels and the
+# npm cache) across builds on the node's buildkit store. Cache mounts are build-time only, so
+# download caches are reused without baking cache directories into the image.
 DOCKERFILE_SUFFIX = """
-# --- AMD OneClick: auto-appended (Jupyter + OpenCode + Hermes) ---
+# --- AMD OneClick: auto-appended (Jupyter + OpenCode) ---
 # JupyterLab provides the Jupyter server + Lab UI the workspace launches with. Try each pip
 # variant in turn, but DO NOT swallow the final failure: the workspace cannot start without
 # Jupyter, so a build that can't install it must fail here rather than be pushed as "ready"
@@ -163,10 +163,7 @@ RUN jupyter lab --version
 RUN --mount=type=cache,target=/root/.npm curl -fsSL https://opencode.ai/install | bash -s -- --version 1.4.6 || npm i -g opencode-ai@1.4.6
 RUN [ -x /root/.opencode/bin/opencode ] && ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode || true
 RUN opencode --version
-# Hermes is best-effort. Cache uv's download cache and bound the install so a slow Hermes install
-# cannot consume the whole custom-image build budget.
-RUN --mount=type=cache,target=/root/.cache/uv UV_CACHE_DIR=/root/.cache/uv timeout 1500 sh -c 'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-browser' || true
-ENV PATH="/root/.opencode/bin:/root/.hermes/bin:${PATH}"
+ENV PATH="/root/.opencode/bin:${PATH}"
 """
 
 
