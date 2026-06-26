@@ -32,8 +32,10 @@ Hardening expectations (enforced by the systemd unit / host setup, not this scri
 
 Only the Python standard library is used so the agent needs no pip installs.
 """
+import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -121,6 +123,19 @@ def _cli(*args):
 # Same as _cli but as a shell-string prefix, for the save|gzip|ssh pipeline in run_distribute.
 def _cli_str(*args):
     return " ".join(_cli(*args))
+
+
+# Built images are exported by buildkit straight to a docker-format tarball under IMAGE_WORK_DIR,
+# rather than relying on `nerdctl save <ref>` reading the image back out of a containerd namespace.
+# The rootless buildkit containerd worker does not reliably load the built ref into the namespace
+# nerdctl save queries, so distribute reads this file directly instead. Keyed by a filesystem-safe
+# digest of the ref so build and the follow-up distribute job agree on the path without sharing state.
+IMAGE_TAR_DIR = os.path.join(IMAGE_WORK_DIR, "image-tars")
+
+
+def _image_tar_path(ref):
+    safe = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:32]
+    return os.path.join(IMAGE_TAR_DIR, f"{safe}.tar")
 
 # Outdated reaper cadence: how often the daemon asks the manager for outdated (ref,node)
 # pairs and enqueues evict jobs. Singleton by construction (one daemon polls).
@@ -297,6 +312,8 @@ def run_build(job):
         report_result(job_id, "failed", {"ref": ref, "error": "build_network_unset"})
         return
 
+    tar_path = _image_tar_path(ref)
+    os.makedirs(IMAGE_TAR_DIR, exist_ok=True)
     workdir = tempfile.mkdtemp(prefix=f"oneclick-build-{job_id}-", dir=IMAGE_WORK_DIR)
     try:
         # Clean, minimal build context: only the Dockerfile. COPY/ADD can therefore only
@@ -309,6 +326,12 @@ def run_build(job):
             "build",
             "--tag", ref,
             "--label", "amd-oneclick-custom=1",
+            # Export buildkit's result straight to a docker-format tarball on disk. The follow-up
+            # distribute job pipes this file into `ctr import` instead of `nerdctl save <ref>` —
+            # the rootless buildkit containerd worker does not reliably load the ref into the
+            # namespace nerdctl save reads, so reading the tarball directly avoids the namespace
+            # ambiguity entirely. The tarball persists across the build->distribute job boundary.
+            "--output", f"type=docker,dest={tar_path}",
         )
         # --force-rm / --memory / --cpuset-cpus are docker classic-builder flags. `nerdctl build`
         # drives buildkitd and rejects all three ("unknown flag"). Under rootless nerdctl, build
@@ -329,13 +352,15 @@ def run_build(job):
             report_result(job_id, "failed", {"ref": ref, "error": "build_failed"})
             return
 
-        push_log(job_id, "\nBuild complete.\n")
+        if not os.path.exists(tar_path) or os.path.getsize(tar_path) == 0:
+            push_log(job_id, f"Build reported success but no tarball at {tar_path}.\n")
+            report_result(job_id, "failed", {"ref": ref, "error": "build_no_tarball"})
+            return
+
+        push_log(job_id, f"\nBuild complete; image tarball at {tar_path}.\n")
         report_result(job_id, "succeeded", {"ref": ref, "built": True})
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        # Free local disk: the built image now lives in the local containerd/docker store
-        # and will be distributed by a follow-up job; drop the build tag.
-        subprocess.run(_cli("image", "rm", "-f", ref), capture_output=True)
 
 
 def run_pull(job):
@@ -460,7 +485,18 @@ def run_distribute(job):
 
     ips = [t["ip"] for t in targets if t.get("ip")]
     compress, decompress = _pick_compressor(ips)
-    push_log(job_id, f"Distributing {ref} to {len(targets)} node(s) using {compress}.\n")
+
+    # Two image sources: a build job exported a docker tarball to disk (read it directly with cat,
+    # avoiding the nerdctl-save namespace problem); a pull job loaded the ref into the local store
+    # (no tarball — fall back to `nerdctl save <ref>`). Prefer the tarball when present.
+    tar_path = _image_tar_path(ref)
+    have_tar = os.path.exists(tar_path) and os.path.getsize(tar_path) > 0
+    image_source = f"cat {shlex.quote(tar_path)}" if have_tar else _cli_str("save", ref)
+    push_log(
+        job_id,
+        f"Distributing {ref} to {len(targets)} node(s) using {compress} "
+        f"(source: {'tarball' if have_tar else 'nerdctl save'}).\n",
+    )
 
     results = []
     lock = threading.Lock()
@@ -482,7 +518,7 @@ def run_distribute(job):
         remote = (
             f"sudo {decompress} | sudo ctr -n {CTR_NAMESPACE} images import -"
         )
-        local = f"{_cli_str('save', ref)} | {compress}"
+        local = f"{image_source} | {compress}"
         ssh_remote = " ".join([
             "ssh",
             "-o", "BatchMode=yes",
@@ -506,6 +542,12 @@ def run_distribute(job):
     all_loaded = all(e["loaded"] for e in results)
     status = "succeeded" if all_loaded else "failed"
     push_log(job_id, f"\nDistribute {status}: {sum(e['loaded'] for e in results)}/{len(results)} loaded.\n")
+    # On full success free the build tarball; on partial failure keep it so a retry can reuse it.
+    if all_loaded and have_tar:
+        try:
+            os.remove(tar_path)
+        except OSError:
+            pass
     report_result(job_id, status, {"ref": ref, "nodes": results})
 
 
