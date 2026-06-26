@@ -290,14 +290,13 @@ def run_build(job):
             CONTAINER_CLI, "build",
             "--tag", ref,
             "--label", "amd-oneclick-custom=1",
-            "--force-rm",
         ]
-        # --memory / --cpuset-cpus are docker classic-builder RUN-step limits. `nerdctl build`
-        # rejects them (it drives buildkitd, which takes no per-build resource flags). Under
-        # rootless nerdctl, RUN-step limits are enforced via cgroup limits on the buildkitd
-        # --user service instead (see runbook). Only pass them to docker.
+        # --force-rm / --memory / --cpuset-cpus are docker classic-builder flags. `nerdctl build`
+        # drives buildkitd and rejects all three ("unknown flag"). Under rootless nerdctl, build
+        # containers are always cleaned up and RUN-step limits are enforced via cgroup limits on
+        # the buildkitd --user service instead (see runbook). Only pass them to docker.
         if not _IS_NERDCTL:
-            build_cmd += ["--memory", BUILD_MEMORY]
+            build_cmd += ["--force-rm", "--memory", BUILD_MEMORY]
             if BUILD_CPUSET:
                 build_cmd += ["--cpuset-cpus", BUILD_CPUSET]
         if BUILD_NETWORK:
