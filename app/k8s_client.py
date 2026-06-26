@@ -1859,15 +1859,16 @@ findmnt "$mnt"
     def _opencode_host(self) -> str:
         """Host for direct OpenCode NodePort access.
 
-        Must be the host users actually reach the cluster on (the hostname in
-        PUBLIC_BASE_URL, e.g. 36.150.116.200), NOT SERVICE_HOST (36.151.243.69),
-        which is only used for the path-proxied Jupyter URLs and is not routable
-        for direct NodePort access from the browser.
+        Use the SAME host the working Jupyter NodePort URLs use: SERVICE_HOST
+        (the cluster edge that forwards raw NodePorts directly, e.g. 36.150.116.220).
+        PUBLIC_BASE_URL's hostname is the Azure Front Door domain, which only serves
+        443 and does NOT forward arbitrary NodePorts — so building a direct
+        host:nodeport URL on it times out. OPENCODE_NODEPORT_HOST overrides if the
+        OpenCode edge ever differs from the Jupyter edge.
         """
-        if settings.PUBLIC_BASE_URL:
-            host = urlparse(settings.PUBLIC_BASE_URL).hostname
-            if host:
-                return host
+        override = getattr(settings, "OPENCODE_NODEPORT_HOST", "").strip()
+        if override:
+            return override
         return settings.SERVICE_HOST
 
     def _opencode_password(self, instance_id: str) -> str:

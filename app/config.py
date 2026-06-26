@@ -339,7 +339,14 @@ class Settings:
     OPENCODE_PASSWORD_SECRET: str = os.getenv("OPENCODE_PASSWORD_SECRET") or SESSION_SECRET
     # Optional HTTPS origin for OpenCode. When set, OpenCode links go through the manager's
     # reverse proxy with signed handoff/session cookies instead of direct cleartext NodePorts.
+    # When set, OpenCode is served through the manager proxy at this base URL (e.g. an AFD/ingress
+    # host on 443). LEAVE EMPTY to serve OpenCode directly on its per-instance NodePort via
+    # OPENCODE_NODEPORT_HOST/SERVICE_HOST — required when the public domain is fronted by Azure
+    # Front Door, which only serves 443 and cannot reach the tls-proxy NodePort (e.g. :30450).
     OPENCODE_PUBLIC_BASE_URL: str = os.getenv("OPENCODE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    # Host for direct OpenCode NodePort URLs. Defaults to SERVICE_HOST (the edge that forwards
+    # raw NodePorts, same as the working Jupyter URLs). Override only if OpenCode's edge differs.
+    OPENCODE_NODEPORT_HOST: str = os.getenv("OPENCODE_NODEPORT_HOST", "").strip()
 
     @property
     def OPENCODE_PUBLIC_HOST(self) -> str:

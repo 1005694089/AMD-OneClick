@@ -113,6 +113,11 @@ data:
   MAX_LIFETIME_HOURS: "6"
   SERVICE_HOST: "36.150.116.220"
   PUBLIC_BASE_URL: "https://radeon-beta.anruicloud.com"
+  # OpenCode is served directly on its per-instance NodePort via SERVICE_HOST (the edge that
+  # forwards raw NodePorts, same as Jupyter). The public domain is fronted by Azure Front Door
+  # (443 only), which cannot reach the tls-proxy NodePort :30450 — so OPENCODE_PUBLIC_BASE_URL
+  # MUST stay empty here (a non-empty AFD :30450 value makes OpenCode links time out).
+  OPENCODE_PUBLIC_BASE_URL: ""
   NODE_PORT_BASE: "32500"
   NODE_PORT_MAX: "32699"
   NODE_PORT_CLUSTER_SCAN_ENABLED: "false"
