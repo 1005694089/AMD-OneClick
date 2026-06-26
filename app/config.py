@@ -158,11 +158,23 @@ RUN --mount=type=cache,target=/root/.cache/pip pip3 install jupyterlab || pip in
 # Hard gate: the image is only usable if `jupyter lab` is actually on PATH and runnable.
 # This converts a silently-incomplete base (no working pip, missing deps) into a build failure.
 RUN jupyter lab --version
-# Pin OpenCode to the version validated on radeon-beta. Both the curl installer and npm fallback
-# are pinned so a transient installer failure cannot silently pull @latest.
-RUN --mount=type=cache,target=/root/.npm curl -fsSL https://opencode.ai/install | bash -s -- --version 1.4.6 || npm i -g opencode-ai@1.4.6
+# OpenCode is an opt-in convenience (launched from a terminal), NOT the workspace server, so it is
+# installed BEST-EFFORT. The opencode.ai installer downloads its binary from github.com/Fastly,
+# which has no domestic mirror and is intermittently throttled from the cn-shanghai build region —
+# and the bare `curl | bash` had no timeout, so a stalled connect consumed the entire build
+# watchdog budget (and the `|| npm` fallback never ran because curl never returned). Bound every
+# network call: download to a file (so curl's exit code isn't masked by the pipe), hard curl
+# timeouts + retries, an OUTER `timeout` ceiling per branch, real fallthrough to the npm mirror
+# (Cloudflare, reachable), then a no-op so a transient outage degrades to "image without OpenCode"
+# rather than failing the whole build. Version stays pinned on both paths.
+RUN --mount=type=cache,target=/root/.npm set -o pipefail; \
+      ( timeout 300 bash -c 'curl -4 -fsSL --connect-timeout 10 --max-time 180 --retry 3 --retry-connrefused --retry-delay 2 -o /tmp/opencode-install.sh https://opencode.ai/install \
+          && bash /tmp/opencode-install.sh --version 1.4.6' ) \
+      || timeout 300 npm i -g opencode-ai@1.4.6 \
+      || echo 'WARNING: OpenCode install failed; image will ship without it.'
 RUN [ -x /root/.opencode/bin/opencode ] && ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode || true
-RUN opencode --version
+# Best-effort verify — do NOT hard-fail the build on OpenCode (Jupyter above is the hard gate).
+RUN opencode --version || echo 'WARNING: opencode not on PATH; continuing.'
 ENV PATH="/root/.opencode/bin:${PATH}"
 """
 
