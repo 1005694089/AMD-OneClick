@@ -2760,6 +2760,18 @@ _ADMIN_SOURCE_HEAD_KIND = {
     "github_build": "build",
 }
 
+# The admin UI Select uses short labels ("registry", "github"); map them to the
+# backend source kinds. "registry" -> acr_pull (same head verb + chain as a
+# Docker Hub pull). Already-canonical values pass through unchanged.
+_UI_SOURCE_TYPE_ALIASES = {
+    "registry": "acr_pull",
+    "github": "github_build",
+}
+
+
+def _normalize_source_type(source_type: str) -> str:
+    return _UI_SOURCE_TYPE_ALIASES.get(source_type, source_type)
+
 
 def _upsert_image_with_source(name, image, description, enabled, image_id, source_type, source_ref):
     """upsert_image carrying source_type/source_ref so the admin flow persists the source columns."""
@@ -2809,7 +2821,7 @@ def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: st
 
 @app.post("/api/admin/images")
 async def admin_create_image(req: ImageRequest, username: str = Depends(verify_admin)):
-    source_type = (getattr(req, "source_type", None) or "").strip()
+    source_type = _normalize_source_type((getattr(req, "source_type", None) or "").strip())
     if source_type and settings.IMAGE_SERVICE_ENABLED:
         if source_type not in _ADMIN_SOURCE_HEAD_KIND:
             raise HTTPException(status_code=400, detail="Invalid source_type")
@@ -2823,6 +2835,8 @@ async def admin_create_image(req: ImageRequest, username: str = Depends(verify_a
         _enqueue_admin_image_chain(image, source_type, source_ref)
         return update_image_sync_status(image["id"], "distributing", 0, 0, "Distribution enqueued", False)
 
+    if not (req.image or "").strip():
+        raise HTTPException(status_code=400, detail="image is required")
     image = upsert_image(req.name, req.image, req.description or "", req.enabled)
     try:
         sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
@@ -2842,7 +2856,7 @@ async def admin_create_image(req: ImageRequest, username: str = Depends(verify_a
 
 @app.put("/api/admin/images/{image_id}")
 async def admin_update_image(image_id: int, req: ImageRequest, username: str = Depends(verify_admin)):
-    source_type = (getattr(req, "source_type", None) or "").strip()
+    source_type = _normalize_source_type((getattr(req, "source_type", None) or "").strip())
     if source_type and settings.IMAGE_SERVICE_ENABLED:
         if source_type not in _ADMIN_SOURCE_HEAD_KIND:
             raise HTTPException(status_code=400, detail="Invalid source_type")
