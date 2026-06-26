@@ -330,21 +330,33 @@ findmnt "$mnt"
             "set +e\n"
             "export PATH=\"/usr/local/bin:/usr/bin:/root/.opencode/bin:$PATH\"\n"
             ": > /tmp/opencode-web.log\n"
-            f"OPENCODE_REQUIRED_VERSION='{settings.OPENCODE_VERSION}'\n"
-            "OPENCODE_CURRENT_VERSION=\"$(opencode --version 2>/dev/null | tr -d '[:space:]' || true)\"\n"
-            "if [ \"$OPENCODE_CURRENT_VERSION\" != \"$OPENCODE_REQUIRED_VERSION\" ]; then\n"
-            "  echo \"Installing OpenCode ${OPENCODE_REQUIRED_VERSION} (current: ${OPENCODE_CURRENT_VERSION:-missing})\" >>/tmp/opencode-web.log\n"
-            "  (curl -fsSL https://opencode.ai/install | bash -s -- --version \"$OPENCODE_REQUIRED_VERSION\" || npm i -g \"opencode-ai@$OPENCODE_REQUIRED_VERSION\") >>/tmp/opencode-web.log 2>&1 || true\n"
-            "  if [ \"$(/usr/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /usr/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
-            "  if [ \"$(/root/.opencode/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
-            "fi\n"
-            "opencode --version >>/tmp/opencode-web.log 2>&1 || true\n"
+            # CRITICAL: start Jupyter FIRST and never block it on OpenCode. OpenCode is opt-in and
+            # its installer fetches from opencode.ai/github (intermittently throttled from
+            # cn-shanghai); a blocking, un-timed install there used to hang the whole startup so
+            # Jupyter never launched and the instance was stuck "JupyterStarting". Jupyter is the
+            # required process — launch it immediately; reconcile + run OpenCode in the background.
             f"jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root "
             f"--ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{base_url}' "
             f"--notebook-dir={notebook_dir} &\n"
             "JUPYTER_PID=$!\n"
-            f"opencode web --port {settings.OPENCODE_WEB_PORT} --hostname 0.0.0.0 "
-            ">>/tmp/opencode-web.log 2>&1 &\n"
+            # OpenCode setup runs entirely in a backgrounded subshell, fully bounded so it can never
+            # delay Jupyter. The version normally matches the baked image (no reinstall); if it ever
+            # mismatches, the install is timeout-capped and best-effort. opencode web only starts if
+            # the binary is present.
+            "(\n"
+            f"  OPENCODE_REQUIRED_VERSION='{settings.OPENCODE_VERSION}'\n"
+            "  OPENCODE_CURRENT_VERSION=\"$(opencode --version 2>/dev/null | tr -d '[:space:]' || true)\"\n"
+            "  if [ \"$OPENCODE_CURRENT_VERSION\" != \"$OPENCODE_REQUIRED_VERSION\" ]; then\n"
+            "    echo \"Installing OpenCode ${OPENCODE_REQUIRED_VERSION} (current: ${OPENCODE_CURRENT_VERSION:-missing})\" >>/tmp/opencode-web.log\n"
+            "    ( timeout 300 sh -c 'curl -4 -fsSL --connect-timeout 10 --max-time 180 --retry 2 -o /tmp/oc-install.sh https://opencode.ai/install && bash /tmp/oc-install.sh --version \"'\"$OPENCODE_REQUIRED_VERSION\"'\"' ) >>/tmp/opencode-web.log 2>&1 || timeout 300 npm i -g \"opencode-ai@$OPENCODE_REQUIRED_VERSION\" >>/tmp/opencode-web.log 2>&1 || echo 'OpenCode install failed; continuing without it.' >>/tmp/opencode-web.log\n"
+            "    if [ \"$(/usr/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /usr/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
+            "    if [ \"$(/root/.opencode/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
+            "  fi\n"
+            "  opencode --version >>/tmp/opencode-web.log 2>&1 || true\n"
+            "  if command -v opencode >/dev/null 2>&1; then\n"
+            f"    opencode web --port {settings.OPENCODE_WEB_PORT} --hostname 0.0.0.0 >>/tmp/opencode-web.log 2>&1\n"
+            "  fi\n"
+            ") &\n"
             "OPENCODE_PID=$!\n"
             'wait "$JUPYTER_PID"\n'
             "JUPYTER_RC=$?\n"
