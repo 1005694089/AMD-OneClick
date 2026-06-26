@@ -687,16 +687,27 @@ def _fetch_github_dockerfile(url: str) -> str:
     """
     import ipaddress
     import socket
+    import time
 
     raw_url = _normalize_github_raw_url((url or "").strip())
-    parsed = urlparse(raw_url)
+    # The user-supplied URL must be a raw github URL (validated before proxying), so a proxy can't
+    # be abused to fetch arbitrary hosts. Then route the actual fetch through GITHUB_RAW_PROXY
+    # (gh-proxy.org) to avoid raw.githubusercontent.com throttling from cn-shanghai.
+    src = urlparse(raw_url)
+    if src.scheme != "https" or (src.hostname or "") != "raw.githubusercontent.com":
+        raise HTTPException(
+            status_code=400,
+            detail="Dockerfile URL host is not allowed; use a github.com/...blob or raw.githubusercontent.com URL",
+        )
+    fetch_url = (settings.GITHUB_RAW_PROXY + raw_url) if settings.GITHUB_RAW_PROXY else raw_url
+    parsed = urlparse(fetch_url)
     if parsed.scheme != "https":
         raise HTTPException(status_code=400, detail="Dockerfile URL must use https")
     host = parsed.hostname or ""
     if host not in settings.GITHUB_RAW_ALLOWED_HOSTS:
         raise HTTPException(
             status_code=400,
-            detail="Dockerfile URL host is not allowed; use a raw.githubusercontent.com URL",
+            detail="Dockerfile fetch host is not allowed",
         )
     port = parsed.port or 443
     try:
@@ -715,16 +726,28 @@ def _fetch_github_dockerfile(url: str) -> str:
             raise HTTPException(status_code=400, detail="Dockerfile URL resolves to a disallowed address")
 
     max_bytes = settings.CUSTOM_IMAGE_MAX_DOCKERFILE_BYTES
-    try:
-        with httpx.Client(
-            follow_redirects=False,
-            timeout=settings.GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS,
-        ) as client:
-            resp = client.get(raw_url)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to fetch Dockerfile")
-    if resp.status_code >= 300:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch Dockerfile (HTTP {resp.status_code})")
+    # Retry transient fetch failures (timeouts / connreset) — even via the proxy, github can blip.
+    attempts = max(1, settings.GITHUB_DOCKERFILE_FETCH_RETRIES)
+    resp = None
+    last_err = None
+    for i in range(attempts):
+        try:
+            with httpx.Client(
+                follow_redirects=False,
+                timeout=settings.GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS,
+            ) as client:
+                resp = client.get(fetch_url)
+            if resp.status_code < 300:
+                break
+            last_err = f"HTTP {resp.status_code}"
+            resp = None
+        except Exception as e:
+            last_err = type(e).__name__
+            resp = None
+        if i < attempts - 1:
+            time.sleep(1)
+    if resp is None:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch Dockerfile ({last_err or 'unknown error'})")
     content = resp.content[: max_bytes + 1]
     if len(content) > max_bytes:
         raise HTTPException(status_code=400, detail=f"Dockerfile exceeds {max_bytes} bytes")

@@ -408,11 +408,21 @@ class Settings:
     ACR_ENTERPRISE_REGISTRY: str = os.getenv("ACR_ENTERPRISE_REGISTRY", "")
     # Optional Docker Hub pull secret for dockerhub_pull source images.
     DOCKERHUB_PULL_SECRET_NAME: str = os.getenv("DOCKERHUB_PULL_SECRET_NAME", "")
+    # Optional proxy prefix for raw GitHub fetches. raw.githubusercontent.com is intermittently
+    # throttled from the cn-shanghai region (~1/3 of fetches time out), so route through a GitHub
+    # mirror: the fetch URL becomes f"{GITHUB_RAW_PROXY}{raw_url}". Default gh-proxy.org (Cloudflare,
+    # returns 200 directly, no redirect). Set to "" to fetch raw.githubusercontent.com directly.
+    GITHUB_RAW_PROXY: str = os.getenv("GITHUB_RAW_PROXY", "https://gh-proxy.org/").strip()
     # Hosts the server may fetch a raw Dockerfile from for github_build sources (SSRF allowlist).
+    # Includes the proxy host so the SSRF guard accepts the proxied URL.
     GITHUB_RAW_ALLOWED_HOSTS: set = {
-        h.strip() for h in os.getenv("GITHUB_RAW_ALLOWED_HOSTS", "raw.githubusercontent.com").split(",") if h.strip()
+        h.strip() for h in os.getenv(
+            "GITHUB_RAW_ALLOWED_HOSTS", "raw.githubusercontent.com,gh-proxy.org"
+        ).split(",") if h.strip()
     }
     GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS: int = int(os.getenv("GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS", "10"))
+    # Retries for the raw Dockerfile fetch (the proxy/github can still blip intermittently).
+    GITHUB_DOCKERFILE_FETCH_RETRIES: int = int(os.getenv("GITHUB_DOCKERFILE_FETCH_RETRIES", "3"))
     # An image is considered outdated (eligible for node eviction) this many days after its last launch.
     IMAGE_OUTDATED_DAYS: int = int(os.getenv("IMAGE_OUTDATED_DAYS", "5"))
     # image_jobs whose lease is older than this are reaped back to pending (or failed) by the scheduler.
