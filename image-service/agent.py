@@ -103,6 +103,25 @@ CTR_NAMESPACE = _env("CTR_NAMESPACE", "k8s.io")
 NODE_SSH_USER = _env("NODE_SSH_USER", "root")
 DISTRIB_SSH_KEY = _env("DISTRIB_SSH_KEY", "")
 
+
+def _cli(*args):
+    """Local container-CLI argv, pinned to one containerd namespace for nerdctl.
+
+    nerdctl's default namespace is "default", but the rootless buildkit containerd worker
+    lands built images in its own namespace — so a bare `nerdctl build` then bare `nerdctl save`
+    disagree and save reports "not found". Pin every LOCAL nerdctl verb (build/pull/save/tag/
+    push/rm) to CTR_NAMESPACE so build and save share one store, matching the remote
+    `ctr -n CTR_NAMESPACE import`. docker has no namespaces, so the flag is nerdctl-only.
+    """
+    if _IS_NERDCTL:
+        return [CONTAINER_CLI, "--namespace", CTR_NAMESPACE, *args]
+    return [CONTAINER_CLI, *args]
+
+
+# Same as _cli but as a shell-string prefix, for the save|gzip|ssh pipeline in run_distribute.
+def _cli_str(*args):
+    return " ".join(_cli(*args))
+
 # Outdated reaper cadence: how often the daemon asks the manager for outdated (ref,node)
 # pairs and enqueues evict jobs. Singleton by construction (one daemon polls).
 OUTDATED_POLL_SECONDS = float(_env("OUTDATED_POLL_SECONDS", "300"))
@@ -286,11 +305,11 @@ def run_build(job):
         with open(os.path.join(workdir, "Dockerfile"), "w", encoding="utf-8") as fh:
             fh.write(dockerfile)
 
-        build_cmd = [
-            CONTAINER_CLI, "build",
+        build_cmd = _cli(
+            "build",
             "--tag", ref,
             "--label", "amd-oneclick-custom=1",
-        ]
+        )
         # --force-rm / --memory / --cpuset-cpus are docker classic-builder flags. `nerdctl build`
         # drives buildkitd and rejects all three ("unknown flag"). Under rootless nerdctl, build
         # containers are always cleaned up and RUN-step limits are enforced via cgroup limits on
@@ -316,7 +335,7 @@ def run_build(job):
         shutil.rmtree(workdir, ignore_errors=True)
         # Free local disk: the built image now lives in the local containerd/docker store
         # and will be distributed by a follow-up job; drop the build tag.
-        subprocess.run([CONTAINER_CLI, "image", "rm", "-f", ref], capture_output=True)
+        subprocess.run(_cli("image", "rm", "-f", ref), capture_output=True)
 
 
 def run_pull(job):
@@ -327,7 +346,7 @@ def run_pull(job):
         report_result(job_id, "failed", {"ref": ref, "error": "insufficient_disk"})
         return
 
-    if not stream_command(job_id, [CONTAINER_CLI, "pull", ref]):
+    if not stream_command(job_id, _cli("pull", ref)):
         report_result(job_id, "failed", {"ref": ref, "error": "pull_failed"})
         return
 
@@ -356,10 +375,10 @@ def run_acr_backup(job):
 
     # Creds come from the dedicated DOCKER_CONFIG in the environment (systemd EnvironmentFile),
     # never via --build-arg/--secret and never reachable from a build sandbox.
-    if not stream_command(job_id, [CONTAINER_CLI, "tag", src, dst]):
+    if not stream_command(job_id, _cli("tag", src, dst)):
         report_result(job_id, "failed", {"ref": src, "error": "tag_failed"})
         return
-    if not stream_command(job_id, [CONTAINER_CLI, "push", dst]):
+    if not stream_command(job_id, _cli("push", dst)):
         report_result(job_id, "failed", {"ref": src, "error": "push_failed"})
         return
 
@@ -463,7 +482,7 @@ def run_distribute(job):
         remote = (
             f"sudo {decompress} | sudo ctr -n {CTR_NAMESPACE} images import -"
         )
-        local = f"{CONTAINER_CLI} save {ref} | {compress}"
+        local = f"{_cli_str('save', ref)} | {compress}"
         ssh_remote = " ".join([
             "ssh",
             "-o", "BatchMode=yes",
