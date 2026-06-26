@@ -1386,6 +1386,19 @@ async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if settings.IMAGE_SERVICE_ENABLED:
+        # Build on the image-service host (node 0042) so run_build exports a docker tarball; the
+        # launch-time distribute (_ensure_image_on_node) then ships it via `cat tar | ctr import`.
+        # Without this the row is only built by the LEGACY build-agent, which writes no tarball, so
+        # distribute falls back to `nerdctl save` (nonexistent on 0042) and the launch never lands.
+        # Enqueue the RAW dockerfile — claim_image_job appends DOCKERFILE_SUFFIX at claim time
+        # (do NOT append it here or it would be duplicated).
+        enqueue_image_job(
+            kind="build",
+            ref=image_tag,
+            custom_image_id=record["id"],
+            payload={"dockerfile": dockerfile},
+        )
     return _custom_image_public(record)
 
 
@@ -1604,6 +1617,22 @@ async def report_image_job_result(job_id: int, req: ImageJobResultRequest, _agen
             _sync_image_job_lifecycle(job, req.result)
         except Exception as e:
             logger.error("Failed to sync lifecycle for image job %s (%s): %s", job_id, job.get("kind"), e)
+    else:
+        # A failed step aborts the chain (no next step is enqueued). Surface the failure on the
+        # linked catalog image so it shows 'failed' instead of spinning in 'pulling'/'distributing'.
+        image_id = job.get("image_id")
+        if image_id is not None:
+            err = req.result.get("error") if isinstance(req.result, dict) else None
+            update_image_sync_status(
+                image_id, "failed", 0, 0,
+                f"{job.get('kind')} job {job_id} failed: {err or 'see job log'}", False,
+            )
+        custom_image_id = job.get("custom_image_id")
+        if custom_image_id is not None:
+            try:
+                update_custom_image_status(custom_image_id, status="failed", require_claimed_by=None)
+            except Exception as e:
+                logger.warning("Could not mark custom image %s failed: %s", custom_image_id, e)
     return {"ok": True}
 
 
@@ -2806,10 +2835,15 @@ def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: st
     """
     head_kind = _ADMIN_SOURCE_HEAD_KIND[source_type]
     ref = image_row["image"]
+    # acr_backup is OPTIONAL: only chain it when an enterprise backup registry is configured.
+    # Otherwise (the common case — the source is already in ACR) it would hard-fail with
+    # acr_registry_unset and abort the whole chain, leaving the image stuck "pulling".
+    acr_target_ref = _acr_backup_target_ref(ref)
+    chain = (["acr_backup"] if acr_target_ref else []) + ["distribute"]
     payload = {
         "image_id": image_row["id"],
-        "acr_target_ref": _acr_backup_target_ref(ref),
-        "chain": ["acr_backup", "distribute"],
+        "acr_target_ref": acr_target_ref,
+        "chain": chain,
         "scope": "all",
     }
     if head_kind == "build":

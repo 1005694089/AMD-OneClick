@@ -1172,6 +1172,13 @@ def set_image_acr_backup(image_id: int, ref: Optional[str], status: str) -> Opti
 
 def delete_image(image_id: int) -> bool:
     with engine.begin() as conn:
+        # image_jobs.image_id -> images.id is a plain FK (NO ACTION on PostgreSQL), so leaving
+        # child job rows makes the images DELETE raise ForeignKeyViolation and roll back — which
+        # made admin "Delete" silently no-op while the row survived. Detach the job history first
+        # (keep the rows for audit; only the link is cleared), then delete the image.
+        conn.execute(
+            update(image_jobs).where(image_jobs.c.image_id == image_id).values(image_id=None)
+        )
         result = conn.execute(images.delete().where(images.c.id == image_id))
         return result.rowcount > 0
 
