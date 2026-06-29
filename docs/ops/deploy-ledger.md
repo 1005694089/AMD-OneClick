@@ -26,6 +26,64 @@ secrets.
 
 ---
 
+## 2026-06-29 (latest) — Radeon beta: remove prepull, deadlock-resistant image-service
+
+**Commit:** `572d4b2` on `BETA-test` (pushed to origin). Fixes the containerd
+per-layer-chain unpack-mutex deadlock (`unpack.lockSnChainID`) by making the
+image-service the ONLY image-management system and hardening it.
+
+**What shipped (4 parts):**
+- **A. Prepull removed.** The legacy prepull-DaemonSet / pull-probe path is gone
+  (`k8s_client.sync_image_to_nodes` now only enqueues a `distribute` job;
+  custom-image delete enqueues an `evict` job; `IMAGE_PREPULL_ENABLED` /
+  `IMAGE_PULL_PROBE_*` config + `image_pull_probe_enabled` stat removed). No
+  manager process ever creates an image-pull DaemonSet, so a prepull pull can no
+  longer co-tenant a node and race a same-digest image-service import.
+- **B. Deadlock-resistant imports (agent.py).** Remote `ctr import` wrapped in
+  `timeout -s KILL` (`REMOTE_IMPORT_TIMEOUT_SECONDS=1200`); containerd liveness
+  probe before/after import; per-node import serialization (in-process lock + a
+  queue-level guard in `claim_next_image_job`); `importing` `image_nodes` status.
+- **C. Pod-safe recovery.** Automated `systemctl restart containerd` never runs on
+  a node with >0 running user pods (live count via new
+  `/api/internal/nodes/{node}/user-pods`; unknown count fails safe to
+  "pods present"); default `AUTO_CONTAINERD_RESTART_ENABLED=0` (quarantine + alert).
+- **D. No retry-into-wedged-node.** Wedged nodes are quarantined (additive
+  `image_nodes.quarantined_until`); the reaper drops quarantined targets (fails the
+  job if all are quarantined); `_select_target_gpu_node` routes around them;
+  quarantine clears on a successful reload; a stale evict is superseded by a newer
+  rebuild of the same ref.
+
+**Deploy mechanism:**
+- **Manager:** patched 7 keys (`main/store/k8s_client/config/models.py`,
+  `admin/profile.html`) in the existing `amd-oneclick-radeon-beta-code-overrides`
+  ConfigMap (other 14 keys byte-preserved), `kubectl replace` + `rollout restart`.
+  The live CM was confirmed byte-identical to the committed working tree before the
+  patch, so no drift was reconciled. The live-only `data_mounts.py` mount +
+  `data-mounts-root` volume were left untouched.
+- **Image-service agent:** new `agent.py` (md5 `bc86730b…`) copied to
+  `wx-ms-w7900d-0042:/opt/amd-oneclick/image-service/agent.py` via a one-shot
+  privileged `hostNetwork` pod (node 0042 has a broken flannel CNI, so normal pods
+  can't get a sandbox there; `hostNetwork` bypasses it), `py_compile`-checked, then
+  `systemctl restart image-service` via an `nsenter`-into-PID1 pod. Backup at
+  `agent.py.bak-deploy` on the node.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Rollback snapshots (sha256, git-ignored) |
+|----------------|----------------|-----------------------|------------------------------------------|
+| radeon-beta / 30444 | `crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-image-service-20260625` (image unchanged) + `code-overrides` ConfigMap | `38ef5ab035ac55f47fd6c13a08a0534ac72badf0f81a864b0c1a4062565a13bb` | `local-deploy-history/radeon-beta/2026-06-29-image-system-PRE-rollback-code-overrides.yaml` (`7272cdc0…`), `…-deployment.yaml` (`91b3cde5…`) |
+
+**Verified live:** manager `/health` 200; new pod clean startup (no traceback);
+`quarantined_until` column migrated on prod Postgres; new endpoints
+`/api/internal/nodes/status` + `/nodes/{node}/user-pods` registered; launchable
+image list unchanged (4 ready); `sync_image_to_nodes(1)` returns image-service
+shape (`2/2 nodes loaded`); importing→loaded / quarantine→clear roundtrip works on
+prod DB; **pod-safety gate sees `u-11` on 0043 (`count_user_pods_on_node`==1) so it
+would refuse a restart there**; new agent on 0042 active + polling the new manager.
+**`u-11` user instance undisturbed** (Running, 0 restarts, 3d13h). Offline: full
+pytest suite green except 4 pre-existing baseline failures; prepull-only tests
+removed; `test_image_system_hardening.py` added.
+
+---
+
 ## 2026-06-29 (later) — Radeon beta: FULL BETA-test line + all 7 merge-blocker fixes
 
 **SUPERSEDES the "5 P1/P2 fixes" entry below.** That earlier entry described a
