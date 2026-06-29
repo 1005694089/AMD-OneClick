@@ -26,6 +26,100 @@ secrets.
 
 ---
 
+## 2026-06-29 (later) — Radeon beta: FULL BETA-test line + all 7 merge-blocker fixes
+
+**SUPERSEDES the "5 P1/P2 fixes" entry below.** That earlier entry described a
+*rebase-onto-live* approach (keep live `data_mounts`, skip the 2 frontend fixes).
+Per explicit user decision, this deploy instead switched beta to the **full
+BETA-test code line** (`e158438`) + all 7 fixes. NET EFFECT vs the previous live
+pod: GAINED the SSH feature (`ssh_enabled`, `SshPublicKeyRequest`,
+`set_user_ssh_public_key`, `ssh_command`), the shared `useLaunchFlow`/`launch_flow.js`
+frontend, and both frontend fixes; **DROPPED the live-only `data_mounts` feature**
+(catalog physical-disk mounts) and the k8s_client +338 line edits — the two code
+lines had diverged and could not be cleanly merged.
+
+**Code commit:** `e158438820d55c0468a72b75b64f64d86b9a0637` (BETA-test) + 7 uncommitted fixes.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Deployment sha256 | Rollback snapshots |
+|----------------|----------------|-----------------------|-------------------|--------------------|
+| radeon-beta / 30444 | `crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-image-service-20260625` (image unchanged) + `code-overrides` ConfigMap | `bb9bf5dbce08249efbf5d22869d98a758a51d34dd44bed2a3a0120b80c55daff` | `655ada8ef5637d17d50974265d62c2e279c3dbfa2838d64d4ca8c91dbcc36103` | `local-deploy-history/radeon-beta/2026-06-29-PRE-7fix-rollback-{code-overrides,deployment}.yaml` |
+
+**Deploy mechanism:** ConfigMap rebuilt from full working tree (13 app + 6 templates
++ **2 static JS** `launch_flow.js`/`template_form.js` — needed because the base image
+`/app/static` has only `.gitkeep`). Deployment edited to (a) ADD subPath mounts for the
+2 static files, (b) REMOVE the `data_mounts.py` mount + `data-mounts-root` hostPath
+volume. `kubectl replace` ConfigMap (648K, avoids apply annotation limit) + `kubectl apply`
+Deployment + `rollout restart`.
+
+**All 7 fixes verified live:** P1-deadend (`launch_intents` table auto-created;
+`_resume_distributing_launch`), P1-addimage (legacy source_ref fallback), P1-ghref
+(`_derive_admin_image_ref` → real tag, validated `admin-acme-widgets:ce6cabe4`),
+P2-readiness (real `live_status`), P3-hf-proxy (`_github_clone_url` in HF wrapper),
+plus frontend #1 (profile `launchCustomImage` → `lf.startLaunch`) and #2 (homepage
+SSH access card + isCustom/canOpenWeb).
+
+**Verification:** rollout `1/1 ready` (pod `65d766c4bd-66vf7`, 0 restarts); `/health`
+200 on NodePort `36.150.116.220:30444` + HTTPS `radeon-beta.anruicloud.com`; homepage
+200; `/static/launch_flow.js` + `/static/template_form.js` 200 (the 404 risk); served
+homepage inline JS passes `node --check`; all 6 changed files hash-match the pod;
+`launch_intents` table exists; SSH symbols present in pod; active user instance
+`u-11-3414db96` undisturbed (Running 3d6h, 0 restarts). Pre-existing 404s for orphaned
+`hf-14/15/17` services (pods already gone before deploy) persist — NOT caused by this
+deploy and NOT touched by my fixes (`_instance_service_base` unchanged).
+
+**Rollback:** `kubectl -n amd-oneclick-radeon-beta replace -f local-deploy-history/radeon-beta/2026-06-29-PRE-7fix-rollback-code-overrides.yaml && kubectl -n amd-oneclick-radeon-beta apply -f local-deploy-history/radeon-beta/2026-06-29-PRE-7fix-rollback-deployment.yaml && kubectl -n amd-oneclick-radeon-beta rollout restart deployment/amd-oneclick-radeon-beta-manager` (restores the data_mounts line, drops SSH+frontend).
+
+**Caveat:** working-tree fixes are NOT committed/pushed to BETA-test; the running pod is
+the only place they exist besides the local-deploy-history snapshots. Commit+push BETA-test
+to make this durable.
+
+---
+
+## 2026-06-29 — Radeon beta merge-blocker backend fixes (5 P1/P2 fixes) [SUPERSEDED — see entry above]
+
+**Code base:** rebased onto the LIVE `code-overrides` ConfigMap (which is ahead of
+git `e158438` — it carries un-committed live-only edits: the `data_mounts` feature
++ `data_mounts.py`, k8s_client/config/models/admin/template_sync live edits).
+Only 3 backend override files changed: `app/main.py`, `app/store.py`,
+`app/notebook_sources.py`. The 2 frontend fixes (launch ReferenceError, homepage
+SSH card) were deliberately NOT applied — the live frontend is an older
+implementation (no `useLaunchFlow`/`launch_flow.js`) that does not have those bugs.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Rollback snapshot | Snapshot |
+|----------------|----------------|-----------------------|-------------------|----------|
+| radeon-beta / 30444 | `crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-image-service-20260625` plus `amd-oneclick-radeon-beta-code-overrides` (image unchanged) | new manifest sha256 `8b8af13f5e575210ba74d19b5cd533dd31af59b363db22ac7f3729e3c3e0484e` | pre-deploy ConfigMap sha256 `8b8fd90b7f25f8b407763c8fff1a04510651a46f9cf8311f1ba123387307caf7` | `local-deploy-history/radeon-beta/2026-06-29-merge-blocker-fixes-code-overrides.local.yaml` |
+
+**Fixes (all verified present in the running pod):**
+- **P1-deadend** — launches needing image distribution no longer dead-end at
+  "No notebook instance found": added `launch_intents` table + `_resume_distributing_launch`
+  (status poll resumes and creates the pod once the image lands), shared
+  `_provision_notebook_instance`/`_provision_template_instance` helpers (thread `data_mounts`).
+- **P1-addimage** — admin Add Image in default (image-service-off) mode no longer 400s;
+  legacy POST/PUT fall back to `source_ref` when `image` is omitted.
+- **P1-ghref** — admin github_build source stores a real registry tag (`_derive_admin_image_ref`),
+  not the Dockerfile URL.
+- **P2-readiness** — `_active_instance_context` passes real `live_status` (not hardcoded
+  "ready") and gates opencode URL/creds on readiness; no pre-ready URL/cred exposure.
+- **P3-hf-proxy** — HF-demo GitHub clone routed through `_github_clone_url` instead of a
+  hardcoded `http://github.com` (notebook_sources.py).
+
+**Process:** snapshotted live ConfigMap (rollback point), rebased the 3 backend files
+onto the live override set (preserving `data_mounts.py` and all 17 other live-only keys
+byte-identical), validated in-container (full unittest suite: only the 4 pre-existing
+unrelated failures; 8 new blocker tests pass), regenerated the ConfigMap via
+`kubectl create --from-file --dry-run | kubectl replace` (replace avoids the apply
+annotation size limit), then `rollout restart`. No Postgres, Secret, builder, image, or
+production resources mutated.
+
+**Verification:** rollout `1/1 ready` (new pod `5f6f779c8c-pwmj4`, 0 restarts);
+NodePort `:30444/health`, `https://radeon-beta.anruicloud.com/health`, and homepage `/`
+all 200; `launch_intents` table created and `app.data_mounts` imports OK in the running
+pod (live-only feature intact); all 5 fixes grep-confirmed in the running pod source;
+active user instance `u-11-3414db96` preserved (3d5h, 1/1); only benign stale-browser
+`/global/event` 404 noise in logs.
+
+**Rollback:** `kubectl -n amd-oneclick-radeon-beta replace -f local-deploy-history/radeon-beta/2026-06-29-PRE-merge-blocker-fixes-rollback.local.yaml` then `kubectl -n amd-oneclick-radeon-beta rollout restart deployment/amd-oneclick-radeon-beta-manager`.
+
 ## 2026-06-24 — Radeon beta oauth-credit-manager merge
 
 **Code commit:** `e7df4328f0dce4ebde449ab7558bb9912c823505`

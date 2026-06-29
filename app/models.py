@@ -137,6 +137,15 @@ class ImageJobResultRequest(BaseModel):
     result: Optional[dict] = None
 
 
+class ImageNodeStatusRequest(BaseModel):
+    """Image-service report of a node's status for an image ref (importing | quarantined | loaded)."""
+    agent_id: str
+    node: str
+    ref: str
+    status: str
+    quarantine_seconds: Optional[int] = None
+
+
 class GitHubNotebookInfo(BaseModel):
     """GitHub notebook information"""
     org: str

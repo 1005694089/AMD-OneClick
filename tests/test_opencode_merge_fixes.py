@@ -165,21 +165,14 @@ class CustomImageNoPrepullTests(unittest.TestCase):
             "sync_custom_image_to_nodes must be removed so custom images are never prepulled",
         )
 
-    def test_delete_custom_image_sync_still_cleans_up(self):
-        # Best-effort cleanup of any pre-existing DaemonSet (from older deployments) must remain,
-        # and must swallow a 404 (nothing to delete is the normal case now).
-        client = object.__new__(k8s_module.K8sClient)
-        client.namespace = "amd-oneclick-radeon-beta"
-        deleted = []
-
-        class _Apps:
-            def delete_namespaced_daemon_set(self, name, namespace):
-                deleted.append(name)
-                raise ApiException(status=404, reason="Not Found")
-
-        client.apps_v1 = _Apps()
-        client.delete_custom_image_sync(7)  # must not raise on 404
-        self.assertEqual(deleted, ["image-prepull-custom-7"])
+    def test_delete_custom_image_sync_removed(self):
+        # The prepull system is gone: there is no custom-prepull DaemonSet to clean up, so the
+        # legacy delete_custom_image_sync method must no longer exist. Custom-image deletion now
+        # enqueues a kind="evict" image_job instead (covered by the main delete-route tests).
+        self.assertFalse(
+            hasattr(k8s_module.K8sClient, "delete_custom_image_sync"),
+            "delete_custom_image_sync must be removed; custom-image delete enqueues an evict job",
+        )
 
 
 class DualPortAllocationTests(unittest.TestCase):

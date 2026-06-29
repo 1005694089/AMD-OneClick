@@ -92,5 +92,4 @@ def parse_huggingface_demo_notebook_path(notebook_path: str) -> dict:
         raise ValueError("notebook_path must point to an .ipynb file")
 
     github_info = parse_github_path(path)
-    github_info["repo_url"] = f"http://github.com/{github_info['org']}/{github_info['repo']}.git"
     return github_info

@@ -8,8 +8,7 @@ os.close(_DB_FD)
 os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
 os.environ["ADMIN_PASSWORD"] = "testpass"
 os.environ["NOTEBOOK_NODE_NAME"] = "fake-node"
-os.environ["IMAGE_PULL_PROBE_ENABLED"] = "true"
-os.environ["IMAGE_PREPULL_ENABLED"] = "false"
+os.environ["IMAGE_SERVICE_ENABLED"] = "true"
 
 # (b) Install the kube stub before importing app.main.
 from tests.kube_stub import install
@@ -34,13 +33,11 @@ class AdminImageRouteTests(unittest.TestCase):
         # different env) by another test module first, so pin the values here.
         self._orig = (
             main_module.settings.ADMIN_PASSWORD,
-            main_module.settings.IMAGE_PULL_PROBE_ENABLED,
-            main_module.settings.IMAGE_PREPULL_ENABLED,
+            main_module.settings.IMAGE_SERVICE_ENABLED,
             main_module.settings.NOTEBOOK_NODE_NAME,
         )
         main_module.settings.ADMIN_PASSWORD = "testpass"
-        main_module.settings.IMAGE_PULL_PROBE_ENABLED = True
-        main_module.settings.IMAGE_PREPULL_ENABLED = False
+        main_module.settings.IMAGE_SERVICE_ENABLED = True
         main_module.settings.NOTEBOOK_NODE_NAME = "fake-node"
         store.init_db()
         self.client = TestClient(main_module.app)
@@ -49,8 +46,7 @@ class AdminImageRouteTests(unittest.TestCase):
     def tearDown(self):
         (
             main_module.settings.ADMIN_PASSWORD,
-            main_module.settings.IMAGE_PULL_PROBE_ENABLED,
-            main_module.settings.IMAGE_PREPULL_ENABLED,
+            main_module.settings.IMAGE_SERVICE_ENABLED,
             main_module.settings.NOTEBOOK_NODE_NAME,
         ) = self._orig
         with store.engine.begin() as conn:
@@ -77,20 +73,6 @@ class AdminImageRouteTests(unittest.TestCase):
 
         self.assertEqual(res.status_code, 409)
         self.assertIn("being deleted", res.json()["detail"])
-
-    def test_delete_route_handles_runtime_error(self):
-        def boom(image_id):
-            raise RuntimeError("Refusing to delete unmanaged pull probe pod")
-
-        orig = main_module.k8s_client.delete_image_sync
-        main_module.k8s_client.delete_image_sync = boom
-        try:
-            res = self.client.delete(f"/api/admin/images/{self.image['id']}", auth=AUTH)
-        finally:
-            main_module.k8s_client.delete_image_sync = orig
-
-        self.assertEqual(res.status_code, 500)
-        self.assertIn("unmanaged", res.json()["detail"])
 
     def test_list_images_survives_single_probe_failure(self):
         def boom(image_id, image):

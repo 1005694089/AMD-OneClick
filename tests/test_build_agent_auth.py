@@ -9,6 +9,9 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
 os.environ["ADMIN_PASSWORD"] = "testpass"
 os.environ["NOTEBOOK_NODE_NAME"] = "fake-node"
 os.environ["BUILD_AGENT_TOKEN"] = "agent-secret"
+# These tests exercise the LEGACY node-local build-agent endpoints (claim_build/log/result), which
+# are intentionally starved when the image-service is on. Pin it off so the legacy path stays live.
+os.environ["IMAGE_SERVICE_ENABLED"] = "false"
 
 # (b) Install the kube stub before importing app.main.
 from tests.kube_stub import install  # noqa: E402
@@ -31,10 +34,13 @@ class BuildAgentOwnershipTests(unittest.TestCase):
             main_module.settings.BUILD_AGENT_TOKEN,
             main_module.settings.BUILD_AGENT_ALLOWED_IPS,
             main_module.settings.CUSTOM_IMAGE_MAX_PER_USER,
+            main_module.settings.IMAGE_SERVICE_ENABLED,
         )
         main_module.settings.BUILD_AGENT_TOKEN = "agent-secret"
         main_module.settings.BUILD_AGENT_ALLOWED_IPS = []
         main_module.settings.CUSTOM_IMAGE_MAX_PER_USER = 5
+        # Legacy build-agent path under test; keep image-service off so claim_build is not starved.
+        main_module.settings.IMAGE_SERVICE_ENABLED = False
         store.init_db()
         self.client = TestClient(main_module.app)
         self.img = store.create_custom_image(1, "demo", "registry/demo:1", "FROM scratch", 5)
@@ -44,6 +50,7 @@ class BuildAgentOwnershipTests(unittest.TestCase):
             main_module.settings.BUILD_AGENT_TOKEN,
             main_module.settings.BUILD_AGENT_ALLOWED_IPS,
             main_module.settings.CUSTOM_IMAGE_MAX_PER_USER,
+            main_module.settings.IMAGE_SERVICE_ENABLED,
         ) = self._orig
         with store.engine.begin() as conn:
             conn.exec_driver_sql("DELETE FROM custom_images")

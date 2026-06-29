@@ -104,6 +104,20 @@ DISTRIBUTE_CONCURRENCY = int(_env("DISTRIBUTE_CONCURRENCY", "2"))
 CTR_NAMESPACE = _env("CTR_NAMESPACE", "k8s.io")
 NODE_SSH_USER = _env("NODE_SSH_USER", "root")
 DISTRIB_SSH_KEY = _env("DISTRIB_SSH_KEY", "")
+# Hard ceiling on the REMOTE `ctr import` (wrapped in `timeout -s KILL`). stream_command's watchdog
+# only kills the LOCAL ssh/cat process group on the image-service host; without this the remote ctr
+# client would keep blocking inside the daemon's chain-ID mutex forever (the RCA failure mode),
+# streaming 10.8GB into a wedged daemon. Keep < BUILD_TIMEOUT so the remote dies before the local.
+REMOTE_IMPORT_TIMEOUT = int(_env("REMOTE_IMPORT_TIMEOUT_SECONDS", "1200"))
+# Timeout for the cheap containerd liveness probe (a `ctr images ls -q | head` over SSH). A wedged
+# daemon hangs this; a healthy one answers in <1s.
+CONTAINERD_PROBE_TIMEOUT = int(_env("CONTAINERD_PROBE_TIMEOUT_SECONDS", "20"))
+# Pod-safe automated recovery. Default OFF: the default path on a detected wedge is to quarantine +
+# alert for an operator, never to restart containerd automatically. When enabled, a restart is still
+# only ever issued to a node that hosts ZERO running user instance pods (checked live via the
+# manager), so automated recovery can never destroy a user pod.
+AUTO_CONTAINERD_RESTART_ENABLED = _env("AUTO_CONTAINERD_RESTART_ENABLED", "0") in {"1", "true", "True", "yes", "on"}
+CONTAINERD_RESTART_COOLDOWN = int(_env("CONTAINERD_RESTART_COOLDOWN_SECONDS", "1800"))
 
 
 def _cli(*args):
@@ -142,16 +156,17 @@ def _image_tar_path(ref):
 OUTDATED_POLL_SECONDS = float(_env("OUTDATED_POLL_SECONDS", "300"))
 
 
-def _request(path, payload, timeout=30):
-    data = json.dumps(payload).encode("utf-8")
+def _request(path, payload, timeout=30, method="POST"):
+    # GET endpoints (e.g. the user-pod count) carry no body; POST endpoints send JSON.
+    data = None if method == "GET" else json.dumps(payload or {}).encode("utf-8")
+    headers = {"Authorization": f"Bearer {BUILD_AGENT_TOKEN}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(
         MANAGER_URL + path,
         data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {BUILD_AGENT_TOKEN}",
-        },
+        method=method,
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = resp.read().decode("utf-8")
@@ -185,6 +200,91 @@ def report_result(job_id, status, result=None):
     if result is not None:
         payload["result"] = result
     _request(f"/api/internal/jobs/{job_id}/result", payload)
+
+
+def report_node_status(node, ref, status, quarantine_seconds=None):
+    """Report a node's status (importing | quarantined | loaded) to the manager. Best-effort."""
+    payload = {"agent_id": AGENT_ID, "node": node, "ref": ref, "status": status}
+    if quarantine_seconds is not None:
+        payload["quarantine_seconds"] = quarantine_seconds
+    _request("/api/internal/nodes/status", payload)
+
+
+def _node_user_pod_count(node):
+    """Ask the manager how many running user notebook pods are on `node`.
+
+    Returns an int, or None when the count is unknown (kube error / non-ok). The caller MUST treat
+    None as 'pods present' and refuse to restart (fail safe — never destroy a user pod)."""
+    try:
+        resp = _request(f"/api/internal/nodes/{node}/user-pods", {}, method="GET")
+    except Exception as exc:
+        print(f"[agent] user-pod count error for {node}: {exc}", file=sys.stderr)
+        return None
+    if not resp.get("ok"):
+        return None
+    count = resp.get("user_pods")
+    return count if isinstance(count, int) else None
+
+
+# When containerd on a node last had a restart issued (per-node), for cooldown enforcement.
+_last_restart_guard = threading.Lock()
+_last_restart_at: dict = {}
+
+
+def _handle_wedged_node(job_id, node, ip, ref=""):
+    """A node's containerd is wedged. Quarantine it and (only if SAFE) attempt pod-preserving recovery.
+
+    Hard safety contract: an automated `systemctl restart containerd` is issued ONLY when ALL hold:
+      - AUTO_CONTAINERD_RESTART_ENABLED is on (default OFF — default path is quarantine + alert),
+      - the node hosts ZERO running user notebook pods (live count; unknown == treated as present),
+      - the per-node restart cooldown has elapsed.
+    A restart kills every pod on the node, so the zero-user-pod gate is what guarantees automated
+    recovery can never destroy a user instance (e.g. u-11). When not safe, we only quarantine + log
+    so an operator can recover during a maintenance window."""
+    # Always quarantine first so launches/retries route away from the wedge immediately. Pass the
+    # real ref so the manager can anchor a quarantine row even when the node has no prior image_nodes
+    # rows (a first-import wedge) — quarantine is node-wide regardless of which ref carried it.
+    try:
+        report_node_status(node, ref or "", "quarantined", quarantine_seconds=None)
+    except Exception as exc:
+        print(f"[agent] failed to quarantine {node}: {exc}", file=sys.stderr)
+
+    if not AUTO_CONTAINERD_RESTART_ENABLED:
+        push_log(job_id, f"[{node}] quarantined (containerd wedged). Auto-restart disabled; operator must recover.\n")
+        return
+
+    user_pods = _node_user_pod_count(node)
+    if user_pods is None or user_pods > 0:
+        push_log(
+            job_id,
+            f"[{node}] containerd wedged but user pods present/unknown ({user_pods}); "
+            f"REFUSING auto-restart. Quarantined for operator recovery.\n",
+        )
+        return
+
+    # Cooldown: at most one restart per node per CONTAINERD_RESTART_COOLDOWN window.
+    nowt = time.time()
+    with _last_restart_guard:
+        last = _last_restart_at.get(node, 0.0)
+        if nowt - last < CONTAINERD_RESTART_COOLDOWN:
+            push_log(job_id, f"[{node}] auto-restart skipped (within {CONTAINERD_RESTART_COOLDOWN}s cooldown).\n")
+            return
+        _last_restart_at[node] = nowt
+
+    push_log(job_id, f"[{node}] zero user pods; issuing pod-safe containerd restart.\n")
+    restart = (
+        ["timeout", "60", "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+         "-i", DISTRIB_SSH_KEY, f"{NODE_SSH_USER}@{ip}", "sudo systemctl restart containerd"]
+    )
+    try:
+        rc = subprocess.run(restart, capture_output=True, timeout=90).returncode
+    except (OSError, subprocess.SubprocessError) as exc:
+        push_log(job_id, f"[{node}] containerd restart command errored: {exc}\n")
+        return
+    if rc == 0:
+        push_log(job_id, f"[{node}] containerd restarted (was wedged, zero user pods).\n")
+    else:
+        push_log(job_id, f"[{node}] containerd restart returned rc={rc}; left quarantined.\n")
 
 
 def free_disk_gb(path):
@@ -453,6 +553,46 @@ def _node_root_free_gb(ip):
         return float("inf")
 
 
+def _containerd_responsive(ip):
+    """True if containerd on the node answers a trivial query within CONTAINERD_PROBE_TIMEOUT.
+
+    A daemon wedged on its chain-ID unpack mutex (the RCA failure mode) hangs even this cheap
+    `ctr images ls` because the API goroutine is blocked; a healthy daemon answers immediately.
+    We pin the SSH-side timeout AND wrap the remote `ctr` in `timeout` so neither side can hang
+    past the deadline. Any error / non-zero / timeout reads as NOT responsive (fail safe)."""
+    if not ip:
+        return False
+    remote = f"sudo timeout -s KILL {CONTAINERD_PROBE_TIMEOUT}s ctr -n {CTR_NAMESPACE} images ls -q >/dev/null 2>&1"
+    try:
+        rc = subprocess.run(
+            _ssh_base(ip) + [remote],
+            capture_output=True,
+            timeout=CONTAINERD_PROBE_TIMEOUT + 10,
+        ).returncode
+        return rc == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# Per-node import serialization: even within one distribute job's ThreadPoolExecutor (and across
+# back-to-back jobs handled by this single daemon), two `ctr import` of the same chain onto one node
+# must never run concurrently — that is exactly what contends containerd's chain-ID unpack mutex.
+# A lock per node name (cross-node imports still run in parallel) enforces it in-process; the
+# queue-level guard in claim_next_image_job enforces it across agent restarts.
+_node_locks_guard = threading.Lock()
+_node_locks: dict = {}
+
+
+def _node_lock(node):
+    key = node or "_unknown_"
+    with _node_locks_guard:
+        lock = _node_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _node_locks[key] = lock
+        return lock
+
+
 def _pick_compressor(ips):
     """Pick zstd if present locally AND on every target node, else gzip."""
     if shutil.which("zstd") is None:
@@ -509,30 +649,59 @@ def run_distribute(job):
             entry["error"] = "missing_ip"
             return entry
 
-        free_gb = _node_root_free_gb(ip)
-        if free_gb < IMAGE_NODE_MIN_FREE_DISK_GB:
-            entry["error"] = f"node_low_disk:{free_gb:.1f}GB<{IMAGE_NODE_MIN_FREE_DISK_GB}GB"
-            push_log(job_id, f"[{node}] refusing: containerd root free {free_gb:.1f}GB below floor.\n")
-            return entry
+        # Serialize all imports to one node (see _node_lock): two unpacks of the same chain onto one
+        # node are what wedge containerd's chain-ID mutex. Cross-node imports still run in parallel.
+        with _node_lock(node):
+            free_gb = _node_root_free_gb(ip)
+            if free_gb < IMAGE_NODE_MIN_FREE_DISK_GB:
+                entry["error"] = f"node_low_disk:{free_gb:.1f}GB<{IMAGE_NODE_MIN_FREE_DISK_GB}GB"
+                push_log(job_id, f"[{node}] refusing: containerd root free {free_gb:.1f}GB below floor.\n")
+                return entry
 
-        remote = (
-            f"sudo {decompress} | sudo ctr -n {CTR_NAMESPACE} images import -"
-        )
-        local = f"{image_source} | {compress}"
-        ssh_remote = " ".join([
-            "ssh",
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-i", DISTRIB_SSH_KEY,
-            f"{NODE_SSH_USER}@{ip}",
-            f"'{remote}'",
-        ])
-        pipeline = f"{local} | {ssh_remote}"
-        ok = stream_command(job_id, pipeline)
-        entry["loaded"] = ok
-        if not ok:
-            entry["error"] = "import_failed"
-        return entry
+            # Liveness gate: never stream 10.8GB into a daemon that is already wedged.
+            if not _containerd_responsive(ip):
+                entry["error"] = "containerd_wedged"
+                push_log(job_id, f"[{node}] containerd not responsive before import; skipping stream.\n")
+                _handle_wedged_node(job_id, node, ip, ref)
+                return entry
+
+            # Mark importing so a hung import is visible (vs. "never started"). Best-effort.
+            try:
+                report_node_status(node, ref, "importing")
+            except Exception:
+                pass
+
+            # Wrap the REMOTE ctr in `timeout -s KILL` so the remote client dies on its own deadline
+            # instead of blocking forever inside the daemon — stream_command's watchdog only reaches
+            # the LOCAL process group.
+            remote = (
+                f"sudo {decompress} | sudo timeout -s KILL {REMOTE_IMPORT_TIMEOUT}s "
+                f"ctr -n {CTR_NAMESPACE} images import -"
+            )
+            local = f"{image_source} | {compress}"
+            ssh_remote = " ".join([
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-i", DISTRIB_SSH_KEY,
+                f"{NODE_SSH_USER}@{ip}",
+                f"'{remote}'",
+            ])
+            pipeline = f"{local} | {ssh_remote}"
+            ok = stream_command(job_id, pipeline)
+            entry["loaded"] = ok
+            if ok:
+                return entry
+
+            # Import failed. Distinguish a wedged daemon (post-probe unresponsive) from an ordinary
+            # failure so the manager can quarantine the node and trigger pod-safe recovery.
+            if not _containerd_responsive(ip):
+                entry["error"] = "containerd_wedged"
+                push_log(job_id, f"[{node}] containerd unresponsive after failed import; node wedged.\n")
+                _handle_wedged_node(job_id, node, ip, ref)
+            else:
+                entry["error"] = "import_failed"
+            return entry
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         for entry in pool.map(_one, targets):

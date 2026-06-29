@@ -101,7 +101,7 @@ function App(){
   React.useEffect(()=>{ loadSection('stats'); },[]);
   React.useEffect(()=>{
     if(activeTab!=='images') return;
-    const hasActivePull = images.some(img => ['pulling','queued','pending','distributing'].includes(img.sync_status));
+    const hasActivePull = images.some(img => ['pulling','pending','distributing'].includes(img.sync_status));
     if(!hasActivePull) return;
     const interval = setInterval(refreshImages, 15000);
     return ()=>clearInterval(interval);
@@ -137,11 +137,10 @@ function App(){
   },[stats,activeTab]);
 
   function confirmLargeImage(){
-    if(!stats.image_pull_probe_enabled) return Promise.resolve(true);
     return new Promise(resolve=>{
       Modal.confirm({
-        title:'Start image pull?',
-        content:'Image pulls for large images (tens of GB) can sit in ContainerCreating for an extended period. Continue?',
+        title:'Start image distribution?',
+        content:'Distributing large images (tens of GB) to GPU nodes can take several minutes. Continue?',
         okText:'Continue', cancelText:'Cancel',
         onOk:()=>resolve(true), onCancel:()=>resolve(false),
       });
@@ -222,11 +221,11 @@ function App(){
   }
 
   function imageStatusColor(status){
+    // Image-service sync states: pending | pulling | ready | failed (distributing kept for the
+    // launch-time per-node distribute path). Legacy prepull-only states (queued/skipped) removed.
     if(status === 'ready') return 'green';
     if(status === 'failed') return 'red';
-    if(status === 'skipped') return 'blue';
     if(status === 'distributing') return 'cyan';
-    if(status === 'queued') return 'gold';
     return 'gold';
   }
   function imageStatusLabel(r){

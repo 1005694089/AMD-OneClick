@@ -268,10 +268,16 @@ image_nodes = Table(
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("image_ref", Text, nullable=False, index=True),
     Column("node_name", String(255), nullable=False),
+    # status: loaded | importing | quarantined. Only "loaded" counts as available (see
+    # image_loaded_on_node / list_nodes_for_image). "importing" marks an in-flight distribute so a
+    # hung import is distinguishable from "never started"; "quarantined" marks a wedged node.
     Column("status", String(32), nullable=False, server_default="loaded"),
     Column("size_bytes", Integer),
     Column("loaded_at", String(64)),
     Column("last_seen_at", String(64)),
+    # When set (ISO-8601 UTC), this node is quarantined until the timestamp: the reaper will not
+    # requeue distribute/evict onto it and launches route around it (Part D).
+    Column("quarantined_until", String(64)),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
     UniqueConstraint("image_ref", "node_name", name="uq_image_node"),
@@ -301,6 +307,23 @@ image_jobs = Table(
 
 IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "distribute", "evict")
 IMAGE_JOB_TERMINAL = ("succeeded", "failed")
+
+# A launch that needs its image distributed to a GPU node first cannot create a pod inside the
+# request handler (the off-cluster daemon does the copy asynchronously). We persist the full
+# launch parameters here so /api/notebook/status can resume and create the pod once the image
+# lands — otherwise the launch dead-ends ("No notebook instance found") with no row to resume.
+launch_intents = Table(
+    "launch_intents",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False, unique=True),
+    Column("email", String(255), nullable=False),
+    Column("image", Text, nullable=False),
+    Column("kind", String(32), nullable=False),  # "notebook" or "template"
+    Column("params", Text, nullable=False),       # JSON: all create_instance args
+    Column("created_at", String(64), nullable=False),
+    Column("updated_at", String(64), nullable=False),
+)
 
 
 def utc_now() -> str:
@@ -390,6 +413,13 @@ def ensure_schema_columns(conn):
 
     # Backward-compatible creation for databases initialized before these tables.
     metadata.create_all(bind=conn, tables=[template_preview_cache, template_preview_assets, coupon_redemptions, instance_launch_events, custom_images, image_nodes, image_jobs])
+
+    # Additive: a node whose containerd wedged is quarantined until this timestamp (ISO-8601 UTC).
+    # Mirrors the acr_backup_status additive-column pattern above so old databases upgrade in place.
+    if inspector.has_table("image_nodes"):
+        image_node_columns = {col["name"] for col in inspector.get_columns("image_nodes")}
+        if "quarantined_until" not in image_node_columns:
+            conn.execute(text("ALTER TABLE image_nodes ADD COLUMN quarantined_until VARCHAR(64)"))
 
 
 def ensure_default_image(conn):
@@ -711,11 +741,13 @@ def redeem_user_coupon(user_id: int, coupon: dict) -> dict:
 
 
 def list_images(enabled_only: bool = False) -> list[dict]:
+    # Catalog images are gated only on `enabled`. Under the image-service model there is no
+    # sync-readiness gate on the launchable list (the legacy IMAGE_PREPULL_ENABLED branch that
+    # filtered sync_status=="ready" was a no-op in production, where prepull was off, so removing
+    # it preserves current live behavior — see launch-time _ensure_image_on_node for distribution).
     stmt = select(images).order_by(images.c.id)
     if enabled_only:
         stmt = stmt.where(images.c.enabled == True)  # noqa: E712
-        if settings.IMAGE_PREPULL_ENABLED:
-            stmt = stmt.where(images.c.sync_status == "ready")
     with engine.begin() as conn:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
 
@@ -1631,13 +1663,40 @@ def enqueue_image_job(
         return row_to_dict(conn.execute(select(image_jobs).where(image_jobs.c.id == new_id)).mappings().first())
 
 
+def _job_target_nodes(payload_raw) -> set[str]:
+    """Extract the set of target node names from an image_job payload (JSON or dict)."""
+    if isinstance(payload_raw, str):
+        try:
+            payload_raw = json.loads(payload_raw) if payload_raw else {}
+        except (ValueError, TypeError):
+            return set()
+    if not isinstance(payload_raw, dict):
+        return set()
+    nodes: set[str] = set()
+    for t in payload_raw.get("targets") or []:
+        if isinstance(t, dict) and t.get("node"):
+            nodes.add(t["node"])
+        elif isinstance(t, str) and t:
+            nodes.add(t)
+    return nodes
+
+
 def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Optional[dict]:
     """Atomically lease the oldest pending job for the agent.
 
     Walks pending rows in id order, optionally filtered by kind, and conditionally claims
     pending->claimed (attempts+1). Retries the next row when it loses the claim race so it
     returns None only when no claimable work remains.
+
+    Per-node serialization (Part B): a pending distribute/evict is skipped while another
+    distribute/evict for an overlapping target node is already claimed/running. Two unpacks of the
+    same chain onto one node are what contend containerd's chain-ID mutex; serializing per node
+    removes that race even across agent restarts (the queue, not just an in-process lock, enforces
+    it). The skip is best-effort: a stuck claim is reclaimed by reap_stale_image_jobs after the
+    lease timeout, so the queue cannot starve permanently. Cross-node distributes still run
+    concurrently.
     """
+    SERIALIZED_KINDS = ("distribute", "evict")
     with engine.begin() as conn:
         tried: list[int] = []
         while True:
@@ -1650,6 +1709,48 @@ def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Op
             if not pending:
                 return None
             tried.append(pending["id"])
+
+            # Supersede a stale evict: if a NEWER non-terminal distribute/build for the SAME ref
+            # exists, the tag was rebuilt/redistributed after this delete, so running the evict would
+            # wipe the freshly-loaded image. Drop the evict (mark superseded) instead of running it.
+            # Tags are mutable and reused, so a delete's evict can otherwise race a later rebuild.
+            if pending["kind"] == "evict" and pending.get("ref"):
+                newer = conn.execute(
+                    select(image_jobs.c.id).where(
+                        image_jobs.c.ref == pending["ref"],
+                        image_jobs.c.kind.in_(("distribute", "build")),
+                        image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL),
+                        image_jobs.c.id > pending["id"],
+                    ).limit(1)
+                ).first()
+                if newer:
+                    conn.execute(
+                        update(image_jobs)
+                        .where(image_jobs.c.id == pending["id"], image_jobs.c.status == "pending")
+                        .values(
+                            status="failed",
+                            result=json.dumps({"ref": pending["ref"], "error": "superseded_by_newer_distribute"}),
+                            updated_at=utc_now(),
+                        )
+                    )
+                    continue
+
+            if pending["kind"] in SERIALIZED_KINDS:
+                pending_nodes = _job_target_nodes(pending.get("payload"))
+                if pending_nodes:
+                    inflight = conn.execute(
+                        select(image_jobs.c.payload).where(
+                            image_jobs.c.status.in_(("claimed", "running")),
+                            image_jobs.c.kind.in_(SERIALIZED_KINDS),
+                        )
+                    ).all()
+                    busy_nodes: set[str] = set()
+                    for (payload_raw,) in inflight:
+                        busy_nodes |= _job_target_nodes(payload_raw)
+                    if pending_nodes & busy_nodes:
+                        # A distribute/evict for an overlapping node is in flight; defer this one.
+                        continue
+
             now = utc_now()
             result = conn.execute(
                 update(image_jobs)
@@ -1752,8 +1853,21 @@ def reap_stale_image_jobs(timeout_seconds: int) -> int:
     a concurrently-finalized job is not clobbered.
     """
     now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
     reaped = 0
     with engine.begin() as conn:
+        # Nodes currently quarantined (containerd wedged). A requeued distribute/evict must NOT be
+        # re-attempted onto a quarantined node (the RCA's "retry-into-wedged-node"); we strip such
+        # targets, and if a job has no surviving targets we fail it outright instead of blindly
+        # retrying (Part D).
+        q_rows = conn.execute(
+            select(image_nodes.c.node_name).where(
+                image_nodes.c.quarantined_until.isnot(None),
+                image_nodes.c.quarantined_until > now_iso,
+            )
+        ).all()
+        quarantined = {r[0] for r in q_rows}
+
         leased = conn.execute(
             select(
                 image_jobs.c.id,
@@ -1761,6 +1875,8 @@ def reap_stale_image_jobs(timeout_seconds: int) -> int:
                 image_jobs.c.status,
                 image_jobs.c.attempts,
                 image_jobs.c.max_attempts,
+                image_jobs.c.kind,
+                image_jobs.c.payload,
             ).where(image_jobs.c.status.in_(("claimed", "running")))
         ).all()
         for row in leased:
@@ -1773,8 +1889,35 @@ def reap_stale_image_jobs(timeout_seconds: int) -> int:
                     stale = True
             if not stale:
                 continue
-            if int(row[3]) < int(row[4]):
-                values = dict(status="pending", claimed_by=None, claimed_at=None, updated_at=utc_now())
+
+            kind = row[5]
+            requeue = int(row[3]) < int(row[4])
+            extra: dict = {}
+            if requeue and quarantined and kind in ("distribute", "evict"):
+                payload_raw = row[6]
+                payload = {}
+                if isinstance(payload_raw, str):
+                    try:
+                        payload = json.loads(payload_raw) if payload_raw else {}
+                    except (ValueError, TypeError):
+                        payload = {}
+                elif isinstance(payload_raw, dict):
+                    payload = payload_raw
+                targets = payload.get("targets") if isinstance(payload, dict) else None
+                if isinstance(targets, list) and targets:
+                    surviving = [
+                        t for t in targets
+                        if not (isinstance(t, dict) and t.get("node") in quarantined)
+                    ]
+                    if not surviving:
+                        # Every target is quarantined — do not retry into a wedged node; fail.
+                        requeue = False
+                    elif len(surviving) != len(targets):
+                        payload["targets"] = surviving
+                        extra["payload"] = json.dumps(payload)
+
+            if requeue:
+                values = dict(status="pending", claimed_by=None, claimed_at=None, updated_at=utc_now(), **extra)
             else:
                 values = dict(status="failed", updated_at=utc_now())
             result = conn.execute(
@@ -1798,15 +1941,26 @@ def upsert_image_node(node_name: str, image_ref: str, status: str = "loaded", si
             last_seen_at=now,
             updated_at=now,
         )
-        try:
-            result = conn.execute(
-                image_nodes.insert().values(
-                    image_ref=image_ref,
-                    node_name=node_name,
-                    created_at=now,
-                    **values,
-                )
+        # A genuine successful (re)load proves containerd on this node is healthy again, so clear any
+        # quarantine on it — otherwise a recovered node keeps being routed around until the wall-clock
+        # NODE_QUARANTINE_SECONDS window expires. Clearing is node-wide (quarantine is node-wide).
+        if status == "loaded":
+            conn.execute(
+                update(image_nodes)
+                .where(image_nodes.c.node_name == node_name)
+                .values(quarantined_until=None, updated_at=now)
             )
+            values["quarantined_until"] = None
+        try:
+            with conn.begin_nested():
+                result = conn.execute(
+                    image_nodes.insert().values(
+                        image_ref=image_ref,
+                        node_name=node_name,
+                        created_at=now,
+                        **values,
+                    )
+                )
             new_id = result.inserted_primary_key[0]
         except IntegrityError:
             conn.execute(
@@ -1822,6 +1976,114 @@ def upsert_image_node(node_name: str, image_ref: str, status: str = "loaded", si
             ).first()
             new_id = existing[0]
         return row_to_dict(conn.execute(select(image_nodes).where(image_nodes.c.id == new_id)).mappings().first())
+
+
+def set_image_node_status(node_name: str, image_ref: str, status: str, size_bytes: Optional[int] = None) -> dict:
+    """Set the (image_ref, node_name) row's status, upserting the row if it does not exist yet.
+
+    Used to record `importing` (in-flight distribute) and `quarantined` (wedged node) states so a
+    hung import is distinguishable from "never started". Only `loaded` counts as available elsewhere.
+    """
+    now = utc_now()
+    with engine.begin() as conn:
+        values = dict(status=status, last_seen_at=now, updated_at=now)
+        if status == "loaded":
+            values["loaded_at"] = now
+        if size_bytes is not None:
+            values["size_bytes"] = size_bytes
+        # Existence-check then UPDATE-or-INSERT. We avoid catching IntegrityError inside the txn: on
+        # PostgreSQL a failed INSERT aborts the whole transaction, so a fallback statement on the
+        # same connection would raise InFailedSqlTransaction (see notebook-template note above).
+        result = conn.execute(
+            update(image_nodes)
+            .where(image_nodes.c.image_ref == image_ref, image_nodes.c.node_name == node_name)
+            .values(**values)
+        )
+        if result.rowcount == 0:
+            # Insert in a SAVEPOINT so a concurrent inserter winning the UNIQUE race doesn't poison
+            # the outer txn; on conflict fall back to UPDATE.
+            try:
+                with conn.begin_nested():
+                    conn.execute(
+                        image_nodes.insert().values(
+                            image_ref=image_ref,
+                            node_name=node_name,
+                            created_at=now,
+                            **values,
+                        )
+                    )
+            except IntegrityError:
+                conn.execute(
+                    update(image_nodes)
+                    .where(image_nodes.c.image_ref == image_ref, image_nodes.c.node_name == node_name)
+                    .values(**values)
+                )
+        row = conn.execute(
+            select(image_nodes).where(
+                image_nodes.c.image_ref == image_ref,
+                image_nodes.c.node_name == node_name,
+            )
+        ).mappings().first()
+        return row_to_dict(row)
+
+
+# Sentinel image_ref for a node-level quarantine anchor row when the wedge happened on a node with
+# no prior image_nodes rows (a first-import wedge). status='quarantined' keeps it out of the
+# loaded/list views; it exists only so quarantined_nodes() reports the node.
+_QUARANTINE_ANCHOR_REF = "__node_quarantine__"
+
+
+def quarantine_node(node_name: str, image_ref: str, seconds: int) -> None:
+    """Quarantine a node for `seconds`: stamp quarantined_until across ALL of its image_nodes rows.
+
+    Quarantine is a node-wide fact (containerd wedged), so it is applied to every row the node has.
+    If the node has NO rows yet (first-import wedge), an anchor row is inserted under a sentinel ref
+    so the quarantine is never silently lost — even when the caller passes an empty image_ref.
+    """
+    until = (datetime.now(timezone.utc) + timedelta(seconds=int(seconds))).isoformat()
+    now = utc_now()
+    anchor_ref = image_ref or _QUARANTINE_ANCHOR_REF
+    with engine.begin() as conn:
+        updated = conn.execute(
+            update(image_nodes)
+            .where(image_nodes.c.node_name == node_name)
+            .values(quarantined_until=until, updated_at=now)
+        )
+        if updated.rowcount == 0:
+            # No existing rows for this node — insert an anchor (SAVEPOINT-guarded against a racing
+            # inserter; on conflict the other writer created rows, so re-stamp them).
+            try:
+                with conn.begin_nested():
+                    conn.execute(
+                        image_nodes.insert().values(
+                            image_ref=anchor_ref,
+                            node_name=node_name,
+                            status="quarantined",
+                            quarantined_until=until,
+                            last_seen_at=now,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+            except IntegrityError:
+                conn.execute(
+                    update(image_nodes)
+                    .where(image_nodes.c.node_name == node_name)
+                    .values(quarantined_until=until, updated_at=now)
+                )
+
+
+def quarantined_nodes() -> set[str]:
+    """Return the set of node names currently quarantined (quarantined_until in the future)."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(image_nodes.c.node_name).where(
+                image_nodes.c.quarantined_until.isnot(None),
+                image_nodes.c.quarantined_until > now_iso,
+            )
+        ).all()
+        return {r[0] for r in rows}
 
 
 def image_loaded_on_node(image_ref: str, node_name: str) -> bool:
@@ -1933,6 +2195,52 @@ def get_active_instance_for_user(user_id: int) -> Optional[dict]:
                 .limit(1)
             ).mappings().first()
         )
+
+
+def upsert_launch_intent(user_id: int, email: str, image: str, kind: str, params: dict) -> dict:
+    """Persist (or replace) the pending launch a user is waiting on while its image distributes.
+
+    One pending intent per user (unique user_id); a new launch overwrites any stale intent."""
+    now = utc_now()
+    params_json = json.dumps(params)
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(launch_intents).where(launch_intents.c.user_id == user_id)
+        ).mappings().first()
+        if existing:
+            conn.execute(
+                update(launch_intents)
+                .where(launch_intents.c.user_id == user_id)
+                .values(email=email, image=image, kind=kind, params=params_json, updated_at=now)
+            )
+            row_id = existing["id"]
+        else:
+            result = conn.execute(
+                launch_intents.insert().values(
+                    user_id=user_id, email=email, image=image, kind=kind,
+                    params=params_json, created_at=now, updated_at=now,
+                )
+            )
+            row_id = result.inserted_primary_key[0]
+        return row_to_dict(conn.execute(select(launch_intents).where(launch_intents.c.id == row_id)).mappings().first())
+
+
+def get_launch_intent(user_id: int) -> Optional[dict]:
+    with engine.begin() as conn:
+        row = row_to_dict(
+            conn.execute(select(launch_intents).where(launch_intents.c.user_id == user_id)).mappings().first()
+        )
+    if row and row.get("params"):
+        try:
+            row["params"] = json.loads(row["params"])
+        except (ValueError, TypeError):
+            row["params"] = {}
+    return row
+
+
+def delete_launch_intent(user_id: int) -> None:
+    with engine.begin() as conn:
+        conn.execute(launch_intents.delete().where(launch_intents.c.user_id == user_id))
 
 
 def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None):

@@ -51,6 +51,7 @@ from .models import (
     ImageJobClaimRequest,
     ImageJobLogRequest,
     ImageJobResultRequest,
+    ImageNodeStatusRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .notebook_sources import (
@@ -67,6 +68,9 @@ from .store import (
     delete_image,
     delete_notebook_template,
     get_active_instance_for_user,
+    upsert_launch_intent,
+    get_launch_intent,
+    delete_launch_intent,
     get_admin_daily_stats,
     get_charged_credits_for_instance,
     get_image_by_value,
@@ -596,11 +600,18 @@ def _active_instance_context(user: Optional[dict], request: Optional[Request] = 
     active_instance["live_status"] = live_status or "unknown"
     active_instance["live_reason"] = status_details.get("reason")
     active_instance["live_message"] = status_details.get("message")
-    active_instance["url"] = _ready_instance_url(request, live_instance, "ready") if request else live_instance.get("url")
+    active_instance["url"] = (
+        _ready_instance_url(request, live_instance, live_status)
+        if request
+        else (live_instance.get("url") if live_status == "ready" else None)
+    )
+    # Only surface access URL/credentials once the pod is actually ready; otherwise the profile
+    # JSON would hand out endpoints that 404 (or leak credentials) while the pod is still pending.
     notebook_like = (live_instance.get("instance_type") or "").strip() in {"jupyter", "opencode"}
-    active_instance["opencode_url"] = live_instance.get("opencode_url") if notebook_like else None
-    active_instance["opencode_username"] = live_instance.get("opencode_username") if notebook_like else None
-    active_instance["opencode_password"] = live_instance.get("opencode_password") if notebook_like else None
+    opencode_ready = notebook_like and live_status == "ready"
+    active_instance["opencode_url"] = live_instance.get("opencode_url") if opencode_ready else None
+    active_instance["opencode_username"] = live_instance.get("opencode_username") if opencode_ready else None
+    active_instance["opencode_password"] = live_instance.get("opencode_password") if opencode_ready else None
     active_instance["github_path"] = live_instance.get("github_path")
     active_instance["template_id"] = live_instance.get("template_id")
     active_instance["template_title"] = live_instance.get("template_title")
@@ -1220,6 +1231,121 @@ async def redeem_credits(req: CouponRedeemRequest, user: dict = Depends(current_
         raise HTTPException(status_code=400, detail=str(e))
 
 
+async def _provision_notebook_instance(user: dict, email: str, image: str, params: dict, target_node: Optional[str]) -> dict:
+    """Create + record a plain notebook/opencode/custom instance. Shared by the request handler
+    and the distribute-resume path so both produce an identical instance + DB row + telemetry."""
+    instance_type = params["instance_type"]
+    gpu_count = params["gpu_count"]
+    instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
+    instance = k8s_client.create_instance(
+        email, image,
+        instance_type=instance_type,
+        gpu_count=gpu_count,
+        custom_instance_id=instance_id,
+        resource_profile=params.get("resource_profile", "auto"),
+        disk_size_gb=params.get("disk_size_gb"),
+    )
+    _stamp_launch(user, image, target_node or None)
+    record_instance(
+        user["id"], email, instance["id"], image, instance_type, gpu_count,
+        instance.get("node_port"), instance.get("opencode_node_port"),
+    )
+    record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count)
+    from .telemetry import report_gpu_instance_created_event
+
+    await report_gpu_instance_created_event(
+        instance_id=instance["id"],
+        user_id=user["id"],
+        instance_type=instance_type,
+        gpu_count=gpu_count,
+    )
+    return instance
+
+
+async def _provision_template_instance(user: dict, email: str, template: dict, params: dict, target_node: Optional[str]) -> dict:
+    """Create + record a template instance. Shared by the launch handler and the resume path."""
+    gpu_count = params["gpu_count"]
+    github_info = _template_github_info(template) or None
+    template_instance_type = (template.get("instance_type") or "").strip() or "opencode"
+    instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
+    instance = k8s_client.create_instance(
+        email,
+        template["image"],
+        instance_type=template_instance_type,
+        gpu_count=gpu_count,
+        github_info=github_info,
+        custom_instance_id=instance_id,
+        resource_profile="auto",
+        template_id=str(template["id"]),
+        template_title=template["title"],
+        start_command=template.get("start_command"),
+        app_port=template.get("app_port"),
+        model_source=template.get("model_source"),
+        ssh_enabled=bool(template.get("ssh_enabled")),
+        ssh_public_key=user.get("ssh_public_key"),
+    )
+    _stamp_launch(user, template["image"], target_node or None)
+    record_instance(
+        user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count,
+        instance.get("node_port"), instance.get("opencode_node_port"),
+    )
+    record_instance_launch_event(
+        user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count,
+        template_id=template["id"], template_title=template["title"],
+    )
+    from .telemetry import report_gpu_instance_created_event
+
+    await report_gpu_instance_created_event(
+        instance_id=instance["id"],
+        user_id=user["id"],
+        instance_type=template_instance_type,
+        gpu_count=gpu_count,
+        template_id=template["id"],
+    )
+    return instance
+
+
+async def _resume_distributing_launch(user: dict) -> Optional[str]:
+    """Resume a launch that was waiting on image distribution.
+
+    Returns "ready" (instance created — caller should report allocating/pending), "distributing"
+    (image still not on a node — keep waiting), or None (no pending intent / unrecoverable, intent
+    cleared). Called from the status poll, which the frontend already drives every few seconds.
+    """
+    intent = get_launch_intent(user["id"])
+    if not intent:
+        return None
+    email = user["email"].lower()
+    image = intent["image"]
+    params = intent.get("params") or {}
+    gpu_count = params.get("gpu_count", 1)
+    # An instance may already exist (the user raced or a prior resume succeeded).
+    if get_active_instance_for_user(user["id"]):
+        delete_launch_intent(user["id"])
+        return None
+    if int(user["credits"]) < gpu_count:
+        delete_launch_intent(user["id"])
+        return None
+    target_node = _ensure_image_on_node(image, gpu_count)
+    if target_node is None:
+        return "distributing"  # still copying; re-enqueue is deduped by enqueue_image_job
+    try:
+        if intent["kind"] == "template":
+            template_id = params.get("template_id")
+            template = _template_accessible_to_user(int(template_id), user) if template_id else None
+            if not template:
+                delete_launch_intent(user["id"])
+                return None
+            await _provision_template_instance(user, email, template, params, target_node)
+        else:
+            await _provision_notebook_instance(user, email, image, params, target_node)
+    except Exception as e:
+        logger.error("Failed to resume distributing launch for %s: %s", email, e)
+        return "distributing"  # transient; let the next poll retry rather than fail hard
+    delete_launch_intent(user["id"])
+    return "ready"
+
+
 @app.post("/api/notebook/request", response_model=NotebookStatus)
 async def request_notebook(request: Request, req: NotebookRequest, user: dict = Depends(current_user)):
     """Request a notebook instance"""
@@ -1261,6 +1387,14 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
 
     target_node = _ensure_image_on_node(image, gpu_count)
     if target_node is None:
+        # Image is being copied to the node; persist the launch so /api/notebook/status can
+        # resume it once distribution finishes (otherwise it dead-ends with no instance row).
+        upsert_launch_intent(user["id"], email, image, "notebook", {
+            "instance_type": instance_type,
+            "gpu_count": gpu_count,
+            "resource_profile": resource_profile,
+            "disk_size_gb": disk_size_gb,
+        })
         return NotebookStatus(
             status="distributing",
             message="Loading image onto the GPU node…",
@@ -1269,35 +1403,18 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
         )
 
     try:
-        instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
-        instance = k8s_client.create_instance(
-            email, image,
-            instance_type=instance_type,
-            gpu_count=gpu_count,
-            custom_instance_id=instance_id,
-            resource_profile=resource_profile,
-            disk_size_gb=disk_size_gb,
-        )
-        _stamp_launch(user, image, target_node or None)
-        record_instance(
-            user["id"], email, instance["id"], image, instance_type, gpu_count,
-            instance.get("node_port"), instance.get("opencode_node_port"),
-        )
-        record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count)
-        from .telemetry import report_gpu_instance_created_event
-
-        await report_gpu_instance_created_event(
-            instance_id=instance["id"],
-            user_id=user["id"],
-            instance_type=instance_type,
-            gpu_count=gpu_count,
-        )
-
+        instance = await _provision_notebook_instance(user, email, image, {
+            "instance_type": instance_type,
+            "gpu_count": gpu_count,
+            "resource_profile": resource_profile,
+            "disk_size_gb": disk_size_gb,
+        }, target_node)
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your instance...",
             url=None,
-            email=email
+            email=email,
+            instance_id=instance["id"],
         )
 
     except Exception as e:
@@ -1319,11 +1436,24 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
     try:
         active = get_active_instance_for_user(user["id"])
         if not active:
-            return NotebookStatus(
-                status="not_found",
-                message="No notebook instance found for this user",
-                email=email
-            )
+            # A launch waiting on image distribution has no instance row yet. Resume it (create the
+            # pod once the image lands) instead of reporting not_found, which the UI treats as a
+            # terminal failure and would strand the launch forever.
+            resume = await _resume_distributing_launch(user)
+            if resume == "ready":
+                active = get_active_instance_for_user(user["id"])
+            elif resume == "distributing":
+                return NotebookStatus(
+                    status="distributing",
+                    message="Loading image onto the GPU node…",
+                    email=email,
+                )
+            if not active:
+                return NotebookStatus(
+                    status="not_found",
+                    message="No notebook instance found for this user",
+                    email=email
+                )
         instance = k8s_client.get_instance_by_id(active["instance_id"])
         
         if not instance:
@@ -1395,6 +1525,9 @@ async def notebook_logs(user: dict = Depends(current_user)):
 @app.delete("/api/notebook/current", response_model=DestroyResponse)
 async def destroy_current_notebook(user: dict = Depends(current_user)):
     """Destroy the current user's active notebook instance."""
+    # Cancelling during image distribution: drop the pending intent so a later status poll does
+    # not resurrect a pod the user just cancelled.
+    delete_launch_intent(user["id"])
     active = get_active_instance_for_user(user["id"])
     if not active:
         return DestroyResponse(
@@ -1488,10 +1621,24 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
         raise HTTPException(status_code=409, detail=str(e))
     if not record:
         raise HTTPException(status_code=404, detail="Custom image not found")
-    try:
-        k8s_client.delete_custom_image_sync(image_id)
-    except Exception as e:
-        logger.warning("Failed to delete custom prepull DaemonSet for image %s: %s", image_id, e)
+    # Image-service is the only image-management system: removing the catalog row must also evict
+    # the image's layers from the nodes it was distributed to (the legacy prepull cleanup that used
+    # to run here is gone). The Manager resolves evict targets (the daemon has no kubectl): prefer
+    # the nodes recorded as holding this ref, falling back to all eligible nodes when none recorded.
+    image_ref = record.get("image")
+    if image_ref:
+        try:
+            recorded = store.list_nodes_for_image(image_ref)
+            targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
+            # Do NOT link custom_image_id: the row was already deleted above, and image_jobs has a
+            # plain FK to custom_images — a link to a missing row would raise ForeignKeyViolation.
+            enqueue_image_job(
+                kind="evict",
+                ref=image_ref,
+                payload={"scope": "all", "targets": targets},
+            )
+        except Exception as e:
+            logger.warning("Failed to enqueue evict for custom image %s (%s): %s", image_id, image_ref, e)
     return {"success": True}
 
 
@@ -1692,6 +1839,18 @@ async def report_image_job_result(job_id: int, req: ImageJobResultRequest, _agen
     job = finish_image_job(job_id, status, agent_id=req.agent_id, result=result_json)
     if not job:
         raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
+    # Quarantine any node the daemon reported as containerd_wedged, regardless of overall job status
+    # (a distribute can partially succeed while one node wedged). The agent also quarantines inline,
+    # but doing it here too is the durable backstop and covers agents that die before reporting.
+    if isinstance(req.result, dict):
+        ref = job.get("ref")
+        for node in req.result.get("nodes", []) or []:
+            if isinstance(node, dict) and node.get("error") == "containerd_wedged" and node.get("node"):
+                try:
+                    store.quarantine_node(node["node"], ref, settings.NODE_QUARANTINE_SECONDS)
+                    logger.warning("Quarantined node %s (containerd_wedged) for %ss", node["node"], settings.NODE_QUARANTINE_SECONDS)
+                except Exception as e:
+                    logger.warning("Failed to quarantine node %s: %s", node.get("node"), e)
     if status == "succeeded":
         try:
             _sync_image_job_lifecycle(job, req.result)
@@ -1714,6 +1873,43 @@ async def report_image_job_result(job_id: int, req: ImageJobResultRequest, _agen
             except Exception as e:
                 logger.warning("Could not mark custom image %s failed: %s", custom_image_id, e)
     return {"ok": True}
+
+
+@app.post("/api/internal/nodes/status")
+async def report_image_node_status(req: ImageNodeStatusRequest, _agent: bool = Depends(verify_build_agent)):
+    """Image-service reports a node's status for an image ref (importing | quarantined | loaded).
+
+    `quarantined` additionally stamps quarantined_until = now + (quarantine_seconds or the configured
+    NODE_QUARANTINE_SECONDS) so the reaper routes around the wedged node (Part D)."""
+    status = (req.status or "").strip().lower()
+    if status not in ("importing", "quarantined", "loaded"):
+        raise HTTPException(status_code=400, detail="status must be importing|quarantined|loaded")
+    try:
+        if status == "quarantined":
+            seconds = req.quarantine_seconds if req.quarantine_seconds is not None else settings.NODE_QUARANTINE_SECONDS
+            store.quarantine_node(req.node, req.ref, seconds)
+        else:
+            store.set_image_node_status(req.node, req.ref, status)
+    except Exception as e:
+        logger.warning("Failed to record node status %s for %s/%s: %s", status, req.node, req.ref, e)
+        raise HTTPException(status_code=500, detail="failed to record node status")
+    return {"ok": True}
+
+
+@app.get("/api/internal/nodes/{node}/user-pods")
+async def node_user_pod_count(node: str, _agent: bool = Depends(verify_build_agent)):
+    """Return the count of running (non-terminal) USER notebook pods on `node`.
+
+    The image-service consults this before any automated containerd restart: a restart is only ever
+    issued to a node with zero user pods (pod-safety gate, Part C). Fail-safe: on any kube error the
+    count is reported as unknown so the agent treats the node as "pods present" and refuses to
+    restart — automated recovery must never destroy a user pod."""
+    try:
+        count = k8s_client.count_user_pods_on_node(node)
+        return {"node": node, "user_pods": count, "ok": True}
+    except Exception as e:
+        logger.warning("Failed to count user pods on %s: %s", node, e)
+        return {"node": node, "user_pods": None, "ok": False}
 
 
 @app.post("/api/internal/images/outdated")
@@ -1948,6 +2144,11 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
     email = user["email"].lower()
     target_node = _ensure_image_on_node(template["image"], gpu_count)
     if target_node is None:
+        # Persist so /api/notebook/status can resume the template launch once the image lands.
+        upsert_launch_intent(user["id"], email, template["image"], "template", {
+            "gpu_count": gpu_count,
+            "template_id": template["id"],
+        })
         return NotebookStatus(
             status="distributing",
             message="Loading image onto the GPU node…",
@@ -1955,48 +2156,8 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             email=email,
         )
     try:
-        github_info = _template_github_info(template) or None
-        template_instance_type = (template.get("instance_type") or "").strip() or "opencode"
-        instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
-        instance = k8s_client.create_instance(
-            email,
-            template["image"],
-            instance_type=template_instance_type,
-            gpu_count=gpu_count,
-            github_info=github_info,
-            custom_instance_id=instance_id,
-            resource_profile="auto",
-            template_id=str(template["id"]),
-            template_title=template["title"],
-            start_command=template.get("start_command"),
-            app_port=template.get("app_port"),
-            model_source=template.get("model_source"),
-            ssh_enabled=bool(template.get("ssh_enabled")),
-            ssh_public_key=user.get("ssh_public_key"),
-        )
-        _stamp_launch(user, template["image"], target_node or None)
-        record_instance(
-            user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count,
-            instance.get("node_port"), instance.get("opencode_node_port"),
-        )
-        record_instance_launch_event(
-            user["id"],
-            email,
-            instance["id"],
-            template["image"],
-            template_instance_type,
-            gpu_count,
-            template_id=template["id"],
-            template_title=template["title"],
-        )
-        from .telemetry import report_gpu_instance_created_event
-
-        await report_gpu_instance_created_event(
-            instance_id=instance["id"],
-            user_id=user["id"],
-            instance_type=template_instance_type,
-            gpu_count=gpu_count,
-            template_id=template["id"],
+        instance = await _provision_template_instance(
+            user, email, template, {"gpu_count": gpu_count}, target_node
         )
         return NotebookStatus(
             status="allocating",
@@ -2040,7 +2201,14 @@ def _parse_huggingface_notebook_url(raw_url: str) -> Optional[dict]:
 
 
 def _parse_huggingface_demo_notebook_path(notebook_path: str) -> dict:
-    return parse_huggingface_demo_notebook_path(notebook_path)
+    github_info = parse_huggingface_demo_notebook_path(notebook_path)
+    # GitHub-backed demos clone the repo inside the pod, so the clone URL must honor the
+    # configured GitHub proxy (GITHUB_WEB_BASE) exactly like _parse_github_path. The native
+    # huggingface.co path downloads over HTTP and needs no git clone URL.
+    if (github_info.get("org") or "") != "huggingface":
+        repo_url = f"https://github.com/{github_info['org']}/{github_info['repo']}"
+        github_info["repo_url"] = _github_clone_url(repo_url)
+    return github_info
 
 
 @app.post("/api/huggingface/notebooks", response_model=NotebookStatus)
@@ -2805,10 +2973,7 @@ async def admin_list_users(username: str = Depends(verify_admin)):
 
 @app.get("/api/admin/stats")
 async def admin_stats(username: str = Depends(verify_admin)):
-    stats = get_admin_daily_stats()
-    if isinstance(stats, dict):
-        stats["image_pull_probe_enabled"] = bool(settings.IMAGE_PULL_PROBE_ENABLED)
-    return stats
+    return get_admin_daily_stats()
 
 
 @app.post("/api/admin/users/{user_id}/credits")
@@ -2920,6 +3085,32 @@ def _normalize_source_type(source_type: str) -> str:
     return _UI_SOURCE_TYPE_ALIASES.get(source_type, source_type)
 
 
+def _derive_admin_image_ref(source_type: str, source_ref: str, explicit_image: Optional[str]) -> str:
+    """Resolve the runnable registry tag stored in images.image for an admin source.
+
+    For pull sources source_ref IS a registry reference, so it is a valid tag. For github_build
+    source_ref is a Dockerfile URL, which is NOT a runnable image tag — storing it would make the
+    catalog row un-launchable and feed a URL to the build/distribute job as its ref. Derive a real
+    tag under the custom-image registry instead (mirrors the user build path at build_custom_image).
+    An explicit image always wins when provided.
+    """
+    explicit = (explicit_image or "").strip()
+    if explicit:
+        return explicit
+    ref = (source_ref or "").strip()
+    if source_type != "github_build":
+        return ref
+    # source_ref is a github.com/<org>/<repo>/blob/... Dockerfile URL; _github_repo_parts reads
+    # org/repo straight from that path. raise 400 (not 500) if it is not a parseable GitHub URL.
+    try:
+        org, repo = _github_repo_parts(ref)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    slug = re.sub(r"[^a-z0-9-]+", "-", f"{org}-{repo}".lower()).strip("-") or "admin-build"
+    digest = hashlib.md5(ref.encode()).hexdigest()[:8]
+    return f"{settings.CUSTOM_IMAGE_LOCAL_TAG_PREFIX}/admin-{slug}:{digest}"
+
+
 def _upsert_image_with_source(name, image, description, enabled, image_id, source_type, source_ref):
     """upsert_image carrying source_type/source_ref so the admin flow persists the source columns."""
     return upsert_image(
@@ -2980,16 +3171,20 @@ async def admin_create_image(req: ImageRequest, username: str = Depends(verify_a
         source_ref = (getattr(req, "source_ref", None) or req.image or "").strip()
         if not source_ref:
             raise HTTPException(status_code=400, detail="source_ref is required")
+        image_ref = _derive_admin_image_ref(source_type, source_ref, req.image)
         image = _upsert_image_with_source(
-            req.name, req.image or source_ref, req.description or "", req.enabled, None,
+            req.name, image_ref, req.description or "", req.enabled, None,
             source_type, source_ref,
         )
         _enqueue_admin_image_chain(image, source_type, source_ref)
         return update_image_sync_status(image["id"], "distributing", 0, 0, "Distribution enqueued", False)
 
-    if not (req.image or "").strip():
+    # Legacy mode (image-service off): the admin form sends source_ref (the registry reference)
+    # but no separate `image` field, so fall back to source_ref before requiring a value.
+    image_ref = (req.image or getattr(req, "source_ref", None) or "").strip()
+    if not image_ref:
         raise HTTPException(status_code=400, detail="image is required")
-    image = upsert_image(req.name, req.image, req.description or "", req.enabled)
+    image = upsert_image(req.name, image_ref, req.description or "", req.enabled)
     try:
         sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
     except ApiException as e:
@@ -3015,8 +3210,9 @@ async def admin_update_image(image_id: int, req: ImageRequest, username: str = D
         source_ref = (getattr(req, "source_ref", None) or req.image or "").strip()
         if not source_ref:
             raise HTTPException(status_code=400, detail="source_ref is required")
+        image_ref = _derive_admin_image_ref(source_type, source_ref, req.image)
         image = _upsert_image_with_source(
-            req.name, req.image or source_ref, req.description or "", req.enabled, image_id,
+            req.name, image_ref, req.description or "", req.enabled, image_id,
             source_type, source_ref,
         )
         if not image:
@@ -3024,7 +3220,10 @@ async def admin_update_image(image_id: int, req: ImageRequest, username: str = D
         _enqueue_admin_image_chain(image, source_type, source_ref)
         return update_image_sync_status(image["id"], "distributing", 0, 0, "Distribution enqueued", False)
 
-    image = upsert_image(req.name, req.image, req.description or "", req.enabled, image_id=image_id)
+    image_ref = (req.image or getattr(req, "source_ref", None) or "").strip()
+    if not image_ref:
+        raise HTTPException(status_code=400, detail="image is required")
+    image = upsert_image(req.name, image_ref, req.description or "", req.enabled, image_id=image_id)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
     try:

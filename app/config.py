@@ -248,9 +248,6 @@ class Settings:
     HF_TOKEN_SECRET_KEY: str = os.getenv("HF_TOKEN_SECRET_KEY", "HF_TOKEN")
     # PyPI mirror for in-pod pip installs (e.g. app requirements.txt at startup).
     PIP_INDEX_URL: str = os.getenv("PIP_INDEX_URL", "https://pypi.tuna.tsinghua.edu.cn/simple")
-    IMAGE_PREPULL_ENABLED: bool = os.getenv("IMAGE_PREPULL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-    IMAGE_PULL_PROBE_ENABLED: bool = os.getenv("IMAGE_PULL_PROBE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-    IMAGE_PULL_PROBE_DEADLINE_SECONDS: int = int(os.getenv("IMAGE_PULL_PROBE_DEADLINE_SECONDS", "7200"))
     WORKSPACE_HOST_ROOT: str = os.getenv("WORKSPACE_HOST_ROOT", "/workspace/amd-oneclick")
     WORKSPACE_MOUNT_PATH: str = os.getenv("WORKSPACE_MOUNT_PATH", "/workspace")
     WORKSPACE_VOLUME_TYPE: str = os.getenv("WORKSPACE_VOLUME_TYPE", "hostPath")
@@ -422,10 +419,11 @@ class Settings:
         os.getenv("CUSTOM_IMAGE_BUILD_LEASE_TIMEOUT_SECONDS", "3600")
     )
 
-    # Isolated Image Service. When enabled, image distribution goes through the image_jobs queue
-    # consumed by the off-cluster daemon (save | ssh ctr import) instead of the prepull DaemonSet/
-    # ACR-pull path. When false, the legacy DaemonSet/ACR path is used unchanged.
-    IMAGE_SERVICE_ENABLED: bool = os.getenv("IMAGE_SERVICE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # Isolated Image Service — the sole image-management system. Image distribution goes through the
+    # image_jobs queue consumed by the off-cluster daemon (save | ssh ctr import). The legacy prepull
+    # DaemonSet / pull-probe path has been removed, so this is effectively always-on; the setting is
+    # retained for one release as a safety toggle and defaults true.
+    IMAGE_SERVICE_ENABLED: bool = os.getenv("IMAGE_SERVICE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     # The Image-Service host is itself a labelled prepull node; node-target resolution must drop it
     # so it never receives distributions. Must exactly match its `kubectl get nodes` name.
     IMAGE_SERVICE_NODE_NAME: str = os.getenv("IMAGE_SERVICE_NODE_NAME", "")
@@ -454,6 +452,10 @@ class Settings:
     JOB_LEASE_TIMEOUT_SECONDS: int = int(os.getenv("JOB_LEASE_TIMEOUT_SECONDS", "3600"))
     # The daemon refuses a distribute job when the target node's containerd-root free space is below this.
     IMAGE_NODE_MIN_FREE_DISK_GB: int = int(os.getenv("IMAGE_NODE_MIN_FREE_DISK_GB", "50"))
+    # A node whose containerd wedged (import timed out / liveness probe failed) is quarantined for this
+    # long: the reaper will not requeue distribute/evict onto it and launches route around it. After the
+    # window expires it becomes eligible again (recovery may have cleared the wedge in the meantime).
+    NODE_QUARANTINE_SECONDS: int = int(os.getenv("NODE_QUARANTINE_SECONDS", "1800"))
 
 
 settings = Settings()

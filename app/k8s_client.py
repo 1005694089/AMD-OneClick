@@ -1204,190 +1204,6 @@ exit 0
                     raise
         raise RuntimeError("Unable to allocate NodePort for service")
 
-    @staticmethod
-    def _normalize_image_ref(ref: str) -> str:
-        """Canonicalize a docker image reference for reliable comparison.
-
-        kubelet reports container status images in fully-qualified form
-        (e.g. ``docker.io/library/nginx:latest``) while the catalog may store
-        short names (e.g. ``nginx`` or ``rocm/atom-dev:tag``). Normalize both
-        sides so the sync counter matches regardless of how it was entered.
-        """
-        if not ref:
-            return ref
-        ref = ref.strip()
-        # Separate digest if present (keep it as-is, it is already canonical).
-        digest = ""
-        if "@" in ref:
-            ref, digest = ref.split("@", 1)
-            digest = "@" + digest
-        first = ref.split("/", 1)[0]
-        has_registry = "." in first or ":" in first or first == "localhost"
-        if not has_registry:
-            if "/" not in ref:
-                ref = "library/" + ref
-            ref = "docker.io/" + ref
-        if not digest and ":" not in ref.rsplit("/", 1)[-1]:
-            ref = ref + ":latest"
-        return ref + digest
-
-    def _prepull_name(self, image_id: int) -> str:
-        return f"image-prepull-catalog-{image_id}"
-
-    def _prepull_labels(self, image_id: int) -> dict:
-        return {
-            "app": "amd-oneclick-image-prepull",
-            "image-id": str(image_id),
-        }
-
-    def _pull_probe_name(self, image_id: int) -> str:
-        return f"image-pull-catalog-{image_id}"
-
-    def _pull_probe_labels(self, image_id: int) -> dict:
-        return {
-            "app": "amd-oneclick-image-pull-check",
-            "managed-by": "amd-oneclick-manager",
-            "image-id": str(image_id),
-        }
-
-    def _image_pull_probe_enabled(self) -> bool:
-        return (
-            not settings.IMAGE_PREPULL_ENABLED
-            and bool(settings.IMAGE_PULL_PROBE_ENABLED)
-            and bool(settings.NOTEBOOK_NODE_NAME.strip())
-        )
-
-    def _pull_probe_admin_auth_block_message(self) -> Optional[str]:
-        if settings.ADMIN_PASSWORD == "admin123":
-            return "Image pull probe disabled until ADMIN_PASSWORD is set to a non-default beta secret"
-        return None
-
-    def _pull_probe_desired_count(self) -> int:
-        return 1 if settings.NOTEBOOK_NODE_NAME.strip() else 0
-
-    def _pull_probe_status(
-        self,
-        status: str,
-        ready_count: int = 0,
-        message: str = "",
-        completed: bool = False,
-    ) -> dict:
-        return {
-            "status": status,
-            "desired_count": self._pull_probe_desired_count(),
-            "ready_count": ready_count,
-            "message": message,
-            "completed": completed,
-        }
-
-    def _pull_probe_node_block_message(self) -> Optional[str]:
-        node_name = settings.NOTEBOOK_NODE_NAME.strip()
-        if not node_name:
-            return "IMAGE_PULL_PROBE_ENABLED requires NOTEBOOK_NODE_NAME"
-        try:
-            node = self.core_v1.read_node(name=node_name)
-        except ApiException as e:
-            reason = e.reason or str(e)
-            return f"Cannot inspect pull node {node_name}: {reason}"
-
-        conditions = {cond.type: cond for cond in (node.status.conditions or [])}
-        disk_pressure = conditions.get("DiskPressure")
-        if disk_pressure and disk_pressure.status == "True":
-            detail = disk_pressure.message or disk_pressure.reason or "DiskPressure=True"
-            return f"{node_name} DiskPressure=True: {detail}"
-
-        ready = conditions.get("Ready")
-        if not ready or ready.status != "True":
-            detail = (ready.message or ready.reason) if ready else "Ready condition missing"
-            return f"{node_name} is not Ready: {detail}"
-        return None
-
-    def _image_cached_on_pull_node(self, image: str) -> bool:
-        image = (image or "").strip()
-        node_name = settings.NOTEBOOK_NODE_NAME.strip()
-        if not image or not node_name:
-            return False
-        try:
-            node = self.core_v1.read_node(name=node_name)
-        except ApiException:
-            return False
-        for item in node.status.images or []:
-            if image in (item.names or []):
-                return True
-        return False
-
-    def _is_managed_pull_probe(self, pod, image_id: int) -> bool:
-        labels = pod.metadata.labels or {}
-        expected = self._pull_probe_labels(image_id)
-        return all(labels.get(key) == value for key, value in expected.items())
-
-    def _delete_image_pull_probe(self, image_id: int, wait: bool = False):
-        name = self._pull_probe_name(image_id)
-        try:
-            pod = self.core_v1.read_namespaced_pod(name=name, namespace=self.namespace)
-        except ApiException as e:
-            if e.status == 404:
-                return
-            raise
-
-        if not self._is_managed_pull_probe(pod, image_id):
-            raise RuntimeError(f"Refusing to delete unmanaged pull probe pod {name}")
-
-        self.core_v1.delete_namespaced_pod(name=name, namespace=self.namespace)
-        if not wait:
-            return
-        for _ in range(30):
-            try:
-                self.core_v1.read_namespaced_pod(name=name, namespace=self.namespace)
-                time.sleep(1)
-            except ApiException as e:
-                if e.status == 404:
-                    return
-                raise
-
-    def _active_pull_probe_name(self, exclude_name: Optional[str] = None) -> Optional[str]:
-        pods = self.core_v1.list_namespaced_pod(
-            namespace=self.namespace,
-            label_selector="app=amd-oneclick-image-pull-check,managed-by=amd-oneclick-manager",
-        )
-        for pod in pods.items:
-            name = pod.metadata.name
-            if exclude_name and name == exclude_name:
-                continue
-            phase = getattr(pod.status, "phase", "") or ""
-            if phase in {"Succeeded", "Failed"}:
-                continue
-            # A terminating probe still holds containerd image-pull work and disk on the
-            # node until it is fully gone, so it must keep counting as active. The caller
-            # only soft-queues on this (user retries Sync), so a draining pod can't wedge
-            # future pulls -- it disappears once deletion completes.
-            return name
-        return None
-
-    def _eligible_prepull_nodes(self) -> set[str]:
-        """Nodes that should count toward image availability."""
-        eligible: set[str] = set()
-        try:
-            nodes = self.core_v1.list_node()
-        except ApiException as e:
-            if e.status == 403:
-                logger.warning("Cannot list nodes for image pre-pull status; returning best-effort status")
-                return eligible
-            raise
-        for node in nodes.items:
-            labels = node.metadata.labels or {}
-            conditions = {cond.type: cond.status for cond in node.status.conditions or []}
-            if labels.get("amd-oneclick-prepull") != "enabled":
-                continue
-            if getattr(node.spec, "unschedulable", False):
-                continue
-            if conditions.get("Ready") != "True":
-                continue
-            if conditions.get("DiskPressure") == "True":
-                continue
-            eligible.add(node.metadata.name)
-        return eligible
-
     def _node_belongs_to_service(self, node) -> bool:
         """True if `node` belongs to THIS manager's service (taint-wise).
 
@@ -1498,9 +1314,14 @@ exit 0
 
         Reads each node's LIVE `amd.com/gpu` allocatable and subtracts the GPUs
         already committed by non-terminal pods on that node. Returns the first
-        node with `allocatable - committed >= gpu_count`, else None."""
+        node with `allocatable - committed >= gpu_count`, else None. Quarantined
+        nodes (containerd wedged — Part D) are skipped so launches route around
+        the wedge instead of into it."""
+        quarantined = store.quarantined_nodes()
         for target in self._eligible_target_nodes():
             name = target["node"]
+            if name in quarantined:
+                continue
             try:
                 node = self.core_v1.read_node(name=name)
             except ApiException:
@@ -1531,421 +1352,68 @@ exit 0
                 return name
         return None
 
-    def _configured_notebook_node_count(self) -> int:
-        """Return the configured runtime node count when pre-pull is intentionally off."""
-        return 1 if settings.NOTEBOOK_NODE_NAME else 0
+    def count_user_pods_on_node(self, node_name: str) -> int:
+        """Count running (non-terminal) user notebook pods on a node.
 
-    def _create_image_pull_probe(self, image_id: int, image: str):
-        name = self._pull_probe_name(image_id)
-        labels = self._pull_probe_labels(image_id)
-        node_name = settings.NOTEBOOK_NODE_NAME.strip()
-        spec = {
-            "nodeName": node_name,
-            "restartPolicy": "Never",
-            "activeDeadlineSeconds": settings.IMAGE_PULL_PROBE_DEADLINE_SECONDS,
-            "automountServiceAccountToken": False,
-            "tolerations": self._notebook_tolerations(),
-            "containers": [
-                {
-                    "name": "pull",
-                    "image": image,
-                    "imagePullPolicy": "Always",
-                    "command": ["sh", "-c"],
-                    "args": ["echo image pull probe ready on $(hostname)"],
-                    "resources": {
-                        "requests": {"cpu": "10m", "memory": "16Mi"},
-                        "limits": {"cpu": "100m", "memory": "64Mi"},
-                    },
-                    "securityContext": {
-                        "allowPrivilegeEscalation": False,
-                        "capabilities": {"drop": ["ALL"]},
-                        "readOnlyRootFilesystem": True,
-                        "seccompProfile": {"type": "RuntimeDefault"},
-                    },
-                }
-            ],
-        }
-        image_pull_secret_name = settings.IMAGE_PULL_SECRET_NAME.strip()
-        if image_pull_secret_name:
-            spec["imagePullSecrets"] = [{"name": image_pull_secret_name}]
-        body = {
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": name,
-                "namespace": self.namespace,
-                "labels": labels,
-                "annotations": {
-                    "amd-oneclick/image": image,
-                    "amd-oneclick/pull-node": node_name,
-                },
-            },
-            "spec": spec,
-        }
-        self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
-
-    def _sync_image_pull_probe(self, image_id: int, image: str) -> dict:
-        image = image.strip()
-        if not image:
-            raise ValueError("image must not be empty")
-
-        auth_message = self._pull_probe_admin_auth_block_message()
-        if auth_message:
-            return self._pull_probe_status("failed", 0, auth_message, False)
-
-        blocking_message = self._pull_probe_node_block_message()
-        if blocking_message:
-            return self._pull_probe_status("failed", 0, blocking_message, False)
-
-        probe_name = self._pull_probe_name(image_id)
-        active_probe = self._active_pull_probe_name(exclude_name=probe_name)
-        if active_probe:
-            return self._pull_probe_status(
-                "queued",
-                0,
-                f"Another image pull is active ({active_probe}); click Sync after it finishes",
-                False,
-            )
-
-        self._delete_image_pull_probe(image_id, wait=True)
-        node_name = settings.NOTEBOOK_NODE_NAME.strip()
-        for attempt in range(1, 7):
-            try:
-                self._create_image_pull_probe(image_id, image)
-                break
-            except ApiException as e:
-                if e.status == 409 and attempt < 6:
-                    logger.warning(
-                        "Pull probe %s still terminating while creating; retry %s",
-                        probe_name, attempt,
-                    )
-                    time.sleep(5)
-                    continue
-                if e.status == 409:
-                    return self._pull_probe_status(
-                        "queued",
-                        0,
-                        f"Previous pull probe still terminating on {node_name}; click Sync again shortly",
-                        False,
-                    )
-                raise
-        return self.get_image_sync_status(image_id, image)
+        Selects pods by the notebook app label and the node, excluding Succeeded/Failed. Raises on a
+        kube API error so the caller (the pod-safety gate before an automated containerd restart)
+        fails safe — an uncertain count must be treated as "pods present", never as zero."""
+        pods = self.core_v1.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector=f"app={settings.NOTEBOOK_LABEL_PREFIX}",
+            field_selector=f"spec.nodeName={node_name},status.phase!=Succeeded,status.phase!=Failed",
+        )
+        return len(pods.items)
 
     def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
         """Distribute a catalog image to every eligible GPU node.
 
-        With the Image Service enabled this enqueues a `distribute` job (the
-        out-of-cluster daemon does the actual `save | ssh ctr import`) and
-        synthesizes status from `image_nodes`. With it disabled the legacy
-        prepull-DaemonSet / pull-probe path is used unchanged."""
-        if settings.IMAGE_SERVICE_ENABLED:
-            image = image.strip()
-            if not image:
-                raise ValueError("image must not be empty")
-            targets = self._eligible_target_nodes()
-            store.enqueue_image_job(
-                kind="distribute",
-                ref=image,
-                image_id=image_id,
-                payload={"targets": targets, "concurrency": 2},
-            )
-            return self.get_image_sync_status(image_id, image)
-
-        if not settings.IMAGE_PREPULL_ENABLED:
-            if self._image_pull_probe_enabled():
-                return self._sync_image_pull_probe(image_id, image)
-            return self.get_image_sync_status(image_id)
-
+        Image-service is the sole image-management system: this enqueues a
+        `distribute` job (the out-of-cluster daemon does the actual
+        `save | ssh ctr import`) and synthesizes status from `image_nodes`.
+        The legacy prepull-DaemonSet / pull-probe path has been removed — no
+        manager process ever creates an image-pull DaemonSet on a node, so a
+        prepull pull can never co-tenant a node and race a same-digest
+        image-service import on containerd's chain-ID unpack mutex."""
         image = image.strip()
         if not image:
             raise ValueError("image must not be empty")
-
-        name = self._prepull_name(image_id)
-        labels = self._prepull_labels(image_id)
-
-        try:
-            self.apps_v1.delete_namespaced_daemon_set(name=name, namespace=self.namespace)
-        except ApiException as e:
-            if e.status != 404:
-                raise
-
-        body = {
-            "apiVersion": "apps/v1",
-            "kind": "DaemonSet",
-            "metadata": {
-                "name": name,
-                "namespace": self.namespace,
-                "labels": labels,
-            },
-            "spec": {
-                "selector": {"matchLabels": labels},
-                "template": {
-                    "metadata": {"labels": labels},
-                    "spec": {
-                        "nodeSelector": {"amd-oneclick-prepull": "enabled"},
-                        "tolerations": [{"operator": "Exists"}],
-                        "containers": [
-                            {
-                                "name": "pull",
-                                "image": image,
-                                "imagePullPolicy": "IfNotPresent",
-                                "command": [
-                                    "sh",
-                                    "-c",
-                                    "echo image ready on $(hostname); while true; do sleep 86400; done",
-                                ],
-                                "resources": {
-                                    "requests": {"cpu": "10m", "memory": "16Mi"},
-                                    "limits": {"cpu": "100m", "memory": "64Mi"},
-                                },
-                            }
-                        ],
-                    },
-                },
-            },
-        }
-        self.apps_v1.create_namespaced_daemon_set(namespace=self.namespace, body=body)
-        return self.get_image_sync_status(image_id)
-
-    def _pull_probe_message_from_waiting(self, waiting) -> str:
-        reason = waiting.reason or "waiting"
-        message = waiting.message or ""
-        node_name = settings.NOTEBOOK_NODE_NAME.strip()
-        suffix = f": {message}" if message else ""
-        return f"{node_name} {reason}{suffix}"
-
-    def _with_elapsed(self, pod, message: str) -> str:
-        start = getattr(pod.status, "start_time", None) or getattr(pod.metadata, "creation_timestamp", None)
-        if not start:
-            return message
-        elapsed = datetime.now(timezone.utc) - start
-        elapsed_min = int(elapsed.total_seconds() // 60)
-        deadline_min = int(settings.IMAGE_PULL_PROBE_DEADLINE_SECONDS // 60)
-        return f"{message} ({elapsed_min}m / {deadline_min}m deadline)"
-
-    def _get_image_pull_probe_status(self, image_id: int, image: Optional[str] = None) -> dict:
-        auth_message = self._pull_probe_admin_auth_block_message()
-        if auth_message:
-            return self._pull_probe_status("failed", 0, auth_message, False)
-
-        node_name = settings.NOTEBOOK_NODE_NAME.strip()
-        image = (image or "").strip()
-        name = self._pull_probe_name(image_id)
-        try:
-            pod = self.core_v1.read_namespaced_pod(name=name, namespace=self.namespace)
-        except ApiException as e:
-            if e.status == 404:
-                if image and self._image_cached_on_pull_node(image):
-                    return self._pull_probe_status("ready", 1, f"Image cached on {node_name}", True)
-                return self._pull_probe_status("pending", 0, f"not pulled on {node_name}", False)
-            raise
-
-        if not self._is_managed_pull_probe(pod, image_id):
-            return self._pull_probe_status("failed", 0, f"Probe pod {name} has unexpected labels", False)
-
-        # The probe pod is named by image_id, not by image, so a pod left over from a previous
-        # image value for this catalog entry can still be present (or terminating) after the admin
-        # edits the image. Its imageID then proves the OLD image is pulled, not the requested one --
-        # never treat that as readiness for the new image. The probe records the image it pulled in
-        # an annotation; the imageID is only trustworthy as proof for the requested image when that
-        # annotation confirms it. If it disagrees -- OR is absent (a legacy pod from before this
-        # annotation shipped, where we cannot prove which image was pulled) -- force a re-Sync
-        # rather than trusting the digest.
-        if image:
-            probe_annotations = getattr(pod.metadata, "annotations", None) or {}
-            probe_image = (probe_annotations.get("amd-oneclick/image") or "").strip()
-            if probe_image != image:
-                detail = (
-                    f"last pulled {probe_image}" if probe_image
-                    else "cannot confirm which image this probe pulled"
-                )
-                return self._pull_probe_status(
-                    "pending",
-                    0,
-                    f"{node_name} {detail}; click Sync to pull {image}",
-                    False,
-                )
-
-        pod_status = pod.status
-        phase = getattr(pod_status, "phase", "") or "Pending"
-        pod_reason = getattr(pod_status, "reason", "") or ""
-        pod_message = getattr(pod_status, "message", "") or ""
-        statuses = getattr(pod_status, "container_statuses", None) or []
-        container_status = next((status for status in statuses if getattr(status, "name", "") == "pull"), None)
-        container_status = container_status or (statuses[0] if statuses else None)
-
-        if container_status:
-            image_id_value = getattr(container_status, "image_id", "") or ""
-            if image_id_value:
-                state = getattr(container_status, "state", None)
-                terminated = getattr(state, "terminated", None) if state else None
-                if terminated and phase == "Failed":
-                    reason = terminated.reason or "terminated"
-                    return self._pull_probe_status(
-                        "ready",
-                        1,
-                        f"Image pulled on {node_name}; probe command ended with {reason}",
-                        True,
-                    )
-                return self._pull_probe_status("ready", 1, f"Image pulled on {node_name}", True)
-
-            # After activeDeadlineSeconds, Kubernetes marks the pod Failed/DeadlineExceeded while
-            # the container can still report state.waiting (e.g. ContainerCreating) because it never
-            # started. That must read as a terminal timeout, not an indefinite "pulling" -- check it
-            # before the waiting branch below, but after the image-pulled success above so a probe
-            # that actually pulled then hit the deadline still counts as ready.
-            if phase == "Failed" or pod_reason == "DeadlineExceeded":
-                detail = pod_message or pod_reason or "probe deadline exceeded"
-                return self._pull_probe_status("failed", 0, f"{node_name} {detail}", False)
-
-            if pod.metadata.deletion_timestamp:
-                return self._pull_probe_status(
-                    "failed",
-                    0,
-                    f"{node_name} previous pull stuck terminating; retry Sync once it clears",
-                    False,
-                )
-
-            state = getattr(container_status, "state", None)
-            waiting = getattr(state, "waiting", None) if state else None
-            if waiting:
-                reason = waiting.reason or "waiting"
-                message = self._pull_probe_message_from_waiting(waiting)
-                if reason in {"ErrImagePull", "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError", "RunContainerError"}:
-                    return self._pull_probe_status("failed", 0, message, False)
-                return self._pull_probe_status("pulling", 0, self._with_elapsed(pod, message), False)
-
-            terminated = getattr(state, "terminated", None) if state else None
-            if terminated:
-                reason = terminated.reason or "terminated"
-                detail = terminated.message or ""
-                suffix = f": {detail}" if detail else ""
-                return self._pull_probe_status("failed", 0, f"{node_name} probe {reason}{suffix}", False)
-
-        if pod.metadata.deletion_timestamp:
-            return self._pull_probe_status(
-                "failed",
-                0,
-                f"{node_name} previous pull stuck terminating; retry Sync once it clears",
-                False,
-            )
-
-        if phase == "Succeeded":
-            return self._pull_probe_status("failed", 0, f"{node_name} probe succeeded but image id was not reported", False)
-        if phase == "Failed" or pod_reason == "DeadlineExceeded":
-            detail = pod_message or pod_reason or "probe pod failed"
-            return self._pull_probe_status("failed", 0, f"{node_name} {detail}", False)
-        return self._pull_probe_status("pulling", 0, self._with_elapsed(pod, f"{node_name} probe phase {phase}"), False)
+        targets = self._eligible_target_nodes()
+        store.enqueue_image_job(
+            kind="distribute",
+            ref=image,
+            image_id=image_id,
+            payload={"targets": targets, "concurrency": 2},
+        )
+        return self.get_image_sync_status(image_id, image)
 
     def get_image_sync_status(self, image_id: int, image: Optional[str] = None) -> dict:
-        """Return distribution status for an image catalog entry."""
-        if settings.IMAGE_SERVICE_ENABLED:
-            ref = (image or "").strip()
-            targets = self._eligible_target_nodes()
-            target_names = {t["node"] for t in targets}
-            desired = len(target_names)
-            loaded_nodes = set(store.list_nodes_for_image(ref)) if ref else set()
-            ready = len(loaded_nodes & target_names) if target_names else len(loaded_nodes)
-            if desired > 0 and ready >= desired:
-                status = "ready"
-            elif desired == 0:
-                status = "pending"
-            else:
-                status = "pulling"
-            return {
-                "status": status,
-                "desired_count": desired,
-                "ready_count": ready,
-                "message": f"{ready}/{desired} nodes loaded",
-                "completed": status == "ready",
-            }
-
-        if not settings.IMAGE_PREPULL_ENABLED:
-            if self._image_pull_probe_enabled():
-                return self._get_image_pull_probe_status(image_id, image)
-            desired = self._configured_notebook_node_count()
-            return {
-                "status": "skipped",
-                "desired_count": desired,
-                "ready_count": 0,
-                "message": "Image pre-pull disabled; catalog image remains launchable on configured runtime nodes",
-                "completed": False,
-            }
-
-        name = self._prepull_name(image_id)
-        try:
-            ds = self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
-            eligible_nodes = self._eligible_prepull_nodes()
-            desired = len(eligible_nodes) or (ds.status.desired_number_scheduled or 0)
-            ds_uid = ds.metadata.uid
-            image = ds.spec.template.spec.containers[0].image
-            image_norm = self._normalize_image_ref(image)
-            pulled_nodes = set()
-            pods = self.core_v1.list_namespaced_pod(
-                namespace=self.namespace,
-                label_selector=f"app=amd-oneclick-image-prepull,image-id={image_id}",
-            )
-            for pod in pods.items:
-                if not pod.spec.node_name:
-                    continue
-                if not any(ref.uid == ds_uid for ref in (pod.metadata.owner_references or [])):
-                    continue
-                statuses = pod.status.container_statuses or []
-                if not statuses:
-                    continue
-                status = statuses[0]
-                if status.image_id and self._normalize_image_ref(status.image) == image_norm:
-                    pulled_nodes.add(pod.spec.node_name)
-
-            effective_pulled_nodes = pulled_nodes & eligible_nodes if eligible_nodes else pulled_nodes
-            ready = len(effective_pulled_nodes)
-            target = max(1, int(desired * 0.8 + 0.999)) if desired else 0
-            status = "ready" if target > 0 and ready >= target else "pulling"
-            message = f"{ready}/{desired} eligible nodes pulled (threshold {target}, 80%)"
-            return {
-                "status": status,
-                "desired_count": desired,
-                "ready_count": ready,
-                "message": message,
-                "completed": status == "ready",
-            }
-        except ApiException as e:
-            if e.status == 404:
-                return {
-                    "status": "pending",
-                    "desired_count": 0,
-                    "ready_count": 0,
-                    "message": "not synced",
-                    "completed": False,
-                }
-            raise
+        """Return distribution status for an image catalog entry (image-service only)."""
+        ref = (image or "").strip()
+        targets = self._eligible_target_nodes()
+        target_names = {t["node"] for t in targets}
+        desired = len(target_names)
+        loaded_nodes = set(store.list_nodes_for_image(ref)) if ref else set()
+        ready = len(loaded_nodes & target_names) if target_names else len(loaded_nodes)
+        if desired > 0 and ready >= desired:
+            status = "ready"
+        elif desired == 0:
+            status = "pending"
+        else:
+            status = "pulling"
+        return {
+            "status": status,
+            "desired_count": desired,
+            "ready_count": ready,
+            "message": f"{ready}/{desired} nodes loaded",
+            "completed": status == "ready",
+        }
 
     def delete_image_sync(self, image_id: int):
-        # With the Image Service enabled there is no prepull DaemonSet/probe to tear
-        # down; node eviction (image_nodes cleanup + ssh ctr rm) is orchestrated by
-        # the DELETE handler via an `evict` job. Keep the legacy cleanup for off.
-        if settings.IMAGE_SERVICE_ENABLED:
-            return
-        try:
-            self.apps_v1.delete_namespaced_daemon_set(name=self._prepull_name(image_id), namespace=self.namespace)
-        except ApiException as e:
-            if e.status != 404:
-                raise
-        if settings.IMAGE_PULL_PROBE_ENABLED:
-            self._delete_image_pull_probe(image_id)
-
-    def _custom_prepull_name(self, custom_image_id: int) -> str:
-        return f"image-prepull-custom-{custom_image_id}"
-
-    def delete_custom_image_sync(self, custom_image_id: int):
-        # Custom user images are never prepulled (pulled lazily by the notebook pod on launch).
-        # This remains a best-effort cleanup of any pre-existing custom-prepull DaemonSet from
-        # an older deployment that did auto-prepull.
-        try:
-            self.apps_v1.delete_namespaced_daemon_set(name=self._custom_prepull_name(custom_image_id), namespace=self.namespace)
-        except ApiException as e:
-            if e.status != 404:
-                raise
+        # Image-service mode: there is no prepull DaemonSet/probe to tear down. Node
+        # eviction (image_nodes cleanup + ssh ctr rm) is orchestrated by the DELETE
+        # handler via an `evict` job, so this is a no-op kept for call-site stability.
+        return
 
     def get_instance_by_email(self, email: str) -> Optional[dict]:
         """Get existing notebook instance for an email"""

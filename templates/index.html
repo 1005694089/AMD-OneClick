@@ -507,22 +507,41 @@
           )
         );
       }
+      function renderSshAccessCard(data) {
+        if (!data || !data.ssh_command) return null;
+        return React.createElement('div', { className:'api-access-card' },
+          React.createElement('div', { className:'api-access-title' }, 'SSH access'),
+          React.createElement('div', { className:'api-access-row' },
+            React.createElement('span', { className:'api-access-label' }, 'Command'),
+            React.createElement(Paragraph, { copyable:{ text: data.ssh_command }, style:{ margin:0 } }, React.createElement('code', null, data.ssh_command))
+          ),
+          React.createElement('div', { className:'api-access-row' },
+            React.createElement('span', { className:'api-access-label' }, 'Host : Port'),
+            React.createElement(Paragraph, { copyable:{ text: (data.ssh_host || '') + ' ' + (data.ssh_port || '') }, style:{ margin:0 } }, React.createElement('code', null, (data.ssh_host || '') + ' : ' + (data.ssh_port || '')))
+          ),
+          React.createElement('div', { style:{ color:'#6b758c', fontSize:12, marginTop:4 } }, 'Key-based login using the SSH public key from your Profile.')
+        );
+      }
       function renderLaunchModal() {
         const data = launchStatus || {};
         const failed = data.status === 'failed' || data.status === 'not_found';
-        const ready = data.status === 'ready' && (data.url || readyUrl || data.api_base_url);
-        const current = launchStepIndex(data);
-        const detail = displayStatusDetail(data);
-        const openUrl = data.url || readyUrl;
-        const opencodeUrl = data.opencode_url || readyOpencodeUrl;
-        const opencodeUsername = data.opencode_username || readyOpencodeUsername;
-        const opencodePassword = data.opencode_password || readyOpencodePassword;
         const itype = (data.instance_type || '').trim();
         const isApi = !!data.api_base_url;
         const isApp = ['gradio','streamlit','comfyui'].includes(itype);
-        const kindNoun = isApi ? 'API' : (isApp ? 'app' : 'workspace');
+        const isCustom = itype === 'custom';
+        // A web "Open" action only makes sense for notebook/app instances. Custom / SSH-only
+        // images do not serve the Jupyter lab URL, so never auto-open it (it would 404).
+        const canOpenWeb = !isApi && !isCustom;
+        const openUrl = canOpenWeb ? (data.url || readyUrl) : '';
+        const ready = data.status === 'ready' && (openUrl || data.api_base_url || data.ssh_command || isCustom);
+        const current = launchStepIndex(data);
+        const detail = displayStatusDetail(data);
+        const opencodeUrl = data.opencode_url || readyOpencodeUrl;
+        const opencodeUsername = data.opencode_username || readyOpencodeUsername;
+        const opencodePassword = data.opencode_password || readyOpencodePassword;
+        const kindNoun = isApi ? 'API' : (isApp ? 'app' : (isCustom ? 'instance' : 'workspace'));
         const openLabel = isApp ? 'Open App' : 'Open Notebook';
-        const title = ready ? (isApi ? 'Your API is ready' : (isApp ? 'Your app is ready' : 'Your workspace is ready')) : displayStatusMessage(data);
+        const title = ready ? (isApi ? 'Your API is ready' : (isApp ? 'Your app is ready' : (isCustom ? 'Your instance is ready' : 'Your workspace is ready'))) : displayStatusMessage(data);
         const footer = ready
           ? (isApi
               ? [ React.createElement(Button, { key:'close', type:'primary', onClick:closeLaunchModal }, 'Done') ]
@@ -569,6 +588,7 @@
             ),
             (ready && isApi) && renderApiAccessCard(data.api_base_url, data.api_key, data.api_model),
             (ready && opencodeUrl && !isApp) && opencodeCredentials(opencodeUsername, opencodePassword),
+            (ready && data.ssh_command) && renderSshAccessCard(data),
             (data.detail && data.detail !== detail) && React.createElement('details', { className: 'launch-modal-technical' },
               React.createElement('summary', null, 'Technical details'),
               React.createElement('div', { className: 'launch-modal-technical-body' }, data.detail)
