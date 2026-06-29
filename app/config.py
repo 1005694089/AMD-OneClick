@@ -295,6 +295,24 @@ class Settings:
         "true",
     ).lower() in {"1", "true", "yes", "on"}
 
+    # Opt-in SSH access: only templates with ssh_enabled expose a second NodePort
+    # -> pod:22. Auth is key-only (the launching user's public key from Profile is
+    # injected; password login is disabled). The image must ship sshd.
+    SSH_PORT: int = int(os.getenv("SSH_PORT", "22"))
+    SSH_USERNAME: str = os.getenv("SSH_USERNAME", "root")
+    # Host advertised in the ssh command; falls back to SERVICE_HOST when empty.
+    SSH_HOST: str = os.getenv("SSH_HOST", "")
+
+    # GitHub access goes through an in-cluster proxy on nodes that cannot reach
+    # github.com directly. Defaults are the real GitHub hosts; on proxied envs set
+    # these to the proxy (e.g. https://gh-test.anruicloud.com / https://gh-api-test.anruicloud.com).
+    # Used for server-side OAuth token exchange, the GitHub REST API, git clone,
+    # and raw file fetches (template preview). The browser-facing OAuth authorize
+    # stays on github.com so the user's github.com session cookies are sent.
+    GITHUB_API_BASE: str = os.getenv("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
+    GITHUB_WEB_BASE: str = os.getenv("GITHUB_WEB_BASE", "https://github.com").rstrip("/")
+    GITHUB_AUTHORIZE_BASE: str = os.getenv("GITHUB_AUTHORIZE_BASE", "https://github.com").rstrip("/")
+
     PYPI_MIRROR: str = "https://pypi.tuna.tsinghua.edu.cn/simple"
     PYPI_HOST: str = "pypi.tuna.tsinghua.edu.cn"
     PYPI_HOST_IP: str = "101.6.15.130"

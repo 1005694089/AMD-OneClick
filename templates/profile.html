@@ -9,6 +9,8 @@
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
+  <script src="/static/template_form.js"></script>
+  <script src="/static/launch_flow.js"></script>
   <style>
     body { margin:0; background:#f5f6fb; }
     #root { min-height:100vh; }
@@ -27,7 +29,7 @@
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Descriptions, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Select, Space, Statistic, Table, Tag, Typography, Alert, message } = antd;
+    const { Avatar, Button, Card, Descriptions, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Select, Space, Statistic, Switch, Table, Tag, Typography, Alert, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const __apiCardStyle = document.createElement('style');
@@ -166,6 +168,14 @@
       const [buildForm] = Form.useForm();
       // null = still checking, true = pod ready, false = pod still starting/pulling image
       const [instanceReady, setInstanceReady] = React.useState(null);
+      const [sshKey, setSshKey] = React.useState((user && user.ssh_public_key) || '');
+      const [sshKeySaving, setSshKeySaving] = React.useState(false);
+      const lf = useLaunchFlow({
+        allocatingMessage: 'Allocating resources...',
+        onReady: () => { setLaunchingTemplateId(null); },
+        onFinish: () => { setLaunchingTemplateId(null); },
+        onClose: (st) => { if (st && st.status === 'ready') window.location.reload(); },
+      });
       const isEditor = !!(user && user.is_editor);
       const activeGpuCount = Number((activeInstance && activeInstance.gpu_count) || 1);
       const remainingRunHours = activeGpuCount > 0 ? Math.floor(Number(user.credits || 0) / activeGpuCount) : 0;
@@ -293,6 +303,7 @@
         } : {
           branch: 'main',
           image: defaultImage,
+          enabled: false,
         });
         setTemplateModalOpen(true);
       }
@@ -302,7 +313,7 @@
           ...values,
           slug: editingTemplate ? editingTemplate.slug : '',
           tags: values.tags || '',
-          enabled: isEditor ? (editingTemplate ? editingTemplate.enabled !== false : true) : false,
+          enabled: isEditor ? (values.enabled === true) : false,
           sort_order: 0,
         };
         const url = editingTemplate ? `/api/profile/templates/${editingTemplate.id}` : '/api/profile/templates';
@@ -359,49 +370,10 @@
         }
       }
 
-      async function launchTemplate(record) {
+      function launchTemplate(record) {
+        // Shared launch flow (same modal + type-aware result as the homepage).
         setLaunchingTemplateId(record.id);
-        try {
-          const res = await fetch(`/api/templates/${record.id}/launch`, {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({gpu_count:1}),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (!res.ok) throw new Error(data.detail || 'Launch failed');
-          message.info('Launching notebook template...');
-          pollNotebookReady();
-        } catch (e) {
-          message.error(e.message || 'Launch failed');
-          setLaunchingTemplateId(null);
-        }
-      }
-
-      function pollNotebookReady() {
-        let attempts = 0;
-        const timer = setInterval(async () => {
-          attempts += 1;
-          try {
-            const res = await fetch('/api/notebook/status');
-            const data = await res.json();
-            if (data.status === 'ready') {
-              clearInterval(timer);
-              setLaunchingTemplateId(null);
-              message.success('Notebook is ready');
-              if (data.url) window.open(data.url, '_blank');
-              window.location.reload();
-            } else if (data.status === 'failed' || data.status === 'not_found') {
-              clearInterval(timer);
-              setLaunchingTemplateId(null);
-              message.error(data.message || 'Launch failed');
-            }
-            if (attempts >= 240) {
-              clearInterval(timer);
-              setLaunchingTemplateId(null);
-              message.warning('Launch is taking longer than expected. Please check Profile later.');
-            }
-          } catch (e) {}
-        }, 3000);
+        lf.startLaunch(`/api/templates/${record.id}/launch`, { gpu_count: 1 }, { type: 'template', templateId: record.id });
       }
 
       const templateColumns = [
@@ -440,6 +412,41 @@
           )
         );
       }
+      function renderSshAccessCard(inst) {
+        if (!inst || !inst.ssh_command) return null;
+        return React.createElement('div', {className:'api-access-card', style:{marginTop:16}},
+          React.createElement('div', {style:{fontWeight:800,color:'#273049',marginBottom:10}}, 'SSH access'),
+          React.createElement('div', {style:{display:'flex',alignItems:'center',gap:10,marginBottom:8}},
+            React.createElement('span', {style:{width:72,color:'#6b758c',fontSize:13,flex:'0 0 auto'}}, 'Command'),
+            React.createElement(Paragraph, {copyable:{text:inst.ssh_command}, style:{margin:0}}, React.createElement('code', null, inst.ssh_command))
+          ),
+          React.createElement('div', {style:{display:'flex',alignItems:'center',gap:10,marginBottom:8}},
+            React.createElement('span', {style:{width:72,color:'#6b758c',fontSize:13,flex:'0 0 auto'}}, 'Host : Port'),
+            React.createElement(Paragraph, {copyable:{text:`${inst.ssh_host} ${inst.ssh_port}`}, style:{margin:0}}, React.createElement('code', null, `${inst.ssh_host} : ${inst.ssh_port}`))
+          )
+        );
+      }
+      async function saveSshKey() {
+        setSshKeySaving(true);
+        try {
+          const res = await fetch('/api/profile/ssh-key', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ssh_public_key: sshKey})});
+          const data = await res.json().catch(()=>({}));
+          if (res.ok) { setSshKey(data.ssh_public_key || ''); message.success(data.ssh_public_key ? 'SSH public key saved' : 'SSH public key cleared'); }
+          else message.error(data.detail || 'Failed to save SSH public key');
+        } catch (e) { message.error('Failed to save SSH public key'); }
+        setSshKeySaving(false);
+      }
+      function renderSshKeyCard() {
+        if (!user || !user.email) return null;
+        return React.createElement(Card, {title:'SSH Public Key'},
+          React.createElement(Paragraph, {type:'secondary'}, 'Used for key-based SSH into instances launched from SSH-enabled templates. Paste your public key (e.g. the contents of ~/.ssh/id_ed25519.pub). No password is ever used.'),
+          React.createElement(Input.TextArea, {value:sshKey, onChange:e=>setSshKey(e.target.value), autoSize:{minRows:3,maxRows:6}, placeholder:'ssh-ed25519 AAAA... you@host'}),
+          React.createElement(Space, {style:{marginTop:12}},
+            React.createElement(Button, {type:'primary', loading:sshKeySaving, onClick:saveSshKey}, 'Save Key'),
+            (user.ssh_public_key) && React.createElement(Tag, {color:'green'}, 'Key on file')
+          )
+        );
+      }
       function renderEditorTemplates() {
         if (!user || !user.email || !isEditor) return null;
         return React.createElement(Card, {
@@ -451,25 +458,15 @@
           React.createElement(Table, {rowKey:'id', columns:templateColumns, dataSource:editorTemplates, loading:editorLoading, pagination:false, scroll:{x:980}, size:'middle'}),
           React.createElement(Modal, {title:editingTemplate?'Edit Template':'Add Template', open:templateModalOpen, onCancel:()=>{setTemplateModalOpen(false); setEditingTemplate(null); templateForm.resetFields();}, footer:null, destroyOnClose:true, width:760},
             React.createElement(Form, {form:templateForm, layout:'vertical', onFinish:saveTemplate},
-              React.createElement(Form.Item, {name:'title', label:'Title', rules:[{required:true,message:'Title is required'}]}, React.createElement(Input, {placeholder:'10-minute Skill Agent'})),
-              React.createElement(Form.Item, {name:'description', label:'Description'}, React.createElement(Input.TextArea, {autoSize:true, placeholder:'Short user-facing description'})),
-              React.createElement(Space, {style:{width:'100%'}, size:16},
-                React.createElement(Form.Item, {name:'category', label:'Category', style:{width:180}}, React.createElement(Input, {placeholder:'LLM'})),
-                React.createElement(Form.Item, {name:'tags', label:'Tags', style:{flex:1}}, React.createElement(Input, {placeholder:'tutorial, Qwen3, agent'}))
-              ),
-              React.createElement(Form.Item, {name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}]}, React.createElement(Select, {options:[...editorImages.map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`})), ...(customImages||[]).filter(ci=>ci.build_status==='ready').map(ci=>({value:ci.image,label:`${ci.name} (custom)`}))]})),
-              React.createElement(Form.Item, {name:'instance_type', label:'Deploy Type', tooltip:'Notebook opens Jupyter; app types open a web app; API types serve an OpenAI-compatible endpoint.'}, React.createElement(Select, {options:tplInstanceTypeOptions, placeholder:'Notebook (Jupyter / OpenCode)'})),
-              tplIsApiType && React.createElement(Form.Item, {name:'model_source', label:'Model Source', tooltip:'Where the model weights are downloaded from. ModelScope is usually faster in China.'}, React.createElement(Select, {options:[{value:'huggingface',label:'HuggingFace (mirror)'},{value:'modelscope',label:'ModelScope'}], placeholder:'HuggingFace (mirror)'})),
-              tplIsApiType && React.createElement(Alert, {type:'info', showIcon:true, style:{marginBottom:16}, message:'Model API: set the serve command (including the model). Users get an OpenAI-compatible base URL + API key. Serves at /spaces/<id>/'+(tplAppPortDefaults[tplInstanceType]||'')+'/v1.'}),
-              (tplInstanceType==='comfyui') && React.createElement(Alert, {type:'info', showIcon:true, style:{marginBottom:16}, message:'One-click app: just pick the image. ComfyUI starts automatically and opens at /spaces/<id>/'+(tplAppPortDefaults.comfyui)+'/.'}),
-              tplIsAppType && React.createElement(Form.Item, {name:'start_command', label: tplIsApiType?'Serve Command':'Start Command', rules: tplIsApiType?[{required:true,message:'Serve command (with model) is required'}]:[], tooltip:'Leave empty to use the framework default.'}, React.createElement(Input.TextArea, {autoSize:{minRows:1,maxRows:4}, placeholder: tplAppStartDefaults[tplInstanceType] || ''})),
-              tplIsAppType && React.createElement(Form.Item, {name:'app_port', label:'Port', style:{maxWidth:180}}, React.createElement(Select, {allowClear:true, placeholder:String(tplAppPortDefaults[tplInstanceType]||''), options:[{value:7860,label:'7860'},{value:8501,label:'8501'},{value:8188,label:'8188'},{value:8000,label:'8000'},{value:30000,label:'30000'}]})),
-              tplNeedsGithub && React.createElement(Form.Item, {name:'repo_url', label:'GitHub Repo URL', tooltip: tplIsNotebookType?'Optional. Leave empty for a blank workspace.':'Repo containing your app (cloned into the workspace).'}, React.createElement(Input, {placeholder: tplIsNotebookType?'optional, e.g. https://github.com/org/repo':'https://github.com/org/repo'})),
-              tplNeedsGithub && React.createElement(Space, {style:{width:'100%'}, size:16},
-                React.createElement(Form.Item, {name:'branch', label:'Branch', style:{width:180}}, React.createElement(Input, {placeholder:'main'})),
-                tplIsNotebookType && React.createElement(Form.Item, {name:'notebook_path', label:'Notebook Path', style:{flex:1}}, React.createElement(Input, {placeholder:'optional, e.g. notebooks/workshop.ipynb'}))
-              ),
-              React.createElement(Form.Item, {name:'cover_url', label:'Cover URL'}, React.createElement(Input, {placeholder:'optional'})),
+              React.createElement(window.TemplateFormFields, {
+                form: templateForm,
+                imageOptions: [
+                  ...editorImages.map(i=>({value:i.image,label:`${i.name} (${i.image.split('/').pop()})`})),
+                  ...(customImages||[]).filter(ci=>ci.build_status==='ready').map(ci=>({value:ci.image,label:`${ci.name} (custom)`}))
+                ],
+                isAdmin:false,
+                canPublish:isEditor
+              }),
               React.createElement(Button, {type:'primary', htmlType:'submit', block:true}, editingTemplate?'Save Template':'Add Template')
             )
           )
@@ -561,6 +558,7 @@
                 ].filter(Boolean)}),
                 activeInstance.live_status && !activeReady && activeInstance.live_status !== 'ready' && React.createElement(Alert, {type:activeInstance.live_status === 'failed' ? 'error' : 'info', showIcon:true, style:{marginTop:16}, message:displayInstanceStatus(activeInstance) || 'Instance is not ready yet', description:displayInstanceDetail(activeInstance) || undefined}),
                 activeInstance.api_base_url && renderApiAccessCard(activeInstance.api_base_url, activeInstance.api_key, activeInstance.api_model),
+                renderSshAccessCard(activeInstance),
                 React.createElement(Space, {style:{marginTop:16}, wrap:true},
                   (activeInstance.url && !activeInstance.api_base_url) && React.createElement(Button, {type:'primary', ghost:!['gradio','streamlit','comfyui'].includes((activeInstance.instance_type||'').trim()), href:activeReady ? activeInstance.url : undefined, target:'_blank', disabled:!activeReady, loading:!activeReady && instanceReady === null, title:['gradio','streamlit','comfyui'].includes((activeInstance.instance_type||'').trim()) ? 'Open App' : 'Open Notebook (Jupyter)'}, activeReady ? (['gradio','streamlit','comfyui'].includes((activeInstance.instance_type||'').trim()) ? 'Open App' : brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')) : 'Preparing...'),
                   (activeInstance.opencode_url && !activeInstance.api_base_url) && React.createElement(Button, {type:'primary', ghost:true, href:activeReady ? activeInstance.opencode_url : undefined, target:'_blank', disabled:!activeReady, title:'Open in OpenCode'}, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
@@ -577,8 +575,10 @@
                 React.createElement(Button, {type:'primary', htmlType:'submit', block:true, disabled:!couponRedeemEnabled, loading:redeemLoading}, 'Redeem')
               )
             ),
+            renderSshKeyCard(),
             renderEditorTemplates(),
-            renderCustomImages()
+            renderCustomImages(),
+            lf.launchModal
           ) : React.createElement(React.Fragment, null,
             React.createElement('section', {className:'profile-hero'}, React.createElement(Text, {style:{color:'#aaa7bc'}}, 'Account'), React.createElement(Title, {level:1, style:{color:'#fff', marginTop:8}}, 'Sign in to Radeon Cloud'), React.createElement(Paragraph, {style:{color:'#c5c2cf', maxWidth:620}}, 'Use GitHub or ModelScope to claim credits and launch GPU notebooks.')),
             React.createElement('div', {className:'profile-grid'},

@@ -9,6 +9,8 @@
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.13/dayjs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
+  <script src="/static/template_form.js"></script>
+  <script src="/static/launch_flow.js"></script>
   <style>
     html { scrollbar-gutter: stable; }
     body { margin: 0; background: #f5f6fb; }
@@ -310,7 +312,7 @@
       }
 
       function openCreateModal() {
-        createForm.setFieldsValue({ image: defaultImage, branch: 'main', category: 'Workspace' });
+        createForm.setFieldsValue({ image: defaultImage, branch: 'main', category: 'Workspace', enabled: false });
         setCreateModalOpen(true);
       }
 
@@ -318,7 +320,7 @@
         if (!currentUser || !currentUser.email) return;
         setCreateLoading(true);
         try {
-          const payload = { ...values, tags: values.tags || '', enabled: !!currentUser.is_editor, sort_order: 0 };
+          const payload = { ...values, tags: values.tags || '', sort_order: 0 };
           const res = await fetch('/api/profile/templates', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Template create failed');
@@ -776,25 +778,7 @@
         renderLaunchModal(),
         React.createElement(Modal, { title:'Publish Template', open:createModalOpen, onCancel:()=>setCreateModalOpen(false), footer:null, destroyOnClose:true, width:760 },
           currentUser && currentUser.email ? React.createElement(Form, { form:createForm, layout:'vertical', onFinish:createTemplate },
-            React.createElement(Form.Item, { name:'title', label:'Title', rules:[{required:true,message:'Title is required'}] }, React.createElement(Input, { placeholder:'Blank OpenCode Workspace' })),
-            React.createElement(Form.Item, { name:'description', label:'Description' }, React.createElement(Input.TextArea, { autoSize:true, placeholder:'Short description shown on the Gallery card' })),
-            React.createElement(Space, { style:{width:'100%'}, size:16 },
-              React.createElement(Form.Item, { name:'category', label:'Category', style:{width:180} }, React.createElement(Input, { placeholder:'Workspace' })),
-              React.createElement(Form.Item, { name:'tags', label:'Tags', style:{flex:1} }, React.createElement(Input, { placeholder:'workspace, opencode' }))
-            ),
-            React.createElement(Form.Item, { name:'image', label:'Container Image', rules:[{required:true,message:'Image is required'}] }, React.createElement(Select, { options:templateImageOptions, className:'fixed-select', popupMatchSelectWidth:true, listHeight:360 })),
-            React.createElement(Form.Item, { name:'instance_type', label:'Deploy Type', tooltip:'What this template deploys. Notebook opens Jupyter; app types open a web app; API types serve an OpenAI-compatible endpoint.' }, React.createElement(Select, { options:instanceTypeOptions, placeholder:'Notebook (Jupyter / OpenCode)' })),
-            isApiType && React.createElement(Form.Item, { name:'model_source', label:'Model Source', tooltip:'Where the model weights are downloaded from. ModelScope is usually faster in China.' }, React.createElement(Select, { options:[{value:'huggingface',label:'HuggingFace (mirror)'},{value:'modelscope',label:'ModelScope'}], placeholder:'HuggingFace (mirror)' })),
-            isApiType && React.createElement(Alert, { type:'info', showIcon:true, style:{marginBottom:16}, message: 'Model API: set the serve command (including the model). Users get an OpenAI-compatible base URL + API key. Serves at /spaces/<id>/'+(appPortDefaults[createInstanceType]||'')+'/v1.' }),
-            (createInstanceType==='comfyui') && React.createElement(Alert, { type:'info', showIcon:true, style:{marginBottom:16}, message: 'One-click app: just pick the image. ComfyUI starts automatically and opens at /spaces/<id>/'+(appPortDefaults.comfyui)+'/.' }),
-            isAppType && React.createElement(Form.Item, { name:'start_command', label: isApiType?'Serve Command':'Start Command', rules: isApiType?[{required:true,message:'Serve command (with model) is required'}]:[], tooltip:'Leave empty to use the framework default.' }, React.createElement(Input.TextArea, { autoSize:{ minRows:1, maxRows:4 }, placeholder: appStartDefaults[createInstanceType] || '' })),
-            isAppType && React.createElement(Form.Item, { name:'app_port', label:'Port', style:{maxWidth:180}, tooltip:'Port the process listens on.' }, React.createElement(Select, { allowClear:true, placeholder: String(appPortDefaults[createInstanceType] || ''), options:[{value:7860,label:'7860'},{value:8501,label:'8501'},{value:8188,label:'8188'},{value:8000,label:'8000'},{value:30000,label:'30000'}] })),
-            needsGithub && React.createElement(Form.Item, { name:'repo_url', label:'GitHub Repo URL', tooltip: isNotebookType?'Optional. Leave empty for a blank workspace.':'Repo containing your app (cloned into the workspace).' }, React.createElement(Input, { placeholder: isNotebookType?'Optional. Leave empty for an image-only workspace.':'https://github.com/org/repo' })),
-            needsGithub && React.createElement(Space, { style:{width:'100%'}, size:16 },
-              React.createElement(Form.Item, { name:'branch', label:'Branch', style:{width:180} }, React.createElement(Input, { placeholder:'main' })),
-              isNotebookType && React.createElement(Form.Item, { name:'notebook_path', label:'Notebook Path', style:{flex:1} }, React.createElement(Input, { placeholder:'Optional, e.g. notebooks/workshop.ipynb' }))
-            ),
-            React.createElement(Form.Item, { name:'cover_url', label:'Cover URL' }, React.createElement(Input, { placeholder:'Optional image URL' })),
+            React.createElement(window.TemplateFormFields, { form:createForm, imageOptions:templateImageOptions, isAdmin:false, canPublish: !!(currentUser && currentUser.is_editor) }),
             React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:createLoading }, 'Create Template')
           ) : React.createElement('div', null,
             React.createElement(Paragraph, null, 'Login first to create your own Gallery template.'),
