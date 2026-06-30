@@ -114,7 +114,11 @@ Optional fields:
 Rules:
 
 - `user_name` is required and is used as the stable demo user identity.
-- `notebook_path` is **optional**. When provided it must point to an `.ipynb` file (it is opened in the launched notebook). When omitted or empty, a blank notebook environment is started with no file pre-loaded — the returned `url` opens the JupyterLab root.
+- `notebook_path` is **optional** and accepts three shapes:
+  - **Omitted / empty** — a blank notebook environment is started with no file pre-loaded; the returned `url` opens the JupyterLab root.
+  - **An `.ipynb` file** (a `github/org/repo/blob/branch/path.ipynb` path or a `huggingface.co` notebook URL) — the notebook is fetched server-side and opened in the launched notebook.
+  - **A `.git` repo** (workshop only — see below) — the repo is cloned and JupyterLab opens at the repo root.
+- **Workshop `.git` repos:** when `pod_type` is `workshop`, `notebook_path` may be a GitHub repository instead of a notebook file: `org/repo.git`, a full `https://github.com/org/repo.git` URL, or the scp form `git@github.com:org/repo.git`. Append `@branch` to pick a branch (e.g. `org/repo.git@dev`); with no `@branch` the repo's default branch is cloned. The repo is cloned into the workspace and JupyterLab opens at its root — **no `.ipynb` is required**. A `.git` value with any non-workshop `pod_type` (or none) is rejected with `400 A .git repo can only be launched with pod_type='workshop'`. Only GitHub repositories are accepted.
 - Hugging Face notebook URLs are downloaded server-side through the configured internal Hugging Face proxy and server-side `HF_TOKEN`.
 - `image` is optional. Pass either the friendly `name` or the full `image` ref from `GET /api/huggingface/images` (name match is case-insensitive); anything not in the enabled catalog is rejected with `400 Invalid image selected`. Defaults to `default_image`.
 - `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
@@ -215,7 +219,7 @@ Example response:
 ```ts
 export type LaunchRequest = {
   user_name: string;
-  notebook_path?: string; // omit/empty for a blank notebook
+  notebook_path?: string; // omit/empty = blank; .ipynb path/URL = open notebook; org/repo.git[@branch] = clone repo (pod_type "workshop" only)
   gpu_count?: 1 | 2 | 4;
   image?: string; // a value from GET /api/huggingface/images
   pod_type?: "hackathon" | "workshop" | "one-click";

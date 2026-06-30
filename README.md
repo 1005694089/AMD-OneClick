@@ -42,10 +42,12 @@ Programmatic surface for external callers. Full guide: [`docs/huggingface-demo-a
 
 Launch request highlights:
 
-- `notebook_path` is optional — omit it for a blank JupyterLab; provide an `.ipynb` URL to pre-open it.
+- `notebook_path` is optional — omit it for a blank JupyterLab; provide an `.ipynb` URL to pre-open it; or, with `pod_type` `workshop`, provide a `.git` repo (`org/repo.git`, optional `@branch`) to clone the repo and open JupyterLab at its root (no `.ipynb` needed).
 - `image` accepts either the admin-panel **name** (e.g. `Huggingface`, case-insensitive) or the full registry ref; omit to use the API default.
 - `gpu_count` is `1`, `2`, or `4` (default `1`). CPU/memory scale automatically with the GPU count.
 - `pod_type` is an optional tag: `hackathon`, `workshop`, or `one-click`.
+
+Notebook **templates** (admin/Gallery) may likewise point at a GitHub repo with no notebook path — the repo is cloned and JupyterLab opens at its root.
 
 ## Resource Sizing
 

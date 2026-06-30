@@ -403,8 +403,24 @@ fi
             repo_url = github_info.get("repo_url") or github_info.get("clone_url")
             if repo_url:
                 repo_url_q = shlex.quote(repo_url)
-                branch_q = shlex.quote(github_info.get("branch") or "main")
                 notebook_path_q = shlex.quote(notebook_path)
+                # Pin a branch only when one is given; otherwise follow the remote's default
+                # HEAD so master-default (or any non-main) repos clone too. Templates default
+                # branch to "main", so their behaviour is unchanged.
+                branch = (github_info.get("branch") or "").strip()
+                branch_opt = f"--branch {shlex.quote(branch)} " if branch else ""
+                # Only look for / warn about a missing notebook when a path was requested. A
+                # repo-only clone (no notebook_path) just opens JupyterLab at the repo root.
+                notebook_check = ""
+                if notebook_path:
+                    # Echo the shlex-quoted path, never the raw value — a notebook_path can
+                    # contain shell metacharacters (the .ipynb parser does not sanitize the
+                    # path segments), which unquoted would break out of the echo.
+                    notebook_check = f"""if [ ! -f {notebook_path_q} ]; then
+    echo "Notebook not found:" {notebook_path_q}
+    find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
+fi
+"""
                 return f"""
 set -e
 export PATH="/root/.opencode/bin:$PATH"
@@ -415,7 +431,7 @@ if [ ! -e {workspace}/repo ]; then
     echo "Cloning {repo_url}..."
     for i in 1 2 3; do
         rm -rf {workspace}/.repo-tmp
-        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {workspace}/.repo-tmp; then
+        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 {branch_opt}{repo_url_q} {workspace}/.repo-tmp; then
             mv {workspace}/.repo-tmp {workspace}/repo
             echo "Repository cloned"
             break
@@ -428,11 +444,7 @@ else
 fi
 
 cd {workspace}/repo
-if [ ! -f {notebook_path_q} ]; then
-    echo "Notebook not found: {notebook_path}"
-    find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
-fi
-
+{notebook_check}
 {jupyter_ensure}
 {self._service_launch_snippet(instance_id, f"{workspace}/repo")}"""
             return f"""

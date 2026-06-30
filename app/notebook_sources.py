@@ -93,3 +93,70 @@ def parse_huggingface_demo_notebook_path(notebook_path: str) -> dict:
 
     github_info = parse_github_path(path)
     return github_info
+
+
+def parse_huggingface_demo_git_path(value: str) -> Optional[dict]:
+    """Parse a `.git` repo reference for a workshop launch (clone, no notebook).
+
+    Accepts a bare shorthand (`org/repo.git`), a full GitHub URL
+    (`https://github.com/org/repo.git`), or the scp form (`git@github.com:org/repo.git`),
+    each with an optional trailing `@branch` (e.g. `org/repo.git@dev`). Returns None when
+    the value is not a `.git` reference (so the caller can fall back to the `.ipynb` parser).
+    Raises ValueError when it looks like a `.git` reference but is malformed or non-GitHub.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+
+    # Split an optional trailing @branch on the LAST ".git@" so branch names with no dots are
+    # handled and the ".git" suffix detection below still works on the base.
+    base = raw
+    branch: Optional[str] = None
+    marker = raw.rfind(".git@")
+    if marker != -1:
+        base = raw[: marker + len(".git")]
+        branch = raw[marker + len(".git@") :].strip() or None
+
+    # Tolerate a trailing slash / query / fragment after ".git" (common copy/paste shapes).
+    base = base.rstrip("/")
+    for sep in ("?", "#"):
+        cut = base.find(sep)
+        if cut != -1:
+            base = base[:cut]
+    if not base.endswith(".git"):
+        return None
+
+    if base.startswith("git@"):
+        # scp form: git@HOST:org/repo.git — enforce the GitHub host like the URL branch.
+        host, _, scp_path = base[len("git@"):].partition(":")
+        if host.lower() not in {"github.com", "www.github.com"}:
+            raise ValueError("Only GitHub .git repositories are supported")
+        path = scp_path
+    elif "://" in base:
+        # An explicit URL: enforce GitHub host.
+        parsed = urlparse(base)
+        host = (parsed.netloc or "").lower()
+        if host not in {"github.com", "www.github.com"}:
+            raise ValueError("Only GitHub .git repositories are supported")
+        path = parsed.path.lstrip("/")
+    else:
+        # Bare shorthand like "org/repo.git" (no scheme): use it directly. Do NOT prepend a
+        # scheme — that would make urlparse treat "org" as the host.
+        path = base.lstrip("/")
+
+    path = path.removesuffix(".git").strip("/")
+    parts = path.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError("git repo must look like org/repo.git")
+    # Org/repo are interpolated into a github.com URL and an in-pod clone; reject any stray
+    # URL/scp metacharacters that survived parsing so they can never reach git as a wrong host.
+    if any(c in parts[0] + parts[1] for c in ("@", ":", "\\", " ")):
+        raise ValueError("git repo must look like org/repo.git")
+
+    return {
+        "org": parts[0],
+        "repo": parts[1],
+        "branch": branch,
+        "path": "",
+        "raw_url": "",
+    }

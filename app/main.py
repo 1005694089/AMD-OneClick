@@ -56,6 +56,7 @@ from .models import (
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .notebook_sources import (
     parse_github_path,
+    parse_huggingface_demo_git_path,
     parse_huggingface_demo_notebook_path,
     parse_huggingface_notebook_url,
 )
@@ -404,13 +405,9 @@ def _template_asset_base_path(template_id: int, notebook_path: str) -> str:
 
 
 def _template_github_info(template: dict) -> dict:
-    # App types (gradio/streamlit/...) clone the repo without needing a notebook
-    # path; notebook types require both repo_url and notebook_path.
-    itype = (template.get("instance_type") or "").strip()
-    is_app = itype in APP_FRAMEWORK_PRESETS
+    # Any template with a repo_url clones it. A notebook_path (when present) is opened in the
+    # launched notebook; without one, JupyterLab opens at the repo root. No repo = image-only.
     if not template.get("repo_url"):
-        return {}
-    if not is_app and not template.get("notebook_path"):
         return {}
     org, repo = _github_repo_parts(template["repo_url"])
     notebook_path = (template.get("notebook_path") or "").lstrip("/")
@@ -446,10 +443,10 @@ def _save_notebook_template(
     has_notebook = bool((req.notebook_path or "").strip())
     _req_itype = (req.instance_type or "").strip()
     _is_app_type = _req_itype in APP_FRAMEWORK_PRESETS
-    # App types may provide a repo without a notebook path (the repo is cloned and
-    # the app is started). Notebook types require repo+notebook together (or neither).
-    if not _is_app_type and has_repo != has_notebook:
-        raise ValueError("GitHub repo URL and notebook path must be provided together, or both left empty for an image-only template")
+    # A repo is always optional (no repo = image-only / blank workspace). A notebook path,
+    # however, needs a repo to clone it from. App types never use a notebook path.
+    if not _is_app_type and has_notebook and not has_repo:
+        raise ValueError("A notebook path needs a GitHub repo URL to clone from; provide a repo URL, or leave both empty for an image-only template")
     if has_repo:
         _github_repo_parts(req.repo_url or "")
     template_instance_type = (req.instance_type or "").strip() or None
@@ -2245,6 +2242,17 @@ def _parse_huggingface_demo_notebook_path(notebook_path: str) -> dict:
     return github_info
 
 
+def _parse_huggingface_demo_git_path(value: str) -> Optional[dict]:
+    """Parse a workshop `.git` repo reference into a clone-ready github_info, or None when the
+    value is not a `.git` reference (caller falls back to the .ipynb/HF parser)."""
+    git_info = parse_huggingface_demo_git_path(value)
+    if not git_info:
+        return None
+    repo_url = f"https://github.com/{git_info['org']}/{git_info['repo']}"
+    git_info["repo_url"] = _github_clone_url(repo_url)
+    return git_info
+
+
 @app.post("/api/huggingface/notebooks", response_model=NotebookStatus)
 async def launch_huggingface_demo_notebook(
     request: Request,
@@ -2253,12 +2261,25 @@ async def launch_huggingface_demo_notebook(
 ):
     pod_type = _normalize_pod_type(req.pod_type)
 
-    # A blank notebook_path launches a bare Jupyter with no repo clone.
+    # notebook_path can be: blank (bare Jupyter), a `.git` repo (workshop-only: clone + open
+    # JupyterLab at repo root), or an .ipynb / HF URL (download or clone + open the notebook).
     if (req.notebook_path or "").strip():
         try:
-            github_info = _parse_huggingface_demo_notebook_path(req.notebook_path)
+            git_info = _parse_huggingface_demo_git_path(req.notebook_path)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        if git_info is not None:
+            if pod_type != "workshop":
+                raise HTTPException(
+                    status_code=400,
+                    detail="A .git repo can only be launched with pod_type='workshop'",
+                )
+            github_info = git_info
+        else:
+            try:
+                github_info = _parse_huggingface_demo_notebook_path(req.notebook_path)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
     else:
         github_info = None
 

@@ -503,5 +503,210 @@ class BillingScope(unittest.TestCase):
         self.assertNotIn("u-b1-web", ids)
 
 
+class GitRepoParser(unittest.TestCase):
+    """parse_huggingface_demo_git_path: .git shorthand/URL/scp + optional @branch."""
+
+    def setUp(self):
+        from app.notebook_sources import parse_huggingface_demo_git_path
+        self.parse = parse_huggingface_demo_git_path
+
+    def test_shorthand_no_branch(self):
+        info = self.parse("org/repo.git")
+        self.assertEqual(info["org"], "org")
+        self.assertEqual(info["repo"], "repo")
+        self.assertIsNone(info["branch"])
+        self.assertEqual(info["path"], "")
+        self.assertEqual(info["raw_url"], "")
+
+    def test_shorthand_with_branch(self):
+        info = self.parse("org/repo.git@dev")
+        self.assertEqual((info["org"], info["repo"], info["branch"]), ("org", "repo", "dev"))
+
+    def test_full_github_url(self):
+        info = self.parse("https://github.com/org/repo.git")
+        self.assertEqual((info["org"], info["repo"]), ("org", "repo"))
+
+    def test_full_github_url_with_branch(self):
+        info = self.parse("https://github.com/org/repo.git@feature/x")
+        self.assertEqual(info["branch"], "feature/x")
+
+    def test_scp_form(self):
+        info = self.parse("git@github.com:org/repo.git")
+        self.assertEqual((info["org"], info["repo"]), ("org", "repo"))
+
+    def test_non_git_returns_none(self):
+        self.assertIsNone(self.parse("org/repo"))
+        self.assertIsNone(self.parse("https://huggingface.co/x/y/blob/main/a.ipynb"))
+        self.assertIsNone(self.parse(""))
+
+    def test_non_github_host_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse("https://gitlab.com/o/r.git")
+
+    def test_non_github_scp_rejected(self):
+        # scp form must enforce the GitHub host too (not silently accepted as a corrupt org).
+        with self.assertRaises(ValueError):
+            self.parse("git@gitlab.com:org/repo.git")
+        with self.assertRaises(ValueError):
+            self.parse("git@bitbucket.org:o/r.git")
+
+    def test_trailing_slash_query_fragment_tolerated(self):
+        self.assertEqual(self.parse("org/repo.git/")["repo"], "repo")
+        self.assertEqual(self.parse("https://github.com/org/repo.git?x=1")["repo"], "repo")
+        self.assertEqual(self.parse("https://github.com/org/repo.git#frag")["org"], "org")
+
+    def test_malformed_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse("org/x/y.git")
+        with self.assertRaises(ValueError):
+            self.parse("just-one.git")
+
+
+class GitWorkshopLaunch(HFLaunchTestBase):
+    """HF launch: a .git repo is workshop-only, builds a clone-ready github_info."""
+
+    def test_workshop_git_launch_builds_clone_info(self):
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "wsa", "image": "registry/image:tag",
+                  "pod_type": "workshop", "notebook_path": "org/repo.git"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        gi = self.fake.created[0]["github_info"]
+        self.assertEqual(gi["org"], "org")
+        self.assertEqual(gi["repo"], "repo")
+        self.assertEqual(gi["path"], "")
+        self.assertTrue(gi.get("repo_url"))
+        self.assertTrue(self.fake.created[0]["api_launched"])
+        # Root URL (no notebook path appended).
+        self.assertNotIn("/tree/", resp.json()["url"])
+
+    def test_workshop_git_branch_threaded(self):
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "wsb", "image": "registry/image:tag",
+                  "pod_type": "workshop", "notebook_path": "org/repo.git@dev"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self.fake.created[0]["github_info"]["branch"], "dev")
+
+    def test_git_requires_workshop_pod_type(self):
+        for body in (
+            {"user_name": "wsc", "image": "registry/image:tag",
+             "pod_type": "hackathon", "notebook_path": "org/repo.git"},
+            {"user_name": "wsd", "image": "registry/image:tag",
+             "notebook_path": "org/repo.git"},  # no pod_type
+        ):
+            resp = self.client.post("/api/huggingface/notebooks", json=body, headers=BEARER)
+            self.assertEqual(resp.status_code, 400, resp.text)
+            self.assertIn("workshop", resp.json()["detail"])
+
+    def test_blank_path_still_none(self):
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "wse", "image": "registry/image:tag", "pod_type": "workshop"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(self.fake.created[0]["github_info"])
+
+    def test_non_git_non_workshop_still_parses_ipynb(self):
+        # A normal .ipynb HF URL must NOT be forced into workshop-only.
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "wsf", "image": "registry/image:tag",
+                  "notebook_path": "https://huggingface.co/org/repo/blob/main/x.ipynb"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        gi = self.fake.created[0]["github_info"]
+        self.assertEqual(gi["path"], "x.ipynb")
+
+
+class TemplateRepoOnly(unittest.TestCase):
+    """Notebook templates may clone a repo with no notebook path."""
+
+    def setUp(self):
+        _pin_settings()
+
+    def test_save_allows_repo_without_notebook(self):
+        from app.models import NotebookTemplateRequest
+        store.init_db()
+        store.upsert_image("ti", "registry/image:tag", "", True)
+        req = NotebookTemplateRequest(
+            title="repo-only", slug="repo-only", image="registry/image:tag",
+            repo_url="https://github.com/org/repo", branch="main",
+            notebook_path="", instance_type="jupyter",
+        )
+        tmpl = main_module._save_notebook_template(req)
+        self.assertEqual(tmpl["repo_url"], "https://github.com/org/repo")
+        self.assertFalse((tmpl.get("notebook_path") or ""))
+
+    def test_save_rejects_notebook_without_repo(self):
+        from app.models import NotebookTemplateRequest
+        store.init_db()
+        store.upsert_image("ti2", "registry/image:tag", "", True)
+        req = NotebookTemplateRequest(
+            title="no-repo", slug="no-repo", image="registry/image:tag",
+            repo_url="", branch="main",
+            notebook_path="notebooks/x.ipynb", instance_type="jupyter",
+        )
+        with self.assertRaises(ValueError):
+            main_module._save_notebook_template(req)
+
+    def test_github_info_built_for_repo_only(self):
+        gi = main_module._template_github_info({
+            "instance_type": "jupyter", "repo_url": "https://github.com/org/repo",
+            "branch": "main", "notebook_path": "", "id": 1, "title": "t",
+        })
+        self.assertTrue(gi)  # not {}
+        self.assertEqual(gi["path"], "")
+        self.assertEqual(gi["raw_url"], "")
+        self.assertTrue(gi["repo_url"])
+
+    def test_github_info_empty_without_repo(self):
+        gi = main_module._template_github_info({
+            "instance_type": "jupyter", "repo_url": "", "branch": "main",
+            "notebook_path": "", "id": 1, "title": "t",
+        })
+        self.assertEqual(gi, {})
+
+
+class StartupScriptClone(unittest.TestCase):
+    """_build_startup_script clone branch: repo-only skips notebook-not-found; branch optional."""
+
+    def setUp(self):
+        from app.k8s_client import K8sClient
+        self.k = K8sClient.__new__(K8sClient)
+
+    def _script(self, github_info):
+        return self.k._build_startup_script("inst-1", "jupyter", github_info)
+
+    def test_repo_only_no_notebook_check_no_branch_flag(self):
+        gi = {"org": "o", "repo": "r", "branch": None, "path": "",
+              "raw_url": "", "repo_url": "http://github.com/o/r.git"}
+        s = self._script(gi)
+        self.assertIn("clone", s)
+        self.assertNotIn("Notebook not found", s)
+        self.assertNotIn("--branch", s)
+        self.assertIn("/repo", s)
+
+    def test_repo_with_path_keeps_notebook_check(self):
+        gi = {"org": "o", "repo": "r", "branch": "main", "path": "nb/x.ipynb",
+              "raw_url": "", "repo_url": "http://github.com/o/r.git"}
+        s = self._script(gi)
+        self.assertIn("Notebook not found", s)
+        self.assertIn("--branch main", s)
+
+    def test_repo_only_with_branch(self):
+        gi = {"org": "o", "repo": "r", "branch": "dev", "path": "",
+              "raw_url": "", "repo_url": "http://github.com/o/r.git"}
+        s = self._script(gi)
+        self.assertIn("--branch dev", s)
+        self.assertNotIn("Notebook not found", s)
+
+
 if __name__ == "__main__":
     unittest.main()
