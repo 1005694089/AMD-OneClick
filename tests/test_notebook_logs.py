@@ -127,6 +127,7 @@ class GithubStatusAuthTests(unittest.TestCase):
         self.client = TestClient(main_module.app)
         self._orig = main_module.k8s_client.get_instance_by_id
         self._orig_status = main_module.k8s_client.get_pod_status
+        self._orig_details = main_module.k8s_client.get_pod_status_details
         main_module.k8s_client.get_instance_by_id = lambda iid: {
             "url": "http://h:30000/lab?token=user-visible-tok",
             "opencode_url": "http://h:30001/",
@@ -135,10 +136,14 @@ class GithubStatusAuthTests(unittest.TestCase):
             "instance_id": iid,
         }
         main_module.k8s_client.get_pod_status = lambda email, instance_id=None: "ready"
+        # The status handler reads get_pod_status_details (not get_pod_status); stub it so the
+        # test exercises the auth gate, not the kube stub's missing read_namespaced_pod.
+        main_module.k8s_client.get_pod_status_details = lambda email, instance_id=None: {"status": "ready"}
 
     def tearDown(self):
         main_module.k8s_client.get_instance_by_id = self._orig
         main_module.k8s_client.get_pod_status = self._orig_status
+        main_module.k8s_client.get_pod_status_details = self._orig_details
 
     def test_status_rejected_without_matching_cookie(self):
         # No cookie at all: cannot harvest another instance's credentials by guessing the id.

@@ -34,6 +34,7 @@ class OpenCodeAuthTests(unittest.TestCase):
             k8s_module.settings.OPENCODE_WEB_USERNAME,
             k8s_module.settings.PUBLIC_BASE_URL,
             k8s_module.settings.SERVICE_HOST,
+            k8s_module.settings.OPENCODE_PUBLIC_BASE_URL,
         )
         # NOTEBOOK_TOKEN is deliberately DIFFERENT from the password secret: the OpenCode
         # password must derive from the server-only secret, never from the user-visible token.
@@ -48,6 +49,7 @@ class OpenCodeAuthTests(unittest.TestCase):
             k8s_module.settings.OPENCODE_WEB_USERNAME,
             k8s_module.settings.PUBLIC_BASE_URL,
             k8s_module.settings.SERVICE_HOST,
+            k8s_module.settings.OPENCODE_PUBLIC_BASE_URL,
         ) = self._orig
 
     @staticmethod
@@ -131,7 +133,11 @@ class OpenCodeAuthTests(unittest.TestCase):
         self.assertEqual(auth["opencode_username"], "opencode")
 
     def test_opencode_url_does_not_embed_credentials(self):
-        k8s_module.settings.PUBLIC_BASE_URL = "http://1.2.3.4:8080"
+        # Direct-NodePort branch: no handoff proxy configured, so the URL is built from
+        # _opencode_host() (SERVICE_HOST, the edge that forwards raw NodePorts) + the port.
+        # The owner authenticates via Basic auth; credentials MUST NOT be embedded in the URL.
+        k8s_module.settings.OPENCODE_PUBLIC_BASE_URL = ""
+        k8s_module.settings.SERVICE_HOST = "1.2.3.4"
         client = object.__new__(k8s_module.K8sClient)
 
         url = client._build_opencode_url(31000, "inst-a")

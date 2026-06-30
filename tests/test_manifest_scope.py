@@ -30,10 +30,14 @@ class ManifestScopeTests(unittest.TestCase):
         self.assertIn("10.233.0.10", manifest)
         self.assertNotIn("8.8.8.8", manifest)
 
-    def test_beta_notebooks_are_node_pinned(self):
+    def test_beta_notebooks_are_scoped_to_beta_nodes(self):
         manifest = (ROOT / "k8s-radeon-beta.yaml").read_text(encoding="utf-8")
 
-        self.assertIn('NOTEBOOK_NODE_NAME: "wx-ms-w7900d-0044"', manifest)
+        # Notebooks are no longer pinned to a single node: with the image-service enabled,
+        # NOTEBOOK_NODE_NAME is empty so notebooks auto-spread across all eligible beta GPU
+        # nodes (0043 + 0044) by free GPU capacity. Scoping is enforced by the beta taint
+        # toleration, not a hard node pin.
+        self.assertIn('NOTEBOOK_NODE_NAME: ""', manifest)
         self.assertIn('NOTEBOOK_TOLERATION_KEY: "amd-oneclick/beta"', manifest)
         self.assertIn("key: amd-oneclick/beta", manifest)
         self.assertIn('IMAGE_PULL_SECRET_NAME: "amd-oneclick-radeon-beta-regcred"', manifest)
