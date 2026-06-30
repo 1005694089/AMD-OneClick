@@ -26,7 +26,46 @@ secrets.
 
 ---
 
-## 2026-06-30 (latest) — Radeon beta: API default image = Radeon HuggingFace
+## 2026-06-30 (latest) — Radeon beta: evidence-based multi-GPU resource sizing
+
+**Commit:** `79b0f33` on `BETA-test` (pushed to origin). Re-sized the auto
+resource profiles so API multi-GPU launches (gpu_count 1/2/4) get CPU/RAM matched
+to the real node hardware.
+
+**Evidence (measured live on GPU nodes wx-ms-w7900d-0043/0044):** 128 CPU,
+~1007.5 GiB allocatable RAM, 8 amd.com/gpu, ~0 reserved overhead. GPU is the
+binding constraint (8/node) → per-GPU fair share ≈ 16 CPU / 125 GiB.
+
+**New profiles** (CPU unchanged from before; only RAM raised to use the node
+fully with eviction margin — per-GPU 48Gi req / 110Gi limit = 88% of fair share):
+
+| gpu_count | profile  | CPU req/lim | RAM req/lim   |
+|-----------|----------|-------------|---------------|
+| 1         | standard | 8 / 16      | 48Gi / 110Gi  |
+| 2         | large    | 16 / 32     | 96Gi / 220Gi  |
+| 4         | xlarge   | 32 / 64     | 192Gi / 440Gi |
+
+Full node bin-packs by requests (8×48=384 ≤ 1007 GiB) and stays under allocatable
+at limits (8×110=880 ≤ 1007 GiB, ~13% headroom). Reviewed by a 3-dimension
+adversarial workflow (capacity-math / correctness / ops-safety): 0 real defects.
+
+**Deploy mechanism:** patched 1 key (`k8s_client.py`) in
+`amd-oneclick-radeon-beta-code-overrides` (`kubectl patch --type merge`) +
+`rollout restart`. No config-CM or Postgres change.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Rollback snapshot (sha256, git-ignored) |
+|----------------|----------------|-----------------------|------------------------------------------|
+| radeon-beta / 30444 | `…:radeon-beta-image-service-20260625` (image unchanged) + CMs | `34ef4b45297ef16f1f1e76ece35c64d2e97f71373681801559a841cf6197cf61` | `local-deploy-history/radeon-beta/20260630-1646-gpusizing-PRE-code-overrides.yaml` (`fd7ef44f…`) |
+
+**Verified live e2e:** clean startup; a 2-GPU launch (`simtest-gpu2-ed`) got
+profile=large (CPU 16/32, RAM 96Gi/220Gi) and a 4-GPU launch (`simtest-gpu4-fi`)
+got profile=xlarge (CPU 32/64, RAM 192Gi/440Gi); both reached Running 1/1
+co-scheduled on one node (6 GPUs, no overcommit/eviction), then destroyed. 0
+residue. Full pytest suite: 143 passed.
+
+---
+
+## 2026-06-30 — Radeon beta: API default image = Radeon HuggingFace
 
 **Commit:** `502c12c` on `BETA-test` (pushed to origin). Adds
 `HUGGINGFACE_DEMO_DEFAULT_IMAGE` (env-overridable, default
