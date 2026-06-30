@@ -672,11 +672,15 @@ def grant_initial_credits_once(user_id: int, amount: int, marker: str) -> Option
         if already:
             return row_to_dict(user)
         now = utc_now()
-        if int(user["credits"]) < amount:
+        before = int(user["credits"])
+        # Record the actual credit movement so the ledger reconciles with the balance. The marker
+        # is the (user_id, reason) pair — its presence, not the delta, is what enforces once-only.
+        delta = amount - before if before < amount else 0
+        if delta:
             conn.execute(update(users).where(users.c.id == user_id).values(credits=amount, updated_at=now))
         conn.execute(
             credit_ledger.insert().values(
-                user_id=user_id, delta=0, reason=marker, instance_id=None, created_at=now,
+                user_id=user_id, delta=delta, reason=marker, instance_id=None, created_at=now,
             )
         )
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())

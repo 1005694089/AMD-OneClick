@@ -134,9 +134,18 @@ class Feature3Credits(HFLaunchTestBase):
     def test_grant_marker_written_once_and_no_retop_after_spend_to_zero(self):
         cap = main_module.settings.HUGGINGFACE_DEMO_MIN_CREDITS
         u = store.get_or_create_external_user(main_module.HF_DEMO_PROVIDER, "zoe", "zoe@hf.local")
+        # New user starts at 0 credits, so the grant delta must equal the full floor.
+        _set_credits(u["id"], 0)
         store.grant_initial_credits_once(u["id"], cap, "hf_initial_grant")
         self.assertEqual(store.get_user(u["id"])["credits"], cap)
-        # Spend to zero, then call grant again: marker present -> no re-top.
+        # Ledger must reconcile: the grant row records the real +cap movement, not 0.
+        with store.engine.begin() as conn:
+            rows = conn.exec_driver_sql(
+                "SELECT delta FROM credit_ledger WHERE user_id=? AND reason='hf_initial_grant'",
+                (u["id"],),
+            ).fetchall()
+        self.assertEqual([r[0] for r in rows], [cap])
+        # Spend to zero, then call grant again: marker present -> no re-top, no new ledger row.
         _set_credits(u["id"], 0)
         store.grant_initial_credits_once(u["id"], cap, "hf_initial_grant")
         self.assertEqual(store.get_user(u["id"])["credits"], 0)
