@@ -2263,7 +2263,7 @@ async def launch_huggingface_demo_notebook(
 
     provider_id, display_name, email = _huggingface_demo_user_identity(req.user_name)
     gpu_count = req.gpu_count or 1
-    image = req.image or settings.DEFAULT_IMAGE
+    image = req.image or settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE
 
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
@@ -2435,7 +2435,7 @@ async def destroy_huggingface_demo_notebook(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _image_catalog_payload() -> dict:
+def _image_catalog_payload(default_image: Optional[str] = None) -> dict:
     """The enabled image catalog (same set the launch validator accepts)."""
     return {
         "images": [
@@ -2446,14 +2446,14 @@ def _image_catalog_payload() -> dict:
             }
             for img in list_images(enabled_only=True)
         ],
-        "default_image": settings.DEFAULT_IMAGE,
+        "default_image": default_image or settings.DEFAULT_IMAGE,
     }
 
 
 @app.get("/api/huggingface/images")
 async def huggingface_demo_images(_auth: None = Depends(verify_huggingface_demo_api)):
     """Discover the selectable image catalog (HF bearer auth)."""
-    return _image_catalog_payload()
+    return _image_catalog_payload(default_image=settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE)
 
 
 @app.get("/api/admin/images-list")

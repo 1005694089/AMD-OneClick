@@ -31,6 +31,59 @@ Do not put this token in a public frontend bundle. The recommended frontend flow
 
 This bearer token is separate from the upstream Hugging Face access token. The upstream `HF_TOKEN` is configured server-side in the beta deployment and is used only by notebook pods when downloading `.ipynb` files through the internal Hugging Face proxy. Frontend code should never send or know the upstream `HF_TOKEN`.
 
+## Credits
+
+Each demo user is granted a small starting credit balance the first time they launch (one-time grant; it is **not** refilled on later launches). Running instances are metered at **1 credit per GPU per hour**. When a user's balance is exhausted, their running instance is automatically destroyed. A launch is rejected with `400 Insufficient credits` if the balance is below the requested `gpu_count`.
+
+## List Available Images
+
+Discover the images a notebook can launch with. This is the same enabled catalog the admin panel shows.
+
+```http
+GET /api/huggingface/images
+Authorization: Bearer <token>
+```
+
+Example response:
+
+```json
+{
+  "images": [
+    {
+      "name": "AMD OneClick Base",
+      "image": "<registry>/amd-oneclick-base:<tag>",
+      "description": "Default ROCm Jupyter/OpenCode image"
+    }
+  ],
+  "default_image": "<registry>/amd-oneclick-base:<tag>"
+}
+```
+
+Use any returned `image` value as the optional `image` field when launching. Omit `image` to use `default_image` (the API default is the Hugging Face image built for AMD Radeon).
+
+## Check GPU Availability
+
+Report free vs total GPUs reachable by this service's launches (not the whole cluster).
+
+```http
+GET /api/huggingface/gpus
+Authorization: Bearer <token>
+```
+
+Example response:
+
+```json
+{
+  "total_gpus": 16,
+  "free_gpus": 15,
+  "nodes": [
+    { "node": "<node-name>", "total": 8, "free": 7, "committed": 1, "quarantined": false }
+  ]
+}
+```
+
+`free` is schedulable capacity (`total - committed`), not live utilization. Check this before launching multi-GPU instances.
+
 ## Launch A Notebook
 
 ```http
@@ -49,19 +102,22 @@ Request body:
 }
 ```
 
-Optional field:
+Optional fields:
 
 ```json
 {
-  "image": "<allowed-notebook-image>"
+  "image": "<allowed-notebook-image>",
+  "pod_type": "hackathon"
 }
 ```
 
 Rules:
 
 - `user_name` is required and is used as the stable demo user identity.
-- `notebook_path` must point to an `.ipynb` file.
+- `notebook_path` is **optional**. When provided it must point to an `.ipynb` file (it is opened in the launched notebook). When omitted or empty, a blank notebook environment is started with no file pre-loaded — the returned `url` opens the JupyterLab root.
 - Hugging Face notebook URLs are downloaded server-side through the configured internal Hugging Face proxy and server-side `HF_TOKEN`.
+- `image` is optional. It must be one of the values returned by `GET /api/huggingface/images`; otherwise the launch is rejected with `400 Invalid image selected`. Defaults to the catalog's `default_image`.
+- `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
 - `gpu_count` must be `1`, `2`, or `4`. Default is `1`.
 - Each `user_name` can have only one active notebook.
 
@@ -145,6 +201,14 @@ Example response:
 ## Minimal TypeScript Types
 
 ```ts
+export type LaunchRequest = {
+  user_name: string;
+  notebook_path?: string; // omit/empty for a blank notebook
+  gpu_count?: 1 | 2 | 4;
+  image?: string; // a value from GET /api/huggingface/images
+  pod_type?: "hackathon" | "workshop" | "one-click";
+};
+
 export type NotebookStatus = {
   status: string;
   message: string;
@@ -158,11 +222,30 @@ export type DestroyResponse = {
   message: string;
   destroyed_count: number;
 };
+
+export type ImageCatalog = {
+  images: { name: string; image: string; description: string }[];
+  default_image: string;
+};
+
+export type GpuAvailability = {
+  total_gpus: number;
+  free_gpus: number;
+  nodes: {
+    node: string;
+    total: number;
+    free: number;
+    committed: number;
+    quarantined: boolean;
+  }[];
+};
 ```
 
 ## UX Notes
 
 - If launch returns `400` with `Each user can only have one active instance`, call the status endpoint and show the existing notebook.
+- If launch returns `400` with `Insufficient credits`, the user is out of credits — show their balance and stop offering launch.
+- To build a launch form, call `GET /api/huggingface/images` for the image dropdown and `GET /api/huggingface/gpus` to show available capacity before submitting.
 - If status stays `initializing` or `jupyter_starting`, keep polling.
 - If status is `failed`, show an error and offer retry or cleanup.
 - If the notebook URL opens but the expected `.ipynb` is missing, report it as a backend download issue. Frontend clients should not retry direct Hugging Face downloads themselves.

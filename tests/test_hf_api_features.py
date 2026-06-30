@@ -107,6 +107,18 @@ class Feature1BlankPath(HFLaunchTestBase):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertIsNone(self.fake.created[0]["github_info"])
 
+    def test_omitting_image_uses_api_default(self):
+        # The API default must exist in the enabled catalog and be selected when image is omitted.
+        store.upsert_image("Huggingface", main_module.settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE, "", True)
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "carl-default"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self.fake.created[0]["image"],
+                         main_module.settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE)
+
 
 class Feature3Credits(HFLaunchTestBase):
     def test_grant_once_on_creation_no_retop(self):
@@ -285,6 +297,11 @@ class Feature2And6Endpoints(unittest.TestCase):
         imgs = {i["image"] for i in resp.json()["images"]}
         self.assertIn("registry/image:tag2", imgs)
         self.assertNotIn("registry/off:tag", imgs)
+
+    def test_hf_images_reports_api_default_image(self):
+        resp = self.client.get("/api/huggingface/images", headers=BEARER)
+        self.assertEqual(resp.json()["default_image"],
+                         main_module.settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE)
 
     def test_admin_images_list_matches(self):
         resp = self.client.get("/api/admin/images-list", auth=ADMIN)

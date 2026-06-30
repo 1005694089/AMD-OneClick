@@ -343,6 +343,12 @@ class Settings:
     HUGGINGFACE_DEMO_MIN_CREDITS: int = int(
         os.getenv("HUGGINGFACE_DEMO_MIN_CREDITS", os.getenv("HUGGINGFACE_MIN_CREDITS", "8"))
     )
+    # Default image for API launches when the caller omits `image`. Must exist in the enabled
+    # catalog. Independent of DEFAULT_IMAGE (the web UI default).
+    HUGGINGFACE_DEMO_DEFAULT_IMAGE: str = os.getenv(
+        "HUGGINGFACE_DEMO_DEFAULT_IMAGE",
+        "crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:latest",
+    )
     TELEMETRY_API_URL: str = os.getenv("TELEMETRY_API_URL", "")
     METRICS_INGEST_API_KEY: str = os.getenv("METRICS_INGEST_API_KEY", "")
     ONECLICK_TELEMETRY_ENABLED: bool = os.getenv("ONECLICK_TELEMETRY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
