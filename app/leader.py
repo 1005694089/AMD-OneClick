@@ -38,6 +38,11 @@ class LeaderElector:
         self._thread = None
         self._coord = None
         self._namespace = settings.K8S_NAMESPACE
+        # Timestamp of our last successful acquire/renew. On a TRANSIENT renew error we keep
+        # leadership as long as our own lease has not yet expired, instead of dropping it on the
+        # first blip (which would briefly leave zero leaders). Only a confirmed loss (a peer holds
+        # a fresh lease) flips us to follower.
+        self._last_renew_ok = None
 
     @property
     def identity(self) -> str:
@@ -83,12 +88,28 @@ class LeaderElector:
 
     def _run(self):
         renew = max(1.0, float(settings.LEADER_LEASE_RENEW_SECONDS))
+        # Claim promptly on startup rather than waiting one full interval first.
+        try:
+            self._renew_or_acquire()
+        except Exception as exc:
+            logger.warning("Leader election initial acquire error: %s", exc)
         while not self._stop.wait(renew):
             try:
                 self._renew_or_acquire()
             except Exception as exc:
-                logger.warning("Leader election loop error: %s", exc)
-                self._is_leader = False
+                # Transient apiserver error: do NOT immediately abdicate. Keep leadership while our
+                # own last successful renew is still within the lease duration (fail-safe toward one
+                # leader). Only a confirmed loss inside _renew_or_acquire flips us to follower.
+                duration = float(settings.LEADER_LEASE_DURATION_SECONDS)
+                if (
+                    self._is_leader
+                    and self._last_renew_ok is not None
+                    and (_now() - self._last_renew_ok).total_seconds() < duration
+                ):
+                    logger.warning("Leader renew transient error (holding lease): %s", exc)
+                else:
+                    logger.warning("Leader renew error past lease window; dropping leadership: %s", exc)
+                    self._is_leader = False
 
     def _renew_or_acquire(self, release: bool = False):
         from kubernetes import client
@@ -107,7 +128,8 @@ class LeaderElector:
                 raise
 
         if lease is None:
-            # Create and claim.
+            # Create and claim. If a peer created it first we get 409 — re-read and evaluate the
+            # now-existing lease instead of treating it as a generic loop error.
             body = client.V1Lease(
                 metadata=client.V1ObjectMeta(name=name, namespace=self._namespace),
                 spec=client.V1LeaseSpec(
@@ -117,9 +139,16 @@ class LeaderElector:
                     renew_time=now,
                 ),
             )
-            self._coord.create_namespaced_lease(self._namespace, body)
-            self._is_leader = True
-            return
+            try:
+                self._coord.create_namespaced_lease(self._namespace, body)
+                self._is_leader = True
+                self._last_renew_ok = now
+                return
+            except ApiException as e:
+                if e.status == 409:
+                    lease = self._coord.read_namespaced_lease(name, self._namespace)
+                else:
+                    raise
 
         spec = lease.spec
         holder = spec.holder_identity
@@ -142,6 +171,7 @@ class LeaderElector:
             spec.lease_duration_seconds = duration
             self._coord.replace_namespaced_lease(name, self._namespace, lease)
             self._is_leader = True
+            self._last_renew_ok = now
         elif holder is None or expired:
             # Vacant or stale: take over.
             spec.holder_identity = self._identity
@@ -150,8 +180,9 @@ class LeaderElector:
             spec.lease_duration_seconds = duration
             self._coord.replace_namespaced_lease(name, self._namespace, lease)
             self._is_leader = True
+            self._last_renew_ok = now
         else:
-            # Someone else holds a fresh lease.
+            # Someone else holds a fresh lease: confirmed loss.
             self._is_leader = False
 
 
