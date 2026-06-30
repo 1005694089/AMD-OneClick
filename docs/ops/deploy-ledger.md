@@ -26,7 +26,59 @@ secrets.
 
 ---
 
-## 2026-06-29 (latest) — Radeon beta: remove prepull, deadlock-resistant image-service
+## 2026-06-30 (latest) — Radeon beta: HuggingFace external-API features (6)
+
+**Commit:** `9bbac49` on `BETA-test` (pushed to origin). Adds six external/HF-API
+features so the demo API is self-serve and correctly metered.
+
+**What shipped:**
+- **Blank `notebook_path`** launches a bare Jupyter (no repo clone).
+- **Image discovery** endpoints: `GET /api/huggingface/images` (HF bearer) +
+  `GET /api/admin/images-list` (admin Basic), enabled catalog only.
+- **HF credits stick:** the starting floor is granted exactly once via a
+  `credit_ledger` marker (`hf_initial_grant`) — race-safe across concurrent
+  first-launches, never re-topped after spend-down. Repo default floor 48→8
+  (note: beta `amd-oneclick-radeon-beta-config` overrides
+  `HUGGINGFACE_DEMO_MIN_CREDITS=48`, so the effective beta floor is still 48 —
+  change the ConfigMap to apply 8 on beta). One-time backfill
+  (`hf_backfill_cap_v1`) caps inflated `huggingface_demo` balances to the floor;
+  on beta it ran as a no-op at cap=48 (29 users already at 48).
+- **Idle reaper fixed** to key on the real instance id (not `nb-{md5(email)}`),
+  wired into the scheduler as `idle_reaper_job`; API-launched pods auto-destroyed
+  after 8h idle (`API_IDLE_TIMEOUT_MINUTES=480`), uptime fallback only on empty
+  logs, transient log-read errors skip the tick. **Note:** beta runs
+  `RUN_SCHEDULER=false`, so neither billing nor the reaper executes on beta until
+  that flag is flipped.
+- **pod_type tag** (`hackathon`/`workshop`/`one-click`) validated + persisted to
+  `instance_records`/`instance_launch_events` (new `pod_type` column + ALTER) and
+  set as the `amd-oneclick/pod-type` annotation, on both HF and standard paths.
+- **GPU availability:** `GET /api/huggingface/gpus` + `GET /api/admin/gpus`,
+  free/total over launch-eligible nodes.
+
+**Deploy mechanism:**
+- **Manager:** patched 6 keys (`config/k8s_client/main/models/scheduler/store.py`)
+  in the existing `amd-oneclick-radeon-beta-code-overrides` ConfigMap (other 15
+  keys byte-preserved), `kubectl patch --type merge` + `rollout restart`. Live CM
+  was confirmed byte-identical to committed HEAD (27c8093) before the patch, so no
+  drift was reconciled. The live-only `data_mounts.py` mount + `data-mounts-root`
+  volume were left untouched. Postgres Deployment/Service/Secret untouched.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 (`kubectl get cm -o yaml \| sha256sum`) | Rollback snapshot (sha256, git-ignored) |
+|----------------|----------------|-----------------------|------------------------------------------|
+| radeon-beta / 30444 | `crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-image-service-20260625` (image unchanged) + `code-overrides` ConfigMap | `ac9890dee3cb1d0baa09c2ee96646d63cad9d3fe466061f5dc6d65c0caf1e944` | `local-deploy-history/radeon-beta/20260630-1450-hf-api-PRE-code-overrides.yaml` (`90d5bafef26ee9104559d73f8654a3671eeec5728d087c09642eea544c054918`) |
+
+**Verified live:** manager pod clean startup (no traceback); `pod_type` columns
+migrated on beta Postgres; `hf_backfill_cap_v1` marker written; endpoints e2e:
+`/api/huggingface/images` 200 + 401 unauth, `/api/huggingface/gpus` 200
+(`total_gpus:16, free_gpus:15`), admin variants 200 + 401 unauth, bad `pod_type`
+→ 400; a blank-path `pod_type=workshop` launch created pod `hf-43-96b719c3` with
+`api-launched=true` + `pod-type=workshop` annotations and no github annotation,
+DB row `pod_type=workshop`, exactly one `hf_initial_grant` marker — then destroyed
+cleanly via the DELETE endpoint. Full pytest suite: 138 passed.
+
+---
+
+## 2026-06-29 — Radeon beta: remove prepull, deadlock-resistant image-service
 
 **Commit:** `572d4b2` on `BETA-test` (pushed to origin). Fixes the containerd
 per-layer-chain unpack-mutex deadlock (`unpack.lockSnChainID`) by making the
