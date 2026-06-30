@@ -26,7 +26,49 @@ secrets.
 
 ---
 
-## 2026-06-30 (latest) — Radeon beta: clone a repo with no notebook file
+## 2026-06-30 (latest) — Radeon beta: GPU nodes dashboard (admin, beta-only)
+
+**Commit:** `807d286` on `BETA-test` (pushed). New admin "GPU Nodes" tab showing
+per-node GPU status (health, used/total/free, CPU/mem, model) + cluster utilization
+(counters, per-node bar chart, per-node running instances). Gated by a new
+`GPU_DASHBOARD_ENABLED` flag (default false; set true only in the beta config CM).
+
+**Design notes:** `gpu_cluster_status()` lists every GPU node this service owns
+(incl cordoned/NotReady) via `list_node()` + `_node_belongs_to_service`. The beta
+SA can list nodes cluster-wide but NOT pods across namespaces (403), so committed/
+free + the instance list are scoped to this deployment's namespace and labeled as
+such (`usage_scope=namespace`; "Schedulable free" excludes idle GPUs on
+unhealthy nodes). `list_instances()` now carries `node_name` (getattr-safe).
+
+**Review:** 3-dimension adversarial workflow (correctness/security/regression),
+each finding verified. 3 confirmed, all fixed before deploy: (HIGH) `node_name`
+access would break an existing opencode test mock → switched to
+`getattr(pod.spec,"node_name",None)` (verified that test now passes); (low) headline
+counters didn't visibly sum → relabeled "Schedulable free" + disclaimer; (low)
+error-fallback object shape → mirror the default. Security pass: clean (admin auth
++ 404 gate; React escapes; tojson-safe).
+
+**Deploy mechanism:** patched 4 keys (`config.py`, `k8s_client.py`, `main.py`,
+`admin.html`) in `amd-oneclick-radeon-beta-code-overrides` (`kubectl patch --type
+merge`) AND added `GPU_DASHBOARD_ENABLED: "true"` to `amd-oneclick-radeon-beta-config`
+(envFrom source). `rollout restart`. No Postgres change.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 (post-patch, data) | Rollback snapshot (sha256, git-ignored) |
+|----------------|----------------|------------------------------------------|------------------------------------------|
+| radeon-beta / 30444 | image unchanged + CMs | `58c18cc5f07450a72b957427656c9ecd9ccaa18b00f25fa61b0ac3ae36705f67` | `local-deploy-history/radeon-beta/cm-snapshot-20260630-211322.yaml` (`26eeb8a5429b97e1344b4fa644cf20dd2282012dd4ea6982e9bdcfb16ae00c05`) |
+
+(Rollback also requires removing `GPU_DASHBOARD_ENABLED` from the config CM, or the
+tab stays visible even on old code — though the endpoint 404s without the new main.py.)
+
+**Verified live e2e:** new pod runs new code, flag True. `gpu_cluster_status()`
+returns 2 beta GPU nodes (model AMD_Radeon_Pro_W7900D, mem 1007.5 GiB, health,
+used=1/16, usage_scope=namespace). `GET /api/admin/gpu-nodes` with admin auth → 200
+total=16; no-auth → 401. `/admin` serves `gpuDashboardEnabled=true` + the "GPU Nodes"
+tab. Tests: the at-risk opencode test passes with the getattr fix; 11 GPU tests green.
+
+---
+
+## 2026-06-30 — Radeon beta: clone a repo with no notebook file (prev)
 
 **Commit:** `64b2ec3` on `BETA-test` (pushed to origin). Two ways to launch
 JupyterLab from a cloned repo with no `.ipynb`: (A) the HF demo API accepts a
