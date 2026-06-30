@@ -14,6 +14,7 @@ class NotebookRequest(BaseModel):
     gpu_count: int = 1
     resource_profile: Optional[str] = "auto"
     disk_size_gb: Optional[int] = None
+    pod_type: Optional[str] = None
 
 
 class ImageRequest(BaseModel):
@@ -82,9 +83,10 @@ class TemplateLaunchRequest(BaseModel):
 class HuggingFaceNotebookLaunchRequest(BaseModel):
     """Request model for launching a GitHub notebook from the Hugging Face demo API"""
     user_name: str
-    notebook_path: str
+    notebook_path: Optional[str] = None
     gpu_count: int = 1
     image: Optional[str] = None
+    pod_type: Optional[str] = None
 
 
 class CustomImageBuildRequest(BaseModel):

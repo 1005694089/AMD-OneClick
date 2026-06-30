@@ -82,6 +82,7 @@ from .store import (
     get_user_by_provider,
     get_user,
     ensure_user_min_credits,
+    grant_initial_credits_once,
     grant_user_credits,
     ensure_template_preview_cache,
     init_db,
@@ -206,6 +207,22 @@ templates = Jinja2Templates(directory="templates")
 # HTTP Basic Auth for admin
 security = HTTPBasic()
 HF_DEMO_PROVIDER = "huggingface_demo"
+
+# Caller-supplied pod tags accepted by the API. Empty/None means untagged interactive.
+ALLOWED_POD_TYPES = {"hackathon", "workshop", "one-click"}
+
+
+def _normalize_pod_type(value: Optional[str]) -> Optional[str]:
+    """Validate an optional caller-supplied pod tag; raise 400 if non-empty and unknown."""
+    normalized = (value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized not in ALLOWED_POD_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid pod_type. Allowed: {', '.join(sorted(ALLOWED_POD_TYPES))}",
+        )
+    return normalized
 
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -1236,6 +1253,7 @@ async def _provision_notebook_instance(user: dict, email: str, image: str, param
     and the distribute-resume path so both produce an identical instance + DB row + telemetry."""
     instance_type = params["instance_type"]
     gpu_count = params["gpu_count"]
+    pod_type = params.get("pod_type")
     instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
     instance = k8s_client.create_instance(
         email, image,
@@ -1244,13 +1262,16 @@ async def _provision_notebook_instance(user: dict, email: str, image: str, param
         custom_instance_id=instance_id,
         resource_profile=params.get("resource_profile", "auto"),
         disk_size_gb=params.get("disk_size_gb"),
+        pod_type=pod_type,
     )
     _stamp_launch(user, image, target_node or None)
     record_instance(
         user["id"], email, instance["id"], image, instance_type, gpu_count,
         instance.get("node_port"), instance.get("opencode_node_port"),
+        pod_type=pod_type,
     )
-    record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count)
+    record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count,
+                                 pod_type=pod_type)
     from .telemetry import report_gpu_instance_created_event
 
     await report_gpu_instance_created_event(
@@ -1354,6 +1375,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     instance_type = req.instance_type or "jupyter"
     gpu_count = req.gpu_count or 1
     resource_profile = _validate_resource_profile(req.resource_profile)
+    pod_type = _normalize_pod_type(req.pod_type)
 
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
@@ -1394,6 +1416,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             "gpu_count": gpu_count,
             "resource_profile": resource_profile,
             "disk_size_gb": disk_size_gb,
+            "pod_type": pod_type,
         })
         return NotebookStatus(
             status="distributing",
@@ -1408,6 +1431,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             "gpu_count": gpu_count,
             "resource_profile": resource_profile,
             "disk_size_gb": disk_size_gb,
+            "pod_type": pod_type,
         }, target_node)
         return NotebookStatus(
             status="allocating",
@@ -2226,10 +2250,16 @@ async def launch_huggingface_demo_notebook(
     req: HuggingFaceNotebookLaunchRequest,
     _auth: None = Depends(verify_huggingface_demo_api),
 ):
-    try:
-        github_info = _parse_huggingface_demo_notebook_path(req.notebook_path)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    pod_type = _normalize_pod_type(req.pod_type)
+
+    # A blank notebook_path launches a bare Jupyter with no repo clone.
+    if (req.notebook_path or "").strip():
+        try:
+            github_info = _parse_huggingface_demo_notebook_path(req.notebook_path)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        github_info = None
 
     provider_id, display_name, email = _huggingface_demo_user_identity(req.user_name)
     gpu_count = req.gpu_count or 1
@@ -2247,7 +2277,12 @@ async def launch_huggingface_demo_notebook(
         name=display_name,
         initial_credits=0,
     )
-    user = ensure_user_min_credits(user["id"], settings.HUGGINGFACE_DEMO_MIN_CREDITS) or user
+    # Grant the starting credit floor exactly once (tracked by a ledger marker), never re-topping
+    # on later launches — otherwise usage the billing loop charged would be refunded and credits
+    # would never decrease. The marker is race-safe across concurrent first-launches.
+    user = grant_initial_credits_once(
+        user["id"], settings.HUGGINGFACE_DEMO_MIN_CREDITS, "hf_initial_grant"
+    ) or user
 
     active = get_active_instance_for_user(user["id"])
     if active:
@@ -2268,11 +2303,15 @@ async def launch_huggingface_demo_notebook(
             github_info=github_info,
             custom_instance_id=instance_id,
             resource_profile="auto",
+            pod_type=pod_type,
+            api_launched=True,
         )
         _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,
-                        instance.get("node_port"), instance.get("opencode_node_port"))
-        record_instance_launch_event(user["id"], email, instance["id"], image, "jupyter", gpu_count)
+                        instance.get("node_port"), instance.get("opencode_node_port"),
+                        pod_type=pod_type)
+        record_instance_launch_event(user["id"], email, instance["id"], image, "jupyter", gpu_count,
+                                     pod_type=pod_type)
         from .telemetry import report_gpu_instance_created_event
 
         await report_gpu_instance_created_event(
@@ -2285,7 +2324,7 @@ async def launch_huggingface_demo_notebook(
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for the Hugging Face demo notebook...",
-            url=_instance_public_url(request, instance["id"], github_info.get("path")),
+            url=_instance_public_url(request, instance["id"], github_info.get("path") if github_info else None),
             opencode_url=instance.get("opencode_url"),
             opencode_username=instance.get("opencode_username"),
             opencode_password=instance.get("opencode_password"),
@@ -2394,6 +2433,49 @@ async def destroy_huggingface_demo_notebook(
     except Exception as e:
         logger.error("Error destroying Hugging Face demo notebook %s: %s", instance_id, e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _image_catalog_payload() -> dict:
+    """The enabled image catalog (same set the launch validator accepts)."""
+    return {
+        "images": [
+            {
+                "name": img["name"],
+                "image": img["image"],
+                "description": img.get("description") or "",
+            }
+            for img in list_images(enabled_only=True)
+        ],
+        "default_image": settings.DEFAULT_IMAGE,
+    }
+
+
+@app.get("/api/huggingface/images")
+async def huggingface_demo_images(_auth: None = Depends(verify_huggingface_demo_api)):
+    """Discover the selectable image catalog (HF bearer auth)."""
+    return _image_catalog_payload()
+
+
+@app.get("/api/admin/images-list")
+async def admin_images_list(_username: str = Depends(verify_admin)):
+    """Same image catalog as the HF endpoint, under admin Basic auth."""
+    return _image_catalog_payload()
+
+
+@app.get("/api/huggingface/gpus")
+async def huggingface_demo_gpus(_auth: None = Depends(verify_huggingface_demo_api)):
+    """Free vs total GPUs reachable by this service's launches (HF bearer auth).
+
+    Scoped to launch-eligible nodes, not the entire cluster — see gpu_capacity_summary."""
+    return k8s_client.gpu_capacity_summary()
+
+
+@app.get("/api/admin/gpus")
+async def admin_gpus(_username: str = Depends(verify_admin)):
+    """Free vs total GPUs reachable by this service's launches (admin Basic auth).
+
+    Scoped to launch-eligible nodes, not the entire cluster — see gpu_capacity_summary."""
+    return k8s_client.gpu_capacity_summary()
 
 
 @app.get("/github/{full_path:path}", response_class=HTMLResponse)

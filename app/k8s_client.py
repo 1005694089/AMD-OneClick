@@ -578,7 +578,9 @@ exec {cmd}
                           disk_size_gb: Optional[int] = None,
                           model_source: Optional[str] = None,
                           ssh_enabled: bool = False,
-                          ssh_public_key: Optional[str] = None) -> dict:
+                          ssh_public_key: Optional[str] = None,
+                          pod_type: Optional[str] = None,
+                          api_launched: bool = False) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -606,6 +608,10 @@ exec {cmd}
             annotations["amd-oneclick/workspace-quota-node"] = workspace_quota_node_name
         if notebook_node_name:
             annotations["amd-oneclick/notebook-node"] = notebook_node_name
+        if pod_type:
+            annotations["amd-oneclick/pod-type"] = pod_type
+        if api_launched:
+            annotations["amd-oneclick/api-launched"] = "true"
 
         if github_info:
             annotations["amd-oneclick/github-org"] = github_info.get("org", "")
@@ -1352,6 +1358,72 @@ exit 0
                 return name
         return None
 
+    def gpu_capacity_summary(self) -> dict:
+        """Report free vs total GPUs over the nodes this service can launch onto.
+
+        Scope is the launch-eligible node set (_eligible_target_nodes): GPU nodes carrying the
+        prepull label whose taints this manager tolerates, excluding the image-service host. This
+        is intentionally NOT the whole cluster — it is the capacity reachable by this service's
+        launches, so free_gpus matches where _select_target_gpu_node actually routes pods. Reuses
+        the launch-time accounting (allocatable amd.com/gpu minus GPUs committed by non-terminal
+        pods). Quarantined nodes count toward total but contribute 0 to free. Kube errors are
+        swallowed per-node so the endpoint returns partial results instead of failing."""
+        quarantined = set()
+        try:
+            quarantined = store.quarantined_nodes()
+        except Exception as e:
+            logger.debug("quarantined_nodes lookup failed: %s", e)
+
+        nodes_out = []
+        total_gpus = 0
+        free_gpus = 0
+        try:
+            targets = self._eligible_target_nodes()
+        except Exception as e:
+            logger.error("gpu_capacity_summary: cannot list nodes: %s", e)
+            return {"total_gpus": 0, "free_gpus": 0, "nodes": []}
+
+        for target in targets:
+            name = target["node"]
+            try:
+                node = self.core_v1.read_node(name=name)
+            except ApiException:
+                continue
+            allocatable = node.status.allocatable or {}
+            try:
+                node_gpus = int(allocatable.get("amd.com/gpu", 0))
+            except (TypeError, ValueError):
+                continue
+            if node_gpus <= 0:
+                continue
+            committed = 0
+            try:
+                pods = self.core_v1.list_namespaced_pod(
+                    namespace=self.namespace,
+                    field_selector=f"spec.nodeName={name},status.phase!=Succeeded,status.phase!=Failed",
+                )
+                for pod in pods.items:
+                    for container in pod.spec.containers or []:
+                        requests = getattr(container.resources, "requests", None) or {}
+                        try:
+                            committed += int(requests.get("amd.com/gpu", 0))
+                        except (TypeError, ValueError):
+                            continue
+            except ApiException:
+                pass
+            is_quarantined = name in quarantined
+            node_free = max(0, node_gpus - committed)
+            total_gpus += node_gpus
+            free_gpus += 0 if is_quarantined else node_free
+            nodes_out.append({
+                "node": name,
+                "total": node_gpus,
+                "free": node_free,
+                "committed": committed,
+                "quarantined": is_quarantined,
+            })
+        return {"total_gpus": total_gpus, "free_gpus": free_gpus, "nodes": nodes_out}
+
     def count_user_pods_on_node(self, node_name: str) -> int:
         """Count running (non-terminal) user notebook pods on a node.
 
@@ -1560,7 +1632,9 @@ exit 0
                         disk_size_gb: Optional[int] = None,
                         model_source: Optional[str] = None,
                         ssh_enabled: bool = False,
-                        ssh_public_key: Optional[str] = None) -> dict:
+                        ssh_public_key: Optional[str] = None,
+                        pod_type: Optional[str] = None,
+                        api_launched: bool = False) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -1613,6 +1687,8 @@ exit 0
             model_source=model_source,
             ssh_enabled=ssh_enabled,
             ssh_public_key=ssh_public_key,
+            pod_type=pod_type,
+            api_launched=api_launched,
         )
         for attempt in range(1, 7):
             try:
@@ -1837,6 +1913,8 @@ exit 0
                     "github_org": github_org,
                     "github_repo": github_repo,
                     "github_path": github_path,
+                    "pod_type": pod.metadata.annotations.get("amd-oneclick/pod-type"),
+                    "api_launched": pod.metadata.annotations.get("amd-oneclick/api-launched") == "true",
                 })
         except ApiException as e:
             logger.error(f"Error listing pods: {e}")
@@ -2207,37 +2285,46 @@ exit 0
             logger.debug(f"TCP health check failed for {host}:{port}: {e}")
             return False
     
-    def check_pod_activity(self, email: str) -> Optional[datetime]:
-        """Check last activity of a pod by examining logs"""
-        instance_id = self._generate_instance_id(email)
-        
-        try:
-            # Get recent logs
-            logs = self.core_v1.read_namespaced_pod_log(
-                name=instance_id,
-                namespace=self.namespace,
-                tail_lines=10,
-                timestamps=True
-            )
-            
-            if logs:
-                # Parse last log timestamp
-                lines = logs.strip().split('\n')
-                if lines:
-                    last_line = lines[-1]
-                    # Kubernetes log format: 2024-01-01T00:00:00.000000000Z ...
-                    timestamp_str = last_line.split(' ')[0]
-                    try:
-                        return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                    except ValueError:
-                        pass
-            
-            return None
-        except ApiException:
-            return None
+    def check_pod_activity(self, email: str, instance_id: Optional[str] = None) -> Optional[datetime]:
+        """Check last activity of a pod by examining logs.
+
+        Pods launched via the API use custom instance IDs (e.g. hf-<id>-<hash>) that do not match
+        _generate_instance_id(email), so callers must pass instance_id to target the right pod.
+
+        Returns None ONLY when the pod has no parseable activity timestamp. A transient kube API
+        error (read_namespaced_pod_log raising) is re-raised so the caller can tell "no activity"
+        apart from "could not check", and avoid reaping an active pod on a flaky tick.
+        """
+        if not instance_id:
+            instance_id = self._generate_instance_id(email)
+
+        # Get recent logs (ApiException propagates: "unknown", not "idle").
+        logs = self.core_v1.read_namespaced_pod_log(
+            name=instance_id,
+            namespace=self.namespace,
+            tail_lines=10,
+            timestamps=True
+        )
+        if logs:
+            # Parse last log timestamp
+            lines = logs.strip().split('\n')
+            if lines:
+                last_line = lines[-1]
+                # Kubernetes log format: 2024-01-01T00:00:00.000000000Z ...
+                timestamp_str = last_line.split(' ')[0]
+                try:
+                    return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                except ValueError:
+                    pass
+        return None
     
     def cleanup_idle_instances(self) -> list:
-        """Cleanup idle and expired instances"""
+        """Cleanup idle and expired instances.
+
+        Targets pods by their real instance id (from list_instances), so custom-id pods
+        (hf-*, u-*) are matched. API-launched pods follow the longer API idle/lifetime budget;
+        all other pods keep their existing per-type behavior.
+        """
         cleaned = []
         instances = self.list_instances()
         now = datetime.now(timezone.utc)
@@ -2245,34 +2332,53 @@ exit 0
         for instance in instances:
             should_delete = False
             reason = ""
+            instance_id = instance.get("id")
+            if not instance_id or instance_id == "unknown":
+                continue
 
-            itype = instance.get("instance_type", "jupyter")
-            type_cfg = INSTANCE_TYPES.get(itype, {})
-            raw_lifetime = type_cfg.get("max_lifetime_hours")
-            max_lifetime = raw_lifetime if raw_lifetime is not None else settings.MAX_LIFETIME_HOURS
-            raw_idle = type_cfg.get("idle_timeout_minutes")
-            idle_timeout = raw_idle if raw_idle is not None else settings.IDLE_TIMEOUT_MINUTES
+            if instance.get("api_launched"):
+                idle_timeout = settings.API_IDLE_TIMEOUT_MINUTES
+                max_lifetime = settings.API_MAX_LIFETIME_HOURS or settings.MAX_LIFETIME_HOURS
+            else:
+                itype = instance.get("instance_type", "jupyter")
+                type_cfg = INSTANCE_TYPES.get(itype, {})
+                raw_lifetime = type_cfg.get("max_lifetime_hours")
+                max_lifetime = raw_lifetime if raw_lifetime is not None else settings.MAX_LIFETIME_HOURS
+                raw_idle = type_cfg.get("idle_timeout_minutes")
+                idle_timeout = raw_idle if raw_idle is not None else settings.IDLE_TIMEOUT_MINUTES
 
-            uptime_hours = instance["uptime_minutes"] / 60
-            if uptime_hours >= max_lifetime:
+            uptime_minutes = instance["uptime_minutes"]
+            if max_lifetime and uptime_minutes / 60 >= max_lifetime:
                 should_delete = True
                 reason = f"exceeded max lifetime ({max_lifetime}h)"
 
-            elif instance["status"] == "running" and idle_timeout > 0:
-                last_activity = self.check_pod_activity(instance["email"])
+            elif instance["status"] == "running" and idle_timeout and idle_timeout > 0:
+                try:
+                    last_activity = self.check_pod_activity(instance["email"], instance_id=instance_id)
+                except ApiException as e:
+                    # Could not read logs this tick; treat as "unknown" and skip, so a flaky
+                    # API call never reaps an active pod via the uptime fallback.
+                    logger.debug("check_pod_activity failed for %s; skipping idle check: %s", instance_id, e)
+                    continue
                 if last_activity:
                     idle_minutes = (now - last_activity).total_seconds() / 60
                     if idle_minutes >= idle_timeout:
                         should_delete = True
                         reason = f"idle for {int(idle_minutes)} minutes (limit {idle_timeout}m)"
+                elif instance.get("api_launched") and uptime_minutes >= idle_timeout:
+                    # No parseable log timestamps: fall back to pod age as the idle proxy.
+                    should_delete = True
+                    reason = f"no activity logs; up {int(uptime_minutes)} minutes (limit {idle_timeout}m)"
 
             if should_delete:
-                if self.delete_instance(instance["email"]):
+                if self.delete_instance_by_id(instance_id):
+                    store.mark_instance_deleted(instance_id)
                     cleaned.append({
                         "email": instance["email"],
-                        "reason": reason
+                        "instance_id": instance_id,
+                        "reason": reason,
                     })
-                    logger.info(f"Cleaned up instance for {instance['email']}: {reason}")
+                    logger.info("Cleaned up instance %s for %s: %s", instance_id, instance["email"], reason)
 
         return cleaned
 

@@ -178,6 +178,7 @@ instance_records = Table(
     Column("ready_at", String(64)),
     Column("billing_started_at", String(64)),
     Column("deleted_at", String(64)),
+    Column("pod_type", String(64)),
 )
 
 instance_launch_events = Table(
@@ -193,6 +194,7 @@ instance_launch_events = Table(
     Column("template_id", Integer),
     Column("template_title", String(255)),
     Column("created_at", String(64), nullable=False),
+    Column("pod_type", String(64)),
 )
 
 credit_ledger = Table(
@@ -421,6 +423,51 @@ def ensure_schema_columns(conn):
         if "quarantined_until" not in image_node_columns:
             conn.execute(text("ALTER TABLE image_nodes ADD COLUMN quarantined_until VARCHAR(64)"))
 
+    # Caller-supplied pod tag (hackathon/workshop/one-click). Nullable, no default -> old rows = NULL.
+    instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
+    if "pod_type" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN pod_type VARCHAR(64)"))
+    launch_event_columns = {col["name"] for col in inspector.get_columns("instance_launch_events")}
+    if "pod_type" not in launch_event_columns:
+        conn.execute(text("ALTER TABLE instance_launch_events ADD COLUMN pod_type VARCHAR(64)"))
+
+    _backfill_hf_credit_cap(conn)
+
+
+def _backfill_hf_credit_cap(conn):
+    """One-time cap of inflated HuggingFace demo balances to the current grant floor.
+
+    Earlier code re-topped HF users to the floor on every launch while billing never decremented
+    in production, leaving balances stuck high. Runs exactly once, guarded by a marker ledger row.
+    """
+    cap = int(settings.HUGGINGFACE_DEMO_MIN_CREDITS)
+    marker = "hf_backfill_cap_v1"
+    already = conn.execute(
+        select(credit_ledger.c.id).where(credit_ledger.c.reason == marker).limit(1)
+    ).first()
+    if already:
+        return
+    # The marker row requires a user_id (NOT NULL). Defer the whole backfill until at least one
+    # user exists, so the cap UPDATE and the marker always commit together — otherwise on an empty
+    # DB the UPDATE would run with no marker and re-run on every later startup.
+    anchor = conn.execute(select(users.c.id).order_by(users.c.id.asc()).limit(1)).scalar()
+    if anchor is None:
+        return
+    conn.execute(
+        update(users)
+        .where(users.c.provider == "huggingface_demo", users.c.credits > cap)
+        .values(credits=cap)
+    )
+    conn.execute(
+        credit_ledger.insert().values(
+            user_id=anchor,
+            delta=0,
+            reason=marker,
+            instance_id=None,
+            created_at=utc_now(),
+        )
+    )
+
 
 def ensure_default_image(conn):
     now = utc_now()
@@ -598,6 +645,35 @@ def ensure_user_min_credits(user_id: int, minimum_credits: int) -> Optional[dict
             return None
         if int(user["credits"]) < minimum_credits:
             conn.execute(update(users).where(users.c.id == user_id).values(credits=minimum_credits, updated_at=utc_now()))
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
+def grant_initial_credits_once(user_id: int, amount: int, marker: str) -> Optional[dict]:
+    """Grant a starting credit floor exactly once per user, tracked by a ledger marker.
+
+    Unlike a _created flag, this survives the get_or_create race: if two concurrent first-launches
+    hit the same brand-new user, only one writes the marker (and the grant), the other is a no-op.
+    It also never re-tops after the user legitimately spends down, because the marker persists.
+    """
+    with engine.begin() as conn:
+        user = conn.execute(select(users).where(users.c.id == user_id)).mappings().first()
+        if not user:
+            return None
+        already = conn.execute(
+            select(credit_ledger.c.id).where(
+                credit_ledger.c.user_id == user_id, credit_ledger.c.reason == marker
+            ).limit(1)
+        ).first()
+        if already:
+            return row_to_dict(user)
+        now = utc_now()
+        if int(user["credits"]) < amount:
+            conn.execute(update(users).where(users.c.id == user_id).values(credits=amount, updated_at=now))
+        conn.execute(
+            credit_ledger.insert().values(
+                user_id=user_id, delta=0, reason=marker, instance_id=None, created_at=now,
+            )
+        )
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
 
 
@@ -2287,7 +2363,7 @@ def delete_launch_intent(user_id: int) -> None:
         conn.execute(launch_intents.delete().where(launch_intents.c.user_id == user_id))
 
 
-def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None):
+def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None, pod_type: Optional[str] = None):
     now = utc_now()
     billing_session_id = f"{instance_id}:{uuid.uuid4().hex[:12]}"
     with engine.begin() as conn:
@@ -2309,6 +2385,7 @@ def record_instance(user_id: int, email: str, instance_id: str, image: str, inst
             ready_at=None,
             billing_started_at=None,
             deleted_at=None,
+            pod_type=pod_type,
         )
         if existing:
             conn.execute(update(instance_records).where(instance_records.c.id == existing["id"]).values(**values))
@@ -2325,6 +2402,7 @@ def record_instance_launch_event(
     gpu_count: int,
     template_id: Optional[int] = None,
     template_title: Optional[str] = None,
+    pod_type: Optional[str] = None,
 ):
     with engine.begin() as conn:
         conn.execute(
@@ -2338,6 +2416,7 @@ def record_instance_launch_event(
                 template_id=template_id,
                 template_title=template_title,
                 created_at=utc_now(),
+                pod_type=pod_type,
             )
         )
 

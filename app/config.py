@@ -277,6 +277,13 @@ class Settings:
     IDLE_TIMEOUT_MINUTES: int = int(os.getenv("IDLE_TIMEOUT_MINUTES", "10"))
     MAX_LIFETIME_HOURS: int = int(os.getenv("MAX_LIFETIME_HOURS", "6"))
 
+    # API-launched (e.g. HuggingFace) pods get a longer budget: auto-destroy after 8h idle.
+    API_IDLE_TIMEOUT_MINUTES: int = int(os.getenv("API_IDLE_TIMEOUT_MINUTES", "480"))
+    API_MAX_LIFETIME_HOURS: Optional[int] = (
+        int(os.getenv("API_MAX_LIFETIME_HOURS")) if os.getenv("API_MAX_LIFETIME_HOURS") else None
+    )
+    IDLE_REAPER_INTERVAL_MINUTES: int = int(os.getenv("IDLE_REAPER_INTERVAL_MINUTES", "5"))
+
     SMTP_HOST: Optional[str] = os.getenv("SMTP_HOST")
     SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
     SMTP_USER: Optional[str] = os.getenv("SMTP_USER")
@@ -334,7 +341,7 @@ class Settings:
 
     HUGGINGFACE_DEMO_API_TOKENS: str = os.getenv("HUGGINGFACE_DEMO_API_TOKENS", os.getenv("HUGGINGFACE_API_TOKENS", ""))
     HUGGINGFACE_DEMO_MIN_CREDITS: int = int(
-        os.getenv("HUGGINGFACE_DEMO_MIN_CREDITS", os.getenv("HUGGINGFACE_MIN_CREDITS", "48"))
+        os.getenv("HUGGINGFACE_DEMO_MIN_CREDITS", os.getenv("HUGGINGFACE_MIN_CREDITS", "8"))
     )
     TELEMETRY_API_URL: str = os.getenv("TELEMETRY_API_URL", "")
     METRICS_INGEST_API_KEY: str = os.getenv("METRICS_INGEST_API_KEY", "")

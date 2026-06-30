@@ -129,14 +129,33 @@ async def reap_stale_image_jobs_job():
         logger.error(f"Stale image job reaper failed: {e}")
 
 
+async def idle_reaper_job():
+    """Auto-destroy idle/expired instances (API-launched pods after 8h idle)."""
+    from .k8s_client import k8s_client
+
+    try:
+        cleaned = k8s_client.cleanup_idle_instances()
+        if cleaned:
+            logger.info("Idle reaper destroyed %s instance(s): %s", len(cleaned), cleaned)
+    except Exception as e:
+        logger.error(f"Idle reaper job failed: {e}")
+
+
 def start_scheduler():
     """Start the background scheduler"""
     scheduler.add_job(
         cleanup_job,
         trigger=IntervalTrigger(minutes=1),
         id="cleanup_job",
-        name="Cleanup idle and expired instances",
+        name="Bill running instances per GPU-hour",
         replace_existing=True
+    )
+    scheduler.add_job(
+        idle_reaper_job,
+        trigger=IntervalTrigger(minutes=settings.IDLE_REAPER_INTERVAL_MINUTES),
+        id="idle_reaper_job",
+        name="Auto-destroy idle and expired instances",
+        replace_existing=True,
     )
     scheduler.add_job(
         template_preview_sync_job,
