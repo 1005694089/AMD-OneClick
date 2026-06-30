@@ -26,7 +26,32 @@ secrets.
 
 ---
 
-## 2026-06-30 (latest) — Radeon beta: fix hf_initial_grant ledger delta
+## 2026-06-30 (latest) — Radeon beta: API default image = Radeon HuggingFace
+
+**Commit:** `502c12c` on `BETA-test` (pushed to origin). Adds
+`HUGGINGFACE_DEMO_DEFAULT_IMAGE` (env-overridable, default
+`crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:latest`).
+The HF launch handler uses it when the caller omits `image`, and
+`/api/huggingface/images` reports it as `default_image`. Independent of the web
+UI `DEFAULT_IMAGE`. The image already exists enabled in the catalog (name
+"Huggingface"), so launches validate.
+
+**Deploy mechanism:** patched 2 keys (`config.py`, `main.py`) in
+`amd-oneclick-radeon-beta-code-overrides` (`kubectl patch --type merge`) +
+`rollout restart`. No config-CM or Postgres change.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Rollback snapshot (sha256, git-ignored) |
+|----------------|----------------|-----------------------|------------------------------------------|
+| radeon-beta / 30444 | `…:radeon-beta-image-service-20260625` (image unchanged) + CMs | `fd7ef44f63c4f9f2ec47ce0cf6b9de4906f738a79c41bc0b3ab82938f0ccde80` | `local-deploy-history/radeon-beta/20260630-1607-apidefault-PRE-code-overrides.yaml` (`570efae4…`) |
+
+**Verified live:** clean startup; `/api/huggingface/images` `default_image` =
+the Radeon HuggingFace ref; a launch omitting `image` (`simtest-apidefault-x`)
+recorded instance `hf-51-4027fb8a` with that exact image, then destroyed. Full
+pytest suite: 141 passed.
+
+---
+
+## 2026-06-30 — Radeon beta: fix hf_initial_grant ledger delta
 
 **Commit:** `00282b3` on `BETA-test` (pushed to origin). Found by a live
 multi-agent API-user simulation (4 personas, 28 steps): the once-only HF credit
