@@ -1983,6 +1983,12 @@ def set_image_node_status(node_name: str, image_ref: str, status: str, size_byte
 
     Used to record `importing` (in-flight distribute) and `quarantined` (wedged node) states so a
     hung import is distinguishable from "never started". Only `loaded` counts as available elsewhere.
+
+    `importing` is a NON-DOWNGRADING marker: it must never overwrite an existing `loaded` row. A
+    re-distribute of an already-loaded image marks the node `importing` before streaming; if that
+    import then FAILS the row would be left stuck `importing` and the image — still physically on the
+    node — would read as unavailable (0/N). So an `importing` write is applied only to rows that are
+    not already `loaded`; a genuine success still flips the row to `loaded` via upsert_image_node.
     """
     now = utc_now()
     with engine.begin() as conn:
@@ -1994,11 +2000,33 @@ def set_image_node_status(node_name: str, image_ref: str, status: str, size_byte
         # Existence-check then UPDATE-or-INSERT. We avoid catching IntegrityError inside the txn: on
         # PostgreSQL a failed INSERT aborts the whole transaction, so a fallback statement on the
         # same connection would raise InFailedSqlTransaction (see notebook-template note above).
+        where = [image_nodes.c.image_ref == image_ref, image_nodes.c.node_name == node_name]
+        if status == "importing":
+            # Do not clobber a known-good loaded row with a transient importing marker.
+            where.append(image_nodes.c.status != "loaded")
         result = conn.execute(
             update(image_nodes)
-            .where(image_nodes.c.image_ref == image_ref, image_nodes.c.node_name == node_name)
+            .where(*where)
             .values(**values)
         )
+        if status == "importing" and result.rowcount == 0:
+            # Either the row is already loaded (leave it) or it does not exist yet. Distinguish: only
+            # insert a fresh importing row when no row exists at all.
+            exists = conn.execute(
+                select(image_nodes.c.status).where(
+                    image_nodes.c.image_ref == image_ref,
+                    image_nodes.c.node_name == node_name,
+                )
+            ).first()
+            if exists is not None:
+                # Row exists and is loaded -> intentionally leave it loaded; return it as-is.
+                row = conn.execute(
+                    select(image_nodes).where(
+                        image_nodes.c.image_ref == image_ref,
+                        image_nodes.c.node_name == node_name,
+                    )
+                ).mappings().first()
+                return row_to_dict(row)
         if result.rowcount == 0:
             # Insert in a SAVEPOINT so a concurrent inserter winning the UNIQUE race doesn't poison
             # the outer txn; on conflict fall back to UPDATE.
@@ -2084,6 +2112,22 @@ def quarantined_nodes() -> set[str]:
             )
         ).all()
         return {r[0] for r in rows}
+
+
+def clear_importing_nodes(image_ref: str) -> int:
+    """Delete rows left in the transient `importing` state for a ref (after a failed distribute).
+
+    Only touches `importing` rows, never `loaded` ones, so a still-resident image keeps its
+    availability. Returns the number of rows removed.
+    """
+    with engine.begin() as conn:
+        result = conn.execute(
+            image_nodes.delete().where(
+                image_nodes.c.image_ref == image_ref,
+                image_nodes.c.status == "importing",
+            )
+        )
+        return result.rowcount
 
 
 def image_loaded_on_node(image_ref: str, node_name: str) -> bool:

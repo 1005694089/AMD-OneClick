@@ -1857,6 +1857,15 @@ async def report_image_job_result(job_id: int, req: ImageJobResultRequest, _agen
         except Exception as e:
             logger.error("Failed to sync lifecycle for image job %s (%s): %s", job_id, job.get("kind"), e)
     else:
+        # A failed distribute must not leave nodes stuck in the transient `importing` state (which
+        # reads as "not loaded" forever). Clear any importing rows for this ref so status reflects
+        # reality. Fix-1 guarantees a previously-loaded row was never downgraded to importing, so
+        # this only drops genuinely-incomplete imports.
+        if job.get("kind") == "distribute" and job.get("ref"):
+            try:
+                store.clear_importing_nodes(job["ref"])
+            except Exception as e:
+                logger.warning("Failed to clear importing rows for %s: %s", job.get("ref"), e)
         # A failed step aborts the chain (no next step is enqueued). Surface the failure on the
         # linked catalog image so it shows 'failed' instead of spinning in 'pulling'/'distributing'.
         image_id = job.get("image_id")

@@ -140,6 +140,28 @@ class NodeStatusQuarantineTests(unittest.TestCase):
         self.assertFalse(store.image_loaded_on_node("img:x", "nodeA"))
         self.assertEqual(store.list_nodes_for_image("img:x"), [])
 
+    def test_importing_does_not_downgrade_loaded(self):
+        # A re-distribute of an already-loaded image marks the node importing before streaming.
+        # That must NOT clobber the loaded row — otherwise a failed re-import leaves the image
+        # (still on the node) reading as unavailable. Regression for the base-image 0/2 incident.
+        store.upsert_image_node("nodeB", "img:base", status="loaded")
+        self.assertTrue(store.image_loaded_on_node("img:base", "nodeB"))
+        store.set_image_node_status("nodeB", "img:base", "importing")  # re-distribute begins
+        self.assertTrue(store.image_loaded_on_node("img:base", "nodeB"))  # still loaded
+        self.assertEqual(store.list_nodes_for_image("img:base"), ["nodeB"])
+
+    def test_clear_importing_nodes_after_failed_distribute(self):
+        # A fresh (never-loaded) node marked importing, then the distribute fails -> the importing
+        # row is cleared so status reflects reality (not stuck importing forever).
+        store.set_image_node_status("nodeC", "img:new", "importing")
+        self.assertEqual(store.list_nodes_for_image("img:new"), [])  # importing != loaded
+        removed = store.clear_importing_nodes("img:new")
+        self.assertEqual(removed, 1)
+        # A loaded row is never cleared by this.
+        store.upsert_image_node("nodeD", "img:keep", status="loaded")
+        self.assertEqual(store.clear_importing_nodes("img:keep"), 0)
+        self.assertTrue(store.image_loaded_on_node("img:keep", "nodeD"))
+
     def test_quarantine_sets_and_lists(self):
         store.quarantine_node("nodeB", "img:y", 1800)
         self.assertIn("nodeB", store.quarantined_nodes())
