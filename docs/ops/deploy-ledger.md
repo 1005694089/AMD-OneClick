@@ -26,7 +26,45 @@ secrets.
 
 ---
 
-## 2026-06-30 (latest) — Radeon beta: HuggingFace external-API features (6)
+## 2026-06-30 (latest) — Radeon beta: scope billing to API instances, enable scheduler
+
+**Commit:** `3eb3b1d` on `BETA-test` (pushed to origin). Makes credit metering
+apply only to API-launched instances, then turns the scheduler on for beta.
+
+**What shipped:**
+- **Billing scoped to API instances.** New `instance_records.api_launched` column
+  (BOOLEAN NOT NULL DEFAULT FALSE, additive ALTER); `list_active_instances()` (the
+  billing loop's source) now filters `api_launched IS TRUE`. `record_instance`
+  gained an `api_launched` param, set True only on the HF launch path. Existing
+  web/template rows default FALSE, so enabling the scheduler does NOT retroactively
+  bill or kill them.
+- **Config flips on beta** (`amd-oneclick-radeon-beta-config`):
+  `HUGGINGFACE_DEMO_MIN_CREDITS` 48→10, `RUN_SCHEDULER` false→true. Billing
+  (`cleanup_job`) and the idle reaper (`idle_reaper_job`) now run every 1m/5m.
+
+**Deploy mechanism:**
+- **Manager:** patched 2 keys (`store.py`, `main.py`) in
+  `amd-oneclick-radeon-beta-code-overrides` (`kubectl patch --type merge`); the
+  live-only data_mounts integration in `config/k8s_client/models.py` was left
+  intact (those keys not touched). Config CM patched for the two env flips.
+  `rollout restart` + status wait. Postgres Deployment/Service/Secret untouched.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Config sha256 | Rollback snapshots (sha256, git-ignored) |
+|----------------|----------------|-----------------------|---------------|------------------------------------------|
+| radeon-beta / 30444 | `…/amd-oneclick:radeon-beta-image-service-20260625` (image unchanged) + CMs | `037f994d56810e0a75410986b4953b9fe917261c60d6bec18c5c111322dcb4d9` | `56cf0cc0ebe793b1f3bcf292f8957e83dcf7adc47237970e9dc2eb217449b57c` | `local-deploy-history/radeon-beta/20260630-1532-billing-scope-PRE-code-overrides.yaml` (`290f96c5…`), `…-PRE-config.yaml` (`4deaf162…`) |
+
+**Verified live:** scheduler running (logs show "Bill running instances per
+GPU-hour" + "Auto-destroy idle and expired instances" jobs executing every minute,
+"No instances to clean up"); aditya's pre-existing web instance `u-11-3414db96`
+(opencode, 4d) **not billed and still Running** (api_launched FALSE); a fresh HF
+launch `billtest-aa` → user funded at exactly **10** credits with one
+`hf_initial_grant` marker, instance `hf-45-0ea74586` recorded `api_launched=t`
+`pod_type=hackathon` (so billing will meter it), then destroyed via the DELETE
+endpoint. Full pytest suite: 139 passed.
+
+---
+
+## 2026-06-30 — Radeon beta: HuggingFace external-API features (6)
 
 **Commit:** `9bbac49` on `BETA-test` (pushed to origin). Adds six external/HF-API
 features so the demo API is self-serve and correctly metered.
