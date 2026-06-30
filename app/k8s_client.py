@@ -26,27 +26,33 @@ logger = logging.getLogger(__name__)
 
 _node_port_lock = threading.Lock()
 
+# Sized to the GPU nodes' real capacity (measured: 128 CPU / ~1007 GiB / 8 GPU per node,
+# ~0 reserved overhead). GPU is the binding constraint (8/node), so each profile takes a
+# GPU-proportional share: CPU limit = 16/GPU (exact fair share), memory limit ~110 GiB/GPU
+# (88% of the 125 GiB/GPU fair share, leaving margin for kernel/page cache/daemonsets so a
+# spike does not trigger node memory-pressure eviction). Requests sit well below limits so a
+# full node of single-GPU pods still bin-packs (8x8 CPU = 64 <= 128; 8x48 GiB = 384 <= 1007).
 RESOURCE_PROFILES = {
     "standard": {
-        "label": "16 CPU / 64Gi memory",
+        "label": "16 CPU / 110Gi memory",
         "cpu_request": "8",
         "cpu_limit": "16",
-        "memory_request": "32Gi",
-        "memory_limit": "64Gi",
+        "memory_request": "48Gi",
+        "memory_limit": "110Gi",
     },
     "large": {
-        "label": "32 CPU / 128Gi memory",
+        "label": "32 CPU / 220Gi memory",
         "cpu_request": "16",
         "cpu_limit": "32",
-        "memory_request": "64Gi",
-        "memory_limit": "128Gi",
+        "memory_request": "96Gi",
+        "memory_limit": "220Gi",
     },
     "xlarge": {
-        "label": "64 CPU / 256Gi memory",
+        "label": "64 CPU / 440Gi memory",
         "cpu_request": "32",
         "cpu_limit": "64",
-        "memory_request": "128Gi",
-        "memory_limit": "256Gi",
+        "memory_request": "192Gi",
+        "memory_limit": "440Gi",
     },
 }
 

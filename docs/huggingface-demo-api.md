@@ -118,7 +118,7 @@ Rules:
 - Hugging Face notebook URLs are downloaded server-side through the configured internal Hugging Face proxy and server-side `HF_TOKEN`.
 - `image` is optional. It must be one of the values returned by `GET /api/huggingface/images`; otherwise the launch is rejected with `400 Invalid image selected`. Defaults to the catalog's `default_image`.
 - `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
-- `gpu_count` must be `1`, `2`, or `4`. Default is `1`.
+- `gpu_count` must be `1`, `2`, or `4`. Default is `1`. CPU and memory scale automatically with the GPU count (see **GPU Sizing** below). Each GPU costs 1 credit/hour, so a 4-GPU instance consumes credits 4x as fast. Check `GET /api/huggingface/gpus` for free capacity before requesting `2` or `4`.
 - Each `user_name` can have only one active notebook.
 
 Example success response:
@@ -132,6 +132,18 @@ Example success response:
   "instance_id": "hf-4-xxxx"
 }
 ```
+
+## GPU Sizing
+
+CPU and memory are allocated automatically in proportion to `gpu_count` (each GPU node has 128 CPU / ~1007 GiB / 8 GPU, so each GPU's fair share is ~16 CPU / ~125 GiB):
+
+| `gpu_count` | CPU (request / limit) | Memory (request / limit) |
+|-------------|-----------------------|--------------------------|
+| 1           | 8 / 16                | 48Gi / 110Gi             |
+| 2           | 16 / 32               | 96Gi / 220Gi             |
+| 4           | 32 / 64               | 192Gi / 440Gi            |
+
+You do not set CPU/memory directly; they follow `gpu_count`. A larger instance needs more free GPUs on a single node, so a `4` request can be rejected if no node has 4 free GPUs even when the cluster total is higher — check `GET /api/huggingface/gpus` (the per-node `free` field) first.
 
 ## Poll Notebook Status
 

@@ -329,6 +329,41 @@ class Feature2And6Endpoints(unittest.TestCase):
         self.assertEqual(r2.json(), r1.json())
 
 
+class MultiGpuResourceProfiles(unittest.TestCase):
+    """gpu_count -> auto resource profile sizing (CPU/RAM scale with GPUs)."""
+
+    def setUp(self):
+        from app.k8s_client import K8sClient
+        self.k = K8sClient.__new__(K8sClient)
+
+    def test_auto_profile_scales_with_gpu_count(self):
+        cases = {
+            1: ("standard", "16", "110Gi"),
+            2: ("large", "32", "220Gi"),
+            4: ("xlarge", "64", "440Gi"),
+        }
+        for gpu, (name, cpu_lim, mem_lim) in cases.items():
+            pname, res = self.k._resolve_resource_profile(gpu, "auto")
+            self.assertEqual(pname, name, f"gpu={gpu}")
+            self.assertEqual(res["cpu_limit"], cpu_lim, f"gpu={gpu}")
+            self.assertEqual(res["memory_limit"], mem_lim, f"gpu={gpu}")
+
+    def test_profiles_fit_within_node_capacity(self):
+        # Node hardware (measured): 128 CPU, ~1007 GiB, 8 GPU. A full node of same-size pods
+        # must fit by REQUESTS (what the scheduler bin-packs on).
+        from app.k8s_client import RESOURCE_PROFILES, AUTO_RESOURCE_PROFILE_BY_GPU
+        NODE_CPU, NODE_GIB, NODE_GPU = 128, 1007, 8
+        for gpu, pname in AUTO_RESOURCE_PROFILE_BY_GPU.items():
+            res = RESOURCE_PROFILES[pname]
+            pods_per_node = NODE_GPU // gpu
+            cpu_req = int(res["cpu_request"]) * pods_per_node
+            mem_req = int(res["memory_request"].rstrip("Gi")) * pods_per_node
+            self.assertLessEqual(cpu_req, NODE_CPU, f"gpu={gpu} cpu requests overcommit")
+            self.assertLessEqual(mem_req, NODE_GIB, f"gpu={gpu} mem requests overcommit")
+            # A single pod's LIMIT must not exceed the node's GPU-proportional share.
+            self.assertLessEqual(int(res["memory_limit"].rstrip("Gi")), (NODE_GIB // NODE_GPU) * gpu + 1)
+
+
 class Feature4IdleReaper(unittest.TestCase):
     """cleanup_idle_instances must key on instance id and scope 8h to API pods."""
 
