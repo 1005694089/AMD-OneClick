@@ -26,7 +26,36 @@ secrets.
 
 ---
 
-## 2026-06-30 (latest) — Radeon beta: evidence-based multi-GPU resource sizing
+## 2026-06-30 (latest) — Radeon beta: select launch image by admin-panel name
+
+**Commit:** `d7375a5` on `BETA-test` (pushed to origin). API callers can now pass
+the friendly image NAME (e.g. `Huggingface`) in the `image` field, not just the
+full registry ref.
+
+**What shipped:** new `store.resolve_enabled_image(value)` matches an ENABLED
+catalog row by ref (priority) or case-insensitive name (deterministic, ordered by
+id to avoid ambiguity if a case-variant duplicate name ever exists). The HF launch
+handler resolves the caller's value and launches with the real ref; unknown/disabled
+→ `400 Invalid image selected`. Reviewed by a 2-dimension adversarial workflow
+(correctness / ambiguity-security): 1 low finding (name-match determinism) fixed
+before deploy.
+
+**Deploy mechanism:** patched 2 keys (`store.py`, `main.py`) in
+`amd-oneclick-radeon-beta-code-overrides` (`kubectl patch --type merge`) +
+`rollout restart`. No config-CM or Postgres change.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Rollback snapshot (sha256, git-ignored) |
+|----------------|----------------|-----------------------|------------------------------------------|
+| radeon-beta / 30444 | `…:radeon-beta-image-service-20260625` (image unchanged) + CMs | `7c250eeff05a135f634b4f9e1a58312d14a01c9ad575710dfe32ff057a74a359` | `local-deploy-history/radeon-beta/20260630-1659-imgbyname-PRE-code-overrides.yaml` (`34ef4b45…`) |
+
+**Verified live e2e:** clean startup; launch by name `Huggingface` resolved to
+`…/huaggingface_for_amd_radeon:latest` and `comfy-ui` to `…/comfyui:latest` (DB
+refs match catalog exactly); an unknown name → 400; both test instances destroyed,
+0 residue. Full pytest suite: 149 passed.
+
+---
+
+## 2026-06-30 — Radeon beta: evidence-based multi-GPU resource sizing
 
 **Commit:** `79b0f33` on `BETA-test` (pushed to origin). Re-sized the auto
 resource profiles so API multi-GPU launches (gpu_count 1/2/4) get CPU/RAM matched
