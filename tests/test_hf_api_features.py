@@ -708,5 +708,167 @@ class StartupScriptClone(unittest.TestCase):
         self.assertNotIn("Notebook not found", s)
 
 
+class GpuClusterStatus(unittest.TestCase):
+    """gpu_cluster_status: all service GPU nodes incl unhealthy; committed/free from own ns."""
+
+    def setUp(self):
+        _pin_settings()
+        from app.k8s_client import K8sClient
+        self.k = K8sClient.__new__(K8sClient)
+        self.k.namespace = "test-ns"
+
+    def _node(self, name, gpus, ready=True, cordoned=False, cpu="128", mem="1056403496Ki",
+              model="AMD_Radeon_Pro_W7900D"):
+        from types import SimpleNamespace as NS
+        labels = {}
+        if model:
+            labels["amd.com/gpu.product-name"] = model
+        allocatable = {"cpu": cpu, "memory": mem}
+        if gpus is not None:
+            allocatable["amd.com/gpu"] = str(gpus)
+        return NS(
+            metadata=NS(name=name, labels=labels),
+            spec=NS(unschedulable=cordoned, taints=[]),
+            status=NS(
+                allocatable=allocatable,
+                conditions=[NS(type="Ready", status="True" if ready else "False")],
+            ),
+        )
+
+    def _pod(self, instance_id, node_name, gpus, phase="Running", pod_type=None):
+        from types import SimpleNamespace as NS
+        return NS(
+            metadata=NS(name=f"{instance_id}-pod", labels={"instance-id": instance_id},
+                        annotations={"amd-oneclick/email": f"{instance_id}@x.local",
+                                     "amd-oneclick/pod-type": pod_type}),
+            spec=NS(node_name=node_name, containers=[
+                NS(resources=NS(requests={"amd.com/gpu": str(gpus)}))]),
+            status=NS(phase=phase),
+        )
+
+    def _patch(self, nodes, pods, raise_pods=False, raise_nodes=False):
+        from kubernetes.client.rest import ApiException
+        from types import SimpleNamespace as NS
+
+        def list_node():
+            if raise_nodes:
+                raise ApiException(status=403)
+            return NS(items=nodes)
+
+        def list_namespaced_pod(namespace=None, label_selector=None, **kw):
+            if raise_pods:
+                raise ApiException(status=403)
+            return NS(items=pods)
+
+        self.k.core_v1 = NS(list_node=list_node, list_namespaced_pod=list_namespaced_pod)
+        # default service (no toleration key) -> every untainted node belongs
+        main_module.settings.NOTEBOOK_TOLERATION_KEY = ""
+        main_module.settings.NOTEBOOK_TOLERATION_VALUE = ""
+        import app.k8s_client as kc
+        kc.settings.NOTEBOOK_TOLERATION_KEY = ""
+        kc.settings.NOTEBOOK_TOLERATION_VALUE = ""
+
+    def test_all_gpu_nodes_listed_incl_unhealthy(self):
+        nodes = [
+            self._node("n-ok", 8),
+            self._node("n-cordon", 8, cordoned=True),
+            self._node("n-notready", 8, ready=False),
+            self._node("n-nogpu", 0),       # skipped: not a GPU node
+            self._node("n-nogpukey", None), # skipped: no amd.com/gpu
+        ]
+        self._patch(nodes, [])
+        out = self.k.gpu_cluster_status()
+        names = [n["node"] for n in out["nodes"]]
+        self.assertEqual(names, ["n-cordon", "n-notready", "n-ok"])  # sorted, GPU-only
+        self.assertEqual(out["total_gpus"], 24)
+        # free only counts the healthy schedulable node
+        self.assertEqual(out["free_gpus"], 8)
+        self.assertEqual(out["usage_scope"], "namespace")
+
+    def test_committed_and_free_from_namespace_pods(self):
+        nodes = [self._node("n1", 8)]
+        pods = [self._pod("i1", "n1", 2), self._pod("i2", "n1", 3),
+                self._pod("done", "n1", 4, phase="Succeeded")]  # terminal excluded
+        self._patch(nodes, pods)
+        out = self.k.gpu_cluster_status()
+        n = out["nodes"][0]
+        self.assertEqual(n["committed"], 5)
+        self.assertEqual(n["free"], 3)
+        self.assertEqual(out["used_gpus"], 5)
+        self.assertEqual(len(n["instances"]), 2)
+
+    def test_committed_capped_at_node_total(self):
+        nodes = [self._node("n1", 4)]
+        pods = [self._pod("i1", "n1", 8)]  # over-subscribed reading
+        self._patch(nodes, pods)
+        out = self.k.gpu_cluster_status()
+        self.assertEqual(out["nodes"][0]["committed"], 4)
+        self.assertEqual(out["nodes"][0]["free"], 0)
+
+    def test_node_metadata_surfaced(self):
+        self._patch([self._node("n1", 8)], [])
+        n = self.k.gpu_cluster_status()["nodes"][0]
+        self.assertEqual(n["gpu_model"], "AMD_Radeon_Pro_W7900D")
+        self.assertEqual(n["cpu_allocatable"], "128")
+        self.assertGreater(n["memory_allocatable_gib"], 900)
+        self.assertTrue(n["ready"])
+        self.assertFalse(n["cordoned"])
+
+    def test_list_nodes_403_degrades(self):
+        self._patch([], [], raise_nodes=True)
+        out = self.k.gpu_cluster_status()
+        self.assertEqual(out, {"total_gpus": 0, "free_gpus": 0, "used_gpus": 0,
+                               "nodes": [], "usage_scope": "namespace"})
+
+    def test_list_pods_403_still_returns_capacity(self):
+        self._patch([self._node("n1", 8)], [], raise_pods=True)
+        out = self.k.gpu_cluster_status()
+        self.assertEqual(out["nodes"][0]["committed"], 0)
+        self.assertEqual(out["nodes"][0]["free"], 8)
+        self.assertEqual(out["total_gpus"], 8)
+
+    def test_memory_to_gib_parsing(self):
+        from app.k8s_client import K8sClient
+        self.assertEqual(K8sClient._memory_to_gib("1073741824"), 1.0)  # 1 GiB in bytes
+        self.assertEqual(K8sClient._memory_to_gib("1048576Ki"), 1.0)
+        self.assertEqual(K8sClient._memory_to_gib("1024Mi"), 1.0)
+        self.assertEqual(K8sClient._memory_to_gib("2Gi"), 2.0)
+        self.assertEqual(K8sClient._memory_to_gib(None), 0.0)
+        self.assertEqual(K8sClient._memory_to_gib("garbage"), 0.0)
+
+
+class GpuDashboardEndpoint(unittest.TestCase):
+    """/api/admin/gpu-nodes is admin-gated and 404 unless GPU_DASHBOARD_ENABLED."""
+
+    def setUp(self):
+        _pin_settings()
+        store.init_db()
+        self.client = TestClient(main_module.app)
+        self._orig = main_module.k8s_client
+        from types import SimpleNamespace as NS
+        main_module.k8s_client = NS(gpu_cluster_status=lambda: {
+            "total_gpus": 8, "free_gpus": 5, "used_gpus": 3, "nodes": [], "usage_scope": "namespace"})
+
+    def tearDown(self):
+        main_module.k8s_client = self._orig
+        main_module.settings.GPU_DASHBOARD_ENABLED = False
+
+    def test_404_when_disabled(self):
+        main_module.settings.GPU_DASHBOARD_ENABLED = False
+        r = self.client.get("/api/admin/gpu-nodes", auth=ADMIN)
+        self.assertEqual(r.status_code, 404, r.text)
+
+    def test_200_when_enabled(self):
+        main_module.settings.GPU_DASHBOARD_ENABLED = True
+        r = self.client.get("/api/admin/gpu-nodes", auth=ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["total_gpus"], 8)
+
+    def test_requires_admin_auth(self):
+        main_module.settings.GPU_DASHBOARD_ENABLED = True
+        r = self.client.get("/api/admin/gpu-nodes")
+        self.assertEqual(r.status_code, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

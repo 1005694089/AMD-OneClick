@@ -2503,6 +2503,17 @@ async def admin_gpus(_username: str = Depends(verify_admin)):
     return k8s_client.gpu_capacity_summary()
 
 
+@app.get("/api/admin/gpu-nodes")
+async def admin_gpu_nodes(_username: str = Depends(verify_admin)):
+    """Per-node GPU status + cluster-utilization summary for the admin GPU dashboard.
+
+    Beta-only: 404 unless GPU_DASHBOARD_ENABLED. Shows every GPU node of this service
+    (including cordoned/NotReady); committed/free reflect this deployment's namespace."""
+    if not settings.GPU_DASHBOARD_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    return k8s_client.gpu_cluster_status()
+
+
 @app.get("/github/{full_path:path}", response_class=HTMLResponse)
 async def github_notebook(
     request: Request,
@@ -3043,7 +3054,7 @@ async def admin_page(request: Request, username: str = Depends(verify_admin)):
     return templates.TemplateResponse(
         request,
         "admin.html",
-        {"username": username},
+        {"username": username, "gpu_dashboard_enabled": settings.GPU_DASHBOARD_ENABLED},
     )
 
 

@@ -1442,6 +1442,135 @@ exit 0
             })
         return {"total_gpus": total_gpus, "free_gpus": free_gpus, "nodes": nodes_out}
 
+    @staticmethod
+    def _quantity_to_int(value) -> int:
+        """Best-effort parse of a Kubernetes quantity to a plain integer (count of GPUs etc.).
+        Returns 0 on anything unparseable."""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _memory_to_gib(value) -> float:
+        """Convert a Kubernetes memory quantity string (e.g. '1056403496Ki', '256Gi', '64Mi')
+        to GiB as a float, rounded to 1 decimal. Returns 0.0 on anything unparseable."""
+        if value is None:
+            return 0.0
+        s = str(value).strip()
+        units = {
+            "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4,
+            "K": 1000, "M": 1000 ** 2, "G": 1000 ** 3, "T": 1000 ** 4,
+        }
+        try:
+            for suffix, mult in units.items():
+                if s.endswith(suffix):
+                    return round(float(s[: -len(suffix)]) * mult / (1024 ** 3), 1)
+            return round(float(s) / (1024 ** 3), 1)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def gpu_cluster_status(self) -> dict:
+        """Per-node GPU status + cluster-utilization summary for the admin dashboard.
+
+        Unlike gpu_capacity_summary (which is scoped to launch-eligible nodes and used by the
+        scheduler), this reports EVERY GPU node belonging to this service — including cordoned /
+        NotReady ones — so the dashboard shows real cluster health, not just schedulable capacity.
+
+        IMPORTANT — usage scope: 'committed' GPUs and the per-node instance list are derived only
+        from pods in THIS deployment's namespace (the service account is not granted cluster-wide
+        pod read). So on shared GPU hardware the committed/free figures reflect THIS deployment's
+        own usage, not every tenant's. node capacity/health (total GPUs, Ready/cordon, CPU/mem,
+        model) is accurate for all nodes. The payload sets usage_scope='namespace' so the UI can
+        label this honestly. Kube errors degrade gracefully to a partial/empty result."""
+        # One namespaced pod list (allowed); group GPU requests + instance rows by node.
+        committed_by_node: dict[str, int] = {}
+        instances_by_node: dict[str, list] = {}
+        try:
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=self.namespace,
+                label_selector=f"app={settings.NOTEBOOK_LABEL_PREFIX}",
+            )
+            for pod in pods.items:
+                phase = (pod.status.phase or "") if pod.status else ""
+                if phase in ("Succeeded", "Failed"):
+                    continue
+                node_name = getattr(pod.spec, "node_name", None)
+                if not node_name:
+                    continue
+                gpus = 0
+                for container in pod.spec.containers or []:
+                    requests = getattr(container.resources, "requests", None) or {}
+                    gpus += self._quantity_to_int(requests.get("amd.com/gpu", 0))
+                committed_by_node[node_name] = committed_by_node.get(node_name, 0) + gpus
+                instances_by_node.setdefault(node_name, []).append({
+                    "id": pod.metadata.labels.get("instance-id", pod.metadata.name),
+                    "email": pod.metadata.annotations.get("amd-oneclick/email", ""),
+                    "gpu_count": gpus,
+                    "status": phase.lower() or "unknown",
+                    "pod_type": pod.metadata.annotations.get("amd-oneclick/pod-type"),
+                })
+        except ApiException as e:
+            logger.warning("gpu_cluster_status: cannot list pods: %s", e)
+
+        quarantined = set()
+        try:
+            quarantined = store.quarantined_nodes()
+        except Exception as e:
+            logger.debug("quarantined_nodes lookup failed: %s", e)
+
+        try:
+            nodes = self.core_v1.list_node()
+        except ApiException as e:
+            logger.error("gpu_cluster_status: cannot list nodes: %s", e)
+            return {"total_gpus": 0, "free_gpus": 0, "used_gpus": 0,
+                    "nodes": [], "usage_scope": "namespace"}
+
+        nodes_out = []
+        total_gpus = 0
+        free_gpus = 0
+        used_gpus = 0
+        for node in nodes.items:
+            if not self._node_belongs_to_service(node):
+                continue
+            allocatable = node.status.allocatable or {}
+            node_gpus = self._quantity_to_int(allocatable.get("amd.com/gpu", 0))
+            if node_gpus <= 0:
+                continue  # not a GPU node (or GPUs not advertised) — skip from a GPU dashboard
+            name = node.metadata.name
+            labels = node.metadata.labels or {}
+            conditions = {c.type: c.status for c in (node.status.conditions or [])}
+            ready = conditions.get("Ready") == "True"
+            cordoned = bool(getattr(node.spec, "unschedulable", False))
+            is_quarantined = name in quarantined
+            committed = min(committed_by_node.get(name, 0), node_gpus)
+            node_free = max(0, node_gpus - committed)
+            total_gpus += node_gpus
+            used_gpus += committed
+            # A cordoned/NotReady/quarantined node cannot take new work — its capacity is not "free".
+            free_gpus += node_free if (ready and not cordoned and not is_quarantined) else 0
+            nodes_out.append({
+                "node": name,
+                "gpu_model": labels.get("amd.com/gpu.product-name") or "",
+                "total": node_gpus,
+                "committed": committed,
+                "free": node_free,
+                "ready": ready,
+                "cordoned": cordoned,
+                "quarantined": is_quarantined,
+                "cpu_allocatable": str(allocatable.get("cpu", "")),
+                "memory_allocatable_gib": self._memory_to_gib(allocatable.get("memory")),
+                "instances": instances_by_node.get(name, []),
+            })
+        nodes_out.sort(key=lambda n: n["node"])
+        return {
+            "total_gpus": total_gpus,
+            "free_gpus": free_gpus,
+            "used_gpus": used_gpus,
+            "nodes": nodes_out,
+            "usage_scope": "namespace",
+        }
+
     def count_user_pods_on_node(self, node_name: str) -> int:
         """Count running (non-terminal) user notebook pods on a node.
 
@@ -1933,6 +2062,7 @@ exit 0
                     "github_path": github_path,
                     "pod_type": pod.metadata.annotations.get("amd-oneclick/pod-type"),
                     "api_launched": pod.metadata.annotations.get("amd-oneclick/api-launched") == "true",
+                    "node_name": getattr(pod.spec, "node_name", None),
                 })
         except ApiException as e:
             logger.error(f"Error listing pods: {e}")

@@ -323,6 +323,8 @@ class Settings:
 
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
     ADMIN_LOGIN_ENABLED: bool = os.getenv("ADMIN_LOGIN_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # Beta-only admin GPU-nodes dashboard. Off by default; set true only in the beta config CM.
+    GPU_DASHBOARD_ENABLED: bool = os.getenv("GPU_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     ADMIN_LOGIN_CREDITS: int = int(os.getenv("ADMIN_LOGIN_CREDITS", "10000"))
     COUPON_PRIVATE_KEY_PEM: Optional[str] = os.getenv("COUPON_PRIVATE_KEY_PEM")
     COUPON_REDEEM_ENABLED: bool = os.getenv("COUPON_REDEEM_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

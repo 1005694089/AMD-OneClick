@@ -49,6 +49,57 @@
 const { Button, Card, Form, Input, InputNumber, Layout, Menu, Modal, Select, Space, Statistic, Switch, Table, Tabs, Tag, Typography, Popconfirm, message } = antd;
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
+const gpuDashboardEnabled = {{ gpu_dashboard_enabled | default(false) | tojson }};
+
+function GpuNodesPanel({data,loading}){
+  const nodes=(data&&data.nodes)||[];
+  const total=data.total_gpus||0, free=data.free_gpus||0, used=data.used_gpus||0;
+  const util=total>0?Math.round((used/total)*100):0;
+  const nodeColumns=[
+    {title:'Node',dataIndex:'node',key:'node'},
+    {title:'GPU Model',dataIndex:'gpu_model',key:'gpu_model',render:v=>v||'—'},
+    {title:'Health',key:'health',render:(_,r)=>React.createElement(Space,{size:4,wrap:true},
+      React.createElement(Tag,{color:r.ready?'green':'red'},r.ready?'Ready':'NotReady'),
+      r.cordoned?React.createElement(Tag,{color:'orange'},'Cordoned'):null,
+      r.quarantined?React.createElement(Tag,{color:'volcano'},'Quarantined'):null
+    )},
+    {title:'GPUs (used / total)',key:'gpus',render:(_,r)=>`${r.committed} / ${r.total}`},
+    {title:'Free',dataIndex:'free',key:'free'},
+    {title:'CPU',dataIndex:'cpu_allocatable',key:'cpu',render:v=>v||'—'},
+    {title:'Memory (GiB)',dataIndex:'memory_allocatable_gib',key:'mem',render:v=>v||'—'},
+    {title:'Instances',key:'inst',render:(_,r)=>(r.instances||[]).length}
+  ];
+  return React.createElement(Space,{direction:'vertical',size:20,style:{width:'100%'}},
+    React.createElement(Card,{loading},
+      React.createElement('div',{className:'admin-metrics'},
+        React.createElement(Statistic,{title:'Total GPUs',value:total}),
+        React.createElement(Statistic,{title:'Used GPUs (this deployment)',value:used}),
+        React.createElement(Statistic,{title:'Schedulable free GPUs',value:free}),
+        React.createElement(Statistic,{title:'Utilization',value:util,suffix:'%'})
+      ),
+      React.createElement(Text,{type:'secondary',style:{display:'block',marginTop:8}},
+        'Used GPUs reflect this deployment’s namespace only; node capacity & health cover all GPU nodes. “Schedulable free” excludes idle GPUs on cordoned / NotReady / quarantined nodes, so Used + Schedulable free can be less than Total.')
+    ),
+    React.createElement(Card,{title:'Per-node GPU utilization',loading},
+      React.createElement('div',{id:'adminGpuChart',className:'stats-chart'})),
+    React.createElement(Card,{title:'GPU Nodes'},
+      React.createElement(Table,{rowKey:'node',columns:nodeColumns,dataSource:nodes,loading,pagination:false,
+        scroll:{x:'max-content'},size:'middle',
+        expandable:{
+          expandedRowRender:r=>React.createElement(Table,{rowKey:'id',size:'small',pagination:false,
+            dataSource:r.instances||[],
+            columns:[
+              {title:'Instance',dataIndex:'id',key:'id'},
+              {title:'User',dataIndex:'email',key:'email',render:v=>v||'—'},
+              {title:'GPUs',dataIndex:'gpu_count',key:'gpu_count'},
+              {title:'Type',dataIndex:'pod_type',key:'pod_type',render:v=>v||'—'},
+              {title:'Status',dataIndex:'status',key:'status'}
+            ]}),
+          rowExpandable:r=>(r.instances||[]).length>0
+        }
+      }))
+  );
+}
 
 function App(){
   const [images,setImages]=React.useState([]);
@@ -56,6 +107,7 @@ function App(){
   const [users,setUsers]=React.useState([]);
   const [templates,setTemplates]=React.useState([]);
   const [stats,setStats]=React.useState({days:[],daily_users:[],daily_instance_launches:[],daily_active_users:[],total_instance_launches:0,total_active_users:0,total_users:0});
+  const [gpunodes,setGpunodes]=React.useState({total_gpus:0,free_gpus:0,used_gpus:0,nodes:[],usage_scope:'namespace'});
   const [loaded,setLoaded]=React.useState({});
   const [sectionLoading,setSectionLoading]=React.useState({});
   const [activeTab,setActiveTab]=React.useState('overview');
@@ -78,7 +130,7 @@ function App(){
 
   // Each admin section loads its own (potentially expensive) endpoint on demand,
   // so the page opens fast instead of fetching everything up front.
-  const SECTION_EP={users:'/api/admin/users',templates:'/api/admin/templates',images:'/api/admin/images',instances:'/api/admin/instances',stats:'/api/admin/stats'};
+  const SECTION_EP={users:'/api/admin/users',templates:'/api/admin/templates',images:'/api/admin/images',instances:'/api/admin/instances',stats:'/api/admin/stats',gpunodes:'/api/admin/gpu-nodes'};
   const SECTION_SET={users:setUsers,templates:setTemplates,images:setImages,instances:setInstances};
   async function loadSection(name,force){
     if(!name) return;
@@ -87,7 +139,9 @@ function App(){
     try{
       const res=await fetch(SECTION_EP[name]);
       const data=await res.json();
-      if(name==='stats') setStats(data||{}); else SECTION_SET[name]((data&&data[name])||[]);
+      if(name==='stats') setStats(data||{});
+      else if(name==='gpunodes') setGpunodes(data||{total_gpus:0,free_gpus:0,used_gpus:0,nodes:[],usage_scope:'namespace'});
+      else SECTION_SET[name]((data&&data[name])||[]);
       setLoaded(l=>({...l,[name]:true}));
     }catch(e){ message.error('Failed to load '+name); }
     setSectionLoading(s=>({...s,[name]:false}));
@@ -135,6 +189,33 @@ function App(){
     const t=setTimeout(resize,350);
     return()=>{window.removeEventListener('resize',resize); if(ro)ro.disconnect(); clearTimeout(t); chart.dispose();};
   },[stats,activeTab]);
+
+  React.useEffect(()=>{
+    if(activeTab!=='gpunodes') return;
+    const node=document.getElementById('adminGpuChart');
+    if(!node || !window.echarts) return;
+    const list=(gpunodes.nodes||[]);
+    const names=list.map(n=>n.node);
+    const chart=echarts.init(node);
+    chart.setOption({
+      tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},
+      legend:{top:0,data:['Used','Free']},
+      grid:{top:48,left:140,right:24,bottom:42},
+      xAxis:{type:'value',minInterval:1},
+      yAxis:{type:'category',data:names},
+      series:[
+        {name:'Used',type:'bar',stack:'gpu',color:'#ff7875',data:list.map(n=>n.committed||0)},
+        {name:'Free',type:'bar',stack:'gpu',color:'#95de64',data:list.map(n=>n.free||0)}
+      ]
+    });
+    const resize=()=>chart.resize();
+    window.addEventListener('resize',resize);
+    let ro;
+    if(window.ResizeObserver){ ro=new ResizeObserver(()=>chart.resize()); ro.observe(node); }
+    requestAnimationFrame(resize);
+    const t=setTimeout(resize,350);
+    return()=>{window.removeEventListener('resize',resize); if(ro)ro.disconnect(); clearTimeout(t); chart.dispose();};
+  },[gpunodes,activeTab]);
 
   function confirmLargeImage(){
     return new Promise(resolve=>{
@@ -334,7 +415,8 @@ function App(){
         {key:'instances',label:'Instances',children:React.createElement(Card,{title:'Instances',extra:React.createElement(Space,{wrap:true},
             React.createElement(Input.Search,{allowClear:true,placeholder:'Search email, type, status',style:{width:'min(280px,100%)'},value:instanceSearch,onChange:e=>setInstanceSearch(e.target.value),onSearch:setInstanceSearch}),
             React.createElement(Button,{danger:true,onClick:()=>setBulkDestroyModalOpen(true)},'Remove Instances')
-          )},React.createElement(Table,{rowKey:'id',columns:instColumns,dataSource:filteredInstances,loading:!!sectionLoading.instances,pagination:tablePagination(),scroll:{x:900},size:'middle'}))}
+          )},React.createElement(Table,{rowKey:'id',columns:instColumns,dataSource:filteredInstances,loading:!!sectionLoading.instances,pagination:tablePagination(),scroll:{x:900},size:'middle'}))},
+        ...(gpuDashboardEnabled?[{key:'gpunodes',label:'GPU Nodes',children:React.createElement(GpuNodesPanel,{data:gpunodes,loading:!!sectionLoading.gpunodes})}]:[])
       ]}),
       React.createElement(Modal,{title:'Add Image',open:imageModalOpen,onCancel:()=>setImageModalOpen(false),footer:null,destroyOnClose:true},
         React.createElement(Form,{form,layout:'vertical',onFinish:addImage,initialValues:{source_type:'registry'}},
