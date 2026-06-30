@@ -74,6 +74,7 @@ from .store import (
     get_admin_daily_stats,
     get_charged_credits_for_instance,
     get_image_by_value,
+    resolve_enabled_image,
     get_notebook_template,
     get_or_create_user,
     get_or_create_external_user,
@@ -2263,12 +2264,15 @@ async def launch_huggingface_demo_notebook(
 
     provider_id, display_name, email = _huggingface_demo_user_identity(req.user_name)
     gpu_count = req.gpu_count or 1
-    image = req.image or settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE
+    requested_image = req.image or settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE
 
     if gpu_count not in [1, 2, 4]:
         raise HTTPException(status_code=400, detail="GPU count must be 1, 2, or 4")
-    if not get_image_by_value(image):
+    # Callers may pass either the full image ref or the admin-panel name (e.g. "Huggingface").
+    resolved = resolve_enabled_image(requested_image)
+    if not resolved:
         raise HTTPException(status_code=400, detail="Invalid image selected")
+    image = resolved["image"]
 
     user = get_or_create_external_user(
         HF_DEMO_PROVIDER,

@@ -120,6 +120,64 @@ class Feature1BlankPath(HFLaunchTestBase):
                          main_module.settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE)
 
 
+class ImageSelectionByName(HFLaunchTestBase):
+    """API callers may pass the admin-panel image NAME or the full ref."""
+
+    def test_launch_by_image_name_resolves_to_ref(self):
+        # Fixture registers name "demo" -> ref "registry/image:tag".
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "byname-1", "image": "demo"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self.fake.created[0]["image"], "registry/image:tag")
+
+    def test_launch_by_image_name_is_case_insensitive(self):
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "byname-2", "image": "DEMO"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self.fake.created[0]["image"], "registry/image:tag")
+
+    def test_launch_by_full_ref_still_works(self):
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "byref-1", "image": "registry/image:tag"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self.fake.created[0]["image"], "registry/image:tag")
+
+    def test_unknown_name_or_ref_rejected(self):
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "byname-bad", "image": "no-such-image"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+
+    def test_disabled_image_name_not_selectable(self):
+        store.upsert_image("OffImage", "registry/off:tag", "", False)
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "byname-off", "image": "OffImage"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+
+    def test_case_folded_name_collision_is_deterministic(self):
+        # If two enabled rows share a case-folded name, resolve picks the lowest id deterministically.
+        a = store.upsert_image("Dup", "registry/dup-a:tag", "", True)
+        store.upsert_image("dup", "registry/dup-b:tag", "", True)
+        for _ in range(3):
+            r = store.resolve_enabled_image("DUP")
+            self.assertEqual(r["id"], a["id"])
+            self.assertEqual(r["image"], "registry/dup-a:tag")
+
+
 class Feature3Credits(HFLaunchTestBase):
     def test_grant_once_on_creation_no_retop(self):
         cap = main_module.settings.HUGGINGFACE_DEMO_MIN_CREDITS

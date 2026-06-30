@@ -1327,6 +1327,35 @@ def get_image_by_value(image: str) -> Optional[dict]:
         )
 
 
+def resolve_enabled_image(value: str) -> Optional[dict]:
+    """Resolve an enabled catalog image by its full ref OR its admin-panel name.
+
+    Lets API callers pass the friendly name (e.g. "Huggingface") instead of the full
+    registry ref. Ref match takes priority; name match is case-insensitive. Returns the
+    catalog row (with the real `image` ref) or None if no enabled image matches.
+    """
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    with engine.begin() as conn:
+        by_ref = conn.execute(
+            select(images).where(images.c.image == candidate, images.c.enabled == True)  # noqa: E712
+        ).mappings().first()
+        if by_ref:
+            return row_to_dict(by_ref)
+        # Fall back to a case-insensitive name match (admin-panel friendly name). Order by id so
+        # the result is deterministic if two enabled rows ever share a case-folded name (the
+        # unique-name constraint is case-sensitive, so "Huggingface"/"huggingface" could coexist).
+        rows = conn.execute(
+            select(images).where(images.c.enabled == True).order_by(images.c.id)  # noqa: E712
+        ).mappings().all()
+        target = candidate.lower()
+        for r in rows:
+            if (r["name"] or "").strip().lower() == target:
+                return row_to_dict(r)
+        return None
+
+
 # =============================================================================
 # Custom images (per-user) + build queue
 # =============================================================================

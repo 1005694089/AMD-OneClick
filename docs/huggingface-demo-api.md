@@ -59,7 +59,7 @@ Example response:
 }
 ```
 
-Use any returned `image` value as the optional `image` field when launching. Omit `image` to use `default_image` (the API default is the Hugging Face image built for AMD Radeon).
+When launching, the `image` field accepts **either** the friendly `name` (e.g. `"Huggingface"`, as configured in the admin panel — case-insensitive) **or** the full `image` ref. Omit `image` to use `default_image` (the API default is the Hugging Face image built for AMD Radeon).
 
 ## Check GPU Availability
 
@@ -116,7 +116,7 @@ Rules:
 - `user_name` is required and is used as the stable demo user identity.
 - `notebook_path` is **optional**. When provided it must point to an `.ipynb` file (it is opened in the launched notebook). When omitted or empty, a blank notebook environment is started with no file pre-loaded — the returned `url` opens the JupyterLab root.
 - Hugging Face notebook URLs are downloaded server-side through the configured internal Hugging Face proxy and server-side `HF_TOKEN`.
-- `image` is optional. It must be one of the values returned by `GET /api/huggingface/images`; otherwise the launch is rejected with `400 Invalid image selected`. Defaults to the catalog's `default_image`.
+- `image` is optional. Pass either the friendly `name` or the full `image` ref from `GET /api/huggingface/images` (name match is case-insensitive); anything not in the enabled catalog is rejected with `400 Invalid image selected`. Defaults to `default_image`.
 - `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
 - `gpu_count` must be `1`, `2`, or `4`. Default is `1`. CPU and memory scale automatically with the GPU count (see **GPU Sizing** below). Each GPU costs 1 credit/hour, so a 4-GPU instance consumes credits 4x as fast. Check `GET /api/huggingface/gpus` for free capacity before requesting `2` or `4`.
 - Each `user_name` can have only one active notebook.
