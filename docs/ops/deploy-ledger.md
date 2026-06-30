@@ -26,7 +26,32 @@ secrets.
 
 ---
 
-## 2026-06-30 (latest) — Radeon beta: scope billing to API instances, enable scheduler
+## 2026-06-30 (latest) — Radeon beta: fix hf_initial_grant ledger delta
+
+**Commit:** `00282b3` on `BETA-test` (pushed to origin). Found by a live
+multi-agent API-user simulation (4 personas, 28 steps): the once-only HF credit
+grant wrote a `credit_ledger` row with `delta=0`, so the ledger did not reconcile
+with `users.credits` (sum 0 vs balance 10). Fixed to record the real movement
+(`amount - prior_balance`); marker presence still enforces once-only.
+
+**Deploy mechanism:** patched 1 key (`store.py`) in
+`amd-oneclick-radeon-beta-code-overrides` (`kubectl patch --type merge`) +
+`rollout restart`. No config change. Postgres untouched.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Rollback snapshot (sha256, git-ignored) |
+|----------------|----------------|-----------------------|------------------------------------------|
+| radeon-beta / 30444 | `…:radeon-beta-image-service-20260625` (image unchanged) + CMs | `570efae441a333de9f4a4343e44800cbe89bd5eefd72fded32c23c9813dc7717` | `local-deploy-history/radeon-beta/20260630-1552-ledger-fix-PRE-code-overrides.yaml` (`037f994d…`) |
+
+**Verified live:** fresh launch `simtest-ledgerfix-dan` → user 50 `credits=10`
+with `hf_initial_grant` ledger `delta=10` (reconciles); instance destroyed. Full
+pytest suite: 139 passed (grant-once test strengthened to assert ledger delta).
+Note: pre-existing HF users (43–49) created before this fix still carry the
+delta=0 grant row — balances are correct; only their historical ledger row is
+understated. No backfill applied.
+
+---
+
+## 2026-06-30 — Radeon beta: scope billing to API instances, enable scheduler
 
 **Commit:** `3eb3b1d` on `BETA-test` (pushed to origin). Makes credit metering
 apply only to API-launched instances, then turns the scheduler on for beta.
