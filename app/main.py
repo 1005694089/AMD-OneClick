@@ -2309,7 +2309,7 @@ async def launch_huggingface_demo_notebook(
         _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,
                         instance.get("node_port"), instance.get("opencode_node_port"),
-                        pod_type=pod_type)
+                        pod_type=pod_type, api_launched=True)
         record_instance_launch_event(user["id"], email, instance["id"], image, "jupyter", gpu_count,
                                      pod_type=pod_type)
         from .telemetry import report_gpu_instance_created_event

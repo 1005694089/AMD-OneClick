@@ -179,6 +179,7 @@ instance_records = Table(
     Column("billing_started_at", String(64)),
     Column("deleted_at", String(64)),
     Column("pod_type", String(64)),
+    Column("api_launched", Boolean, nullable=False, default=False),
 )
 
 instance_launch_events = Table(
@@ -427,6 +428,10 @@ def ensure_schema_columns(conn):
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
     if "pod_type" not in instance_columns:
         conn.execute(text("ALTER TABLE instance_records ADD COLUMN pod_type VARCHAR(64)"))
+    # Billing is scoped to API-launched instances. Existing rows default FALSE so web/template
+    # instances are never retroactively billed when the scheduler is enabled.
+    if "api_launched" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN api_launched BOOLEAN NOT NULL DEFAULT FALSE"))
     launch_event_columns = {col["name"] for col in inspector.get_columns("instance_launch_events")}
     if "pod_type" not in launch_event_columns:
         conn.execute(text("ALTER TABLE instance_launch_events ADD COLUMN pod_type VARCHAR(64)"))
@@ -2363,7 +2368,7 @@ def delete_launch_intent(user_id: int) -> None:
         conn.execute(launch_intents.delete().where(launch_intents.c.user_id == user_id))
 
 
-def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None, pod_type: Optional[str] = None):
+def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None, pod_type: Optional[str] = None, api_launched: bool = False):
     now = utc_now()
     billing_session_id = f"{instance_id}:{uuid.uuid4().hex[:12]}"
     with engine.begin() as conn:
@@ -2386,6 +2391,7 @@ def record_instance(user_id: int, email: str, instance_id: str, image: str, inst
             billing_started_at=None,
             deleted_at=None,
             pod_type=pod_type,
+            api_launched=bool(api_launched),
         )
         if existing:
             conn.execute(update(instance_records).where(instance_records.c.id == existing["id"]).values(**values))
@@ -2518,10 +2524,15 @@ def update_instance_charge_time(record_id: int, charged_at: str):
 
 
 def list_active_instances() -> list[dict]:
+    # Billing is scoped to API-launched instances only; web/template launches are not metered.
     stmt = (
         select(instance_records, users.c.credits)
         .join(users, users.c.id == instance_records.c.user_id)
-        .where(instance_records.c.deleted_at.is_(None), instance_records.c.status.in_(["pending", "running"]))
+        .where(
+            instance_records.c.deleted_at.is_(None),
+            instance_records.c.status.in_(["pending", "running"]),
+            instance_records.c.api_launched.is_(True),
+        )
     )
     with engine.begin() as conn:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]

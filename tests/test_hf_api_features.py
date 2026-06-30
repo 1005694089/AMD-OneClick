@@ -361,5 +361,28 @@ class Feature4IdleReaper(unittest.TestCase):
         self.assertEqual(self.deleted, [])
 
 
+class BillingScope(unittest.TestCase):
+    """Billing (list_active_instances) must include only API-launched instances."""
+
+    def setUp(self):
+        store.init_db()
+        self.user = store.get_or_create_user("google", "b1", "b1@example.com", "B", None)
+        _set_credits(self.user["id"], 50)
+
+    def tearDown(self):
+        with store.engine.begin() as conn:
+            conn.exec_driver_sql("DELETE FROM instance_records")
+            conn.exec_driver_sql("DELETE FROM users WHERE id=?", (self.user["id"],))
+
+    def test_web_instance_excluded_api_instance_included(self):
+        store.record_instance(self.user["id"], "b1@example.com", "u-b1-web", "img",
+                              "opencode", 1, 30001, api_launched=False)
+        store.record_instance(self.user["id"], "b1@example.com", "hf-b1-api", "img",
+                              "jupyter", 1, 30002, api_launched=True)
+        ids = {r["instance_id"] for r in store.list_active_instances()}
+        self.assertIn("hf-b1-api", ids)
+        self.assertNotIn("u-b1-web", ids)
+
+
 if __name__ == "__main__":
     unittest.main()
