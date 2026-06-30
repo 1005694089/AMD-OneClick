@@ -52,6 +52,11 @@ if DATABASE_URL.startswith("sqlite:///"):
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 metadata = MetaData()
 
+# Row-level locking (FOR UPDATE SKIP LOCKED) lets concurrent agents claim different pending jobs
+# without contending on the same row or scanning each other's in-flight work. Only Postgres/MySQL
+# support SKIP LOCKED; SQLite (dev/tests) does not, so gate on the dialect.
+_SUPPORTS_SKIP_LOCKED = engine.dialect.name in ("postgresql", "mysql", "mariadb")
+
 # Serializes the count-and-insert in create_custom_image within a single process so the
 # per-user cap can't be bypassed by concurrent different-name requests. Across multiple
 # Postgres workers a transaction-level advisory lock (taken inside that function) provides
@@ -301,6 +306,11 @@ image_jobs = Table(
     Column("result", Text),
     Column("claimed_by", String(128)),
     Column("claimed_at", String(64)),
+    # Refreshed by the agent's background heartbeat thread while a long job runs (e.g. a 10-19 GB
+    # warm/pull that blocks for many minutes). The reaper measures staleness from
+    # max(claimed_at, heartbeat_at) so a live-but-slow job is not falsely reaped. NULL => use
+    # claimed_at (safe for rows written before this column existed).
+    Column("heartbeat_at", String(64)),
     Column("attempts", Integer, nullable=False, default=0),
     Column("max_attempts", Integer, nullable=False, default=3),
     Column("created_at", String(64), nullable=False),
@@ -310,6 +320,13 @@ image_jobs = Table(
 
 IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "distribute", "evict")
 IMAGE_JOB_TERMINAL = ("succeeded", "failed")
+
+# Kinds that perform a per-node containerd unpack and must be serialized per target node (the
+# claim site defers an overlapping one, and the stale-job reaper strips quarantined nodes from
+# their requeued targets). Hoisted to a single constant so the two call sites can never drift.
+# Includes the Dragonfly warm/purge kinds added for the P2P transport; "distribute" remains for the
+# one-release alias window.
+SERIALIZED_KINDS = ("distribute", "warm", "evict", "purge_node", "purge_p2p")
 
 # A launch that needs its image distributed to a GPU node first cannot create a pod inside the
 # request handler (the off-cluster daemon does the copy asynchronously). We persist the full
@@ -423,6 +440,12 @@ def ensure_schema_columns(conn):
         image_node_columns = {col["name"] for col in inspector.get_columns("image_nodes")}
         if "quarantined_until" not in image_node_columns:
             conn.execute(text("ALTER TABLE image_nodes ADD COLUMN quarantined_until VARCHAR(64)"))
+
+    # Additive: heartbeat for long-running jobs so a live-but-slow warm/pull is not falsely reaped.
+    if inspector.has_table("image_jobs"):
+        image_job_columns = {col["name"] for col in inspector.get_columns("image_jobs")}
+        if "heartbeat_at" not in image_job_columns:
+            conn.execute(text("ALTER TABLE image_jobs ADD COLUMN heartbeat_at VARCHAR(64)"))
 
     # Caller-supplied pod tag (hackathon/workshop/one-click). Nullable, no default -> old rows = NULL.
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
@@ -1641,13 +1664,23 @@ def requeue_custom_image_build(image_id: int, user_id: int) -> Optional[dict]:
         return dict(row)
 
 
-def list_gc_candidates() -> list[dict]:
-    """Ready node-local custom images ordered coldest first for builder-side disk GC."""
+def list_gc_candidates(mode: str = "idle") -> list[dict]:
+    """Ready node-local custom images ordered coldest first for disk GC.
+
+    Two modes, deliberately separated so the idle-delete contract and disk-pressure reclaim do not
+    share one window:
+      - "idle" (default): only images idle past CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS (the 5-day
+        auto-delete window). Drives the R2c idle reaper.
+      - "disk_pressure": ALL ready node-local images, coldest first, ignoring the idle window — so a
+        full disk can evict the coldest image even if it is younger than 5 days, instead of wedging
+        when nothing has crossed the idle threshold.
+    """
     prefix = (settings.CUSTOM_IMAGE_LOCAL_TAG_PREFIX or "").strip("/")
-    grace = int(getattr(settings, "CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", 0) or 0)
     cutoff_iso = None
-    if grace > 0:
-        cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=grace)).isoformat()
+    if mode != "disk_pressure":
+        grace = int(getattr(settings, "CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", 0) or 0)
+        if grace > 0:
+            cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=grace)).isoformat()
 
     with engine.begin() as conn:
         conditions = [
@@ -1810,7 +1843,6 @@ def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Op
     lease timeout, so the queue cannot starve permanently. Cross-node distributes still run
     concurrently.
     """
-    SERIALIZED_KINDS = ("distribute", "evict")
     with engine.begin() as conn:
         tried: list[int] = []
         while True:
@@ -1819,7 +1851,10 @@ def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Op
                 query = query.where(image_jobs.c.kind.in_(kinds))
             if tried:
                 query = query.where(image_jobs.c.id.notin_(tried))
-            pending = conn.execute(query.order_by(image_jobs.c.id).limit(1)).mappings().first()
+            query = query.order_by(image_jobs.c.id).limit(1)
+            if _SUPPORTS_SKIP_LOCKED:
+                query = query.with_for_update(skip_locked=True)
+            pending = conn.execute(query).mappings().first()
             if not pending:
                 return None
             tried.append(pending["id"])
@@ -1932,6 +1967,26 @@ def mark_image_job_running(job_id: int, agent_id: str) -> Optional[dict]:
         return row_to_dict(conn.execute(select(image_jobs).where(image_jobs.c.id == job_id)).mappings().first())
 
 
+def heartbeat_image_job(job_id: int, agent_id: str) -> bool:
+    """Refresh a job's heartbeat_at so a long-running job is not reaped as stale.
+
+    Guarded on ownership and non-terminal status, so a token-holder cannot keep a job it does not
+    own (or an already-finalized one) alive. Returns True if the heartbeat was applied.
+    """
+    now = utc_now()
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(image_jobs)
+            .where(
+                image_jobs.c.id == job_id,
+                image_jobs.c.claimed_by == agent_id,
+                image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL),
+            )
+            .values(heartbeat_at=now, updated_at=now)
+        )
+        return result.rowcount > 0
+
+
 def finish_image_job(job_id: int, status: str, agent_id: str, result: Optional[str] = None) -> Optional[dict]:
     """Finalize a job to succeeded|failed. Guarded on ownership + non-terminal state.
 
@@ -1991,23 +2046,33 @@ def reap_stale_image_jobs(timeout_seconds: int) -> int:
                 image_jobs.c.max_attempts,
                 image_jobs.c.kind,
                 image_jobs.c.payload,
+                image_jobs.c.heartbeat_at,
             ).where(image_jobs.c.status.in_(("claimed", "running")))
         ).all()
         for row in leased:
+            # Staleness is measured from the most recent liveness signal: the claim time or the
+            # last heartbeat (whichever is later). A live-but-slow job (e.g. a multi-GB warm) keeps
+            # its lease via the agent's heartbeat thread; NULL heartbeat falls back to claimed_at.
             claimed_at = row[1]
-            stale = True
-            if claimed_at:
+            heartbeat_at = row[7]
+            last_seen = None
+            for ts in (claimed_at, heartbeat_at):
+                if not ts:
+                    continue
                 try:
-                    stale = (now - datetime.fromisoformat(claimed_at)).total_seconds() > timeout_seconds
+                    parsed = datetime.fromisoformat(ts)
                 except ValueError:
-                    stale = True
+                    continue
+                if last_seen is None or parsed > last_seen:
+                    last_seen = parsed
+            stale = True if last_seen is None else (now - last_seen).total_seconds() > timeout_seconds
             if not stale:
                 continue
 
             kind = row[5]
             requeue = int(row[3]) < int(row[4])
             extra: dict = {}
-            if requeue and quarantined and kind in ("distribute", "evict"):
+            if requeue and quarantined and kind in SERIALIZED_KINDS:
                 payload_raw = row[6]
                 payload = {}
                 if isinstance(payload_raw, str):
@@ -2313,7 +2378,14 @@ def list_outdated_images() -> list[dict]:
             if key in seen:
                 continue
             seen.add(key)
-            out.append({"image_ref": ref, "node_name": node_name, "reason": "custom_idle"})
+            # Carry custom_image_id so the evict job can flip the custom_images row to 'evicted'
+            # (mark_custom_image_evicted fires only when the job has a custom_image_id).
+            out.append({
+                "image_ref": ref,
+                "node_name": node_name,
+                "reason": "custom_idle",
+                "custom_image_id": candidate["id"],
+            })
 
     with engine.begin() as conn:
         enabled_refs = {

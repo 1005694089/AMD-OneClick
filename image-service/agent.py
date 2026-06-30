@@ -59,6 +59,10 @@ MANAGER_URL = _env("MANAGER_URL", required=True).rstrip("/")
 BUILD_AGENT_TOKEN = _env("BUILD_AGENT_TOKEN", required=True)
 AGENT_ID = _env("AGENT_ID", "image-service-1")
 POLL_INTERVAL = float(_env("POLL_INTERVAL_SECONDS", "10"))
+# How often the background heartbeat thread refreshes a running job's lease. Must be well under the
+# manager's JOB_LEASE_TIMEOUT_SECONDS (3600s) so a long warm/pull (10-19 GB, one blocking call) is
+# never reaped as stale while it is genuinely making progress.
+HEARTBEAT_INTERVAL = float(_env("HEARTBEAT_INTERVAL_SECONDS", "30"))
 # Generalized DOCKER_BIN -> CONTAINER_CLI: docker | nerdctl. build/pull/push/save map 1:1.
 # Default to rootless nerdctl: 0042 runs nerdctl as a CLIENT of the imagesvc-owned rootless
 # containerd+buildkit user services (no sudo, no docker group). Defaulting to "docker" here would
@@ -208,6 +212,44 @@ def report_node_status(node, ref, status, quarantine_seconds=None):
     if quarantine_seconds is not None:
         payload["quarantine_seconds"] = quarantine_seconds
     _request("/api/internal/nodes/status", payload)
+
+
+def send_heartbeat(job_id):
+    """Refresh a running job's lease. Best-effort; never crashes the job loop."""
+    try:
+        _request(f"/api/internal/jobs/{job_id}/heartbeat", {"agent_id": AGENT_ID})
+    except Exception as exc:
+        print(f"[agent] heartbeat failed for {job_id}: {exc}", file=sys.stderr)
+
+
+class _Heartbeat:
+    """Context manager running a daemon thread that heartbeats a job on a fixed interval.
+
+    A handler may block for many minutes inside a single ctr pull / import; the heartbeat must come
+    from a thread INDEPENDENT of that blocking call, or the long job would stall its own liveness
+    signal and be falsely reaped. Exiting the context stops the thread promptly.
+    """
+
+    def __init__(self, job_id, interval=HEARTBEAT_INTERVAL):
+        self._job_id = job_id
+        self._interval = max(1.0, float(interval))
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            send_heartbeat(self._job_id)
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._run, name=f"hb-{self._job_id}", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return False
 
 
 def _node_user_pod_count(node):
@@ -832,7 +874,8 @@ def main():
         print(f"[agent] running job id={job['id']} kind={kind} ref={job.get('ref')}")
         try:
             mark_running(job["id"])
-            handler(job)
+            with _Heartbeat(job["id"]):
+                handler(job)
         except Exception as exc:
             print(f"[agent] job error for {job.get('id')} ({kind}): {exc}", file=sys.stderr)
             try:

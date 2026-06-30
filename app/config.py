@@ -334,6 +334,13 @@ class Settings:
     )
 
     RUN_SCHEDULER: bool = os.getenv("RUN_SCHEDULER", "true").lower() in {"1", "true", "yes", "on"}
+    # Leader election: when manager runs >1 replica, only the Lease holder runs the scheduled jobs
+    # (billing, reapers, reconciler) so they don't double-run. Uses a coordination.k8s.io Lease.
+    # Disabled by default to preserve single-replica behaviour; enable when scaling replicas.
+    LEADER_ELECTION_ENABLED: bool = os.getenv("LEADER_ELECTION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    LEADER_LEASE_NAME: str = os.getenv("LEADER_LEASE_NAME", "amd-oneclick-manager-leader")
+    LEADER_LEASE_DURATION_SECONDS: int = int(os.getenv("LEADER_LEASE_DURATION_SECONDS", "15"))
+    LEADER_LEASE_RENEW_SECONDS: float = float(os.getenv("LEADER_LEASE_RENEW_SECONDS", "5"))
     OAUTH_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_CONNECT_TIMEOUT_SECONDS", "5"))
     OAUTH_READ_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_READ_TIMEOUT_SECONDS", "15"))
     SLOW_REQUEST_THRESHOLD_SECONDS: float = float(os.getenv("SLOW_REQUEST_THRESHOLD_SECONDS", "2"))
@@ -422,7 +429,9 @@ class Settings:
     CUSTOM_IMAGE_GC_DISK_PATH: str = os.getenv("CUSTOM_IMAGE_GC_DISK_PATH", "/disk/ssd1/containerd")
     CUSTOM_IMAGE_GC_DISK_THRESHOLD_PERCENT: float = float(os.getenv("CUSTOM_IMAGE_GC_DISK_THRESHOLD_PERCENT", "85"))
     CUSTOM_IMAGE_GC_INTERVAL_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_INTERVAL_SECONDS", "300"))
-    CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", "21600"))
+    # Idle window after a custom image's last launch before it becomes eligible for full delete
+    # (node layers + P2P caches + registry tag). Default 5 days per the auto-delete contract.
+    CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", "432000"))
 
     # Internal build-agent channel (R9700 -> manager). Token guards /api/internal/builds/*.
     BUILD_AGENT_TOKEN: str = os.getenv("BUILD_AGENT_TOKEN", "")
@@ -442,6 +451,14 @@ class Settings:
     # The Image-Service host is itself a labelled prepull node; node-target resolution must drop it
     # so it never receives distributions. Must exactly match its `kubectl get nodes` name.
     IMAGE_SERVICE_NODE_NAME: str = os.getenv("IMAGE_SERVICE_NODE_NAME", "")
+    # Nodes permanently excluded from image distribution regardless of their labels/Ready state
+    # (e.g. off-LAN nodes the daemon cannot reach over the 10.5.10.0/24 routed LAN). Comma-separated
+    # node names. Defaults to the known off-LAN node so a relabel can never make it a target.
+    IMAGE_TARGET_NODE_DENYLIST: list = [
+        n.strip() for n in os.getenv("IMAGE_TARGET_NODE_DENYLIST", "wx-ms-w7900d-0027").split(",") if n.strip()
+    ]
+    # Short TTL (seconds) for the cached list_node() result used in image target resolution.
+    NODE_LIST_CACHE_TTL_SECONDS: float = float(os.getenv("NODE_LIST_CACHE_TTL_SECONDS", "5"))
     # ACR Enterprise registry used as the admin-image backup source of truth.
     ACR_ENTERPRISE_REGISTRY: str = os.getenv("ACR_ENTERPRISE_REGISTRY", "")
     # Optional Docker Hub pull secret for dockerhub_pull source images.

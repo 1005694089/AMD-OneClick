@@ -16,11 +16,29 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
 
+def _skip_not_leader(job_name: str) -> bool:
+    """True if this replica is not the leader and should skip the job.
+
+    With leader election disabled (default / single replica), is_leader() is always True so nothing
+    is skipped. With it enabled and this replica not holding the Lease, the job is a no-op here and
+    runs on the leader instead — preventing double-billing / duplicate reconciliation across
+    replicas.
+    """
+    from .leader import is_leader
+
+    if is_leader():
+        return False
+    logger.debug("Skipping %s on non-leader replica", job_name)
+    return True
+
+
 async def cleanup_job():
     """Periodic job to cleanup idle and expired instances"""
+    if _skip_not_leader("cleanup_job"):
+        return
     from .k8s_client import k8s_client
     from .store import charge_usage_unit, list_active_instances, mark_instance_deleted, mark_instance_ready_for_billing, update_instance_charge_time
-    
+
     logger.info("Running cleanup job...")
     try:
         cleaned = []
@@ -89,6 +107,8 @@ async def cleanup_job():
 
 async def template_preview_sync_job():
     """Periodic job to refresh notebook template preview caches."""
+    if _skip_not_leader("template_preview_sync_job"):
+        return
     from .template_sync import sync_due_template_previews
 
     logger.info("Running template preview sync job...")
@@ -104,6 +124,8 @@ async def template_preview_sync_job():
 
 async def reap_stale_builds_job():
     """Fail custom image builds whose agent lease has expired (agent died/stalled)."""
+    if _skip_not_leader("reap_stale_builds_job"):
+        return
     from .store import reap_stale_builds
 
     try:
@@ -119,6 +141,8 @@ async def reap_stale_image_jobs_job():
 
     Harmless when RUN_SCHEDULER is off: the image-service daemon also reaps stale jobs.
     """
+    if _skip_not_leader("reap_stale_image_jobs_job"):
+        return
     from .store import reap_stale_image_jobs
 
     try:
@@ -131,6 +155,8 @@ async def reap_stale_image_jobs_job():
 
 async def idle_reaper_job():
     """Auto-destroy idle/expired instances (API-launched pods after 8h idle)."""
+    if _skip_not_leader("idle_reaper_job"):
+        return
     from .k8s_client import k8s_client
 
     try:

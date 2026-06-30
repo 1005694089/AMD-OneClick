@@ -132,6 +132,11 @@ class ImageJobLogRequest(BaseModel):
     log: str
 
 
+class ImageJobHeartbeatRequest(BaseModel):
+    """Image-service liveness ping for a long-running job (keeps the lease fresh)."""
+    agent_id: str
+
+
 class ImageJobResultRequest(BaseModel):
     """Image-service terminal result for a job"""
     agent_id: str

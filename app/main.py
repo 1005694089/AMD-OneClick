@@ -50,6 +50,7 @@ from .models import (
     BuildEvictRequest,
     ImageJobClaimRequest,
     ImageJobLogRequest,
+    ImageJobHeartbeatRequest,
     ImageJobResultRequest,
     ImageNodeStatusRequest,
 )
@@ -118,6 +119,7 @@ from .store import (
     enqueue_image_job,
     claim_next_image_job,
     append_image_job_log,
+    heartbeat_image_job,
     finish_image_job,
     upsert_image_node,
     image_loaded_on_node,
@@ -148,6 +150,8 @@ async def lifespan(app: FastAPI):
         )
     init_db()
     if settings.RUN_SCHEDULER:
+        from .leader import elector
+        elector.start()
         start_scheduler()
     else:
         logger.info("Background scheduler disabled for this manager process")
@@ -156,6 +160,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down AMD OneClick Notebook Manager")
     if settings.RUN_SCHEDULER:
         stop_scheduler()
+        from .leader import elector
+        elector.stop()
 
 
 app = FastAPI(
@@ -1707,10 +1713,14 @@ async def report_build_result(image_id: int, req: BuildResultRequest, _agent: bo
 
 
 @app.post("/api/internal/builds/gc-candidates")
-async def build_gc_candidates(req: BuildClaimRequest, _agent: bool = Depends(verify_build_agent)):
+async def build_gc_candidates(req: BuildClaimRequest, mode: str = "idle", _agent: bool = Depends(verify_build_agent)):
+    """Custom-image GC candidates. mode='idle' (default) returns only images past the 5-day idle
+    window; mode='disk_pressure' returns all ready node-local images coldest-first so an
+    over-threshold disk can reclaim the coldest image regardless of the idle window."""
+    gc_mode = "disk_pressure" if mode == "disk_pressure" else "idle"
     candidates = [
         {"id": row["id"], "tag": row["image"], "last_launched_at": row.get("last_launched_at")}
-        for row in list_gc_candidates()
+        for row in list_gc_candidates(mode=gc_mode)
     ]
     return {"candidates": candidates}
 
@@ -1852,6 +1862,14 @@ async def push_image_job_log(job_id: int, req: ImageJobLogRequest, _agent: bool 
     return {"ok": True}
 
 
+@app.post("/api/internal/jobs/{job_id}/heartbeat")
+async def push_image_job_heartbeat(job_id: int, req: ImageJobHeartbeatRequest, _agent: bool = Depends(verify_build_agent)):
+    """Refresh a long-running job's lease so the reaper does not requeue it mid-pull."""
+    if not heartbeat_image_job(job_id, agent_id=req.agent_id):
+        raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
+    return {"ok": True}
+
+
 @app.post("/api/internal/jobs/{job_id}/result")
 async def report_image_job_result(job_id: int, req: ImageJobResultRequest, _agent: bool = Depends(verify_build_agent)):
     status = (req.status or "").strip().lower()
@@ -1952,18 +1970,25 @@ async def list_outdated_image_targets(req: ImageJobClaimRequest, _agent: bool = 
     """
     outdated = list_outdated_images()
     by_ref: dict[str, list[str]] = {}
+    cid_by_ref: dict[str, int] = {}
     for row in outdated:
         ref = row.get("image_ref")
         node = row.get("node_name")
         if not ref or not node:
             continue
         by_ref.setdefault(ref, []).append(node)
+        # Carry the custom_image_id (idle custom images) so the evict job flips the row to
+        # 'evicted' via mark_custom_image_evicted; catalog rows have none.
+        cid = row.get("custom_image_id")
+        if cid is not None:
+            cid_by_ref[ref] = cid
     enqueued = 0
     for ref, node_names in by_ref.items():
         targets = k8s_client.resolve_node_targets(node_names)
         job = enqueue_image_job(
             kind="evict",
             ref=ref,
+            custom_image_id=cid_by_ref.get(ref),
             payload={"targets": targets, "scope": "outdated"},
         )
         if job:
