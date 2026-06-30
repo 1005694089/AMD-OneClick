@@ -26,7 +26,47 @@ secrets.
 
 ---
 
-## 2026-06-30 (latest) — Radeon beta: select launch image by admin-panel name
+## 2026-06-30 (latest) — Radeon beta: clone a repo with no notebook file
+
+**Commit:** `64b2ec3` on `BETA-test` (pushed to origin). Two ways to launch
+JupyterLab from a cloned repo with no `.ipynb`: (A) the HF demo API accepts a
+`.git` repo as `notebook_path` when `pod_type=workshop` (`org/repo.git`, optional
+`@branch`, full URL or scp form, GitHub-only); (B) notebook-type templates may set
+a `repo_url` with no `notebook_path`. Shared startup-script fix: omit `--branch`
+when none given (follow remote HEAD), skip the notebook-not-found check when path
+is empty, echo the shlex-quoted path.
+
+**Review:** 3-dimension adversarial workflow (correctness/security/regression),
+each finding verified by an independent skeptic. 4 findings raised: 1 HIGH was a
+false positive (reviewer ran against a stale tree; the real sole caller at
+`main.py:1287` gates on `_template_github_info(...) or None`, not notebook_path —
+confirmed live on the deployed pod). 3 low findings fixed before deploy: scp-form
+non-GitHub host now rejected, trailing slash/query/fragment tolerated, and the
+`echo` now uses the quoted path (no shell-injection via a crafted `.ipynb` path).
+
+**Deploy mechanism:** patched 3 keys (`main.py`, `k8s_client.py`,
+`notebook_sources.py`) in `amd-oneclick-radeon-beta-code-overrides`
+(`kubectl patch --type merge`) + `rollout restart`. No config-CM or Postgres
+change. Verified live: pre-patch CM byte-identical to git baseline (no drift);
+post-patch keys match committed code.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 (post-patch, data) | Rollback snapshot (sha256, git-ignored) |
+|----------------|----------------|------------------------------------------|------------------------------------------|
+| radeon-beta / 30444 | image unchanged + CM | `1d77c01f7a95a48c4c06b24179975a05eb935ffe7f7d01271db5a2988a06455d` | `local-deploy-history/radeon-beta/cm-snapshot-20260630-202406.yaml` (`7c250eeff05a135f634b4f9e1a58312d14a01c9ad575710dfe32ff057a74a359`) |
+
+**Verified live e2e:** new pod runs new code. Negative: `.git`+`hackathon` → 400,
+`.git`+no-pod_type → 400, `git@gitlab.com:…` → 400 (`Only GitHub …`). Positive:
+workshop launch of `octocat/Hello-World.git` → 200, root URL (`/lab?token=`, no
+`/tree/`), pod Running, logs show `Cloning … Repository cloned` with **no
+"Notebook not found"**, annotations `pod-type=workshop` / `api-launched=true` /
+`github-path=""`; instance destroyed, 0 residue. Part B: deployed
+`_template_github_info` returns a clone-capable `github_info` (`path=""`,
+`repo_url` set) for a repo-only notebook template, `{}` for image-only — same
+clone path the workshop pod exercised. Tests: 53 passed in-pod.
+
+---
+
+## 2026-06-30 — Radeon beta: select launch image by admin-panel name
 
 **Commit:** `d7375a5` on `BETA-test` (pushed to origin). API callers can now pass
 the friendly image NAME (e.g. `Huggingface`) in the `image` field, not just the
