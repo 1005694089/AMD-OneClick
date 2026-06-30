@@ -111,22 +111,12 @@
 
     const JUPYTER_LOGO = 'https://cdn.jsdelivr.net/npm/simple-icons@13/icons/jupyter.svg';
     const OPENCODE_LOGO = 'https://opencode.ai/favicon.svg';
-    const HERMES_LOGO = 'https://hermes-agent.nousresearch.com/favicon.ico';
     // Render a brand logo with a small, always-visible one-word label next to it.
     // If the logo fails to load, the label alone still identifies the button.
     function brandContent(src, alt, label) {
       return React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
         React.createElement('img', { src, alt, style: { height: 18, width: 18, objectFit: 'contain', display: 'block' }, onError: (e) => { e.target.style.display = 'none'; } }),
         React.createElement('span', { style: { fontSize: 12, lineHeight: 1 } }, label)
-      );
-    }
-    // Disabled Hermes button — placeholder for a future experimental feature.
-    function hermesButton(opts) {
-      return React.createElement(Button, Object.assign({ disabled: true, title: 'Hermes - experimental, coming soon' }, opts || {}),
-        React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
-          brandContent(HERMES_LOGO, 'Hermes', 'Hermes'),
-          React.createElement('span', { style: { fontSize: 10, opacity: 0.6 } }, 'soon')
-        )
       );
     }
     function opencodeCredentials(username, password) {
@@ -639,8 +629,7 @@
           ), (!launchModalOpen && readyUrl && launchStatus && launchStatus.status === 'ready') && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Space, { style: { width: '100%' }, direction: 'vertical' },
             React.createElement(Button, { href: readyUrl, target: '_blank', block: true, title: 'Open Notebook (Jupyter)' }, brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')),
             readyOpencodeUrl && React.createElement(Button, { type: 'primary', ghost: true, href: readyOpencodeUrl, target: '_blank', block: true, title: 'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
-            readyOpencodeUrl && opencodeCredentials(readyOpencodeUsername, readyOpencodePassword),
-            hermesButton({ block: true })
+            readyOpencodeUrl && opencodeCredentials(readyOpencodeUsername, readyOpencodePassword)
           ))
         );
       }
@@ -656,8 +645,7 @@
         function openActions(nbUrl, ocUrl, ready) {
           return React.createElement(React.Fragment, null,
             React.createElement(Button, { title: ready ? 'Open Notebook (Jupyter)' : 'Workspace is starting...', disabled: !ready, href: ready && nbUrl ? nbUrl : undefined, target: '_blank' }, ready ? brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter') : 'Starting\u2026'),
-            ocUrl && React.createElement(Button, { type: 'primary', ghost: true, title: ready ? 'Open in OpenCode' : 'Workspace is starting...', disabled: !ready, href: ready ? ocUrl : undefined, target: '_blank' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
-            ready && hermesButton({})
+            ocUrl && React.createElement(Button, { type: 'primary', ghost: true, title: ready ? 'Open in OpenCode' : 'Workspace is starting...', disabled: !ready, href: ready ? ocUrl : undefined, target: '_blank' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode'))
           );
         }
 
@@ -730,8 +718,7 @@
           if (isApi) return React.createElement(Button, { type:'primary', href:'/profile', target:'_blank' }, 'View Endpoint');
           return React.createElement(React.Fragment, null,
             React.createElement(Button, { type:'primary', href: readyUrl, target: '_blank', title: isApp ? 'Open App' : 'Open Notebook' }, isApp ? 'Open App' : brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')),
-            (!isApp && readyOpencodeUrl) && React.createElement(Button, { type:'primary', ghost:true, href: readyOpencodeUrl, target:'_blank', title:'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
-            (!isApp && readyUrl) && hermesButton({})
+            (!isApp && readyOpencodeUrl) && React.createElement(Button, { type:'primary', ghost:true, href: readyOpencodeUrl, target:'_blank', title:'Open in OpenCode' }, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode'))
           );
         }
         return React.createElement(Button, { type: 'primary', loading: launchingTemplateId === tpl.id, disabled: (launchingTemplateId && launchingTemplateId !== tpl.id) || hasActiveInstance, title: hasActiveInstance ? 'Only one active instance is allowed. Open or destroy it from Profile.' : '', onClick: () => launchTemplate(tpl) }, 'Launch');

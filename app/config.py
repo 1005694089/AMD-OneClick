@@ -374,8 +374,8 @@ class Settings:
         if not self.OPENCODE_PUBLIC_BASE_URL:
             return None
         return urlparse(self.OPENCODE_PUBLIC_BASE_URL).port
-    # Appended to every custom-image build. The default uses upstream `curl | bash` installers
-    # (opencode.ai, nousresearch.com) — a third-party supply-chain dependency. Operators who
+    # Appended to every custom-image build. The default uses an upstream `curl | bash` installer
+    # (opencode.ai) — a third-party supply-chain dependency. Operators who
     # want to remove that exposure can set DOCKERFILE_SUFFIX to a vendored, checksum-pinned
     # equivalent (e.g. COPY a verified installer from the build context) via the env var.
     DOCKERFILE_SUFFIX: str = os.getenv("DOCKERFILE_SUFFIX", "").strip() or DOCKERFILE_SUFFIX

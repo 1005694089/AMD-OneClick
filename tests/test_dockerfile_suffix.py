@@ -33,10 +33,9 @@ class DockerfileSuffixJupyterMandatoryTests(unittest.TestCase):
         self.assertFalse(gate.rstrip().endswith("|| true"))
 
     def test_optional_services_stay_best_effort(self):
-        # OpenCode/Hermes are optional side-services; they may keep `|| true`.
+        # OpenCode is an optional side-service; it may keep `|| true`.
         text = DOCKERFILE_SUFFIX
         self.assertIn("opencode.ai/install", text)
-        self.assertIn("hermes", text.lower())
 
 
 if __name__ == "__main__":

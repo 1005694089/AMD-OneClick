@@ -1657,7 +1657,7 @@ async def claim_build(req: BuildClaimRequest, _agent: bool = Depends(verify_buil
     job = claim_next_build(req.agent_id)
     if not job:
         return {"job": None}
-    # The agent always builds with OpenCode + Hermes appended.
+    # The agent always builds with the Jupyter + OpenCode suffix appended.
     dockerfile = job["dockerfile"] + "\n" + settings.DOCKERFILE_SUFFIX
     return {"job": {"id": job["id"], "tag": job["image"], "dockerfile": dockerfile}}
 
@@ -1808,7 +1808,7 @@ async def claim_image_job(req: ImageJobClaimRequest, _agent: bool = Depends(veri
         except (ValueError, TypeError):
             payload = {}
     payload = payload or {}
-    # A build job always builds with OpenCode + Hermes appended, exactly as claim_build does.
+    # A build job always builds with the Jupyter + OpenCode suffix appended, exactly as claim_build does.
     if job.get("kind") == "build" and payload.get("dockerfile"):
         payload["dockerfile"] = payload["dockerfile"] + "\n" + settings.DOCKERFILE_SUFFIX
     return {
