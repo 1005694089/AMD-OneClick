@@ -324,7 +324,7 @@ image_jobs = Table(
     Index("ix_image_jobs_status_kind", "status", "kind"),
 )
 
-IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "push", "distribute", "evict")
+IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "push", "distribute", "warm", "evict")
 IMAGE_JOB_TERMINAL = ("succeeded", "failed")
 
 # Kinds that perform a per-node containerd unpack and must be serialized per target node (the

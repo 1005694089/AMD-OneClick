@@ -98,7 +98,7 @@ DOCKER_BUILDKIT = _env("DOCKER_BUILDKIT", "0")
 _IS_NERDCTL = os.path.basename(CONTAINER_CLI) == "nerdctl"
 
 # Which job kinds this daemon will claim. CSV; default = all.
-ALL_KINDS = ["build", "pull", "acr_backup", "push", "distribute", "evict"]
+ALL_KINDS = ["build", "pull", "acr_backup", "push", "distribute", "warm", "evict"]
 IMAGE_SERVICE_KINDS = [
     k.strip() for k in _env("IMAGE_SERVICE_KINDS", ",".join(ALL_KINDS)).split(",") if k.strip()
 ]
@@ -915,6 +915,100 @@ def run_distribute(job):
     report_result(job_id, status, {"ref": ref, "nodes": results})
 
 
+def run_warm(job):
+    """P3 transport: warm an image onto nodes by triggering a per-node `ctr pull` of the LAN-registry
+    ref THROUGH each node's local Dragonfly dfdaemon mirror (127.0.0.1:4001). Bytes arrive node<-P2P;
+    0042 sends none (unlike run_distribute's save|ssh 'ctr import' byte-push).
+
+    Forks run_distribute's scaffolding EXACTLY — same ThreadPoolExecutor over targets, _node_lock
+    (the chain-ID unpack mutex is graceful, not eliminated), _containerd_responsive pre/post,
+    _handle_wedged_node, 'importing' status, and the SAME per-node results list
+    (report_result nodes=[{node,ip,loaded,size_bytes,error},...]) so the manager's warm/distribute
+    lifecycle branch writes the image_nodes 'loaded' row identically.
+
+    The ref pulled is the LAN-registry ref (payload.lan_target_ref, else the job ref). Each node's
+    containerd must have /etc/containerd/certs.d/<lan-host>/hosts.toml pointing at 127.0.0.1:4001
+    (P2 canary step) — otherwise the pull goes straight to zot (still correct, just not P2P)."""
+    job_id = job["id"]
+    ref = job["ref"]
+    payload = job.get("payload") or {}
+    targets = payload.get("targets") or []
+    # The ref that actually lives in the LAN registry (what nodes pull). Falls back to the job ref.
+    lan_ref = payload.get("lan_target_ref") or ref
+    concurrency = int(payload.get("concurrency") or DISTRIBUTE_CONCURRENCY)
+
+    if not DISTRIB_SSH_KEY:
+        push_log(job_id, "DISTRIB_SSH_KEY is not configured; cannot warm.\n")
+        report_result(job_id, "failed", {"ref": ref, "error": "distrib_ssh_key_unset"})
+        return
+    if not targets:
+        push_log(job_id, "No targets in payload; nothing to warm.\n")
+        report_result(job_id, "failed", {"ref": ref, "error": "no_targets"})
+        return
+
+    push_log(job_id, f"Warming {lan_ref} onto {len(targets)} node(s) via per-node P2P pull.\n")
+    results = []
+    lock = threading.Lock()
+
+    def _one(target):
+        node = target.get("node")
+        ip = target.get("ip")
+        entry = {"node": node, "ip": ip, "loaded": False, "size_bytes": None, "error": None}
+        if not ip:
+            entry["error"] = "missing_ip"
+            return entry
+
+        # Same per-node serialization as distribute: two unpacks of the same chain onto one node
+        # wedge containerd's chain-ID mutex. Cross-node pulls still run in parallel.
+        with _node_lock(node):
+            free_gb = _node_root_free_gb(ip)
+            if free_gb < IMAGE_NODE_MIN_FREE_DISK_GB:
+                entry["error"] = f"node_low_disk:{free_gb:.1f}GB<{IMAGE_NODE_MIN_FREE_DISK_GB}GB"
+                push_log(job_id, f"[{node}] refusing: containerd root free {free_gb:.1f}GB below floor.\n")
+                return entry
+
+            if not _containerd_responsive(ip):
+                entry["error"] = "containerd_wedged"
+                push_log(job_id, f"[{node}] containerd not responsive before pull; skipping.\n")
+                _handle_wedged_node(job_id, node, ip, ref)
+                return entry
+
+            try:
+                report_node_status(node, ref, "importing")
+            except Exception:
+                pass
+
+            # Trigger the pull ON the node. Bytes arrive via the node-local dfdaemon mirror (P2P);
+            # 0042 streams nothing. Wrap the remote ctr in `timeout -s KILL` so a stalled pull dies
+            # on its own deadline instead of blocking inside the daemon.
+            remote = (
+                f"sudo timeout -s KILL {REMOTE_IMPORT_TIMEOUT}s "
+                f"ctr -n {CTR_NAMESPACE} images pull {shlex.quote(lan_ref)}"
+            )
+            ok = stream_command(job_id, _ssh_base(ip) + [remote])
+            entry["loaded"] = ok
+            if ok:
+                return entry
+
+            if not _containerd_responsive(ip):
+                entry["error"] = "containerd_wedged"
+                push_log(job_id, f"[{node}] containerd unresponsive after failed pull; node wedged.\n")
+                _handle_wedged_node(job_id, node, ip, ref)
+            else:
+                entry["error"] = "pull_failed"
+            return entry
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        for entry in pool.map(_one, targets):
+            with lock:
+                results.append(entry)
+
+    all_loaded = all(e["loaded"] for e in results)
+    status = "succeeded" if all_loaded else "failed"
+    push_log(job_id, f"\nWarm {status}: {sum(e['loaded'] for e in results)}/{len(results)} loaded.\n")
+    report_result(job_id, status, {"ref": ref, "nodes": results})
+
+
 def run_evict(job):
     job_id = job["id"]
     ref = job["ref"]
@@ -965,6 +1059,7 @@ DISPATCH = {
     "acr_backup": run_acr_backup,
     "push": run_push,
     "distribute": run_distribute,
+    "warm": run_warm,
     "evict": run_evict,
 }
 

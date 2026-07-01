@@ -1770,7 +1770,9 @@ def _enqueue_next_chain_step(job: dict, payload: dict) -> None:
     next_payload: dict = {"chain": chain}
     if payload.get("scope"):
         next_payload["scope"] = payload["scope"]
-    if next_kind == "distribute":
+    if next_kind in ("distribute", "warm"):
+        # warm forks distribute's target model exactly — Manager resolves node IPs (the daemon has
+        # no kubectl); the daemon triggers a per-node pull through the P2P mirror.
         next_payload["targets"] = _resolve_chain_targets(payload.get("scope") or "all")
     elif next_kind == "acr_backup":
         acr_target_ref = payload.get("acr_target_ref")
@@ -1834,7 +1836,9 @@ def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
         if custom_image_id:
             store.set_custom_image_digest(custom_image_id, digest)
             update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
-    elif kind == "distribute":
+    elif kind in ("distribute", "warm"):
+        # warm writes the SAME 'loaded' rows distribute did — the per-node results contract is
+        # identical, so upload->ready-on-all counting is unchanged whichever transport ran.
         for node in result.get("nodes", []) or []:
             node_name = node.get("node") if isinstance(node, dict) else node
             if node and (not isinstance(node, dict) or node.get("loaded")):
