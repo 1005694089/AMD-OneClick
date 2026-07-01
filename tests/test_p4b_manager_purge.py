@@ -137,11 +137,20 @@ class ManagerPurgeP2PTests(unittest.TestCase):
         self.assertTrue(all(c["command"][:2] == ["sh", "-c"] and "task rm" in c["command"][2] for c in core.calls))
 
     def test_p2p_task_not_found_is_success(self):
-        # rc!=0 but task-specific not-found phrase => already gone => success
-        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=1, text="task not found")
+        # rc!=0 with the REAL dfctl v1.4.0 already-gone output: "... task <id> not found".
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=1,
+                          text="Removing Task Failed!\nBad Code: Internal error\nMessage: task aaaa not found")
         job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "A"}], "blob_ids": ["aaaa"]}}
         res = purge_exec.run_purge_p2p_manager(core, job)
         self.assertTrue(res["nodes"][0]["removed"])
+
+    def test_p2p_missing_binary_notfound_text_still_fails(self):
+        # rc=127 with shell "dfctl: not found" (a BARE not-found, not task-scoped) must FAIL — the
+        # regex requires "task ... not found", so this is not mistaken for already-gone.
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=127, text="sh: dfctl: not found")
+        job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "A"}], "blob_ids": ["aaaa"]}}
+        res = purge_exec.run_purge_p2p_manager(core, job)
+        self.assertFalse(res["nodes"][0]["removed"])
 
     def test_p2p_real_error_fails(self):
         core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=1, text="connection refused")

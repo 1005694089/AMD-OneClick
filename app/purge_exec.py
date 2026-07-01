@@ -17,6 +17,7 @@ truly gone.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from kubernetes.client.rest import ApiException
@@ -26,10 +27,25 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
-# dfctl prints one of these (case-insensitive) when the task is already absent. Deliberately
-# TASK-SPECIFIC: never the bare "not found", which also appears in `exec: "dfctl": ... not found`
-# (missing binary) — treating that as success would open the purge_meta gate while bytes remain.
-_NOT_FOUND_MARKERS = ("task not found", "no such task", "task does not exist", "content not found")
+# dfctl v1.4.0 prints (verified live against a real seed) on an already-absent task, rc=1:
+#   Removing Task Failed! / Bad Code: Internal error / Message: task <64-hex> not found
+# So the real phrase is "task <ID> not found", NOT the literal "task not found". Match it with a
+# regex that requires the word "task" followed (allowing the id) by "not found" — deliberately
+# TASK-SPECIFIC so a MISSING-BINARY shell error ("sh: dfctl: not found") is NOT accepted as success
+# (that must fail so the purge retries instead of dropping the DB handle while bytes remain).
+_NOT_FOUND_RE = re.compile(r"task\b.*\bnot found", re.IGNORECASE | re.DOTALL)
+# Other daemon phrasings that also mean already-gone (kept as plain substrings).
+_NOT_FOUND_MARKERS = ("no such task", "task does not exist", "content not found")
+
+
+def _is_already_gone(text: str) -> bool:
+    """True iff dfctl output indicates the task was already absent (a success for an idempotent
+    delete). Requires a TASK-scoped not-found phrase; a bare 'not found' (e.g. missing binary) is
+    intentionally NOT matched."""
+    low = (text or "").lower()
+    if _NOT_FOUND_RE.search(low):
+        return True
+    return any(m in low for m in _NOT_FOUND_MARKERS)
 
 # Unique sentinels so we can recover the real exit code from the merged stdout+stderr stream
 # (_preload_content=True does NOT surface the exec exit status; the shell wrapper carries it).
@@ -106,8 +122,8 @@ def _exec_dfctl_rm(core_v1, pod: str, container: str, task_id: str) -> tuple[boo
     if rc == 0:
         return True, "deleted"
     # Non-zero: success ONLY for a task-specific already-gone phrase; everything else fails loud.
-    low = text.lower()
-    if any(m in low for m in _NOT_FOUND_MARKERS):
+    # (dfctl v1.4.0 exits 1 with "... task <id> not found" when the task is already gone.)
+    if _is_already_gone(text):
         return True, "already_gone"
     return False, f"dfctl_rc_{rc}:{text.strip()[:200]}"
 
