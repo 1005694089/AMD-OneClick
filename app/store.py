@@ -60,6 +60,10 @@ users = Table(
     Column("credits", Integer, nullable=False, default=100),
     Column("is_editor", Boolean, nullable=False, default=False),
     Column("ssh_public_key", Text),
+    # Session epoch. Every issued session cookie embeds the value that was
+    # current at login; bumping this invalidates all outstanding sessions for
+    # the user (used for admin revocation / kicking abusive accounts).
+    Column("token_version", Integer, nullable=False, default=0),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
     UniqueConstraint("provider", "provider_id", name="uq_users_provider_id"),
@@ -239,6 +243,8 @@ def ensure_schema_columns(conn):
         conn.execute(text("ALTER TABLE users ADD COLUMN is_editor BOOLEAN NOT NULL DEFAULT FALSE"))
     if "ssh_public_key" not in user_columns:
         conn.execute(text("ALTER TABLE users ADD COLUMN ssh_public_key TEXT"))
+    if "token_version" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"))
 
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
     if "billing_session_id" not in instance_columns:
@@ -367,6 +373,7 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
             user["_created"] = False
             return user
 
+        signup_bonus = int(settings.SIGNUP_BONUS_CREDITS)
         result = conn.execute(
             users.insert().values(
                 provider=provider,
@@ -374,15 +381,16 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
                 email=email,
                 name=name,
                 avatar_url=avatar_url,
-                credits=10,
+                credits=signup_bonus,
                 created_at=now,
                 updated_at=now,
             )
         )
         user_id = result.inserted_primary_key[0]
-        conn.execute(
-            credit_ledger.insert().values(user_id=user_id, delta=10, reason="signup_bonus", created_at=now)
-        )
+        if signup_bonus:
+            conn.execute(
+                credit_ledger.insert().values(user_id=user_id, delta=signup_bonus, reason="signup_bonus", created_at=now)
+            )
         user = row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
         user["_created"] = True
         return user
@@ -391,6 +399,24 @@ def get_or_create_user(provider: str, provider_id: str, email: str, name: str = 
 def get_user(user_id: int) -> Optional[dict]:
     with engine.begin() as conn:
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
+def get_user_token_version(user_id: int) -> Optional[int]:
+    with engine.begin() as conn:
+        row = conn.execute(select(users.c.token_version).where(users.c.id == user_id)).first()
+        return int(row[0]) if row else None
+
+
+def bump_user_token_version(user_id: int) -> Optional[int]:
+    """Invalidate all outstanding sessions for a user (admin revocation)."""
+    now = utc_now()
+    with engine.begin() as conn:
+        user = conn.execute(select(users.c.token_version).where(users.c.id == user_id)).first()
+        if not user:
+            return None
+        new_version = int(user[0]) + 1
+        conn.execute(update(users).where(users.c.id == user_id).values(token_version=new_version, updated_at=now))
+        return new_version
 
 
 def ensure_user_min_credits(user_id: int, minimum_credits: int) -> Optional[dict]:
@@ -543,9 +569,14 @@ def redeem_user_coupon(user_id: int, coupon: dict) -> dict:
 
 
 def list_images(enabled_only: bool = False) -> list[dict]:
+    # Availability to users is governed solely by the admin `enabled` flag.
+    # `sync_status` (prepull warmth) is display-only and must NOT hide an image,
+    # otherwise transient node/prepull flaps make enabled images vanish from the
+    # catalog ("image catalog cannot be found"). kubelet pulls on demand when a
+    # node has not been pre-warmed.
     stmt = select(images).order_by(images.c.id)
     if enabled_only:
-        stmt = stmt.where(images.c.enabled == True, images.c.sync_status == "ready")  # noqa: E712
+        stmt = stmt.where(images.c.enabled == True)  # noqa: E712
     with engine.begin() as conn:
         return [dict(r) for r in conn.execute(stmt).mappings().all()]
 
@@ -1175,6 +1206,17 @@ def charge_usage_unit(user_id: int, instance_id: str, billing_session_id: str, b
 def update_instance_charge_time(record_id: int, charged_at: str):
     with engine.begin() as conn:
         conn.execute(update(instance_records).where(instance_records.c.id == record_id).values(last_charged_at=charged_at))
+
+
+def list_active_instance_ids() -> set[str]:
+    """instance_ids of all records that are not soft-deleted (any live status).
+
+    Used by the reconciler to distinguish cluster orphans (pods with our label
+    but no owning DB record) from legitimately managed instances.
+    """
+    stmt = select(instance_records.c.instance_id).where(instance_records.c.deleted_at.is_(None))
+    with engine.begin() as conn:
+        return {r[0] for r in conn.execute(stmt).all()}
 
 
 def list_active_instances() -> list[dict]:
