@@ -82,8 +82,8 @@ See the "Decisions required" section at the bottom. Concretely gather:
 2. **Live CNI probe.** Deploy a tiny DaemonSet that curls a peer pod's IP:port across nodes; confirm
    pod-to-pod works over the node network (Dragonfly P2P needs it), and confirm the **manager pod
    cannot** reach node InternalIPs (validates the B1 trigger choice).
-3. **Registry engine:** registry:2 vs zot (see decisions). Code is written registry-v2-agnostic so
-   this can be deferred to deploy time, but the GC-lock strategy differs.
+3. **Registry engine: zot (decided).** No GC-lock/push-pause needed. Push/delete code is written
+   against the registry v2 API so it is engine-neutral; zot's online GC handles blob reclaim.
 
 ---
 
@@ -102,9 +102,10 @@ See the "Decisions required" section at the bottom. Concretely gather:
   (it is 0042-local, not a per-node unpack).
 
 **Deploy on 0042:**
-1. `sudo install -d -o imagesvc -g imagesvc /disk/ssd2/registry`
-2. Run the chosen registry (Step 1.3) as a systemd-managed container bound to the 0042 LAN IP:5000,
-   TLS + htpasswd, data dir `/disk/ssd2/registry`.
+1. `sudo install -d -o imagesvc -g imagesvc /disk/ssd2/registry` (3.5 TB budget available).
+2. Run **zot** as a systemd-managed container bound to the 0042 LAN IP:5000, TLS + htpasswd, data
+   dir `/disk/ssd2/registry`, with online GC enabled in `zot-config.json` (dedupe + scheduled GC —
+   no push-pause). `delete` extension enabled so `registry_delete` can DELETE manifests by digest.
 3. Generate htpasswd + TLS cert; write registry creds into the agent's `DOCKER_CONFIG` dir and
    (later) into the Dragonfly `hosts.toml`.
 4. Add `LAN_REGISTRY=<0042-LAN-IP>:5000` to `/etc/amd-oneclick-image-service.env` and to the manager
@@ -185,16 +186,16 @@ canary while the fleet stays on `distribute`. **Verify** ready/delete/idle/self-
 
 ---
 
-## Decisions required before P1 (owner: you)
+## Decisions made (locked 2026-06-30)
 
-| # | Decision | Why it blocks | Options |
+| # | Decision | Choice | Consequence for the build |
 |---|---|---|---|
-| 1 | **Registry engine** | Sets the delete/GC story and whether P1 needs a maintenance window | **registry:2** (battle-tested, per-manifest DELETE + offline `garbage-collect`; needs a push-pause during GC) vs **zot** (OCI-native, online/scheduled GC, no push-pause; slightly less ubiquitous) |
-| 2 | **Second routed-LAN host?** | Decides whether 0042 can have real redundancy (P6) or only a rebuild runbook | Provision/identify a 2nd host on `10.5.10.x` → active standby; **or** accept 0042 as a single point kept recoverable via retained tarballs |
-| 3 | **Registry sizing on `/disk/ssd2`** | Registry competes with build tarballs + containerd GC on 0042 NVMe | Confirm ~1–2 TB budget (Σ images 10–19 GB × versions × 1.3) and reconcile with the 85% disk-GC threshold |
-| 4 | **Repo-path scoping in the LAN registry** | Prevents scoped delete from stranding/over-deleting shared blobs | Confirm `admin-<slug>` vs `user-<uid>` repo paths so admin and user images never share a manifest |
-| 5 | **Pre-seed hot base layers to the seed?** | Only lever that speeds up the *custom cold-launch* (single-consumer) path | Decide after P3 canary latency numbers — pre-seed shared ROCm/PyTorch base layers, or leave as parity-with-today |
+| 1 | **Registry engine** | **zot** | OCI-native, online/scheduled GC → **no push-pause / GC-lock needed**. Delete = manifest DELETE via the registry v2 API; blob reclaim is zot's background GC. The `push ↔ registry_delete` mutual-exclusion in the plan is **dropped** for zot. |
+| 2 | **0042 redundancy** | **Recoverable single point for now** (2nd LAN host coming later) | P6 ships the rebuild-from-tarball runbook, not active standby. Build tarballs are **retained** (already the P1 design). When the 2nd host arrives, add the standby registry (rsync `/disk/ssd2/registry`) + cold-standby agent then. |
+| 3 | **Registry disk on `/disk/ssd2`** | **3.5 TB available** | Comfortable for Σ images 10–19 GB × versions × 1.3. Set zot's data dir under `/disk/ssd2/registry`; still reconcile with the 85% disk-GC threshold so registry growth doesn't trip node GC on 0042. |
+| 4 | **Repo-path scoping** | **`admin-<slug>` vs `user-<uid>`** | Admin and user images never share a manifest, so scoped delete is safe. Keep the existing tag-prefix scheme. |
+| 5 | **Pre-seed hot base layers** | **Deferred** | Revisit after P3 canary latency numbers. Custom cold-launch stays parity-with-today until then. |
 
-**Also confirm before flipping HA on (Step 6), not P1:** enabling `LEADER_ELECTION_ENABLED` +
+**Still to confirm before flipping HA on (Step 6), not P1:** enabling `LEADER_ELECTION_ENABLED` +
 manager `replicas=3` requires the Lease RBAC (get/create/update on `coordination.k8s.io/leases`) on
 the manager service account, and Postgres HA staged alongside.
