@@ -141,6 +141,28 @@ class RequeueFailedTests(unittest.TestCase):
         self.assertEqual(store.requeue_failed_purges(REF), 0)
 
 
+class FlagGateTests(unittest.TestCase):
+    """PURGE_FANOUT_ENABLED gates the whole fan-out. Default OFF => delete keeps the pre-P4 `evict`
+    so shipping P4 code to prod is inert for delete until cutover flips the flag."""
+
+    def setUp(self):
+        _reset()
+
+    def test_flag_defaults_off(self):
+        from app.config import settings
+        self.assertFalse(settings.PURGE_FANOUT_ENABLED)
+
+    def test_helper_still_fans_out_regardless(self):
+        # enqueue_purge_fanout itself is unconditional (the CALLERS gate on the flag). Direct call
+        # always produces the 6 surfaces — this is what the delete endpoints invoke when flag ON.
+        main_module.enqueue_purge_fanout(REF, T, digest="d", lan_target_ref=REF)
+        with store.engine.begin() as conn:
+            n = conn.execute(
+                store.image_jobs.select().where(store.image_jobs.c.ref == REF)
+            ).mappings().all()
+        self.assertEqual(len(n), 6)
+
+
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         _reset()

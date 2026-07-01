@@ -1144,12 +1144,14 @@ def run_purge_p2p(job):
             return entry
         # Ask dfdaemon to delete the task. It MUST fail-loud on a real error so the purge_meta gate
         # stays closed (a silent success would drop the DB handle while bytes remain). Only a genuine
-        # "task not found" (already gone) is treated as success — grep the output for it. NO `|| true`
-        # / trailing `; true`: those made this always-succeed, defeating the gate (C3/C4 fix).
+        # already-gone task is treated as success. CRITICAL: rc 127 (command not found — dfget not
+        # installed) must FAIL, not pass — so we (a) hard-fail rc 127/126, (b) match a TASK-specific
+        # not-found phrase, never the bare "command not found". NO `|| true` / trailing `; true`.
         remote = (
             f"out=$(sudo {delete_cmd} 2>&1); rc=$?; "
             f"if [ $rc -eq 0 ]; then exit 0; fi; "
-            f"echo \"$out\" | grep -qiE 'not found|no such|does not exist' && exit 0; "
+            f"if [ $rc -eq 127 ] || [ $rc -eq 126 ]; then echo \"$out\" >&2; exit $rc; fi; "
+            f"echo \"$out\" | grep -qiE 'task not found|no such task|task does not exist|content not found' && exit 0; "
             f"echo \"$out\" >&2; exit $rc"
         )
         ok = stream_command(job_id, _ssh_base(ip) + [remote])
@@ -1182,7 +1184,8 @@ def run_purge_seed(job):
     cmd = (
         f"out=$({delete_cmd} 2>&1); rc=$?; "
         f"if [ $rc -eq 0 ]; then exit 0; fi; "
-        f"echo \"$out\" | grep -qiE 'not found|no such|does not exist' && exit 0; "
+        f"if [ $rc -eq 127 ] || [ $rc -eq 126 ]; then echo \"$out\" >&2; exit $rc; fi; "
+        f"echo \"$out\" | grep -qiE 'task not found|no such task|task does not exist|content not found' && exit 0; "
         f"echo \"$out\" >&2; exit $rc"
     )
     ok = stream_command(job_id, cmd)

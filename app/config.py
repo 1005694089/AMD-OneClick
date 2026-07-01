@@ -467,6 +467,13 @@ class Settings:
     # deploying P1 code before the registry env is wired is a no-op (safe/revertible). When set,
     # admin/custom builds push here and "ready" gates on the pushed digest being recorded.
     LAN_REGISTRY: str = os.getenv("LAN_REGISTRY", "").strip().rstrip("/")
+    # P4 complete-delete fan-out gate. FALSE (default) => delete/idle paths keep the pre-P4 single
+    # `evict` (node-layer removal), so shipping P4 code is INERT for delete and production delete
+    # keeps working exactly as before. TRUE => the 6-surface purge fan-out (purge_node/p2p/seed/
+    # registry_delete/purge_builder/purge_meta). Flip to TRUE only AFTER the P2P cutover, once every
+    # node/seed actually runs a dfdaemon (else purge_p2p/purge_seed have nothing to talk to and would
+    # stick purge_meta). This makes P3/P4 code shippable to prod with zero delete-behavior change.
+    PURGE_FANOUT_ENABLED: bool = os.getenv("PURGE_FANOUT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     # Optional Docker Hub pull secret for dockerhub_pull source images.
     DOCKERHUB_PULL_SECRET_NAME: str = os.getenv("DOCKERHUB_PULL_SECRET_NAME", "")
     # Optional proxy prefix for raw GitHub fetches. raw.githubusercontent.com is intermittently

@@ -1665,18 +1665,21 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
         try:
             recorded = store.list_nodes_for_image(image_ref)
             targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
-            # P4 complete-delete: fan out to every byte-surface (node layers, P2P caches, seed,
-            # registry tag, 0042 tarball, DB rows) — not just node layers. digest is captured from
-            # the just-deleted row so registry_delete can DELETE the zot manifest by digest.
-            # Do NOT link custom_image_id: the row was already deleted above, and image_jobs has a
-            # plain FK to custom_images — a link to a missing row would raise ForeignKeyViolation.
-            enqueue_purge_fanout(
-                image_ref,
-                targets,
-                digest=record.get("digest"),
-                lan_target_ref=_lan_registry_target_ref(image_ref),
-                image_id=None,
-            )
+            # P4 complete-delete fan-out — GATED (see admin_delete_image). Until PURGE_FANOUT_ENABLED,
+            # keep the single `evict`. Do NOT link custom_image_id in either branch: the row was
+            # already deleted above, and image_jobs has a plain FK to custom_images — a link to a
+            # missing row would raise ForeignKeyViolation.
+            if settings.PURGE_FANOUT_ENABLED:
+                enqueue_purge_fanout(
+                    image_ref,
+                    targets,
+                    digest=record.get("digest"),
+                    lan_target_ref=_lan_registry_target_ref(image_ref),
+                    image_id=None,
+                )
+            else:
+                enqueue_image_job(kind="evict", ref=image_ref,
+                                  payload={"scope": "all", "targets": targets})
         except Exception as e:
             logger.warning("Failed to enqueue purge fan-out for custom image %s (%s): %s", image_id, image_ref, e)
     return {"success": True}
@@ -2059,17 +2062,23 @@ async def list_outdated_image_targets(req: ImageJobClaimRequest, _agent: bool = 
         # up so registry_delete can DELETE the zot manifest. custom_image_id rides on purge_meta so
         # mark_custom_image_evicted flips the idle custom row to 'evicted'.
         cid = cid_by_ref.get(ref)
-        enqueue_purge_fanout(
-            ref,
-            targets,
-            digest=store.get_digest_for_ref(ref),
-            lan_target_ref=_lan_registry_target_ref(ref),
-            image_id=None,
-        )
-        if cid is not None:
-            # Re-stamp custom_image_id onto the purge_meta job for this ref (fan-out enqueued it with
-            # image_id=None; the custom mark needs the link). Safe: same-ref purge_meta is unique.
-            store.link_purge_meta_custom_image(ref, cid)
+        if settings.PURGE_FANOUT_ENABLED:
+            enqueue_purge_fanout(
+                ref,
+                targets,
+                digest=store.get_digest_for_ref(ref),
+                lan_target_ref=_lan_registry_target_ref(ref),
+                image_id=None,
+            )
+            if cid is not None:
+                # Re-stamp custom_image_id onto the purge_meta job (fan-out enqueued it with
+                # image_id=None; the custom mark needs the link). Safe: same-ref purge_meta is unique.
+                store.link_purge_meta_custom_image(ref, cid)
+        else:
+            # Pre-cutover: the original layers-only evict, carrying custom_image_id so an idle custom
+            # image is still marked 'evicted' (the P0/R2c behavior). Unchanged from before P4.
+            enqueue_image_job(kind="evict", ref=ref, custom_image_id=cid,
+                              payload={"targets": targets, "scope": "outdated"})
         enqueued += 1
     return {"images": outdated, "enqueued": enqueued}
 
@@ -3551,15 +3560,21 @@ async def admin_delete_image(image_id: int, username: str = Depends(verify_admin
         # currently recorded as holding this ref; fall back to all eligible nodes when none.
         recorded = store.list_nodes_for_image(existing["image"])
         targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
-        # P4 complete-delete fan-out (all six byte-surfaces). digest read NOW from the row; the
-        # subsequent delete_image() NULLs image_jobs.image_id so the images DELETE won't FK-violate.
-        enqueue_purge_fanout(
-            existing["image"],
-            targets,
-            digest=existing.get("digest"),
-            lan_target_ref=_lan_registry_target_ref(existing["image"]),
-            image_id=image_id,
-        )
+        # P4 complete-delete fan-out (all six byte-surfaces) — GATED. Until PURGE_FANOUT_ENABLED is
+        # flipped on (post-cutover, when nodes/seed run dfdaemon), keep the pre-P4 single `evict` so
+        # production delete behaves exactly as before. digest read NOW; the subsequent delete_image()
+        # NULLs image_jobs.image_id so the images DELETE won't FK-violate either way.
+        if settings.PURGE_FANOUT_ENABLED:
+            enqueue_purge_fanout(
+                existing["image"],
+                targets,
+                digest=existing.get("digest"),
+                lan_target_ref=_lan_registry_target_ref(existing["image"]),
+                image_id=image_id,
+            )
+        else:
+            enqueue_image_job(kind="evict", ref=existing["image"], image_id=image_id,
+                              payload={"scope": "all", "targets": targets})
         try:
             k8s_client.delete_image_sync(image_id)
         except Exception as e:
