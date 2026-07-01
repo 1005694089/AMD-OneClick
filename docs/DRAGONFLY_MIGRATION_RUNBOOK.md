@@ -31,7 +31,124 @@ to a self-hosted LAN registry + Dragonfly P2P mirror, sized for 100–300+ nodes
 
 ---
 
-## Step 0 — Deploy P0 (safe; distribution transport unchanged)
+## Ownership split
+
+- **You (SSH to 0042):** everything host-side on node 0042 — the zot registry container, its data
+  dir, TLS/htpasswd, the containerd trust for zot's cert, and the agent `systemctl` restart when I
+  hand you a new `agent.py`. You do **not** touch k8s or edit application code.
+- **Me (kubectl via `KUBECONFIG=/home/zijun/7900_cluster_config`):** all cluster work — the manager
+  `code-overrides` ConfigMap + rollout, the Dragonfly Helm install, DaemonSet/labels, Lease RBAC,
+  and writing/committing all application + agent code on the branch.
+
+Steps below are tagged **[YOU-0042]** (run over your SSH to 0042) or **[ME-k8s]** (I run these).
+
+---
+
+## Prerequisites — [YOU-0042] one-time host setup on node 0042
+
+Run these over your SSH session to 0042. They stand up the zot LAN registry and prepare the host so
+that when I ship the P1 agent code, the push/pull path just works. Nothing here depends on my k8s
+steps — you can do it any time before P1.
+
+> Values (confirmed from the cluster):
+> - `LAN_IP = 10.5.10.43` (node `wx-ms-w7900d-0042`, its `10.5.10.x` InternalIP)
+> - `REG_PORT = 5000`
+> - `REGISTRY_DIR = /disk/ssd2/registry`
+>
+> The commands below use `10.5.10.43` directly. Set `<REGISTRY_PASSWORD>` to a value you choose.
+
+**1. Confirm the disk budget and create the data dir**
+```
+df -h /disk/ssd2                 # expect ~3.5T available
+sudo install -d -o imagesvc -g imagesvc -m 0750 /disk/ssd2/registry
+```
+
+**2. Generate TLS cert + basic-auth for the registry**
+```
+sudo install -d -m 0750 /etc/zot
+# Self-signed cert with the LAN IP as a SAN (nodes connect by IP):
+sudo openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
+  -keyout /etc/zot/tls.key -out /etc/zot/tls.crt \
+  -subj "/CN=amd-oneclick-lan-registry" \
+  -addext "subjectAltName=IP:10.5.10.43"
+# htpasswd (bcrypt). Pick a username/password; you'll give them to me for the k8s-side pull/push secret.
+sudo sh -c 'htpasswd -Bbn imagesvc "<REGISTRY_PASSWORD>" > /etc/zot/htpasswd'
+sudo chmod 0640 /etc/zot/tls.key /etc/zot/htpasswd
+```
+(If `htpasswd` is missing: `sudo apt-get install -y apache2-utils`.)
+
+**3. Write the zot config** (`/etc/zot/config.json`) — online GC + dedupe + delete enabled, so no
+push-pause is ever needed:
+```
+sudo tee /etc/zot/config.json >/dev/null <<'JSON'
+{
+  "distSpecVersion": "1.1.0",
+  "storage": { "rootDirectory": "/disk/ssd2/registry", "dedupe": true,
+    "gc": true, "gcDelay": "1h", "gcInterval": "24h" },
+  "http": { "address": "0.0.0.0", "port": 5000,
+    "tls": { "cert": "/etc/zot/tls.crt", "key": "/etc/zot/tls.key" },
+    "auth": { "htpasswd": { "path": "/etc/zot/htpasswd" } } },
+  "log": { "level": "info" },
+  "extensions": { "scrub": { "interval": "24h" } }
+}
+JSON
+```
+
+**4. Run zot as a systemd-managed container** (pinned tag, restart-always, host NVMe mount). Use
+whichever runtime 0042 already has for host containers — examples for docker or podman:
+```
+# docker:
+sudo docker run -d --name zot --restart=always \
+  -p 10.5.10.43:5000:5000 \
+  -v /disk/ssd2/registry:/disk/ssd2/registry \
+  -v /etc/zot:/etc/zot:ro \
+  ghcr.io/project-zot/zot-linux-amd64:v2.1.2 serve /etc/zot/config.json
+# (podman: same flags; add a matching systemd unit via `podman generate systemd` or a Quadlet.)
+```
+Pin the digest of `v2.1.2` once you've pulled it, so restarts are reproducible.
+
+**5. Trust the registry cert on 0042's containerd/nerdctl** (so the agent's push authenticates):
+```
+sudo install -d /etc/containerd/certs.d/10.5.10.43:5000
+sudo tee /etc/containerd/certs.d/10.5.10.43:5000/hosts.toml >/dev/null <<TOML
+server = "https://10.5.10.43:5000"
+[host."https://10.5.10.43:5000"]
+  capabilities = ["pull", "resolve", "push"]
+  ca = "/etc/zot/tls.crt"
+TOML
+```
+
+**6. Smoke-test the registry from 0042 (no app involvement)**
+```
+# login + round-trip a tiny image to prove push/pull/delete all work:
+sudo nerdctl login 10.5.10.43:5000 -u imagesvc -p '<REGISTRY_PASSWORD>'
+sudo nerdctl pull public.ecr.aws/docker/library/hello-world:latest || true
+sudo nerdctl tag  hello-world:latest 10.5.10.43:5000/smoke/hello:1
+sudo nerdctl push 10.5.10.43:5000/smoke/hello:1
+curl -u imagesvc:'<REGISTRY_PASSWORD>' --cacert /etc/zot/tls.crt \
+  https://10.5.10.43:5000/v2/_catalog          # expect {"repositories":["smoke/hello"]}
+# delete round-trip (proves the delete extension is live):
+DIGEST=$(curl -sI -u imagesvc:'<REGISTRY_PASSWORD>' --cacert /etc/zot/tls.crt \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+  https://10.5.10.43:5000/v2/smoke/hello/manifests/1 | awk -F': ' '/docker-content-digest/{print $2}' | tr -d '\r')
+curl -u imagesvc:'<REGISTRY_PASSWORD>' --cacert /etc/zot/tls.crt -X DELETE \
+  https://10.5.10.43:5000/v2/smoke/hello/manifests/$DIGEST   # expect 202
+```
+
+**7. Hand me these values** (for the k8s-side secrets + the agent EnvironmentFile — I do the wiring):
+- `LAN_IP` and confirmation zot is up (step 6 catalog worked).
+- the registry `username` + `password` you set.
+- the contents of `/etc/zot/tls.crt` (the public cert only — safe to share; I mount it so nodes and
+  the manager trust zot).
+
+> **Env file note:** the agent's `LAN_REGISTRY=10.5.10.43:5000`, `IMAGE_SERVICE_KINDS` (adds `push`,
+> later `warm`/`purge_*`), and `DOCKER_CONFIG` login for zot all live in
+> `/etc/amd-oneclick-image-service.env` on 0042. I'll give you the exact lines to add when the P1
+> agent code is ready; you paste them in and `sudo systemctl restart image-service.service`.
+
+---
+
+## Step 0 — Deploy P0 (safe; distribution transport unchanged)  **[ME-k8s + one YOU-0042 restart]**
 
 P0 is transport-neutral: it hardens the control plane and fixes R2c on the *current* SSH push path.
 Nothing about how images move changes yet, so this is low-risk.
@@ -59,9 +176,11 @@ From the workspace host (has `kubectl`):
    # expect 432000
    ```
    Confirm the `image_jobs.heartbeat_at` column now exists (the additive migration runs at startup).
-6. **Deploy the P0 agent to 0042** (on 0042 / via jump host):
+6. **[YOU-0042] Deploy the P0 agent.** I hand you the new `agent.py` (I can't reach 0042); you place
+   it and restart the unit — no code editing on your side, just install + restart:
    ```
-   sudo install -m 0755 agent.py /opt/amd-oneclick/image-service/agent.py
+   # copy the file I give you to 0042 first (scp from wherever you received it), then:
+   sudo install -m 0755 ~/agent.py /opt/amd-oneclick/image-service/agent.py
    sudo systemctl restart image-service.service
    journalctl -u image-service -f      # confirm clean start, no traceback
    ```
