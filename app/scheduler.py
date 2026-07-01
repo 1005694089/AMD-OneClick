@@ -160,7 +160,16 @@ def reconcile_job():
             and p["instance_id"] not in active_ids
             and p["age_seconds"] >= settings.ORPHAN_GRACE_SECONDS
         ]
-        gone = active_ids - cluster_ids  # DB active but pod absent
+        # DB-active records whose pod is not in THIS manager's label-scoped list.
+        # The instance_records table may be shared with other managers that use a
+        # different pod label prefix (e.g. a v2-test manager on the same cluster),
+        # so a record missing from our label scope may still have a live pod owned
+        # by another manager. Confirm the pod is truly absent BY NAME before
+        # marking it deleted, otherwise we would wipe another manager's instances.
+        gone = [
+            iid for iid in (active_ids - cluster_ids)
+            if not k8s_client._pod_exists(iid)
+        ]
 
         # Terminal / broken pods: dead weight the billing loop never removes
         # (they are never "ready"). CrashLoopBackOff keeps holding its GPU while
