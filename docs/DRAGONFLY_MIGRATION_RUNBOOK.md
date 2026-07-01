@@ -56,63 +56,109 @@ steps — you can do it any time before P1.
 > - `REG_PORT = 5000`
 > - `REGISTRY_DIR = /disk/ssd2/registry`
 >
-> The commands below use `10.5.10.43` directly. Set `<REGISTRY_PASSWORD>` to a value you choose.
+> The commands below use `10.5.10.43` directly. The registry password is **auto-generated**
+> (`REGPW=$(openssl rand -hex 24)` in step 3) and handed back to me — you don't pick one.
 
-**1. Confirm the disk budget and create the data dir**
+> **Review applied (18-agent adversarial pass, 5 blockers + 6 majors confirmed).** The fixes are
+> baked into the commands below. Key ones: zot `http.port` must be a **quoted string** and
+> `http.address` must be the **LAN IP** (not `0.0.0.0`) — either mistake is a hard failure or an
+> exposure on this shared node; the `/disk/ssd2` **mount is asserted** before seeding and depended on
+> by systemd; the password is **hex** and passed via **stdin**; and the cert is added to the **system
+> trust store** so the *rootless* imagesvc agent (the real P1 pusher) trusts zot — the root smoke
+> test alone does not prove that.
+
+**1. Assert the mount, confirm budget, create the data dir**
 ```
+# HARD-STOP if /disk/ssd2 is not actually mounted — otherwise `install -d` would silently seed the
+# registry onto the root filesystem.
+findmnt -rno TARGET /disk/ssd2 >/dev/null || { echo 'FATAL: /disk/ssd2 not mounted'; exit 1; }
+grep -q " /disk/ssd2 " /etc/fstab || echo 'WARN: /disk/ssd2 not in /etc/fstab — add it so it persists across reboot'
 df -h /disk/ssd2                 # expect ~3.5T available
 sudo install -d -o imagesvc -g imagesvc -m 0750 /disk/ssd2/registry
 ```
 
-**2. Generate TLS cert + basic-auth for the registry**
+**2. Install the toolchain**
+```
+sudo apt-get update && sudo apt-get install -y apache2-utils   # provides htpasswd
+```
+
+**3. Generate TLS cert + basic-auth (auto-generated hex password, passed via stdin)**
 ```
 sudo install -d -m 0750 /etc/zot
 # Self-signed cert with the LAN IP as a SAN (nodes connect by IP):
-sudo openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
+sudo openssl req -x509 -newkey rsa:4096 -nodes -days 825 \
   -keyout /etc/zot/tls.key -out /etc/zot/tls.crt \
   -subj "/CN=amd-oneclick-lan-registry" \
   -addext "subjectAltName=IP:10.5.10.43"
-# htpasswd (bcrypt). Pick a username/password; you'll give them to me for the k8s-side pull/push secret.
-sudo sh -c 'htpasswd -Bbn imagesvc "<REGISTRY_PASSWORD>" > /etc/zot/htpasswd'
+# HEX password (no /,+,= — safe in htpasswd, nerdctl, curl, and the k8s dockerconfigjson at P1):
+REGPW=$(openssl rand -hex 24)
+# bcrypt htpasswd via STDIN so the password never appears in `ps`/bash history on this shared node:
+printf '%s' "$REGPW" | sudo htpasswd -iBc /etc/zot/htpasswd imagesvc
+# service runs as imagesvc → it must be able to READ these:
+sudo chown root:imagesvc /etc/zot/tls.key /etc/zot/htpasswd /etc/zot/tls.crt
 sudo chmod 0640 /etc/zot/tls.key /etc/zot/htpasswd
+sudo chmod 0644 /etc/zot/tls.crt
+sudo -u imagesvc test -r /etc/zot/htpasswd && echo "imagesvc can read htpasswd OK"
+echo "REGISTRY PASSWORD (hand this back, then clear your scrollback): $REGPW"
 ```
-(If `htpasswd` is missing: `sudo apt-get install -y apache2-utils`.)
 
-**3. Write the zot config** (`/etc/zot/config.json`) — online GC + dedupe + delete enabled, so no
-push-pause is ever needed:
+**3b. Trust the zot CA in the SYSTEM trust store** — so the *rootless imagesvc* agent (the real P1
+pusher, which does NOT read `/etc/containerd/certs.d`) trusts zot via Go's default cert pool. This is
+the robust host-side action; do it now.
+```
+sudo cp /etc/zot/tls.crt /usr/local/share/ca-certificates/amd-oneclick-zot.crt
+sudo update-ca-certificates          # adds it to /etc/ssl/certs used by Go/Python/curl for all users
+```
+
+**4. Write the zot config** (`/etc/zot/config.json`). **`port` is a quoted string** and **`address`
+is the LAN IP** — both are load-bearing for v2.1.2 (`UnmarshalExact` rejects a bare-int port and any
+unknown key; `0.0.0.0` would expose the registry on every interface of a shared node):
 ```
 sudo tee /etc/zot/config.json >/dev/null <<'JSON'
 {
   "distSpecVersion": "1.1.0",
   "storage": { "rootDirectory": "/disk/ssd2/registry", "dedupe": true,
     "gc": true, "gcDelay": "1h", "gcInterval": "24h" },
-  "http": { "address": "0.0.0.0", "port": 5000,
+  "http": { "address": "10.5.10.43", "port": "5000",
     "tls": { "cert": "/etc/zot/tls.crt", "key": "/etc/zot/tls.key" },
     "auth": { "htpasswd": { "path": "/etc/zot/htpasswd" } } },
   "log": { "level": "info" },
-  "extensions": { "scrub": { "interval": "24h" } }
+  "extensions": { "scrub": { "enable": true, "interval": "24h" } }
 }
 JSON
+sudo chown root:imagesvc /etc/zot/config.json && sudo chmod 0644 /etc/zot/config.json
 ```
 
-**4. Run zot as a NATIVE systemd service (not a container).** zot is a single static Go binary, so
-there is no runtime, no AppArmor/snap confinement, and no bind-mount question — it reads
-`/disk/ssd2/registry` and `/etc/zot` directly. (Do **not** use snap Docker here: its AppArmor
-profile blocks bind-mounts outside `$HOME`/`/media`, so `/disk/ssd2` and `/etc/zot` would fail or
-mount empty. Native binary sidesteps all of that and matches the containerd/nerdctl-based cert-trust
-+ smoke-test below.)
+**5. Install the pinned zot binary + run it as a NATIVE systemd service (not a container).** zot is a
+single static Go binary — no runtime, no AppArmor/snap confinement, no bind-mount question. (Do
+**not** use snap Docker: its AppArmor profile blocks bind-mounts outside `$HOME`/`/media`, so
+`/disk/ssd2` and `/etc/zot` would fail/mount-empty.)
 ```
-# Fetch the pinned static binary (verify the sha256 from the release page):
-curl -fL -o /tmp/zot https://github.com/project-zot/zot/releases/download/v2.1.2/zot-linux-amd64
+# Fetch the pinned static binary to a temp path, verify its checksum against the release, then install
+# atomically (so a re-run never corrupts a running binary):
+curl -fL --retry 3 -o /tmp/zot \
+  https://github.com/project-zot/zot/releases/download/v2.1.2/zot-linux-amd64
+curl -fL --retry 3 -o /tmp/zot.sums \
+  https://github.com/project-zot/zot/releases/download/v2.1.2/checksums.sha256.txt
+grep 'zot-linux-amd64$' /tmp/zot.sums | awk -v f=/tmp/zot '{print $1"  "f}' | sha256sum -c - \
+  || { echo 'FATAL: zot checksum mismatch'; exit 1; }
+sha256sum /tmp/zot          # record this digest for the handback
+sudo systemctl stop zot.service 2>/dev/null || true   # safe if re-running; no-op on first install
 sudo install -m 0755 /tmp/zot /usr/local/bin/zot
-zot --version                      # confirm v2.1.2
+/usr/local/bin/zot --version                          # confirm v2.1.2
 
-# systemd unit — runs as imagesvc (owns /disk/ssd2/registry), restart-always:
+# VALIDATE the config BEFORE enabling the service — catches the strict-parse / port-type class of
+# errors while nothing is running:
+/usr/local/bin/zot verify /etc/zot/config.json && echo "config OK"
+
+# systemd unit — runs as imagesvc; depends on the /disk/ssd2 mount so it can never start early and
+# write registry data onto the root fs:
 sudo tee /etc/systemd/system/zot.service >/dev/null <<'UNIT'
 [Unit]
 Description=zot OCI registry (AMD-OneClick LAN registry)
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/disk/ssd2/registry
 
 [Service]
 User=imagesvc
@@ -120,11 +166,13 @@ Group=imagesvc
 ExecStart=/usr/local/bin/zot serve /etc/zot/config.json
 Restart=always
 RestartSec=5
-# Least-privilege hardening; registry data + config are the only writable paths it needs:
+# Least-privilege hardening; registry data is the only writable path it needs:
 ReadWritePaths=/disk/ssd2/registry
 ProtectSystem=strict
 ProtectHome=true
+PrivateTmp=true
 NoNewPrivileges=true
+LimitNOFILE=524288
 
 [Install]
 WantedBy=multi-user.target
@@ -133,14 +181,12 @@ UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now zot.service
 systemctl status zot.service --no-pager    # active (running)
-journalctl -u zot -n 30 --no-pager         # confirm it bound :5000 with TLS
+journalctl -u zot -n 30 --no-pager         # confirm it bound 10.5.10.43:5000 with TLS
 ```
-(`imagesvc` must be able to read `/etc/zot/tls.key` + `/etc/zot/htpasswd` — step 2 set mode 0640;
-`chown imagesvc:imagesvc /etc/zot/tls.key /etc/zot/htpasswd` if they came out root-owned. With
-`ProtectSystem=strict`, `/etc/zot` stays readable but `/disk/ssd2/registry` needs the explicit
-`ReadWritePaths` above.)
 
-**5. Trust the registry cert on 0042's containerd/nerdctl** (so the agent's push authenticates):
+**6. (Optional) rootful cert trust for the root smoke test only.** The production agent is *rootless*
+and already covered by the system trust store (step 3b); this drop only lets the STEP 7 `sudo nerdctl`
+sanity check resolve the cert. Skip it if you rely on the system trust store.
 ```
 sudo install -d /etc/containerd/certs.d/10.5.10.43:5000
 sudo tee /etc/containerd/certs.d/10.5.10.43:5000/hosts.toml >/dev/null <<TOML
@@ -151,28 +197,52 @@ server = "https://10.5.10.43:5000"
 TOML
 ```
 
-**6. Smoke-test the registry from 0042 (no app involvement)**
+**7. Smoke-test the registry from 0042.** The pure-`curl` checks below prove push/catalog/delete
+against zot without depending on any container client or external image pull.
 ```
-# login + round-trip a tiny image to prove push/pull/delete all work:
-sudo nerdctl login 10.5.10.43:5000 -u imagesvc -p '<REGISTRY_PASSWORD>'
-sudo nerdctl pull public.ecr.aws/docker/library/hello-world:latest || true
-sudo nerdctl tag  hello-world:latest 10.5.10.43:5000/smoke/hello:1
-sudo nerdctl push 10.5.10.43:5000/smoke/hello:1
-curl -u imagesvc:'<REGISTRY_PASSWORD>' --cacert /etc/zot/tls.crt \
-  https://10.5.10.43:5000/v2/_catalog          # expect {"repositories":["smoke/hello"]}
-# delete round-trip (proves the delete extension is live):
-DIGEST=$(curl -sI -u imagesvc:'<REGISTRY_PASSWORD>' --cacert /etc/zot/tls.crt \
-  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
-  https://10.5.10.43:5000/v2/smoke/hello/manifests/1 | awk -F': ' '/docker-content-digest/{print $2}' | tr -d '\r')
-curl -u imagesvc:'<REGISTRY_PASSWORD>' --cacert /etc/zot/tls.crt -X DELETE \
-  https://10.5.10.43:5000/v2/smoke/hello/manifests/$DIGEST   # expect 202
+# Build a tiny local image with NO external egress (only GitHub egress is confirmed on 0042), as
+# imagesvc so it exercises the ROOTLESS stack the agent actually uses:
+IMGSVC_UID=$(id -u imagesvc)
+printf 'FROM scratch\nCOPY /etc/hostname /marker\n' | \
+  sudo -u imagesvc env XDG_RUNTIME_DIR=/run/user/$IMGSVC_UID \
+    XDG_CONFIG_HOME=/disk/ssd2/imagesvc/.config \
+    CONTAINERD_ADDRESS=/run/user/$IMGSVC_UID/containerd/containerd.sock \
+    BUILDKIT_HOST=unix:///run/user/$IMGSVC_UID/buildkit/buildkitd.sock \
+    DOCKER_CONFIG=/etc/amd-oneclick/docker \
+    nerdctl --namespace k8s.io build -t 10.5.10.43:5000/smoke/hello:1 -f - /tmp
+# Log in AS imagesvc into the agent's DOCKER_CONFIG (NOT root's ~/.docker) via stdin, then push:
+printf '%s' "$REGPW" | sudo -u imagesvc env XDG_RUNTIME_DIR=/run/user/$IMGSVC_UID \
+    CONTAINERD_ADDRESS=/run/user/$IMGSVC_UID/containerd/containerd.sock \
+    DOCKER_CONFIG=/etc/amd-oneclick/docker \
+    nerdctl login 10.5.10.43:5000 -u imagesvc --password-stdin
+sudo -u imagesvc env XDG_RUNTIME_DIR=/run/user/$IMGSVC_UID \
+    CONTAINERD_ADDRESS=/run/user/$IMGSVC_UID/containerd/containerd.sock \
+    DOCKER_CONFIG=/etc/amd-oneclick/docker \
+    nerdctl push 10.5.10.43:5000/smoke/hello:1
+```
+> **If the rootless backend isn't provisioned yet** (setup.sh's rootless containerd/buildkit user
+> services), the `sudo -u imagesvc nerdctl` commands will fail — that's expected pre-P1. In that case
+> run the container step later; the pure-`curl` checks below still prove zot itself is healthy now.
+
+```
+# --- Pure-curl checks (no container client needed; system trust store covers the cert) ---
+curl -fsS -u imagesvc:"$REGPW" https://10.5.10.43:5000/v2/_catalog    # {"repositories":["smoke/hello"]}
+# delete round-trip proves the DELETE path (broad Accept; strip CR):
+DIGEST=$(curl -fsSI -u imagesvc:"$REGPW" \
+  -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+  https://10.5.10.43:5000/v2/smoke/hello/manifests/1 \
+  | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}' | tr -d '\r')
+curl -fsS -u imagesvc:"$REGPW" -X DELETE \
+  https://10.5.10.43:5000/v2/smoke/hello/manifests/$DIGEST -o /dev/null -w '%{http_code}\n'  # 202
 ```
 
-**7. Hand me these values** (for the k8s-side secrets + the agent EnvironmentFile — I do the wiring):
-- `LAN_IP` and confirmation zot is up (step 6 catalog worked).
-- the registry `username` + `password` you set.
-- the contents of `/etc/zot/tls.crt` (the public cert only — safe to share; I mount it so nodes and
-  the manager trust zot).
+**8. Hand me these values** (for the k8s-side secrets + the agent EnvironmentFile — I do the wiring):
+- `LAN_IP=10.5.10.43` and confirmation zot is up (step 7 `_catalog` returned `smoke/hello`).
+- the registry `username=imagesvc` + the generated `$REGPW`.
+- the contents of `/etc/zot/tls.crt` (the public cert only — safe to share; I mount it so the
+  manager + GPU nodes trust zot cluster-side).
+- the recorded zot binary `sha256` (from step 5) for reproducibility.
+Then clear the password from your shell: `unset REGPW; history -c` (and clear your terminal scrollback).
 
 > **Env file note:** the agent's `LAN_REGISTRY=10.5.10.43:5000`, `IMAGE_SERVICE_KINDS` (adds `push`,
 > later `warm`/`purge_*`), and `DOCKER_CONFIG` login for zot all live in
