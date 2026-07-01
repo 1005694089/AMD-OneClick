@@ -125,6 +125,10 @@ ZOT_CA_CERT = _env("ZOT_CA_CERT", "/etc/zot/tls.crt")
 DFDAEMON_DELETE_CMD = _env("DFDAEMON_DELETE_CMD", "dfget --delete --url {ref}")
 # dfdaemon on-disk task cache root (storage.dir) — purge_p2p verifies the task file is gone here.
 DFDAEMON_STORAGE_DIR = _env("DFDAEMON_STORAGE_DIR", "/disk/ssd1/dragonfly/peer")
+# containerd hosts.toml drop-in dir. `ctr` (unlike the CRI/kubelet path) does NOT auto-read
+# containerd's config_path, so run_warm must pass `ctr images pull --hosts-dir <this>` for the
+# per-node dfdaemon mirror (127.0.0.1:4001) to be used. Must match config_path on the nodes.
+CERTS_DIR = _env("CERTS_DIR", "/etc/containerd/certs.d")
 DISTRIBUTE_CONCURRENCY = int(_env("DISTRIBUTE_CONCURRENCY", "2"))
 CTR_NAMESPACE = _env("CTR_NAMESPACE", "k8s.io")
 NODE_SSH_USER = _env("NODE_SSH_USER", "root")
@@ -998,9 +1002,14 @@ def run_warm(job):
             # Trigger the pull ON the node. Bytes arrive via the node-local dfdaemon mirror (P2P);
             # 0042 streams nothing. Wrap the remote ctr in `timeout -s KILL` so a stalled pull dies
             # on its own deadline instead of blocking inside the daemon.
+            # CRITICAL: `ctr` does NOT auto-read containerd's config_path/certs.d (only the CRI/
+            # kubelet path does). Without --hosts-dir, ctr pulls DIRECTLY from zot, bypassing the
+            # dfdaemon mirror entirely — the warm "succeeds" but is NOT P2P-served, silently defeating
+            # the transport. Pass --hosts-dir so the hosts.toml (127.0.0.1:4001 + auth) is honored.
+            # (Verified live on the canary: bare ctr pull ignores certs.d; --hosts-dir routes P2P.)
             remote = (
                 f"sudo timeout -s KILL {REMOTE_IMPORT_TIMEOUT}s "
-                f"ctr -n {CTR_NAMESPACE} images pull {shlex.quote(lan_ref)}"
+                f"ctr -n {CTR_NAMESPACE} images pull --hosts-dir {shlex.quote(CERTS_DIR)} {shlex.quote(lan_ref)}"
             )
             ok = stream_command(job_id, _ssh_base(ip) + [remote])
             entry["loaded"] = ok
