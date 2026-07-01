@@ -47,11 +47,19 @@ class FakePod:
 
 
 class FakeCoreV1:
-    """Records exec calls; returns scripted dfctl output per (pod, task_id)."""
+    """Records exec calls; returns scripted dfctl output+rc per exec.
 
-    def __init__(self, pods_by_selector, exec_output=""):
-        self._pods = pods_by_selector  # {selector: [FakePod,...]} ; field_selector filters by suffix
-        self.exec_output = exec_output  # str OR callable(pod, container, cmd)->str
+    The real _exec_dfctl_rm wraps the command in `sh -c "... ; echo __DFCTL_RC__:$rc"` and parses the
+    exit code from the LAST sentinel line. So the fake must append that sentinel. `rc` may be an int
+    (applied to every exec) or a callable(pod, container, command)->int. `text` is optional extra
+    output printed before the sentinel (e.g. an error message or a not-found phrase). Set
+    emit_sentinel=False to simulate an OCI-exec failure (no wrapper ran => no sentinel)."""
+
+    def __init__(self, pods_by_selector, rc=0, text="", emit_sentinel=True):
+        self._pods = pods_by_selector  # {selector: [FakePod,...]}
+        self._rc = rc
+        self._text = text
+        self._emit_sentinel = emit_sentinel
         self.calls = []
 
     def list_namespaced_pod(self, ns, label_selector=None, field_selector=None):
@@ -63,9 +71,11 @@ class FakeCoreV1:
 
     def connect_get_namespaced_pod_exec(self, pod, ns, container=None, command=None, **kw):
         self.calls.append({"pod": pod, "container": container, "command": command})
-        if callable(self.exec_output):
-            return self.exec_output(pod, container, command)
-        return self.exec_output
+        rc = self._rc(pod, container, command) if callable(self._rc) else self._rc
+        text = self._text(pod, container, command) if callable(self._text) else self._text
+        if not self._emit_sentinel:
+            return text  # simulate OCI-exec failure: no sentinel line at all
+        return (text + "\n" if text else "") + f"__DFCTL_RC__:{rc}"
 
 
 class BlobCaptureTests(unittest.TestCase):
@@ -108,48 +118,84 @@ class BlobCaptureTests(unittest.TestCase):
         self.assertEqual(store.unique_blob_ids_for_ref(REF), ["aaaa"])
 
 
+_CLIENT_SEL = "app=dragonfly,component=client"
+_SEED_SEL = "app=dragonfly,component=seed-client"
+
+
 class ManagerPurgeP2PTests(unittest.TestCase):
     def setUp(self):
         _reset()
 
     def test_p2p_execs_dfctl_per_blob_per_node(self):
-        core = FakeCoreV1({"app=dragonfly,component=client": [FakePod("dragonfly-client-A"), FakePod("dragonfly-client-B")]},
-                          exec_output="")  # empty => success
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A"), FakePod("dragonfly-client-B")]}, rc=0)
         job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "A"}, {"node": "B"}], "blob_ids": BLOBS}}
         res = purge_exec.run_purge_p2p_manager(core, job)
         self.assertTrue(all(n["removed"] for n in res["nodes"]))
-        # 2 nodes x 3 blobs = 6 dfctl task rm calls
+        # 2 nodes x 3 blobs = 6 execs (+ selector_has_any probe uses list, not exec)
         self.assertEqual(len(core.calls), 6)
-        self.assertTrue(all(c["command"][:3] == ["dfctl", "task", "rm"] for c in core.calls))
+        # command is now `sh -c "dfctl task rm <id>; rc=$?; echo __DFCTL_RC__:$rc"`
+        self.assertTrue(all(c["command"][:2] == ["sh", "-c"] and "task rm" in c["command"][2] for c in core.calls))
 
     def test_p2p_task_not_found_is_success(self):
-        core = FakeCoreV1({"app=dragonfly,component=client": [FakePod("dragonfly-client-A")]},
-                          exec_output="task not found")
+        # rc!=0 but task-specific not-found phrase => already gone => success
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=1, text="task not found")
         job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "A"}], "blob_ids": ["aaaa"]}}
         res = purge_exec.run_purge_p2p_manager(core, job)
         self.assertTrue(res["nodes"][0]["removed"])
 
     def test_p2p_real_error_fails(self):
-        core = FakeCoreV1({"app=dragonfly,component=client": [FakePod("dragonfly-client-A")]},
-                          exec_output="error: connection refused")
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=1, text="connection refused")
         job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "A"}], "blob_ids": ["aaaa"]}}
         res = purge_exec.run_purge_p2p_manager(core, job)
         self.assertFalse(res["nodes"][0]["removed"])
         self.assertIsNotNone(res["nodes"][0]["error"])
 
-    def test_p2p_no_daemon_on_node_is_success(self):
-        # node with no dfdaemon pod => nothing to purge there => removed True
-        core = FakeCoreV1({"app=dragonfly,component=client": []}, exec_output="")
+    def test_p2p_missing_binary_rc127_fails(self):
+        # Regression: rc=127 (dfctl missing) must FAIL, not pass. Sentinel present, rc=127.
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=127, text="sh: dfctl: not found")
+        job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "A"}], "blob_ids": ["aaaa"]}}
+        res = purge_exec.run_purge_p2p_manager(core, job)
+        self.assertFalse(res["nodes"][0]["removed"])
+
+    def test_p2p_oci_exec_failure_no_sentinel_fails(self):
+        # OCI-runtime exec failure: the wrapper never runs, so NO sentinel. Must fail (was a false
+        # success when we matched a bare "not found").
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]},
+                          text='OCI runtime exec failed: exec: "dfctl": executable file not found in $PATH: unknown',
+                          emit_sentinel=False)
+        job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "A"}], "blob_ids": ["aaaa"]}}
+        res = purge_exec.run_purge_p2p_manager(core, job)
+        self.assertFalse(res["nodes"][0]["removed"])
+
+    def test_p2p_no_daemon_on_valid_selector_is_success(self):
+        # Selector matches a daemon SOMEWHERE (node B) but not on the target node Z => Z has no
+        # daemon => success (no cache there).
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-B")]}, rc=0)
         job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "Z"}], "blob_ids": ["aaaa"]}}
         res = purge_exec.run_purge_p2p_manager(core, job)
         self.assertTrue(res["nodes"][0]["removed"])
-        self.assertEqual(len(core.calls), 0)
+
+    def test_p2p_selector_matches_nothing_fails(self):
+        # Zero client daemons match the selector anywhere => selector drift / outage => FAIL (was a
+        # false success under the old "no pods => removed True").
+        core = FakeCoreV1({_CLIENT_SEL: []}, rc=0)
+        job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "Z"}], "blob_ids": ["aaaa"]}}
+        res = purge_exec.run_purge_p2p_manager(core, job)
+        self.assertFalse(res["nodes"][0]["removed"])
+        self.assertEqual(res["nodes"][0]["error"], "no_client_daemons_match_selector")
 
     def test_p2p_no_blob_ids_skips(self):
-        core = FakeCoreV1({"app=dragonfly,component=client": [FakePod("dragonfly-client-A")]}, exec_output="")
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=0)
         job = {"id": 1, "ref": REF, "payload": {"targets": [{"node": "A"}], "blob_ids": []}}
         res = purge_exec.run_purge_p2p_manager(core, job)
         self.assertEqual(res.get("skipped"), "no_blob_ids")
+        self.assertEqual(len(core.calls), 0)
+
+    def test_p2p_empty_targets_is_success_no_exec(self):
+        core = FakeCoreV1({_CLIENT_SEL: [FakePod("dragonfly-client-A")]}, rc=0)
+        job = {"id": 1, "ref": REF, "payload": {"targets": [], "blob_ids": ["aaaa"]}}
+        res = purge_exec.run_purge_p2p_manager(core, job)
+        self.assertEqual(res["nodes"], [])
         self.assertEqual(len(core.calls), 0)
 
 
@@ -158,7 +204,7 @@ class ManagerPurgeSeedTests(unittest.TestCase):
         _reset()
 
     def test_seed_execs_all_seeds(self):
-        core = FakeCoreV1({"app=dragonfly,component=seed-client": [FakePod("dragonfly-seed-client-0"), FakePod("dragonfly-seed-client-1"), FakePod("dragonfly-seed-client-2")]}, exec_output="")
+        core = FakeCoreV1({_SEED_SEL: [FakePod("dragonfly-seed-client-0"), FakePod("dragonfly-seed-client-1"), FakePod("dragonfly-seed-client-2")]}, rc=0)
         job = {"id": 1, "ref": REF, "payload": {"blob_ids": BLOBS}}
         res = purge_exec.run_purge_seed_manager(core, job)
         self.assertTrue(res["seed_deleted"])
@@ -166,15 +212,32 @@ class ManagerPurgeSeedTests(unittest.TestCase):
         self.assertTrue(all(c["container"] == "seed-client" for c in core.calls))
 
     def test_seed_one_failure_fails_job(self):
-        def out(pod, container, command):
-            return "error: boom" if pod.endswith("-1") else ""
-        core = FakeCoreV1({"app=dragonfly,component=seed-client": [FakePod("dragonfly-seed-client-0"), FakePod("dragonfly-seed-client-1")]}, exec_output=out)
+        def rc(pod, container, command):
+            return 1 if pod.endswith("-1") else 0
+        def text(pod, container, command):
+            return "connection refused" if pod.endswith("-1") else ""
+        core = FakeCoreV1({_SEED_SEL: [FakePod("dragonfly-seed-client-0"), FakePod("dragonfly-seed-client-1")]}, rc=rc, text=text)
+        job = {"id": 1, "ref": REF, "payload": {"blob_ids": ["aaaa"]}}
+        res = purge_exec.run_purge_seed_manager(core, job)
+        self.assertFalse(res["seed_deleted"])
+
+    def test_seed_empty_pod_list_fails(self):
+        # Vacuous-success hole: zero seeds must FAIL, not seed_deleted=True.
+        core = FakeCoreV1({_SEED_SEL: []}, rc=0)
+        job = {"id": 1, "ref": REF, "payload": {"blob_ids": ["aaaa"]}}
+        res = purge_exec.run_purge_seed_manager(core, job)
+        self.assertFalse(res["seed_deleted"])
+        self.assertEqual(res.get("error"), "no_seed_pods")
+        self.assertEqual(len(core.calls), 0)
+
+    def test_seed_missing_binary_rc127_fails(self):
+        core = FakeCoreV1({_SEED_SEL: [FakePod("dragonfly-seed-client-0")]}, rc=127, text="sh: dfctl: not found")
         job = {"id": 1, "ref": REF, "payload": {"blob_ids": ["aaaa"]}}
         res = purge_exec.run_purge_seed_manager(core, job)
         self.assertFalse(res["seed_deleted"])
 
     def test_seed_no_blob_ids_skips(self):
-        core = FakeCoreV1({"app=dragonfly,component=seed-client": [FakePod("dragonfly-seed-client-0")]}, exec_output="")
+        core = FakeCoreV1({_SEED_SEL: [FakePod("dragonfly-seed-client-0")]}, rc=0)
         job = {"id": 1, "ref": REF, "payload": {"blob_ids": []}}
         res = purge_exec.run_purge_seed_manager(core, job)
         self.assertEqual(res.get("skipped"), "no_blob_ids")
@@ -206,7 +269,7 @@ class DrainLoopTests(unittest.TestCase):
         core = FakeCoreV1({
             "app=dragonfly,component=client": [FakePod("dragonfly-client-A")],
             "app=dragonfly,component=seed-client": [FakePod("dragonfly-seed-client-0")],
-        }, exec_output="")
+        }, rc=0)
         import app.k8s_client as kc
         orig = kc.k8s_client.core_v1
         kc.k8s_client.core_v1 = core

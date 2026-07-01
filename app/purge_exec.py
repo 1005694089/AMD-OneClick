@@ -26,8 +26,14 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
-# dfctl prints this (case-insensitive substring) when the task is already absent -> treat as success.
-_NOT_FOUND_MARKERS = ("task not found", "no such task", "task does not exist", "not found")
+# dfctl prints one of these (case-insensitive) when the task is already absent. Deliberately
+# TASK-SPECIFIC: never the bare "not found", which also appears in `exec: "dfctl": ... not found`
+# (missing binary) — treating that as success would open the purge_meta gate while bytes remain.
+_NOT_FOUND_MARKERS = ("task not found", "no such task", "task does not exist", "content not found")
+
+# Unique sentinels so we can recover the real exit code from the merged stdout+stderr stream
+# (_preload_content=True does NOT surface the exec exit status; the shell wrapper carries it).
+_RC_PREFIX = "__DFCTL_RC__:"
 
 
 def _blob_ids_from_payload(payload: dict) -> list[str]:
@@ -50,9 +56,22 @@ def _blob_ids_from_payload(payload: dict) -> list[str]:
 def _exec_dfctl_rm(core_v1, pod: str, container: str, task_id: str) -> tuple[bool, str]:
     """Run `dfctl task rm <task_id>` in one pod/container. Returns (ok, detail).
 
-    ok=True on real deletion OR an already-gone task. ok=False on any other error (RBAC, exec
-    transport, dfctl non-zero for a reason other than not-found)."""
-    cmd = [settings.DRAGONFLY_DFCTL, "task", "rm", task_id]
+    The EXIT CODE is the source of truth (fail-loud for a delete): the stream API with
+    _preload_content=True returns only merged stdout+stderr and drops the exec status, so we run the
+    command through a shell that echoes a sentinel line `__DFCTL_RC__:<rc>` and parse it back.
+
+      ok=True  iff rc==0 (deleted) OR rc!=0 with a TASK-SPECIFIC not-found phrase (already gone).
+      ok=False on: any other non-zero rc (incl. 127 missing binary / 126 not-exec), a MISSING
+                   sentinel (exec never ran the wrapper: OCI-runtime failure, timeout, truncated
+                   stream), or a k8s transport error.
+
+    This closes the false-success holes the review found (missing/misnamed dfctl, localized/gRPC
+    error text, exec timeout) — none of which can now masquerade as a successful delete."""
+    # Shell wrapper: run dfctl, capture rc, always print the sentinel LAST so a truncated/empty stream
+    # is detectable (no sentinel => failure). shlex-free: task_id is a validated 64-hex id, but quote
+    # defensively anyway.
+    inner = f"{settings.DRAGONFLY_DFCTL} task rm {task_id}; rc=$?; echo {_RC_PREFIX}$rc"
+    cmd = ["sh", "-c", inner]
     try:
         resp = stream(
             core_v1.connect_get_namespaced_pod_exec,
@@ -68,19 +87,29 @@ def _exec_dfctl_rm(core_v1, pod: str, container: str, task_id: str) -> tuple[boo
         )
     except ApiException as e:
         return False, f"exec_api_error:{e.status}"
-    except Exception as e:  # transport / websocket errors
+    except Exception as e:  # transport / websocket errors / timeout raised by the client
         return False, f"exec_error:{type(e).__name__}"
-    text = (resp or "")
+
+    text = resp or ""
+    # Recover rc from the LAST sentinel line. Absent sentinel => the wrapper never completed (OCI exec
+    # failure like `exec: "dfctl": ... not found`, a mid-run timeout, or a truncated stream) => FAIL.
+    rc = None
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith(_RC_PREFIX):
+            tail = line[len(_RC_PREFIX):].strip()
+            if tail.isdigit():
+                rc = int(tail)
+            break
+    if rc is None:
+        return False, f"exec_no_rc:{text.strip()[:200]}"
+    if rc == 0:
+        return True, "deleted"
+    # Non-zero: success ONLY for a task-specific already-gone phrase; everything else fails loud.
     low = text.lower()
     if any(m in low for m in _NOT_FOUND_MARKERS):
         return True, "already_gone"
-    # dfctl exits 0 and prints nothing (or a success line) on a real delete. The stream API does not
-    # surface the exit code with _preload_content=True, so we treat "no error marker" as success and
-    # rely on an explicit error substring to fail. Known dfctl error phrases:
-    for marker in ("error", "failed", "cannot", "refused", "no route", "connection"):
-        if marker in low:
-            return False, f"dfctl_error:{text.strip()[:200]}"
-    return True, "deleted"
+    return False, f"dfctl_rc_{rc}:{text.strip()[:200]}"
 
 
 def _list_pods(core_v1, selector: str, field_selector: Optional[str] = None):
@@ -108,6 +137,20 @@ def run_purge_p2p_manager(core_v1, job: dict) -> dict:
         logger.warning("purge_p2p %s: no blob_ids in payload; skipping P2P cache purge (taskTTL will reap)", ref)
         return {"ref": ref, "nodes": [], "skipped": "no_blob_ids"}
 
+    # Distinguish "node genuinely has no dfdaemon" (success — no cache to purge) from "selector drift /
+    # transient absence" (must FAIL, else we'd open purge_meta while bytes remain). If the client
+    # selector matches at least one pod cluster-wide, the selector is valid, so an empty per-node
+    # result means that node truly has no daemon. If it matches ZERO pods anywhere, the selector is
+    # wrong/all daemons are down -> fail every node so requeue_failed_purges retries.
+    if not targets:
+        # No nodes recorded as holding this ref => nothing warmed it => no per-node P2P cache to
+        # purge. Success (seeds are purged by purge_seed separately). Logged since a lost targets[]
+        # would look identical — the seed purge + registry_delete still cover the durable copies.
+        logger.info("purge_p2p %s: empty targets; no per-node P2P cache to purge", ref)
+        return {"ref": ref, "nodes": []}
+
+    selector_has_any = bool(_list_pods(core_v1, settings.DRAGONFLY_CLIENT_SELECTOR))
+
     for target in targets:
         node = target.get("node") if isinstance(target, dict) else target
         entry = {"node": node, "removed": False, "error": None}
@@ -117,10 +160,14 @@ def run_purge_p2p_manager(core_v1, job: dict) -> dict:
             continue
         pods = _list_pods(core_v1, settings.DRAGONFLY_CLIENT_SELECTOR, f"spec.nodeName={node}")
         if not pods:
-            # No dfdaemon on this node (never labeled / drained). Nothing to purge there -> success:
-            # if there's no daemon, there's no P2P cache for this ref on that node.
-            entry["removed"] = True
-            entry["error"] = None
+            if selector_has_any:
+                # Selector is valid but no daemon on THIS node (never labeled / drained). The P2P
+                # cache lives with the daemon, so no daemon => nothing to purge here => success.
+                entry["removed"] = True
+            else:
+                # Zero client daemons match the selector anywhere: selector drift or a fleet-wide
+                # daemon outage. Do NOT claim success — fail so this retries.
+                entry["error"] = "no_client_daemons_match_selector"
             nodes_out.append(entry)
             continue
         pod = pods[0].metadata.name
@@ -154,6 +201,13 @@ def run_purge_seed_manager(core_v1, job: dict) -> dict:
         return {"ref": ref, "seeds": [], "seed_deleted": False, "skipped": "no_blob_ids"}
 
     seeds = _list_pods(core_v1, settings.DRAGONFLY_SEED_SELECTOR)
+    if not seeds:
+        # Seeds are a fixed StatefulSet (>=1 replica). An empty list is a lookup failure (selector
+        # drift, all seeds mid-rollout, or an API race), NOT proof the cache is empty. Fail-loud so
+        # requeue_failed_purges retries — never open purge_meta on a vacuous success.
+        logger.warning("purge_seed %s: zero seed pods matched %s; failing (will retry)", ref, settings.DRAGONFLY_SEED_SELECTOR)
+        return {"ref": ref, "seeds": [], "seed_deleted": False, "error": "no_seed_pods"}
+
     seeds_out = []
     all_ok = True
     for sp in seeds:
