@@ -474,6 +474,25 @@ class Settings:
     # node/seed actually runs a dfdaemon (else purge_p2p/purge_seed have nothing to talk to and would
     # stick purge_meta). This makes P3/P4 code shippable to prod with zero delete-behavior change.
     PURGE_FANOUT_ENABLED: bool = os.getenv("PURGE_FANOUT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # P4 manager-executed purge (purge_p2p/purge_seed run via `kubectl exec dfctl task rm` into the
+    # in-cluster dfdaemon/seed pods — the 0042 agent cannot reach the overlay-only seeds, and the real
+    # v1.4.0 delete CLI is `dfctl task rm <task_id>`, socket-local). The manager drains these kinds on
+    # the scheduler leader. Namespace + workload names of the Dragonfly install:
+    DRAGONFLY_NAMESPACE: str = os.getenv("DRAGONFLY_NAMESPACE", "dragonfly-system")
+    # DaemonSet pod name prefix for the per-node client dfdaemon (label app selection is used; this is
+    # the container name to exec into).
+    DRAGONFLY_CLIENT_CONTAINER: str = os.getenv("DRAGONFLY_CLIENT_CONTAINER", "client")
+    DRAGONFLY_SEED_CONTAINER: str = os.getenv("DRAGONFLY_SEED_CONTAINER", "seed-client")
+    # Label selector to find the per-node client dfdaemon pods (DaemonSet).
+    DRAGONFLY_CLIENT_SELECTOR: str = os.getenv("DRAGONFLY_CLIENT_SELECTOR", "app=dragonfly,component=client")
+    DRAGONFLY_SEED_SELECTOR: str = os.getenv("DRAGONFLY_SEED_SELECTOR", "app=dragonfly,component=seed-client")
+    # dfctl binary path + daemon socket inside the pods (v1.4.0 defaults).
+    DRAGONFLY_DFCTL: str = os.getenv("DRAGONFLY_DFCTL", "dfctl")
+    # How many manager-side purge jobs to drain per scheduler tick (bounded so one tick can't run away).
+    PURGE_DRAIN_BATCH: int = int(os.getenv("PURGE_DRAIN_BATCH", "20"))
+    # How often the manager drains purge_p2p/purge_seed/purge_meta. Deletes are interactive, so keep
+    # this brisk. Inert unless PURGE_FANOUT_ENABLED.
+    PURGE_DRAIN_INTERVAL_SECONDS: int = int(os.getenv("PURGE_DRAIN_INTERVAL_SECONDS", "15"))
     # Optional Docker Hub pull secret for dockerhub_pull source images.
     DOCKERHUB_PULL_SECRET_NAME: str = os.getenv("DOCKERHUB_PULL_SECRET_NAME", "")
     # Optional proxy prefix for raw GitHub fetches. raw.githubusercontent.com is intermittently

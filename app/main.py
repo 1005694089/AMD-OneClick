@@ -1650,6 +1650,11 @@ async def custom_image_status(image_id: int, user: dict = Depends(current_user))
 
 @app.delete("/api/custom-images/{image_id}")
 async def delete_my_custom_image(image_id: int, user: dict = Depends(current_user)):
+    # Compute blobs UNIQUE to this image BEFORE deleting its row (the row's blob_list is one of the
+    # inputs; after delete_custom_image it's gone). Blobs shared with a live image are excluded so the
+    # P2P/seed cache purge never removes a still-referenced blob.
+    _pre = get_custom_image(image_id, user_id=user["id"])
+    unique_blobs = store.unique_blob_ids_for_ref(_pre.get("image")) if _pre and _pre.get("image") else []
     try:
         record = delete_custom_image(image_id, user["id"])
     except ValueError as e:
@@ -1676,6 +1681,7 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
                     digest=record.get("digest"),
                     lan_target_ref=_lan_registry_target_ref(image_ref),
                     image_id=None,
+                    blob_ids=unique_blobs,
                 )
             else:
                 enqueue_image_job(kind="evict", ref=image_ref,
@@ -1837,12 +1843,17 @@ def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
         # (the manager has no route to the LAN registry). A null digest still counts as pushed but
         # can't gate on digest for this ref (logged agent-side).
         digest = result.get("digest")
+        blob_ids = result.get("blob_ids") or []
         image_id = job.get("image_id")
         if image_id is not None:
             store.set_image_digest(image_id, digest)
+            if blob_ids:
+                store.set_image_blob_list(image_id, blob_ids)
         custom_image_id = job.get("custom_image_id")
         if custom_image_id:
             store.set_custom_image_digest(custom_image_id, digest)
+            if blob_ids:
+                store.set_custom_image_blob_list(custom_image_id, blob_ids)
             update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
     elif kind in ("distribute", "warm"):
         # warm writes the SAME 'loaded' rows distribute did — the per-node results contract is
@@ -2069,6 +2080,7 @@ async def list_outdated_image_targets(req: ImageJobClaimRequest, _agent: bool = 
                 digest=store.get_digest_for_ref(ref),
                 lan_target_ref=_lan_registry_target_ref(ref),
                 image_id=None,
+                blob_ids=store.unique_blob_ids_for_ref(ref),
             )
             if cid is not None:
                 # Re-stamp custom_image_id onto the purge_meta job (fan-out enqueued it with
@@ -3374,7 +3386,8 @@ def _acr_backup_target_ref(ref: str) -> Optional[str]:
 
 
 def enqueue_purge_fanout(ref: str, targets: list, *, digest: Optional[str] = None,
-                         lan_target_ref: Optional[str] = None, image_id: Optional[int] = None) -> None:
+                         lan_target_ref: Optional[str] = None, image_id: Optional[int] = None,
+                         blob_ids: Optional[list] = None) -> None:
     """P4 complete-delete: enqueue one INDEPENDENT job per byte-surface (§ six surfaces).
 
     Each is idempotent and — critically — its FAILURE is re-enqueued by requeue_failed_purges until
@@ -3386,11 +3399,17 @@ def enqueue_purge_fanout(ref: str, targets: list, *, digest: Optional[str] = Non
     before/while the purge runs — the ref string + payload are the durable handles, not the row.
     Per-node surfaces carry the full targets[] LIST (the proven distribute/evict model) so the
     (kind,ref) dedup can't collapse them. image_id is linked only where the caller keeps the row
-    until after enqueue (admin path); custom path passes image_id=None (row already deleted)."""
+    until after enqueue (admin path); custom path passes image_id=None (row already deleted).
+
+    blob_ids are this image's dfdaemon task-ids UNIQUE to it (blobs shared with a live image are
+    excluded by the caller so we never delete a still-referenced blob). They ride on purge_p2p +
+    purge_seed so the manager's dfctl-exec handlers know exactly what to `task rm`. Empty/None =>
+    those surfaces skip the cache purge (nothing addressable; Dragonfly taskTTL reaps the tail)."""
     base = {"ref": ref, "digest": digest, "lan_target_ref": lan_target_ref}
+    cache_base = {**base, "blob_ids": list(blob_ids or [])}
     enqueue_image_job(kind="purge_node", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
-    enqueue_image_job(kind="purge_p2p", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
-    enqueue_image_job(kind="purge_seed", ref=ref, image_id=image_id, payload={**base})
+    enqueue_image_job(kind="purge_p2p", ref=ref, image_id=image_id, payload={**cache_base, "scope": "all", "targets": targets})
+    enqueue_image_job(kind="purge_seed", ref=ref, image_id=image_id, payload={**cache_base})
     enqueue_image_job(kind="registry_delete", ref=ref, image_id=image_id, payload={**base})
     enqueue_image_job(kind="purge_builder", ref=ref, image_id=image_id, payload={**base})
     enqueue_image_job(kind="purge_meta", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
@@ -3565,12 +3584,15 @@ async def admin_delete_image(image_id: int, username: str = Depends(verify_admin
         # production delete behaves exactly as before. digest read NOW; the subsequent delete_image()
         # NULLs image_jobs.image_id so the images DELETE won't FK-violate either way.
         if settings.PURGE_FANOUT_ENABLED:
+            # Blobs unique to this image (row still present here — computed before delete_image below).
+            unique_blobs = store.unique_blob_ids_for_ref(existing["image"])
             enqueue_purge_fanout(
                 existing["image"],
                 targets,
                 digest=existing.get("digest"),
                 lan_target_ref=_lan_registry_target_ref(existing["image"]),
                 image_id=image_id,
+                blob_ids=unique_blobs,
             )
         else:
             enqueue_image_job(kind="evict", ref=existing["image"], image_id=image_id,

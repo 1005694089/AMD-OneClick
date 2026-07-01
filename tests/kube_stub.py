@@ -44,7 +44,23 @@ def install():
     kube.client = client
     kube.config = config
 
+    # kubernetes.stream.stream — used by app.purge_exec for pod exec. The stub default just raises so
+    # a test that doesn't inject a fake core_v1 fails loudly rather than silently no-op'ing. Tests
+    # that exercise purge_exec pass their own core_v1 whose connect_get_namespaced_pod_exec is a stub,
+    # and stream() here just calls it and returns its value.
+    stream_mod = types.ModuleType("kubernetes.stream")
+
+    def _stream(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    stream_mod.stream = _stream
+
+    kube.client = client
+    kube.config = config
+    kube.stream = stream_mod
+
     sys.modules["kubernetes"] = kube
     sys.modules["kubernetes.client"] = client
     sys.modules["kubernetes.config"] = config
     sys.modules["kubernetes.client.rest"] = rest
+    sys.modules["kubernetes.stream"] = stream_mod

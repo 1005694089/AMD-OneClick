@@ -118,13 +118,6 @@ ZOT_USERNAME = _env("ZOT_USERNAME", "imagesvc")
 ZOT_PASSWORD = _env("ZOT_PASSWORD", "")
 # CA cert path so curl trusts the self-signed zot TLS (also in the system trust store).
 ZOT_CA_CERT = _env("ZOT_CA_CERT", "/etc/zot/tls.crt")
-# The node-local Dragonfly dfdaemon delete command template ({ref} substituted). Dragonfly v2
-# dfget delete subcommand; kept as one env knob so the exact CLI/flags are a single change if the
-# installed client differs (e.g. `dfcache delete`). Runs over SSH on each node (purge_p2p) or on
-# the seed host (purge_seed).
-DFDAEMON_DELETE_CMD = _env("DFDAEMON_DELETE_CMD", "dfget --delete --url {ref}")
-# dfdaemon on-disk task cache root (storage.dir) — purge_p2p verifies the task file is gone here.
-DFDAEMON_STORAGE_DIR = _env("DFDAEMON_STORAGE_DIR", "/disk/ssd1/dragonfly/peer")
 # containerd hosts.toml drop-in dir. `ctr` (unlike the CRI/kubelet path) does NOT auto-read
 # containerd's config_path, so run_warm must pass `ctr images pull --hosts-dir <this>` for the
 # per-node dfdaemon mirror (127.0.0.1:4001) to be used. Must match config_path on the nodes.
@@ -642,6 +635,51 @@ def _parse_repo_digest(inspect_json, lan_ref):
     return None
 
 
+def _fetch_blob_ids(job_id, lan_ref, manifest_digest):
+    """Return this image's dfdaemon task-ids: the config + each layer blob digest (bare hex).
+
+    Dragonfly v1.4.0 runs task-id == blob-digest-hex, so a node/seed caches ONE task per blob and the
+    task id equals the blob's sha256 hex. We read the OCI manifest FROM ZOT (authoritative — it is
+    exactly what dfdaemon pulls) by digest, and return [config, *layers] as bare hex. Best-effort:
+    returns [] on any error (delete then falls back to ref-only; caller logs)."""
+    if not manifest_digest or "/" not in (lan_ref or ""):
+        return []
+    host, _, rest = lan_ref.partition("/")
+    slash = rest.rfind("/")
+    repo = (rest[:slash + 1] + rest[slash + 1:].split(":", 1)[0]) if slash != -1 else rest.split(":", 1)[0]
+    url = f"https://{host}/v2/{repo}/manifests/{manifest_digest}"
+    cmd = (
+        f"curl -sS --cacert {shlex.quote(ZOT_CA_CERT)} "
+        f"-u {shlex.quote(ZOT_USERNAME + ':' + ZOT_PASSWORD)} "
+        f"-H {shlex.quote('Accept: application/vnd.oci.image.manifest.v1+json')} "
+        f"{shlex.quote(url)}"
+    )
+    rc, out = _run_capture(job_id, cmd, timeout=60)
+    if rc != 0 or not out:
+        return []
+    try:
+        m = json.loads(out)
+    except (ValueError, TypeError):
+        return []
+    ids = []
+    cfg = ((m or {}).get("config") or {}).get("digest")
+    if cfg:
+        ids.append(cfg)
+    for layer in (m or {}).get("layers", []) or []:
+        d = layer.get("digest") if isinstance(layer, dict) else None
+        if d:
+            ids.append(d)
+    # bare hex, de-duped (a layer may repeat, e.g. empty-dir layers)
+    seen = set()
+    bare = []
+    for d in ids:
+        h = d.split(":", 1)[1] if ":" in d else d
+        if h and h not in seen:
+            seen.add(h)
+            bare.append(h)
+    return bare
+
+
 def run_push(job):
     """Push a built/pulled image to the self-hosted LAN registry (zot) with OCI media types.
 
@@ -723,8 +761,15 @@ def run_push(job):
     if not digest:
         push_log(job_id, "WARNING: pushed OK but could not parse the registry digest.\n")
 
-    push_log(job_id, f"\nPush to LAN registry complete: {dst}{(' @ ' + digest) if digest else ''}.\n")
-    report_result(job_id, "succeeded", {"ref": src, "lan_target_ref": dst, "digest": digest})
+    # Enumerate this image's blob task-ids from the pushed manifest so a later delete can purge
+    # exactly its P2P/seed cache tasks (task-id == blob-hex). Best-effort; empty on parse failure.
+    blob_ids = _fetch_blob_ids(job_id, dst, digest) if digest else []
+    if not blob_ids:
+        push_log(job_id, "NOTE: could not enumerate blob task-ids; delete will fall back to ref-only P2P purge.\n")
+
+    push_log(job_id, f"\nPush to LAN registry complete: {dst}{(' @ ' + digest) if digest else ''}"
+                     f" ({len(blob_ids)} blob task-id(s)).\n")
+    report_result(job_id, "succeeded", {"ref": src, "lan_target_ref": dst, "digest": digest, "blob_ids": blob_ids})
 
 
 def _ssh_base(ip):
@@ -1127,83 +1172,11 @@ def run_purge_node(job):
     report_result(job_id, status, {"ref": ref, "nodes": results})
 
 
-def run_purge_p2p(job):
-    """Surface 2: each node's dfdaemon P2P cache. Delete the task via the node-local dfdaemon, then
-    verify no on-disk task file survives under DFDAEMON_STORAGE_DIR. Per-node, serialized."""
-    job_id = job["id"]
-    ref = job["ref"]
-    payload = job.get("payload") or {}
-    targets = payload.get("targets") or []
-    lan_ref = payload.get("lan_target_ref") or ref
-    if not DISTRIB_SSH_KEY:
-        report_result(job_id, "failed", {"ref": ref, "error": "distrib_ssh_key_unset"})
-        return
-    if not targets:
-        report_result(job_id, "failed", {"ref": ref, "error": "no_targets"})
-        return
-
-    delete_cmd = DFDAEMON_DELETE_CMD.format(ref=shlex.quote(lan_ref))
-
-    def _one(target):
-        node = target.get("node")
-        ip = target.get("ip")
-        entry = {"node": node, "ip": ip, "removed": False, "error": None}
-        if not ip:
-            entry["error"] = "missing_ip"
-            return entry
-        # Ask dfdaemon to delete the task. It MUST fail-loud on a real error so the purge_meta gate
-        # stays closed (a silent success would drop the DB handle while bytes remain). Only a genuine
-        # already-gone task is treated as success. CRITICAL: rc 127 (command not found — dfget not
-        # installed) must FAIL, not pass — so we (a) hard-fail rc 127/126, (b) match a TASK-specific
-        # not-found phrase, never the bare "command not found". NO `|| true` / trailing `; true`.
-        remote = (
-            f"out=$(sudo {delete_cmd} 2>&1); rc=$?; "
-            f"if [ $rc -eq 0 ]; then exit 0; fi; "
-            f"if [ $rc -eq 127 ] || [ $rc -eq 126 ]; then echo \"$out\" >&2; exit $rc; fi; "
-            f"echo \"$out\" | grep -qiE 'task not found|no such task|task does not exist|content not found' && exit 0; "
-            f"echo \"$out\" >&2; exit $rc"
-        )
-        ok = stream_command(job_id, _ssh_base(ip) + [remote])
-        entry["removed"] = ok
-        if not ok:
-            # Real dfdaemon error (or wrong DFDAEMON_DELETE_CMD): fail so requeue_failed_purges
-            # retries and purge_meta stays blocked. Verification of on-disk task-file removal (keyed
-            # to dfdaemon's version-specific task hash) is a follow-up hardening item.
-            entry["error"] = "purge_p2p_failed"
-        return entry
-
-    results = [_one(t) for t in targets]
-    all_removed = all(e["removed"] for e in results)
-    status = "succeeded" if all_removed else "failed"
-    push_log(job_id, f"\nPurge_p2p {status}: {sum(e['removed'] for e in results)}/{len(results)} cleared.\n")
-    report_result(job_id, status, {"ref": ref, "nodes": results})
-
-
-def run_purge_seed(job):
-    """Surface 3: the seed-peer cache. Delete the task on the seed via dfdaemon. 0042-local (or
-    SSH to the seed); not serialized. 'not found' => already gone => success."""
-    job_id = job["id"]
-    ref = job["ref"]
-    payload = job.get("payload") or {}
-    lan_ref = payload.get("lan_target_ref") or ref
-    delete_cmd = DFDAEMON_DELETE_CMD.format(ref=shlex.quote(lan_ref))
-    # Delete the task on the seed. MUST fail-loud on a real error (no `|| true`): a false success
-    # would open the purge_meta gate while the seed still holds the bytes (C3 fix). Only a genuine
-    # "not found" (already gone) counts as success.
-    cmd = (
-        f"out=$({delete_cmd} 2>&1); rc=$?; "
-        f"if [ $rc -eq 0 ]; then exit 0; fi; "
-        f"if [ $rc -eq 127 ] || [ $rc -eq 126 ]; then echo \"$out\" >&2; exit $rc; fi; "
-        f"echo \"$out\" | grep -qiE 'task not found|no such task|task does not exist|content not found' && exit 0; "
-        f"echo \"$out\" >&2; exit $rc"
-    )
-    ok = stream_command(job_id, cmd)
-    if ok:
-        push_log(job_id, f"\nPurge_seed complete for {lan_ref}.\n")
-        report_result(job_id, "succeeded", {"ref": ref, "seed_deleted": True})
-    else:
-        push_log(job_id, f"\nPurge_seed FAILED for {lan_ref} (dfdaemon delete errored).\n")
-        report_result(job_id, "failed", {"ref": ref, "error": "purge_seed_failed"})
+# NOTE: purge_p2p and purge_seed are intentionally NOT implemented on the agent. The real Dragonfly
+# v1.4.0 delete primitive is `dfctl task rm <task_id>` against each daemon's LOCAL socket (dfget has
+# no delete; deletion is by task id, not URL), and the seed pods are on the cluster overlay network,
+# unreachable from this host. The MANAGER runs both surfaces in-cluster via kubectl-exec — see
+# app/purge_exec.py and scheduler.drain_manager_purges_job. The agent must not claim these kinds.
 
 
 def run_registry_delete(job):
@@ -1298,8 +1271,10 @@ DISPATCH = {
     "warm": run_warm,
     "evict": run_evict,
     "purge_node": run_purge_node,
-    "purge_p2p": run_purge_p2p,
-    "purge_seed": run_purge_seed,
+    # purge_p2p / purge_seed are NOT handled here: the real Dragonfly v1.4.0 delete is
+    # `dfctl task rm <task_id>` against the LOCAL daemon socket, and the seeds are overlay-only
+    # (unreachable from this host). The MANAGER drains those kinds in-cluster via kubectl-exec
+    # (see app/purge_exec.py + scheduler.drain_manager_purges_job). This agent must not claim them.
     "registry_delete": run_registry_delete,
     "purge_builder": run_purge_builder,
 }

@@ -106,6 +106,10 @@ images = Table(
     # the registry-durable "ready" gate (the manager has no route to the LAN registry, so presence
     # is agent-reported: a non-NULL digest means the image is durable in the registry).
     Column("digest", String(255)),
+    # P4: JSON array of this image's OCI blob task-ids (config+layer digests, sha256: stripped == the
+    # dfdaemon task id). Recorded by the `push` job so a delete can purge exactly this image's P2P/seed
+    # cache tasks. NULL on pre-P4 rows => delete falls back to the ref-only path for those.
+    Column("blob_list", Text),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
 )
@@ -268,6 +272,8 @@ custom_images = Table(
     Column("last_launched_at", String(64)),
     # Manifest digest of the copy pushed to the LAN registry (zot); see images.digest.
     Column("digest", String(255)),
+    # P4 blob task-ids for delete-time P2P/seed purge; see images.blob_list.
+    Column("blob_list", Text),
     UniqueConstraint("user_id", "name", name="uq_custom_image_user_name"),
 )
 
@@ -338,14 +344,14 @@ IMAGE_JOB_TERMINAL = ("succeeded", "failed")
 # requeues leased jobs, so failures would otherwise never retry — the load-bearing P4 fix).
 PURGE_PREREQ_KINDS = ("purge_node", "purge_p2p", "purge_seed", "registry_delete", "purge_builder")
 
-# Kinds that perform a per-node containerd unpack and must be serialized per target node (the
-# claim site defers an overlapping one, and the stale-job reaper strips quarantined nodes from
-# their requeued targets). Hoisted to a single constant so the two call sites can never drift.
-# Includes the Dragonfly warm/purge kinds added for the P2P transport; "distribute" remains for the
-# one-release alias window.
+# Kinds serialized per target node at claim time (the claim site defers an overlapping one; the
+# stale-job reaper strips quarantined nodes from requeued targets). Hoisted to one constant so the
+# call sites can't drift. distribute/warm/evict/purge_node do a per-node containerd unpack/remove.
+# purge_p2p (now manager-drained via dfctl-exec) is kept here so it defers while an agent warm/
+# purge_node is in-flight on the same node — cross-actor ordering safety, not a containerd unpack.
 SERIALIZED_KINDS = ("distribute", "warm", "evict", "purge_node", "purge_p2p")
-# purge_seed/registry_delete/purge_builder/purge_meta are 0042-local or manager-local (no per-node
-# containerd unpack) so they are intentionally NOT serialized.
+# purge_seed/registry_delete/purge_builder/purge_meta are host/manager-local (no per-node target) so
+# they are intentionally NOT serialized.
 
 # A launch that needs its image distributed to a GPU node first cannot create a pod inside the
 # request handler (the off-cluster daemon does the copy asynchronously). We persist the full
@@ -477,6 +483,18 @@ def ensure_schema_columns(conn):
         custom_image_columns = {col["name"] for col in inspector.get_columns("custom_images")}
         if "digest" not in custom_image_columns:
             conn.execute(text("ALTER TABLE custom_images ADD COLUMN digest VARCHAR(255)"))
+
+    # Additive: P4 blob task-id list (JSON) for delete-time P2P/seed cache purge. NULL on old rows =>
+    # a delete of such an image can't target its blob tasks (falls back to ref-only), so the P2P/seed
+    # cache is left to Dragonfly's taskTTL. New pushes record it. Mirrors the digest additive pattern.
+    if inspector.has_table("images"):
+        image_columns = {col["name"] for col in inspector.get_columns("images")}
+        if "blob_list" not in image_columns:
+            conn.execute(text("ALTER TABLE images ADD COLUMN blob_list TEXT"))
+    if inspector.has_table("custom_images"):
+        custom_image_columns = {col["name"] for col in inspector.get_columns("custom_images")}
+        if "blob_list" not in custom_image_columns:
+            conn.execute(text("ALTER TABLE custom_images ADD COLUMN blob_list TEXT"))
 
     # Caller-supplied pod tag (hackathon/workshop/one-click). Nullable, no default -> old rows = NULL.
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
@@ -1391,6 +1409,82 @@ def set_custom_image_digest(custom_image_id: int, digest: Optional[str]) -> Opti
         return row_to_dict(
             conn.execute(select(custom_images).where(custom_images.c.id == custom_image_id)).mappings().first()
         )
+
+
+def _normalize_blob_ids(blobs) -> list[str]:
+    """Coerce a list of blob refs to bare 64-hex dfdaemon task ids (strip an optional 'sha256:').
+    Dragonfly v1.4.0 runs task-id==blob-digest-hex, so the task id is exactly the hex digest."""
+    out: list[str] = []
+    for b in blobs or []:
+        if not b:
+            continue
+        s = str(b).strip()
+        if ":" in s:
+            s = s.split(":", 1)[1]
+        if s:
+            out.append(s)
+    # de-dup preserving order
+    seen: set[str] = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
+
+
+def set_image_blob_list(image_id: int, blobs) -> None:
+    """Record a catalog image's OCI blob task-ids (JSON array) for delete-time P2P/seed purge."""
+    ids = _normalize_blob_ids(blobs)
+    now = utc_now()
+    with engine.begin() as conn:
+        conn.execute(
+            update(images).where(images.c.id == image_id).values(blob_list=json.dumps(ids), updated_at=now)
+        )
+
+
+def set_custom_image_blob_list(custom_image_id: int, blobs) -> None:
+    """Record a custom image's OCI blob task-ids (JSON array); see set_image_blob_list."""
+    ids = _normalize_blob_ids(blobs)
+    now = utc_now()
+    with engine.begin() as conn:
+        conn.execute(
+            update(custom_images)
+            .where(custom_images.c.id == custom_image_id)
+            .values(blob_list=json.dumps(ids), updated_at=now)
+        )
+
+
+def _blob_list_for_ref(conn, image_ref: str) -> list[str]:
+    """The recorded blob task-ids for a ref (images or custom_images). [] if none/unknown."""
+    for tbl in (images, custom_images):
+        row = conn.execute(select(tbl.c.blob_list).where(tbl.c.image == image_ref)).first()
+        if row is not None and row[0]:
+            try:
+                return _normalize_blob_ids(json.loads(row[0]))
+            except (ValueError, TypeError):
+                return []
+    return []
+
+
+def unique_blob_ids_for_ref(image_ref: str) -> list[str]:
+    """Blob task-ids UNIQUE to `image_ref`: this image's blobs minus every blob referenced by any
+    OTHER (non-deleted) image or custom_image. A delete purges only these from the P2P/seed cache;
+    blobs shared with a live image are left for Dragonfly's taskTTL (deleting one would only cause a
+    re-fetch, never corruption — but unique-only avoids even that). Returns [] if the ref has no
+    recorded blob_list (pre-P4 image)."""
+    with engine.begin() as conn:
+        mine = set(_blob_list_for_ref(conn, image_ref))
+        if not mine:
+            return []
+        others: set[str] = set()
+        for tbl in (images, custom_images):
+            rows = conn.execute(
+                select(tbl.c.blob_list).where(tbl.c.image != image_ref, tbl.c.blob_list.isnot(None))
+            ).all()
+            for (bl,) in rows:
+                if not bl:
+                    continue
+                try:
+                    others.update(_normalize_blob_ids(json.loads(bl)))
+                except (ValueError, TypeError):
+                    continue
+    return [b for b in mine if b not in others]
 
 
 def image_digest_present(image_ref: str) -> bool:
