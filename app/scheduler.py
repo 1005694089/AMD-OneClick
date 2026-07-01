@@ -15,9 +15,37 @@ logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
+# The asyncio loop the app runs on, captured at scheduler start. The heavy jobs
+# below are SYNC functions so APScheduler's AsyncIOExecutor runs them in a
+# thread pool (off the event loop); any async telemetry they emit is dispatched
+# back onto this loop thread-safely so a slow job never blocks HTTP/OAuth.
+_main_loop: "asyncio.AbstractEventLoop | None" = None
 
-async def cleanup_job():
-    """Periodic job to cleanup idle and expired instances"""
+
+def _fire_and_forget(coro):
+    """Schedule a coroutine (telemetry) on the main loop from a worker thread."""
+    loop = _main_loop
+    if loop is None:
+        coro.close()
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(coro, loop)
+    except Exception as e:
+        logger.warning("telemetry dispatch failed: %s", e)
+        try:
+            coro.close()
+        except Exception:
+            pass
+
+
+def cleanup_job():
+    """Periodic job to cleanup idle and expired instances.
+
+    SYNC on purpose: it performs many blocking k8s API + TCP readiness calls
+    (one set per active instance). Running it as a coroutine on the event loop
+    starved async HTTP (intermittent OAuth failures) and misfired other jobs at
+    production scale; as a sync job it runs in a worker thread instead.
+    """
     from .k8s_client import k8s_client
     from .store import charge_usage_unit, list_active_instances, mark_instance_deleted, mark_instance_ready_for_billing, update_instance_charge_time
     
@@ -61,13 +89,13 @@ async def cleanup_job():
                     if result == "charged":
                         from .telemetry import report_gpu_hour_charged_event
 
-                        await report_gpu_hour_charged_event(
+                        _fire_and_forget(report_gpu_hour_charged_event(
                             instance_id=record["instance_id"],
                             billing_session_id=billing_session_id,
                             billing_unit=unit,
                             user_id=record["user_id"],
                             gpu_count=int(record["gpu_count"]),
-                        )
+                        ))
                     if result == "insufficient":
                         if k8s_client.delete_instance_by_id(record["instance_id"]):
                             mark_instance_deleted(record["instance_id"])
@@ -102,11 +130,14 @@ async def template_preview_sync_job():
         logger.error(f"Template preview sync job failed: {e}")
 
 
-async def reconcile_job():
+def reconcile_job():
     """Bidirectional reconciliation between the cluster (source of truth) and
     the DB. Reclaims orphan/rogue pods (no owning DB record), force-finalizes
     pods stuck Terminating, and marks DB instances deleted when their pod is
-    gone."""
+    gone.
+
+    SYNC on purpose (blocking k8s calls) so it runs in a worker thread and does
+    not compete with / block the event loop, mirroring cleanup_job."""
     if not settings.RECONCILE_ENABLED:
         return
     from .k8s_client import k8s_client
@@ -254,12 +285,21 @@ def image_sync_refresh_job():
 
 def start_scheduler():
     """Start the background scheduler"""
+    global _main_loop
+    try:
+        _main_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _main_loop = asyncio.get_event_loop()
+    # coalesce + generous misfire grace so a busy moment never silently drops a
+    # cycle; max_instances=1 prevents overlapping runs of the same job.
+    job_defaults = dict(coalesce=True, misfire_grace_time=120, max_instances=1)
     scheduler.add_job(
         cleanup_job,
         trigger=IntervalTrigger(minutes=1),
         id="cleanup_job",
         name="Cleanup idle and expired instances",
-        replace_existing=True
+        replace_existing=True,
+        **job_defaults,
     )
     scheduler.add_job(
         template_preview_sync_job,
@@ -267,6 +307,7 @@ def start_scheduler():
         id="template_preview_sync_job",
         name="Sync notebook template preview cache",
         replace_existing=True,
+        **job_defaults,
     )
     if settings.RECONCILE_ENABLED:
         scheduler.add_job(
@@ -275,6 +316,7 @@ def start_scheduler():
             id="reconcile_job",
             name="Reconcile cluster instances against the database",
             replace_existing=True,
+            **job_defaults,
         )
     scheduler.add_job(
         image_sync_refresh_job,
@@ -282,6 +324,7 @@ def start_scheduler():
         id="image_sync_refresh_job",
         name="Refresh image prepull status and node-ready labels",
         replace_existing=True,
+        **job_defaults,
     )
     scheduler.start()
     logger.info(
