@@ -143,7 +143,7 @@ async def reap_stale_image_jobs_job():
     """
     if _skip_not_leader("reap_stale_image_jobs_job"):
         return
-    from .store import reap_stale_image_jobs
+    from .store import reap_stale_image_jobs, requeue_failed_purges
 
     try:
         reaped = reap_stale_image_jobs(settings.JOB_LEASE_TIMEOUT_SECONDS)
@@ -151,6 +151,16 @@ async def reap_stale_image_jobs_job():
             logger.warning("Reaped %s stale image job(s)", reaped)
     except Exception as e:
         logger.error(f"Stale image job reaper failed: {e}")
+
+    # P4 delete-completeness: the stale reaper above only requeues LEASED jobs. A purge-surface job
+    # that REPORTED failure is terminal and would otherwise never retry, leaving orphaned bytes. Flip
+    # such failed purges back to pending (bounded by max_attempts) so a delete converges to complete.
+    try:
+        requeued = requeue_failed_purges()
+        if requeued:
+            logger.warning("Re-enqueued %s failed purge job(s) for delete-completeness", requeued)
+    except Exception as e:
+        logger.error(f"Failed-purge requeue failed: {e}")
 
 
 async def idle_reaper_job():

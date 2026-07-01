@@ -324,8 +324,19 @@ image_jobs = Table(
     Index("ix_image_jobs_status_kind", "status", "kind"),
 )
 
-IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "push", "distribute", "warm", "evict")
+IMAGE_JOB_KINDS = (
+    "build", "pull", "acr_backup", "push", "distribute", "warm", "evict",
+    # P4 complete-delete fan-out — one job per byte-surface (purge_meta is manager-side only).
+    "purge_node", "purge_p2p", "purge_seed", "registry_delete", "purge_builder", "purge_meta",
+)
 IMAGE_JOB_TERMINAL = ("succeeded", "failed")
+
+# P4: the per-node/seed byte-surface purges whose SUCCESS gates purge_meta (the DB-row cleanup).
+# purge_meta must run only after every one of these has SUCCEEDED for the ref — never on failure
+# (a failed purge means bytes remain, so dropping the DB handle would orphan them). Reported
+# failures are terminal and are re-enqueued by requeue_failed_purges (the stale reaper only
+# requeues leased jobs, so failures would otherwise never retry — the load-bearing P4 fix).
+PURGE_PREREQ_KINDS = ("purge_node", "purge_p2p", "purge_seed", "registry_delete", "purge_builder")
 
 # Kinds that perform a per-node containerd unpack and must be serialized per target node (the
 # claim site defers an overlapping one, and the stale-job reaper strips quarantined nodes from
@@ -333,6 +344,8 @@ IMAGE_JOB_TERMINAL = ("succeeded", "failed")
 # Includes the Dragonfly warm/purge kinds added for the P2P transport; "distribute" remains for the
 # one-release alias window.
 SERIALIZED_KINDS = ("distribute", "warm", "evict", "purge_node", "purge_p2p")
+# purge_seed/registry_delete/purge_builder/purge_meta are 0042-local or manager-local (no per-node
+# containerd unpack) so they are intentionally NOT serialized.
 
 # A launch that needs its image distributed to a GPU node first cannot create a pod inside the
 # request handler (the off-cluster daemon does the copy asynchronously). We persist the full
@@ -1951,6 +1964,33 @@ def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Op
                     )
                     continue
 
+            # P4: purge_meta (the DB-row cleanup) is the LAST step of a delete fan-out. Do not hand
+            # it out until EVERY byte-surface purge for the same ref has SUCCEEDED. If any prereq is
+            # still non-terminal (in flight) OR terminally failed (bytes remain), defer purge_meta —
+            # skip it and try the next pending job. requeue_failed_purges re-enqueues failed prereqs
+            # so this converges; purge_meta only fires once bytes are truly gone. This is a claim-time
+            # gate (not enqueue-time) because all fan-out jobs are enqueued up front and claimed out
+            # of order.
+            if pending["kind"] == "purge_meta" and pending.get("ref"):
+                # A failed prereq may be re-enqueued (a new row), so evaluate the LATEST row per kind
+                # (highest id wins). purge_meta fires only when every prereq kind that was enqueued
+                # has its latest row == succeeded.
+                prereqs = conn.execute(
+                    select(image_jobs.c.id, image_jobs.c.kind, image_jobs.c.status).where(
+                        image_jobs.c.ref == pending["ref"],
+                        image_jobs.c.kind.in_(PURGE_PREREQ_KINDS),
+                    ).order_by(image_jobs.c.id)
+                ).all()
+                latest: dict = {}
+                for _id, k, s in prereqs:
+                    latest[k] = s  # id-ordered scan: last write per kind is the newest row
+                # Require EVERY prereq kind to be present AND succeeded. Iterating only existing rows
+                # would let purge_meta through when a surface job was never enqueued (partial fan-out:
+                # enqueue_purge_fanout is 6 non-atomic inserts) — dropping the DB handle while that
+                # surface's bytes remain. Assert the full set.
+                if set(latest) != set(PURGE_PREREQ_KINDS) or any(s != "succeeded" for s in latest.values()):
+                    continue
+
             if pending["kind"] in SERIALIZED_KINDS:
                 pending_nodes = _job_target_nodes(pending.get("payload"))
                 if pending_nodes:
@@ -2408,6 +2448,112 @@ def clear_image_node(image_ref: str, node_name: str) -> bool:
             )
         )
         return result.rowcount > 0
+
+
+def delete_orphan_image_nodes(image_ref: str) -> int:
+    """P4 purge_meta: delete ALL remaining image_nodes rows for a ref. Returns rows removed.
+
+    Called only from the purge_meta lifecycle branch, which the claim-gate guarantees runs ONLY
+    after every per-node purge_node SUCCEEDED (each successful purge already cleared its own row via
+    clear_image_node). So any rows still here belong to nodes that were NOT purged — but purge_meta
+    cannot run while a prereq is unsucceeded, so in the normal path there are none. This is the
+    final sweep for stragglers (e.g. an 'importing'/'quarantined' row never flipped to a purge
+    result). Safe because reaching purge_meta means bytes are confirmed gone fleet-wide."""
+    with engine.begin() as conn:
+        result = conn.execute(image_nodes.delete().where(image_nodes.c.image_ref == image_ref))
+        return result.rowcount
+
+
+def link_purge_meta_custom_image(image_ref: str, custom_image_id: int) -> bool:
+    """Attach custom_image_id to the pending purge_meta job for a ref (idle-delete path).
+
+    The idle reaper fans out with image_id=None, but for an idle CUSTOM image the custom_images row
+    still exists (it will be marked 'evicted', not deleted) so the FK link is valid — and purge_meta
+    needs it to call mark_custom_image_evicted. Only touches a non-terminal purge_meta row."""
+    now = utc_now()
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(image_jobs)
+            .where(
+                image_jobs.c.ref == image_ref,
+                image_jobs.c.kind == "purge_meta",
+                image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL),
+            )
+            .values(custom_image_id=custom_image_id, updated_at=now)
+        )
+        return result.rowcount > 0
+
+
+def get_digest_for_ref(image_ref: str) -> Optional[str]:
+    """Best-effort LAN-registry digest for a ref (images or custom_images). None if unknown/unpushed.
+    Used by the idle-delete fan-out so registry_delete can DELETE the zot manifest by digest."""
+    if not image_ref:
+        return None
+    with engine.begin() as conn:
+        row = conn.execute(select(images.c.digest).where(images.c.image == image_ref)).first()
+        if row and row[0]:
+            return row[0]
+        row = conn.execute(select(custom_images.c.digest).where(custom_images.c.image == image_ref)).first()
+        if row and row[0]:
+            return row[0]
+    return None
+
+
+def purge_prereqs_satisfied(ref: str) -> bool:
+    """True iff every P4 byte-surface purge kind for `ref` has its LATEST row == succeeded.
+
+    Mirrors the purge_meta claim-gate. Used a SECOND time at purge_meta EXECUTION (lifecycle) as a
+    re-check: a prereq can regress (requeue_failed_purges flips failed->pending) between purge_meta
+    being claimed and its result landing, so the branch must re-verify before dropping DB rows."""
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(image_jobs.c.id, image_jobs.c.kind, image_jobs.c.status).where(
+                image_jobs.c.ref == ref,
+                image_jobs.c.kind.in_(PURGE_PREREQ_KINDS),
+            ).order_by(image_jobs.c.id)
+        ).all()
+    latest: dict = {}
+    for _id, k, s in rows:
+        latest[k] = s
+    return set(latest) == set(PURGE_PREREQ_KINDS) and all(s == "succeeded" for s in latest.values())
+
+
+def requeue_failed_purges(ref: Optional[str] = None) -> int:
+    """P4 convergence: re-enqueue terminally-FAILED purge-surface jobs so a delete completes.
+
+    The stale-job reaper only requeues LEASED (claimed/running) jobs past their lease; a job that
+    REPORTED status='failed' is terminal and never retried. For delete-completeness (the hard "remove
+    every byte" rule) a failed purge_node/purge_p2p/purge_seed/registry_delete/purge_builder MUST be
+    retried until it succeeds. This flips the latest failed row per (kind, ref) back to pending,
+    bounded by max_attempts. Returns the number re-enqueued. Idempotent: a kind with a newer
+    non-terminal row is skipped (dedup semantics)."""
+    now = utc_now()
+    requeued = 0
+    with engine.begin() as conn:
+        base = select(
+            image_jobs.c.id, image_jobs.c.kind, image_jobs.c.ref, image_jobs.c.status,
+            image_jobs.c.attempts, image_jobs.c.max_attempts,
+        ).where(image_jobs.c.kind.in_(PURGE_PREREQ_KINDS))
+        if ref is not None:
+            base = base.where(image_jobs.c.ref == ref)
+        rows = conn.execute(base.order_by(image_jobs.c.id)).all()
+        # Latest row per (kind, ref); only act if that newest row is 'failed' with attempts left.
+        latest: dict = {}
+        for r in rows:
+            latest[(r[1], r[2])] = r
+        for (_kind, _ref), r in latest.items():
+            if r[3] != "failed":
+                continue
+            if int(r[4]) >= int(r[5]):
+                continue  # exhausted retries — leave failed (operator/alert territory)
+            result = conn.execute(
+                update(image_jobs)
+                .where(image_jobs.c.id == r[0], image_jobs.c.status == "failed")
+                .values(status="pending", claimed_by=None, claimed_at=None, updated_at=now)
+            )
+            if result.rowcount > 0:
+                requeued += 1
+    return requeued
 
 
 def touch_image_node(image_ref: str, node_name: str) -> None:

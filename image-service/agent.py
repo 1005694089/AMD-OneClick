@@ -98,7 +98,10 @@ DOCKER_BUILDKIT = _env("DOCKER_BUILDKIT", "0")
 _IS_NERDCTL = os.path.basename(CONTAINER_CLI) == "nerdctl"
 
 # Which job kinds this daemon will claim. CSV; default = all.
-ALL_KINDS = ["build", "pull", "acr_backup", "push", "distribute", "warm", "evict"]
+ALL_KINDS = [
+    "build", "pull", "acr_backup", "push", "distribute", "warm", "evict",
+    "purge_node", "purge_p2p", "purge_seed", "registry_delete", "purge_builder",
+]
 IMAGE_SERVICE_KINDS = [
     k.strip() for k in _env("IMAGE_SERVICE_KINDS", ",".join(ALL_KINDS)).split(",") if k.strip()
 ]
@@ -108,6 +111,20 @@ ACR_ENTERPRISE_REGISTRY = _env("ACR_ENTERPRISE_REGISTRY", "")
 # is already present under DOCKER_CONFIG (imagesvc logged in). Empty => run_push fails fast (the
 # manager only enqueues push when its own LAN_REGISTRY is set, so this stays unreached until wired).
 LAN_REGISTRY = _env("LAN_REGISTRY", "")
+# P4 complete-delete config.
+# zot registry credentials for the manifest DELETE (registry_delete). Basic user:pass; the agent is
+# already logged in via DOCKER_CONFIG, but the DELETE is a raw curl so it needs the pair explicitly.
+ZOT_USERNAME = _env("ZOT_USERNAME", "imagesvc")
+ZOT_PASSWORD = _env("ZOT_PASSWORD", "")
+# CA cert path so curl trusts the self-signed zot TLS (also in the system trust store).
+ZOT_CA_CERT = _env("ZOT_CA_CERT", "/etc/zot/tls.crt")
+# The node-local Dragonfly dfdaemon delete command template ({ref} substituted). Dragonfly v2
+# dfget delete subcommand; kept as one env knob so the exact CLI/flags are a single change if the
+# installed client differs (e.g. `dfcache delete`). Runs over SSH on each node (purge_p2p) or on
+# the seed host (purge_seed).
+DFDAEMON_DELETE_CMD = _env("DFDAEMON_DELETE_CMD", "dfget --delete --url {ref}")
+# dfdaemon on-disk task cache root (storage.dir) — purge_p2p verifies the task file is gone here.
+DFDAEMON_STORAGE_DIR = _env("DFDAEMON_STORAGE_DIR", "/disk/ssd1/dragonfly/peer")
 DISTRIBUTE_CONCURRENCY = int(_env("DISTRIBUTE_CONCURRENCY", "2"))
 CTR_NAMESPACE = _env("CTR_NAMESPACE", "k8s.io")
 NODE_SSH_USER = _env("NODE_SSH_USER", "root")
@@ -1053,6 +1070,213 @@ def run_evict(job):
     report_result(job_id, status, {"ref": ref, "nodes": results})
 
 
+# =============================================================================
+# P4 complete-delete purge handlers. Each targets ONE byte-surface. Golden rule everywhere:
+# "already gone" == SUCCESS (idempotent) — a purge must converge on re-run, never fail because the
+# thing was already removed. Reported failures are re-enqueued by the manager (requeue_failed_purges)
+# until they succeed, which is what makes delete complete.
+# =============================================================================
+
+def run_purge_node(job):
+    """Surface 1: node containerd layers. Per-node `ctr images rm` + content prune (serialized).
+    Mirrors run_evict; `ctr images rm` of a missing image is already a no-op success in containerd."""
+    job_id = job["id"]
+    ref = job["ref"]
+    payload = job.get("payload") or {}
+    targets = payload.get("targets") or []
+    if not DISTRIB_SSH_KEY:
+        report_result(job_id, "failed", {"ref": ref, "error": "distrib_ssh_key_unset"})
+        return
+    if not targets:
+        report_result(job_id, "failed", {"ref": ref, "error": "no_targets"})
+        return
+
+    def _one(target):
+        node = target.get("node")
+        ip = target.get("ip")
+        entry = {"node": node, "ip": ip, "removed": False, "error": None}
+        if not ip:
+            entry["error"] = "missing_ip"
+            return entry
+        # `images rm` tolerates a missing ref (no-op); content prune reclaims layers.
+        remote = (
+            f"sudo ctr -n {CTR_NAMESPACE} images rm {shlex.quote(ref)} >/dev/null 2>&1; "
+            f"sudo ctr -n {CTR_NAMESPACE} content prune >/dev/null 2>&1; "
+            f"! sudo ctr -n {CTR_NAMESPACE} images ls -q 2>/dev/null | grep -qxF {shlex.quote(ref)}"
+        )
+        # The final `! grep` makes the command succeed only when the ref is truly absent afterward.
+        ok = stream_command(job_id, _ssh_base(ip) + [remote])
+        entry["removed"] = ok
+        if not ok:
+            entry["error"] = "purge_node_failed"
+        return entry
+
+    results = [_one(t) for t in targets]
+    all_removed = all(e["removed"] for e in results)
+    status = "succeeded" if all_removed else "failed"
+    push_log(job_id, f"\nPurge_node {status}: {sum(e['removed'] for e in results)}/{len(results)} cleared.\n")
+    report_result(job_id, status, {"ref": ref, "nodes": results})
+
+
+def run_purge_p2p(job):
+    """Surface 2: each node's dfdaemon P2P cache. Delete the task via the node-local dfdaemon, then
+    verify no on-disk task file survives under DFDAEMON_STORAGE_DIR. Per-node, serialized."""
+    job_id = job["id"]
+    ref = job["ref"]
+    payload = job.get("payload") or {}
+    targets = payload.get("targets") or []
+    lan_ref = payload.get("lan_target_ref") or ref
+    if not DISTRIB_SSH_KEY:
+        report_result(job_id, "failed", {"ref": ref, "error": "distrib_ssh_key_unset"})
+        return
+    if not targets:
+        report_result(job_id, "failed", {"ref": ref, "error": "no_targets"})
+        return
+
+    delete_cmd = DFDAEMON_DELETE_CMD.format(ref=shlex.quote(lan_ref))
+
+    def _one(target):
+        node = target.get("node")
+        ip = target.get("ip")
+        entry = {"node": node, "ip": ip, "removed": False, "error": None}
+        if not ip:
+            entry["error"] = "missing_ip"
+            return entry
+        # Ask dfdaemon to delete the task. It MUST fail-loud on a real error so the purge_meta gate
+        # stays closed (a silent success would drop the DB handle while bytes remain). Only a genuine
+        # "task not found" (already gone) is treated as success — grep the output for it. NO `|| true`
+        # / trailing `; true`: those made this always-succeed, defeating the gate (C3/C4 fix).
+        remote = (
+            f"out=$(sudo {delete_cmd} 2>&1); rc=$?; "
+            f"if [ $rc -eq 0 ]; then exit 0; fi; "
+            f"echo \"$out\" | grep -qiE 'not found|no such|does not exist' && exit 0; "
+            f"echo \"$out\" >&2; exit $rc"
+        )
+        ok = stream_command(job_id, _ssh_base(ip) + [remote])
+        entry["removed"] = ok
+        if not ok:
+            # Real dfdaemon error (or wrong DFDAEMON_DELETE_CMD): fail so requeue_failed_purges
+            # retries and purge_meta stays blocked. Verification of on-disk task-file removal (keyed
+            # to dfdaemon's version-specific task hash) is a follow-up hardening item.
+            entry["error"] = "purge_p2p_failed"
+        return entry
+
+    results = [_one(t) for t in targets]
+    all_removed = all(e["removed"] for e in results)
+    status = "succeeded" if all_removed else "failed"
+    push_log(job_id, f"\nPurge_p2p {status}: {sum(e['removed'] for e in results)}/{len(results)} cleared.\n")
+    report_result(job_id, status, {"ref": ref, "nodes": results})
+
+
+def run_purge_seed(job):
+    """Surface 3: the seed-peer cache. Delete the task on the seed via dfdaemon. 0042-local (or
+    SSH to the seed); not serialized. 'not found' => already gone => success."""
+    job_id = job["id"]
+    ref = job["ref"]
+    payload = job.get("payload") or {}
+    lan_ref = payload.get("lan_target_ref") or ref
+    delete_cmd = DFDAEMON_DELETE_CMD.format(ref=shlex.quote(lan_ref))
+    # Delete the task on the seed. MUST fail-loud on a real error (no `|| true`): a false success
+    # would open the purge_meta gate while the seed still holds the bytes (C3 fix). Only a genuine
+    # "not found" (already gone) counts as success.
+    cmd = (
+        f"out=$({delete_cmd} 2>&1); rc=$?; "
+        f"if [ $rc -eq 0 ]; then exit 0; fi; "
+        f"echo \"$out\" | grep -qiE 'not found|no such|does not exist' && exit 0; "
+        f"echo \"$out\" >&2; exit $rc"
+    )
+    ok = stream_command(job_id, cmd)
+    if ok:
+        push_log(job_id, f"\nPurge_seed complete for {lan_ref}.\n")
+        report_result(job_id, "succeeded", {"ref": ref, "seed_deleted": True})
+    else:
+        push_log(job_id, f"\nPurge_seed FAILED for {lan_ref} (dfdaemon delete errored).\n")
+        report_result(job_id, "failed", {"ref": ref, "error": "purge_seed_failed"})
+
+
+def run_registry_delete(job):
+    """Surface 4: the LAN registry (zot) tag/manifest. DELETE /v2/<repo>/manifests/<digest>.
+    Digest comes FROM THE PAYLOAD (captured at enqueue; the DB row may already be deleted). zot's
+    online GC reclaims blobs async, so no push-lock is needed. Idempotent: 404 => already gone =>
+    success; 200/202 => deleted."""
+    job_id = job["id"]
+    ref = job["ref"]
+    payload = job.get("payload") or {}
+    digest = payload.get("digest")
+    lan_ref = payload.get("lan_target_ref")
+    # No registry copy could exist iff neither a LAN ref was ever computed NOR a digest recorded.
+    # Then there is nothing to delete on this surface -> success (do NOT block purge_meta forever).
+    # This covers pre-P1 images and idle catalog images that were never pushed to zot.
+    if not lan_ref and not digest:
+        push_log(job_id, "No LAN ref/digest for this image; no registry copy to delete (no-op).\n")
+        report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": False})
+        return
+    # A registry copy is expected (lan_ref set) but we cannot address it without a digest. Fail so it
+    # retries — but if it never resolves, this is a genuine leak to surface, not silently pass.
+    if not digest:
+        push_log(job_id, "payload.digest missing but a LAN ref exists; cannot DELETE by digest.\n")
+        report_result(job_id, "failed", {"ref": ref, "error": "digest_missing"})
+        return
+    # Registry host: prefer the agent's configured LAN_REGISTRY, else derive from lan_ref (C4: don't
+    # no-op just because the agent env is empty while a copy demonstrably exists).
+    registry_host = LAN_REGISTRY or ((lan_ref or "").split("/", 1)[0] if "/" in (lan_ref or "") else "")
+    if not registry_host:
+        report_result(job_id, "failed", {"ref": ref, "error": "no_registry_host"})
+        return
+    # Derive the repo path (host:port/REPO:tag -> REPO) from the LAN ref, else from ref.
+    src = lan_ref or ref
+    if "/" in src:
+        _host, _, rest = src.partition("/")
+        # strip a trailing :tag only in the LAST path segment (never the host:port colon)
+        slash = rest.rfind("/")
+        if slash != -1:
+            repo = rest[:slash + 1] + rest[slash + 1:].split(":", 1)[0]
+        else:
+            repo = rest.split(":", 1)[0]
+    else:
+        report_result(job_id, "failed", {"ref": ref, "error": "unparseable_repo"})
+        return
+    url = f"https://{registry_host}/v2/{repo}/manifests/{digest}"
+    cmd = (
+        f"curl -sS -o /dev/null -w '%{{http_code}}' -X DELETE "
+        f"--cacert {shlex.quote(ZOT_CA_CERT)} "
+        f"-u {shlex.quote(ZOT_USERNAME + ':' + ZOT_PASSWORD)} "
+        f"{shlex.quote(url)}"
+    )
+    rc, out = _run_capture(job_id, cmd, timeout=60)
+    code = (out or "").strip()[-3:]
+    if rc == 0 and code in ("200", "202", "404"):
+        push_log(job_id, f"\nRegistry delete OK (HTTP {code}) for {repo}@{digest}.\n")
+        report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": code != "404", "http": code})
+    else:
+        push_log(job_id, f"\nRegistry delete failed (rc={rc} HTTP {code}).\n")
+        report_result(job_id, "failed", {"ref": ref, "error": f"registry_delete_http_{code or 'err'}"})
+
+
+def run_purge_builder(job):
+    """Surface 5: the 0042 build tarball + rootless builder cache. rm the retained tarball (kept by
+    run_push as backup) + buildkit prune. 0042-local; not serialized. Missing tarball => success."""
+    job_id = job["id"]
+    ref = job["ref"]
+    tar_path = _image_tar_path(ref)
+    tar_removed = False
+    try:
+        os.remove(tar_path)
+        tar_removed = True
+    except FileNotFoundError:
+        tar_removed = True  # already gone => success
+    except OSError as exc:
+        push_log(job_id, f"Could not remove tarball {tar_path}: {exc}\n")
+        report_result(job_id, "failed", {"ref": ref, "error": "tarball_rm_failed"})
+        return
+    # buildkit prune is best-effort (reclaims dangling build cache, not keyed to this ref); a failure
+    # here should not fail the whole purge — the durable artifact (the tarball) is already gone.
+    if _IS_NERDCTL:
+        stream_command(job_id, _cli("builder", "prune", "-f"))
+    push_log(job_id, f"\nPurge_builder complete (tarball removed={tar_removed}).\n")
+    report_result(job_id, "succeeded", {"ref": ref, "tar_removed": tar_removed})
+
+
 DISPATCH = {
     "build": run_build,
     "pull": run_pull,
@@ -1061,6 +1285,11 @@ DISPATCH = {
     "distribute": run_distribute,
     "warm": run_warm,
     "evict": run_evict,
+    "purge_node": run_purge_node,
+    "purge_p2p": run_purge_p2p,
+    "purge_seed": run_purge_seed,
+    "registry_delete": run_registry_delete,
+    "purge_builder": run_purge_builder,
 }
 
 

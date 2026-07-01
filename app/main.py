@@ -1665,15 +1665,20 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
         try:
             recorded = store.list_nodes_for_image(image_ref)
             targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
+            # P4 complete-delete: fan out to every byte-surface (node layers, P2P caches, seed,
+            # registry tag, 0042 tarball, DB rows) — not just node layers. digest is captured from
+            # the just-deleted row so registry_delete can DELETE the zot manifest by digest.
             # Do NOT link custom_image_id: the row was already deleted above, and image_jobs has a
             # plain FK to custom_images — a link to a missing row would raise ForeignKeyViolation.
-            enqueue_image_job(
-                kind="evict",
-                ref=image_ref,
-                payload={"scope": "all", "targets": targets},
+            enqueue_purge_fanout(
+                image_ref,
+                targets,
+                digest=record.get("digest"),
+                lan_target_ref=_lan_registry_target_ref(image_ref),
+                image_id=None,
             )
         except Exception as e:
-            logger.warning("Failed to enqueue evict for custom image %s (%s): %s", image_id, image_ref, e)
+            logger.warning("Failed to enqueue purge fan-out for custom image %s (%s): %s", image_id, image_ref, e)
     return {"success": True}
 
 
@@ -1853,6 +1858,34 @@ def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
         custom_image_id = job.get("custom_image_id")
         if custom_image_id:
             mark_custom_image_evicted(custom_image_id)
+    elif kind == "purge_node":
+        # P4: clear the image_nodes row for each node whose layers were actually removed. A node
+        # that failed keeps its row (the durable retry handle); requeue_failed_purges retries it.
+        for node in result.get("nodes", []) or []:
+            node_name = node.get("node") if isinstance(node, dict) else node
+            if node and (not isinstance(node, dict) or node.get("removed")):
+                if node_name:
+                    clear_image_node(ref, node_name)
+    elif kind in ("purge_p2p", "purge_seed", "registry_delete", "purge_builder"):
+        # P4 byte-surface purges with no image_nodes-row effect (P2P cache / seed / registry tag /
+        # 0042 tarball). Success is recorded by the job's terminal status; the purge_meta claim-gate
+        # reads that. Nothing to write here.
+        pass
+    elif kind == "purge_meta":
+        # P4 FINAL step — drops the remaining DB handles (image_nodes rows + custom_images mark).
+        # RE-CHECK prereqs at execution time, not just at claim: requeue_failed_purges can flip a
+        # prereq failed->pending AFTER purge_meta was claimed but before this result lands. Dropping
+        # the rows then would orphan that surface's bytes. If any prereq regressed, abort by
+        # re-enqueuing purge_meta (it will defer again at claim until prereqs re-succeed).
+        if not store.purge_prereqs_satisfied(ref):
+            logger.warning("purge_meta for %s aborted: a byte-surface prereq regressed; re-enqueuing", ref)
+            enqueue_image_job(kind="purge_meta", ref=ref, custom_image_id=job.get("custom_image_id"),
+                              payload=payload)
+        else:
+            store.delete_orphan_image_nodes(ref)
+            custom_image_id = job.get("custom_image_id")
+            if custom_image_id:
+                mark_custom_image_evicted(custom_image_id)
     elif kind == "acr_backup":
         image_id = job.get("image_id")
         if image_id is not None:
@@ -2020,14 +2053,24 @@ async def list_outdated_image_targets(req: ImageJobClaimRequest, _agent: bool = 
     enqueued = 0
     for ref, node_names in by_ref.items():
         targets = k8s_client.resolve_node_targets(node_names)
-        job = enqueue_image_job(
-            kind="evict",
-            ref=ref,
-            custom_image_id=cid_by_ref.get(ref),
-            payload={"targets": targets, "scope": "outdated"},
+        # P4: idle-delete must be a COMPLETE purge (node layers + P2P caches + seed + registry tag +
+        # 0042 tarball + rows) — the same hard "remove every byte" contract as an explicit delete,
+        # not the layers-only `evict`. Relaunch rebuilds from the stored Dockerfile. digest is looked
+        # up so registry_delete can DELETE the zot manifest. custom_image_id rides on purge_meta so
+        # mark_custom_image_evicted flips the idle custom row to 'evicted'.
+        cid = cid_by_ref.get(ref)
+        enqueue_purge_fanout(
+            ref,
+            targets,
+            digest=store.get_digest_for_ref(ref),
+            lan_target_ref=_lan_registry_target_ref(ref),
+            image_id=None,
         )
-        if job:
-            enqueued += 1
+        if cid is not None:
+            # Re-stamp custom_image_id onto the purge_meta job for this ref (fan-out enqueued it with
+            # image_id=None; the custom mark needs the link). Safe: same-ref purge_meta is unique.
+            store.link_purge_meta_custom_image(ref, cid)
+        enqueued += 1
     return {"images": outdated, "enqueued": enqueued}
 
 
@@ -3321,6 +3364,29 @@ def _acr_backup_target_ref(ref: str) -> Optional[str]:
     return f"{registry}/{repo}"
 
 
+def enqueue_purge_fanout(ref: str, targets: list, *, digest: Optional[str] = None,
+                         lan_target_ref: Optional[str] = None, image_id: Optional[int] = None) -> None:
+    """P4 complete-delete: enqueue one INDEPENDENT job per byte-surface (§ six surfaces).
+
+    Each is idempotent and — critically — its FAILURE is re-enqueued by requeue_failed_purges until
+    it succeeds (the stale reaper only requeues LEASED jobs, so a reported failure would otherwise
+    never retry and leave orphaned bytes). purge_meta (the DB-row cleanup) is enqueued too but the
+    claim-gate holds it until every byte-surface for this ref has SUCCEEDED.
+
+    digest + lan_target_ref ride in the payload (captured NOW) because the DB row may be deleted
+    before/while the purge runs — the ref string + payload are the durable handles, not the row.
+    Per-node surfaces carry the full targets[] LIST (the proven distribute/evict model) so the
+    (kind,ref) dedup can't collapse them. image_id is linked only where the caller keeps the row
+    until after enqueue (admin path); custom path passes image_id=None (row already deleted)."""
+    base = {"ref": ref, "digest": digest, "lan_target_ref": lan_target_ref}
+    enqueue_image_job(kind="purge_node", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
+    enqueue_image_job(kind="purge_p2p", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
+    enqueue_image_job(kind="purge_seed", ref=ref, image_id=image_id, payload={**base})
+    enqueue_image_job(kind="registry_delete", ref=ref, image_id=image_id, payload={**base})
+    enqueue_image_job(kind="purge_builder", ref=ref, image_id=image_id, payload={**base})
+    enqueue_image_job(kind="purge_meta", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
+
+
 def _lan_registry_target_ref(ref: str) -> Optional[str]:
     """Compute the LAN-registry (zot) ref for an image: <LAN_REGISTRY>/<repo:tag>.
 
@@ -3485,11 +3551,14 @@ async def admin_delete_image(image_id: int, username: str = Depends(verify_admin
         # currently recorded as holding this ref; fall back to all eligible nodes when none.
         recorded = store.list_nodes_for_image(existing["image"])
         targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
-        enqueue_image_job(
-            kind="evict",
-            ref=existing["image"],
+        # P4 complete-delete fan-out (all six byte-surfaces). digest read NOW from the row; the
+        # subsequent delete_image() NULLs image_jobs.image_id so the images DELETE won't FK-violate.
+        enqueue_purge_fanout(
+            existing["image"],
+            targets,
+            digest=existing.get("digest"),
+            lan_target_ref=_lan_registry_target_ref(existing["image"]),
             image_id=image_id,
-            payload={"scope": "all", "targets": targets},
         )
         try:
             k8s_client.delete_image_sync(image_id)
