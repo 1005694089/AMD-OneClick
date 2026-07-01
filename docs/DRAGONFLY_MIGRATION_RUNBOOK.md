@@ -45,7 +45,16 @@ Steps below are tagged **[YOU-0042]** (run over your SSH to 0042) or **[ME-k8s]*
 
 ---
 
-## Prerequisites — [YOU-0042] one-time host setup on node 0042
+## Prerequisites — [YOU-0042] one-time host setup on node 0042  ✅ DONE (2026-07-01)
+
+> **Status: COMPLETE and verified.** zot v2.1.2 is live on `10.5.10.43:5000` (LAN-only bind, TLS,
+> hardened unit, system-trust CA). Smoke test passed (login→build→convert→push→catalog→DELETE 202).
+> Steps retained below as the reproducible record + for a rebuild. Execution notes folded in:
+> (a) also `chown root:imagesvc /etc/zot` (dir traversal — the service failed to start until the dir
+> itself was group-owned, not just the files); (b) if a direct GitHub download stalls, the
+> `gh-proxy.org` mirror works and the checksum still verifies; (c) run the rootless build from `/tmp`
+> (not `/root`, which `nsenter` can't open); (d) zot needs **OCI** media types — convert with
+> `nerdctl image convert --oci` (this becomes a P1 agent-code fix, not a host step).
 
 Run these over your SSH session to 0042. They stand up the zot LAN registry and prepare the host so
 that when I ship the P1 agent code, the push/pull path just works. Nothing here depends on my k8s
@@ -311,31 +320,51 @@ See the "Decisions required" section at the bottom. Concretely gather:
 
 ## Step 2 — P1: LAN registry on 0042 + push / ready-after-push
 
-**Code (worktree, unit-tested before any deploy):**
-- Add `run_push` to `agent.py`: push the built image digest-pinned to the LAN registry, **keep** the
-  `/disk/ssd2/image-tars` tarball (registry is truth, tarball is backup), report the digest.
-- Chain `['push','warm']` for admin, `['push']` for custom.
-- Move the custom "ready" flip out of the `build` branch into a new `push` branch of
-  `_sync_image_job_lifecycle` (so "ready" means registry-durable, not "tarball on 0042").
-- Add `images.digest` / `custom_images.digest` + setter.
-- Agent-side registry HEAD digest check feeding `get_image_sync_status` (manager can't reach the
-  registry, so the agent reports a `digest_present` flag).
-- Add `push` to `IMAGE_JOB_KINDS` + DISPATCH + lifecycle. **Do NOT** add it to `SERIALIZED_KINDS`
-  (it is 0042-local, not a per-node unpack).
+> **STATUS 2026-07-01:** P1 code is DONE (205 tests pass, adversarially reviewed) and the manager is
+> deployed **DORMANT** (code + `digest` migration live; `LAN_REGISTRY` unset ⇒ exact pre-P1
+> behavior). What follows is the **as-built** design + the **activation** steps.
 
-**Deploy on 0042:**
-1. **[YOU-0042]** Stand up zot per the **Prerequisites** section above (native systemd service on
-   `10.5.10.43:5000`, online GC + delete extension, cert-trust, smoke test). If already done, skip.
-2. **[YOU-0042]** When I give you the P1 `agent.py` + the exact env lines, add
-   `LAN_REGISTRY=10.5.10.43:5000` and `push` (→ `IMAGE_SERVICE_KINDS`) to
-   `/etc/amd-oneclick-image-service.env`, install the new `agent.py`, and
-   `sudo systemctl restart image-service.service`.
-3. **[ME-k8s]** Create the registry pull/push secret + trust the zot cert cluster-side (from your
-   handed-over creds + `tls.crt`); regenerate the manager `code-overrides` ConfigMap with the P1
-   code and roll the manager.
+**As-built code (differs from the earlier draft — read this, not the old bullets):**
+- `agent.py` `run_push`: `nerdctl load` the build tarball → `nerdctl image convert --oci` (zot
+  rejects Docker schema2) → `nerdctl push` to the LAN ref (creds from the existing `DOCKER_CONFIG`)
+  → parse the registry manifest digest from `image inspect` and report it. The `/disk/ssd2` tarball
+  is **kept** (registry is truth, tarball is the recoverable-single-point backup + the distribute
+  alias still reads it). Fails with a clear `source_unavailable` error if neither tarball nor local
+  ref exists.
+- Chain: admin `[<head> → (acr_backup?) → push → distribute]`; custom `[build → push]`. Both add
+  `push` **only when `LAN_REGISTRY` is set** (dormant otherwise).
+- Custom "ready" flip **deferred** from the `build` branch to a new `push` branch of
+  `_sync_image_job_lifecycle`, so "ready" means registry-durable.
+- `images.digest` / `custom_images.digest` columns (additive migration) + setters +
+  `image_digest_present` — **recorded for P5 delete-by-digest only.**
+- **Readiness is NOT digest-gated.** `get_image_sync_status` still counts loaded nodes. Because push
+  runs *before* distribute, "loaded on all nodes" already implies "pushed"; a digest gate would have
+  wrongly flipped every pre-P1 image (`digest=NULL`) to `pulling` the instant `LAN_REGISTRY` was set.
+- `push` added to `IMAGE_JOB_KINDS` + DISPATCH + lifecycle; **NOT** in `SERIALIZED_KINDS`
+  (0042-local, not a per-node unpack).
 
-**Verify:** admin upload → `image_jobs` shows build→push→warm; `crane manifest <lan-ref>` resolves;
-"ready" appears only after push; admin delete removes the registry tag.
+**Activation (do in this exact order — agent-first):**
+1. ✅ **[ME-k8s] DONE** — manager deployed dormant: 4 CM keys (`config/store/main/k8s_client.py`)
+   patched (checksums verified), manager rolled, clean start, digest columns migrated, `push` in
+   kinds, `LAN_REGISTRY=''`.
+2. **[YOU-0042]** Install the P1 agent + add the `push` kind. P1 `agent.py` is staged at
+   `zijun@10.161.176.9:/tmp/p1_agent.py` (sha256 `9f25df24ffd58ece35d69334586717b581f5cc4525e04738569dcf7dccbad6bf`).
+   ```
+   sudo install -m 0755 /path/to/p1_agent.py /opt/amd-oneclick/image-service/agent.py
+   # in /etc/amd-oneclick-image-service.env:
+   #   LAN_REGISTRY=10.5.10.43:5000
+   #   IMAGE_SERVICE_KINDS=build,pull,acr_backup,push,distribute,evict
+   sudo systemctl restart image-service.service
+   journalctl -u image-service -f     # clean start; kinds include push
+   ```
+   (zot push cred already under `DOCKER_CONFIG=/etc/amd-oneclick/docker`; CA already in system trust.)
+3. **[ME-k8s]** Only after step 2 is confirmed: add `LAN_REGISTRY=10.5.10.43:5000` to configmap
+   `amd-oneclick-radeon-beta-config` + roll the manager. **If the manager is flipped before step 2,
+   admin uploads stall on an unclaimable `push` step.** Rollback = remove the key + roll (→ dormant).
+
+**Verify:** admin upload → `image_jobs` shows `<head>→push→distribute`;
+`curl --cacert tls.crt https://10.5.10.43:5000/v2/<repo>/tags/list` lists the tag; "ready" only after
+push succeeds; custom build → ready after push.
 
 ---
 
