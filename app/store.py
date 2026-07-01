@@ -102,6 +102,10 @@ images = Table(
     Column("acr_backup_ref", Text),
     Column("acr_backup_status", String(32)),
     Column("last_launched_at", String(64)),
+    # Manifest digest of the copy pushed to the LAN registry (zot). Set by the `push` job; used as
+    # the registry-durable "ready" gate (the manager has no route to the LAN registry, so presence
+    # is agent-reported: a non-NULL digest means the image is durable in the registry).
+    Column("digest", String(255)),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
 )
@@ -262,6 +266,8 @@ custom_images = Table(
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
     Column("last_launched_at", String(64)),
+    # Manifest digest of the copy pushed to the LAN registry (zot); see images.digest.
+    Column("digest", String(255)),
     UniqueConstraint("user_id", "name", name="uq_custom_image_user_name"),
 )
 
@@ -318,7 +324,7 @@ image_jobs = Table(
     Index("ix_image_jobs_status_kind", "status", "kind"),
 )
 
-IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "distribute", "evict")
+IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "push", "distribute", "evict")
 IMAGE_JOB_TERMINAL = ("succeeded", "failed")
 
 # Kinds that perform a per-node containerd unpack and must be serialized per target node (the
@@ -446,6 +452,18 @@ def ensure_schema_columns(conn):
         image_job_columns = {col["name"] for col in inspector.get_columns("image_jobs")}
         if "heartbeat_at" not in image_job_columns:
             conn.execute(text("ALTER TABLE image_jobs ADD COLUMN heartbeat_at VARCHAR(64)"))
+
+    # Additive: LAN-registry manifest digest (P1). NULL on old rows => not-yet-pushed, so the
+    # digest-gated readiness check treats them exactly like today (loaded-row count only) until a
+    # push job records a digest. Mirrors the acr_backup_status/heartbeat_at additive pattern.
+    if inspector.has_table("images"):
+        image_columns = {col["name"] for col in inspector.get_columns("images")}
+        if "digest" not in image_columns:
+            conn.execute(text("ALTER TABLE images ADD COLUMN digest VARCHAR(255)"))
+    if inspector.has_table("custom_images"):
+        custom_image_columns = {col["name"] for col in inspector.get_columns("custom_images")}
+        if "digest" not in custom_image_columns:
+            conn.execute(text("ALTER TABLE custom_images ADD COLUMN digest VARCHAR(255)"))
 
     # Caller-supplied pod tag (hackathon/workshop/one-click). Nullable, no default -> old rows = NULL.
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
@@ -1328,6 +1346,55 @@ def set_image_acr_backup(image_id: int, ref: Optional[str], status: str) -> Opti
             .values(acr_backup_ref=ref, acr_backup_status=status, updated_at=now)
         )
         return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
+
+
+def set_image_digest(image_id: int, digest: Optional[str]) -> Optional[dict]:
+    """Record the LAN-registry manifest digest for a catalog image (guarded UPDATE)."""
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(select(images.c.id).where(images.c.id == image_id)).first()
+        if not current:
+            return None
+        conn.execute(
+            update(images).where(images.c.id == image_id).values(digest=digest, updated_at=now)
+        )
+        return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
+
+
+def set_custom_image_digest(custom_image_id: int, digest: Optional[str]) -> Optional[dict]:
+    """Record the LAN-registry manifest digest for a custom image (guarded UPDATE)."""
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(
+            select(custom_images.c.id).where(custom_images.c.id == custom_image_id)
+        ).first()
+        if not current:
+            return None
+        conn.execute(
+            update(custom_images)
+            .where(custom_images.c.id == custom_image_id)
+            .values(digest=digest, updated_at=now)
+        )
+        return row_to_dict(
+            conn.execute(select(custom_images).where(custom_images.c.id == custom_image_id)).mappings().first()
+        )
+
+
+def image_digest_present(image_ref: str) -> bool:
+    """True if a catalog OR custom image with this ref has a recorded (non-NULL) LAN-registry
+    digest. Used as the registry-durable readiness gate. Ref is unique per table."""
+    if not image_ref:
+        return False
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(images.c.digest).where(images.c.image == image_ref)
+        ).first()
+        if row is not None:
+            return bool(row[0])
+        row = conn.execute(
+            select(custom_images.c.digest).where(custom_images.c.image == image_ref)
+        ).first()
+        return bool(row is not None and row[0])
 
 
 def delete_image(image_id: int) -> bool:

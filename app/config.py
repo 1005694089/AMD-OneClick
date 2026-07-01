@@ -461,6 +461,12 @@ class Settings:
     NODE_LIST_CACHE_TTL_SECONDS: float = float(os.getenv("NODE_LIST_CACHE_TTL_SECONDS", "5"))
     # ACR Enterprise registry used as the admin-image backup source of truth.
     ACR_ENTERPRISE_REGISTRY: str = os.getenv("ACR_ENTERPRISE_REGISTRY", "")
+    # Self-hosted LAN registry (zot) on node 0042 — the durable source of truth for the P2P
+    # transport (host:port, e.g. "10.5.10.43:5000"). EMPTY => P1 push behavior is dormant: the
+    # `push` chain step is not inserted and readiness still gates on node-loaded rows only, so
+    # deploying P1 code before the registry env is wired is a no-op (safe/revertible). When set,
+    # admin/custom builds push here and "ready" gates on the pushed digest being recorded.
+    LAN_REGISTRY: str = os.getenv("LAN_REGISTRY", "").strip().rstrip("/")
     # Optional Docker Hub pull secret for dockerhub_pull source images.
     DOCKERHUB_PULL_SECRET_NAME: str = os.getenv("DOCKERHUB_PULL_SECRET_NAME", "")
     # Optional proxy prefix for raw GitHub fetches. raw.githubusercontent.com is intermittently

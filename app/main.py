@@ -1624,11 +1624,18 @@ async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(
         # distribute falls back to `nerdctl save` (nonexistent on 0042) and the launch never lands.
         # Enqueue the RAW dockerfile — claim_image_job appends DOCKERFILE_SUFFIX at claim time
         # (do NOT append it here or it would be duplicated).
+        # When the LAN registry is wired, chain a `push` after build so a custom image is durable in
+        # zot (its "ready" gate). The build branch defers the ready flip to push in that case.
+        build_payload = {"dockerfile": dockerfile}
+        lan_target_ref = _lan_registry_target_ref(image_tag)
+        if lan_target_ref:
+            build_payload["chain"] = ["push"]
+            build_payload["lan_target_ref"] = lan_target_ref
         enqueue_image_job(
             kind="build",
             ref=image_tag,
             custom_image_id=record["id"],
-            payload={"dockerfile": dockerfile},
+            payload=build_payload,
         )
     return _custom_image_public(record)
 
@@ -1769,6 +1776,14 @@ def _enqueue_next_chain_step(job: dict, payload: dict) -> None:
         acr_target_ref = payload.get("acr_target_ref")
         if acr_target_ref:
             next_payload["acr_target_ref"] = acr_target_ref
+    elif next_kind == "push":
+        lan_target_ref = payload.get("lan_target_ref")
+        if lan_target_ref:
+            next_payload["lan_target_ref"] = lan_target_ref
+    # Carry the LAN ref forward through non-push steps too, so a later push step in the same chain
+    # (or the lifecycle's digest recording) still sees it.
+    if payload.get("lan_target_ref") and "lan_target_ref" not in next_payload:
+        next_payload["lan_target_ref"] = payload["lan_target_ref"]
     enqueue_image_job(
         kind=next_kind,
         ref=ref,
@@ -1793,16 +1808,32 @@ def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
 
     if kind == "build":
         custom_image_id = job.get("custom_image_id")
-        if custom_image_id:
-            # Flip the custom image to ready unconditionally. In IMAGE_SERVICE_ENABLED mode the
-            # custom_images row is never 'building'/claimed (the kind=build image_job owns the
-            # lifecycle; the legacy claim_build path that set 'building' is starved), so guarding on
+        if custom_image_id and "push" not in (payload.get("chain") or []):
+            # Flip the custom image to ready. In IMAGE_SERVICE_ENABLED mode the custom_images row is
+            # never 'building'/claimed (the kind=build image_job owns the lifecycle; the legacy
+            # claim_build path that set 'building' is starved), so guarding on
             # require_claimed_by=<job agent> would match 0 rows and leave it stuck 'pending'.
             # finish_image_job already verified the image_job's own ownership before we get here.
+            #
+            # When a `push` step follows in the chain (LAN registry wired), DEFER the ready flip to
+            # the push branch so "ready" means the image is durable in the registry, not merely
+            # built on 0042. The row stays 'pending' (UI renders "Building...") until push succeeds.
             update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
     elif kind in ("pull",):
         # Source bytes now exist on the Image-Service host; distribution follows as its own job.
         pass
+    elif kind == "push":
+        # Registry-durable: record the manifest digest and flip readiness. digest is agent-reported
+        # (the manager has no route to the LAN registry). A null digest still counts as pushed but
+        # can't gate on digest for this ref (logged agent-side).
+        digest = result.get("digest")
+        image_id = job.get("image_id")
+        if image_id is not None:
+            store.set_image_digest(image_id, digest)
+        custom_image_id = job.get("custom_image_id")
+        if custom_image_id:
+            store.set_custom_image_digest(custom_image_id, digest)
+            update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
     elif kind == "distribute":
         for node in result.get("nodes", []) or []:
             node_name = node.get("node") if isinstance(node, dict) else node
@@ -3286,6 +3317,22 @@ def _acr_backup_target_ref(ref: str) -> Optional[str]:
     return f"{registry}/{repo}"
 
 
+def _lan_registry_target_ref(ref: str) -> Optional[str]:
+    """Compute the LAN-registry (zot) ref for an image: <LAN_REGISTRY>/<repo:tag>.
+
+    Returns None when LAN_REGISTRY is unset, which is the signal that P1 push is dormant (no push
+    step is chained and readiness gates on node-loaded rows only, exactly as before P1)."""
+    registry = (settings.LAN_REGISTRY or "").strip().rstrip("/")
+    if not registry:
+        return None
+    repo = ref.strip()
+    first = repo.split("/", 1)[0]
+    # Strip an existing registry host (has a dot/port or is localhost) so we re-home under zot.
+    if "." in first or ":" in first or first == "localhost":
+        repo = repo.split("/", 1)[1] if "/" in repo else repo
+    return f"{registry}/{repo}"
+
+
 def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: str) -> None:
     """Enqueue the non-blocking distribution chain for a source_type-backed admin image.
 
@@ -3300,10 +3347,19 @@ def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: st
     # Otherwise (the common case — the source is already in ACR) it would hard-fail with
     # acr_registry_unset and abort the whole chain, leaving the image stuck "pulling".
     acr_target_ref = _acr_backup_target_ref(ref)
-    chain = (["acr_backup"] if acr_target_ref else []) + ["distribute"]
+    # push is OPTIONAL too: only chain it when the LAN registry is wired. When set, push runs before
+    # distribute so "ready" means the image is durable in zot. Until P3, distribute stays the
+    # transport (it becomes warm in P3).
+    lan_target_ref = _lan_registry_target_ref(ref)
+    chain = (
+        (["acr_backup"] if acr_target_ref else [])
+        + (["push"] if lan_target_ref else [])
+        + ["distribute"]
+    )
     payload = {
         "image_id": image_row["id"],
         "acr_target_ref": acr_target_ref,
+        "lan_target_ref": lan_target_ref,
         "chain": chain,
         "scope": "all",
     }

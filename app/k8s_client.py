@@ -1642,6 +1642,13 @@ exit 0
         desired = len(target_names)
         loaded_nodes = set(store.list_nodes_for_image(ref)) if ref else set()
         ready = len(loaded_nodes & target_names) if target_names else len(loaded_nodes)
+        # Readiness = image loaded on every eligible node. Registry durability is guaranteed
+        # STRUCTURALLY, not via a digest gate here: the chain runs push BEFORE distribute, so a node
+        # can only reach "loaded" after the push succeeded. Gating additionally on a recorded digest
+        # would (a) flip every pre-P1 image — which has digest=NULL — from ready to pulling the
+        # instant LAN_REGISTRY is set, and (b) strand an image whose digest couldn't be parsed even
+        # though it pushed fine. The digest column is still recorded (P5 delete-by-digest) but must
+        # NOT gate readiness. See tests/test_p1_registry_push.py.
         if desired > 0 and ready >= desired:
             status = "ready"
         elif desired == 0:

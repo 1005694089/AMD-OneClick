@@ -98,12 +98,16 @@ DOCKER_BUILDKIT = _env("DOCKER_BUILDKIT", "0")
 _IS_NERDCTL = os.path.basename(CONTAINER_CLI) == "nerdctl"
 
 # Which job kinds this daemon will claim. CSV; default = all.
-ALL_KINDS = ["build", "pull", "acr_backup", "distribute", "evict"]
+ALL_KINDS = ["build", "pull", "acr_backup", "push", "distribute", "evict"]
 IMAGE_SERVICE_KINDS = [
     k.strip() for k in _env("IMAGE_SERVICE_KINDS", ",".join(ALL_KINDS)).split(",") if k.strip()
 ]
 
 ACR_ENTERPRISE_REGISTRY = _env("ACR_ENTERPRISE_REGISTRY", "")
+# Self-hosted LAN registry (zot) on 0042 — host:port, e.g. "10.5.10.43:5000". The push credential
+# is already present under DOCKER_CONFIG (imagesvc logged in). Empty => run_push fails fast (the
+# manager only enqueues push when its own LAN_REGISTRY is set, so this stays unreached until wired).
+LAN_REGISTRY = _env("LAN_REGISTRY", "")
 DISTRIBUTE_CONCURRENCY = int(_env("DISTRIBUTE_CONCURRENCY", "2"))
 CTR_NAMESPACE = _env("CTR_NAMESPACE", "k8s.io")
 NODE_SSH_USER = _env("NODE_SSH_USER", "root")
@@ -553,6 +557,155 @@ def run_acr_backup(job):
     report_result(job_id, "succeeded", {"ref": src, "acr_backup_ref": dst})
 
 
+def _run_capture(job_id, cmd, env=None, timeout=None):
+    """Run a command, tee combined output to the manager log, and RETURN (rc, output).
+
+    Unlike stream_command (which only returns a bool), run_push needs the command's stdout to
+    parse a manifest digest, so this variant captures it. Uses its own process group + timeout so
+    a stalled push/inspect can't hang the daemon."""
+    if isinstance(cmd, str):
+        push_log(job_id, "$ " + cmd + "\n")
+    else:
+        push_log(job_id, "$ " + " ".join(cmd) + "\n")
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            shell=isinstance(cmd, str),
+            start_new_session=True,
+            timeout=timeout if timeout is not None else BUILD_TIMEOUT,
+        )
+    except FileNotFoundError as exc:
+        push_log(job_id, f"Command not found: {exc}\n")
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        push_log(job_id, f"\nCommand exceeded {timeout or BUILD_TIMEOUT}s timeout; killed.\n")
+        return 124, ""
+    if proc.stdout:
+        push_log(job_id, proc.stdout)
+    return proc.returncode, proc.stdout or ""
+
+
+def _parse_repo_digest(inspect_json, lan_ref):
+    """Extract the sha256 manifest digest for lan_ref from `nerdctl image inspect` JSON output.
+
+    RepoDigests entries look like "<repo>@sha256:<hex>"; return the sha256:... for the entry whose
+    repo matches lan_ref's repo (host/path, tag stripped). Returns None if not found."""
+    try:
+        data = json.loads(inspect_json)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    repo_digests = (data or {}).get("RepoDigests") or []
+    # lan_ref = host:port/repo:tag -> repo key = host:port/repo. Strip only a trailing :tag that
+    # lives in the LAST path segment (never the host:port colon).
+    slash = lan_ref.rfind("/")
+    if slash != -1:
+        ref_repo = lan_ref[:slash + 1] + lan_ref[slash + 1:].split(":", 1)[0]
+    else:
+        ref_repo = lan_ref.split(":", 1)[0]
+    for entry in repo_digests:
+        if not isinstance(entry, str) or "@" not in entry:
+            continue
+        repo, _, digest = entry.partition("@")
+        if repo == ref_repo and digest.startswith("sha256:"):
+            return digest
+    # Fall back to the first sha256 digest present (single-repo push).
+    for entry in repo_digests:
+        if isinstance(entry, str) and "@sha256:" in entry:
+            return entry.split("@", 1)[1]
+    return None
+
+
+def run_push(job):
+    """Push a built/pulled image to the self-hosted LAN registry (zot) with OCI media types.
+
+    P1 durable-source-of-truth step. zot rejects Docker-schema2 manifests (415), so we convert to
+    OCI before pushing. The tarball is KEPT (recoverable-single-point backup + the distribute alias
+    still reads it during P3). Reports the registry manifest digest so the manager can gate "ready"
+    on registry durability and later delete by digest (P5)."""
+    job_id = job["id"]
+    src = job["ref"]
+    payload = job.get("payload") or {}
+    dst = payload.get("lan_target_ref")
+
+    if not LAN_REGISTRY:
+        push_log(job_id, "LAN_REGISTRY is not configured; cannot push.\n")
+        report_result(job_id, "failed", {"ref": src, "error": "lan_registry_unset"})
+        return
+    if not dst:
+        push_log(job_id, "payload.lan_target_ref is required for push.\n")
+        report_result(job_id, "failed", {"ref": src, "error": "lan_target_ref_missing"})
+        return
+    if not _disk_guard(job_id):
+        report_result(job_id, "failed", {"ref": src, "error": "insufficient_disk"})
+        return
+
+    # The source may only exist as an on-disk tarball (build exports type=docker,dest=tar; it is not
+    # reliably loaded into the store). Load it first so convert/push can read it. Idempotent: a
+    # second load of the same content is a no-op.
+    #
+    # push ALWAYS runs before distribute in the chain, so the tarball is present here (distribute
+    # deletes it only on its own full success, which is strictly later). If it is nonetheless
+    # missing AND the ref is not already in the local store, fail with a clear diagnostic rather
+    # than letting `convert` fail cryptically (guards a manual/out-of-order re-enqueue).
+    tar_path = _image_tar_path(src)
+    have_tar = os.path.exists(tar_path) and os.path.getsize(tar_path) > 0
+    if have_tar:
+        if not stream_command(job_id, _cli("load", "-i", tar_path)):
+            push_log(job_id, "Loading build tarball into the local store failed.\n")
+            report_result(job_id, "failed", {"ref": src, "error": "load_failed"})
+            return
+    else:
+        # No tarball: only proceed if the ref is already resolvable in the local store.
+        rc, _ = _run_capture(job_id, _cli("image", "inspect", src, "--format", "{{.ID}}"), timeout=60)
+        if rc != 0:
+            push_log(
+                job_id,
+                f"No build tarball at {tar_path} and {src} is not in the local store; "
+                "cannot push. Re-run the build/pull head step.\n",
+            )
+            report_result(job_id, "failed", {"ref": src, "error": "source_unavailable"})
+            return
+
+    # zot requires OCI media types. `nerdctl image convert --oci <src> <dst>` rewrites the manifest
+    # to OCI and tags it as the LAN ref in one step (the retained docker-format tarball is untouched,
+    # so the distribute alias still loads it during P3).
+    if _IS_NERDCTL:
+        if not stream_command(job_id, _cli("image", "convert", "--oci", src, dst)):
+            report_result(job_id, "failed", {"ref": src, "error": "oci_convert_failed"})
+            return
+    else:
+        # docker has no `image convert`; buildx/crane would be needed. Not supported in P1 (0042 is
+        # nerdctl/containerd). Fail loudly rather than push a schema2 zot rejects.
+        push_log(job_id, "OCI conversion requires nerdctl (CONTAINER_CLI=nerdctl).\n")
+        report_result(job_id, "failed", {"ref": src, "error": "oci_convert_unsupported_cli"})
+        return
+
+    # Creds come from DOCKER_CONFIG (imagesvc already logged in to zot); TLS trusted via the system
+    # CA store. Push over the LAN.
+    if not stream_command(job_id, _cli("push", dst)):
+        report_result(job_id, "failed", {"ref": src, "error": "push_failed"})
+        return
+
+    # Authoritative registry digest for the ready-gate + P5 delete-by-digest. Parse RepoDigests from
+    # the pushed ref's inspect output. Non-fatal if unparseable: report succeeded with a null digest
+    # so the push still counts, but log it (the manager then can't gate on digest for this ref).
+    rc, out = _run_capture(
+        job_id, _cli("image", "inspect", dst, "--format", "{{json .}}"), timeout=120
+    )
+    digest = _parse_repo_digest(out, dst) if rc == 0 else None
+    if not digest:
+        push_log(job_id, "WARNING: pushed OK but could not parse the registry digest.\n")
+
+    push_log(job_id, f"\nPush to LAN registry complete: {dst}{(' @ ' + digest) if digest else ''}.\n")
+    report_result(job_id, "succeeded", {"ref": src, "lan_target_ref": dst, "digest": digest})
+
+
 def _ssh_base(ip):
     return [
         "ssh",
@@ -810,6 +963,7 @@ DISPATCH = {
     "build": run_build,
     "pull": run_pull,
     "acr_backup": run_acr_backup,
+    "push": run_push,
     "distribute": run_distribute,
     "evict": run_evict,
 }
