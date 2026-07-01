@@ -867,16 +867,38 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
     except Exception:
         logger.warning("ModelScope userinfo response is not JSON: status=%s body=%s", profile_resp.status_code, profile_resp.text[:500])
         profile = {}
-    # Identity MUST come from the server-verified userinfo response. We no longer
-    # trust an unverified id_token payload (no signature check) nor synthesize an
-    # identity from the raw access token — both let a caller mint arbitrary/fake
-    # accounts. If userinfo did not return a stable id, reject the login.
-    provider_id = str(profile.get("id") or profile.get("sub") or profile.get("username") or "").strip()
+    # Identity comes from server-verified sources only: the userinfo response,
+    # or the id_token / uid from the token endpoint. The token endpoint is a
+    # direct server-to-server HTTPS exchange authenticated with our
+    # client_secret, so reading the id_token's claims is trustworthy even
+    # without a separate JWT signature check (the TLS channel authenticates the
+    # source). Some ModelScope apps' userinfo endpoint 404s, so the id_token is
+    # the primary identity there. We still refuse to derive identity from the
+    # raw access token (not a stable account id).
+    claims = dict(profile) if isinstance(profile, dict) else {}
+    if not (claims.get("id") or claims.get("sub") or claims.get("username")):
+        id_token = token_data.get("id_token")
+        if id_token:
+            try:
+                payload = id_token.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                decoded = json.loads(base64.urlsafe_b64decode(payload))
+                # userinfo values win over id_token when both present
+                claims = {**decoded, **claims}
+            except Exception as e:
+                logger.warning("Failed to decode ModelScope id_token: %s", e)
+    provider_id = str(
+        claims.get("id") or claims.get("sub") or claims.get("username")
+        or claims.get("email") or token_data.get("uid") or ""
+    ).strip()
     if not provider_id:
-        logger.warning("ModelScope userinfo lacked a stable identity; rejecting login. keys=%s", list(profile.keys()))
+        logger.warning(
+            "ModelScope login: no verifiable identity. userinfo_keys=%s token_keys=%s",
+            list(profile.keys()) if isinstance(profile, dict) else None, list(token_data.keys()),
+        )
         raise HTTPException(status_code=400, detail="ModelScope login failed: no verifiable account identity")
-    email = profile.get("email") or f"{provider_id}@modelscope.local"
-    user = get_or_create_user("modelscope", provider_id, email, profile.get("name") or profile.get("username") or provider_id, profile.get("avatar_url") or profile.get("avatar") or "")
+    email = claims.get("email") or f"{provider_id}@modelscope.local"
+    user = get_or_create_user("modelscope", provider_id, email, claims.get("name") or claims.get("username") or provider_id, claims.get("avatar_url") or claims.get("avatar") or "")
     _enforce_signup_quota(request, user)
     if user.get("_created"):
         from .telemetry import report_user_registered_event
