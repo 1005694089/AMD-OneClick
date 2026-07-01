@@ -142,9 +142,15 @@ async def reconcile_job():
                 if not p["terminating"] and (
                     p["phase"] in ("failed", "succeeded")
                     or (
-                        p.get("waiting_reason") == "CrashLoopBackOff"
-                        and p.get("restart_count", 0) >= settings.CRASHLOOP_RESTART_THRESHOLD
-                        and p["age_seconds"] >= settings.ORPHAN_GRACE_SECONDS
+                        # A broken pod is often sampled mid-restart (state Error,
+                        # not the CrashLoopBackOff waiting window), so trigger on
+                        # EITHER the CrashLoopBackOff signal OR a high cumulative
+                        # restart count, once past the grace window.
+                        p["age_seconds"] >= settings.ORPHAN_GRACE_SECONDS
+                        and (
+                            p.get("waiting_reason") == "CrashLoopBackOff"
+                            or p.get("restart_count", 0) >= settings.CRASHLOOP_RESTART_THRESHOLD
+                        )
                     )
                 )
             ]
