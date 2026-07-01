@@ -11,7 +11,7 @@ to a self-hosted LAN registry + Dragonfly P2P mirror, sized for 100–300+ nodes
 
 > **Hard constraint:** the workspace host `10.161.176.9` has **no route to the 10.5.10.x node LAN**.
 > Only node 0042 is on that LAN. `kubectl` works from the workspace; anything that touches 0042
-> directly (registry container, agent binary, systemd) must run from 0042 or via a jump host.
+> directly (zot registry service, agent binary, systemd) must run from 0042 or via a jump host.
 
 ---
 
@@ -33,9 +33,10 @@ to a self-hosted LAN registry + Dragonfly P2P mirror, sized for 100–300+ nodes
 
 ## Ownership split
 
-- **You (SSH to 0042):** everything host-side on node 0042 — the zot registry container, its data
-  dir, TLS/htpasswd, the containerd trust for zot's cert, and the agent `systemctl` restart when I
-  hand you a new `agent.py`. You do **not** touch k8s or edit application code.
+- **You (SSH to 0042):** everything host-side on node 0042 — the zot registry (native systemd
+  service), its data dir, TLS/htpasswd, the containerd trust for zot's cert, and the agent
+  `systemctl` restart when I hand you a new `agent.py`. You do **not** touch k8s or edit application
+  code.
 - **Me (kubectl via `KUBECONFIG=/home/zijun/7900_cluster_config`):** all cluster work — the manager
   `code-overrides` ConfigMap + rollout, the Dragonfly Helm install, DaemonSet/labels, Lease RBAC,
   and writing/committing all application + agent code on the branch.
@@ -94,18 +95,50 @@ sudo tee /etc/zot/config.json >/dev/null <<'JSON'
 JSON
 ```
 
-**4. Run zot as a systemd-managed container** (pinned tag, restart-always, host NVMe mount). Use
-whichever runtime 0042 already has for host containers — examples for docker or podman:
+**4. Run zot as a NATIVE systemd service (not a container).** zot is a single static Go binary, so
+there is no runtime, no AppArmor/snap confinement, and no bind-mount question — it reads
+`/disk/ssd2/registry` and `/etc/zot` directly. (Do **not** use snap Docker here: its AppArmor
+profile blocks bind-mounts outside `$HOME`/`/media`, so `/disk/ssd2` and `/etc/zot` would fail or
+mount empty. Native binary sidesteps all of that and matches the containerd/nerdctl-based cert-trust
++ smoke-test below.)
 ```
-# docker:
-sudo docker run -d --name zot --restart=always \
-  -p 10.5.10.43:5000:5000 \
-  -v /disk/ssd2/registry:/disk/ssd2/registry \
-  -v /etc/zot:/etc/zot:ro \
-  ghcr.io/project-zot/zot-linux-amd64:v2.1.2 serve /etc/zot/config.json
-# (podman: same flags; add a matching systemd unit via `podman generate systemd` or a Quadlet.)
+# Fetch the pinned static binary (verify the sha256 from the release page):
+curl -fL -o /tmp/zot https://github.com/project-zot/zot/releases/download/v2.1.2/zot-linux-amd64
+sudo install -m 0755 /tmp/zot /usr/local/bin/zot
+zot --version                      # confirm v2.1.2
+
+# systemd unit — runs as imagesvc (owns /disk/ssd2/registry), restart-always:
+sudo tee /etc/systemd/system/zot.service >/dev/null <<'UNIT'
+[Unit]
+Description=zot OCI registry (AMD-OneClick LAN registry)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=imagesvc
+Group=imagesvc
+ExecStart=/usr/local/bin/zot serve /etc/zot/config.json
+Restart=always
+RestartSec=5
+# Least-privilege hardening; registry data + config are the only writable paths it needs:
+ReadWritePaths=/disk/ssd2/registry
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now zot.service
+systemctl status zot.service --no-pager    # active (running)
+journalctl -u zot -n 30 --no-pager         # confirm it bound :5000 with TLS
 ```
-Pin the digest of `v2.1.2` once you've pulled it, so restarts are reproducible.
+(`imagesvc` must be able to read `/etc/zot/tls.key` + `/etc/zot/htpasswd` — step 2 set mode 0640;
+`chown imagesvc:imagesvc /etc/zot/tls.key /etc/zot/htpasswd` if they came out root-owned. With
+`ProtectSystem=strict`, `/etc/zot` stays readable but `/disk/ssd2/registry` needs the explicit
+`ReadWritePaths` above.)
 
 **5. Trust the registry cert on 0042's containerd/nerdctl** (so the agent's push authenticates):
 ```
@@ -221,15 +254,15 @@ See the "Decisions required" section at the bottom. Concretely gather:
   (it is 0042-local, not a per-node unpack).
 
 **Deploy on 0042:**
-1. `sudo install -d -o imagesvc -g imagesvc /disk/ssd2/registry` (3.5 TB budget available).
-2. Run **zot** as a systemd-managed container bound to the 0042 LAN IP:5000, TLS + htpasswd, data
-   dir `/disk/ssd2/registry`, with online GC enabled in `zot-config.json` (dedupe + scheduled GC —
-   no push-pause). `delete` extension enabled so `registry_delete` can DELETE manifests by digest.
-3. Generate htpasswd + TLS cert; write registry creds into the agent's `DOCKER_CONFIG` dir and
-   (later) into the Dragonfly `hosts.toml`.
-4. Add `LAN_REGISTRY=<0042-LAN-IP>:5000` to `/etc/amd-oneclick-image-service.env` and to the manager
-   ConfigMap; add `push` to `IMAGE_SERVICE_KINDS`.
-5. Deploy P1 agent + manager code (as Step 0.3–0.6).
+1. **[YOU-0042]** Stand up zot per the **Prerequisites** section above (native systemd service on
+   `10.5.10.43:5000`, online GC + delete extension, cert-trust, smoke test). If already done, skip.
+2. **[YOU-0042]** When I give you the P1 `agent.py` + the exact env lines, add
+   `LAN_REGISTRY=10.5.10.43:5000` and `push` (→ `IMAGE_SERVICE_KINDS`) to
+   `/etc/amd-oneclick-image-service.env`, install the new `agent.py`, and
+   `sudo systemctl restart image-service.service`.
+3. **[ME-k8s]** Create the registry pull/push secret + trust the zot cert cluster-side (from your
+   handed-over creds + `tls.crt`); regenerate the manager `code-overrides` ConfigMap with the P1
+   code and roll the manager.
 
 **Verify:** admin upload → `image_jobs` shows build→push→warm; `crane manifest <lan-ref>` resolves;
 "ready" appears only after push; admin delete removes the registry tag.
