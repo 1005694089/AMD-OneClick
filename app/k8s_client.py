@@ -1316,7 +1316,28 @@ exit 0
             else:
                 raise
         if existing_pod is not None and existing_pod.metadata.deletion_timestamp is None:
-            return self.get_instance_by_id(instance_id)
+            # A pod already exists for this (per-user) instance_id. Only reuse it
+            # if it matches the requested launch (idempotent double-submit of the
+            # SAME launch). If it differs (e.g. the user picked a different
+            # template/type, or it is a stale pod left over from a delete that
+            # did not fully sync), REPLACE it — otherwise we would silently hand
+            # back the old instance instead of the one the user just requested.
+            try:
+                existing_image = existing_pod.spec.containers[0].image
+            except Exception:
+                existing_image = None
+            existing_type = (existing_pod.metadata.annotations or {}).get("amd-oneclick/instance-type", "jupyter")
+            if existing_image == image and existing_type == instance_type:
+                logger.info("Reusing matching existing pod %s (image/type identical)", instance_id)
+                return self.get_instance_by_id(instance_id)
+            logger.info(
+                "Existing pod %s differs from requested launch (image %s->%s, type %s->%s); replacing",
+                instance_id, existing_image, image, existing_type, instance_type,
+            )
+            # Issue the delete without a long blocking wait; the terminating-wait
+            # loop below (breaks on 404) handles confirming removal before we
+            # recreate the pod with the requested spec.
+            self.delete_instance_by_id(instance_id, wait=False)
         if existing_pod is not None:
             logger.info("Pod %s is terminating; waiting for deletion before recreate", instance_id)
             for _ in range(30):
