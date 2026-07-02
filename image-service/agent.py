@@ -59,6 +59,10 @@ MANAGER_URL = _env("MANAGER_URL", required=True).rstrip("/")
 BUILD_AGENT_TOKEN = _env("BUILD_AGENT_TOKEN", required=True)
 AGENT_ID = _env("AGENT_ID", "image-service-1")
 POLL_INTERVAL = float(_env("POLL_INTERVAL_SECONDS", "10"))
+# How often the background heartbeat thread refreshes a running job's lease. Must be well under the
+# manager's JOB_LEASE_TIMEOUT_SECONDS (3600s) so a long warm/pull (10-19 GB, one blocking call) is
+# never reaped as stale while it is genuinely making progress.
+HEARTBEAT_INTERVAL = float(_env("HEARTBEAT_INTERVAL_SECONDS", "30"))
 # Generalized DOCKER_BIN -> CONTAINER_CLI: docker | nerdctl. build/pull/push/save map 1:1.
 # Default to rootless nerdctl: 0042 runs nerdctl as a CLIENT of the imagesvc-owned rootless
 # containerd+buildkit user services (no sudo, no docker group). Defaulting to "docker" here would
@@ -94,12 +98,30 @@ DOCKER_BUILDKIT = _env("DOCKER_BUILDKIT", "0")
 _IS_NERDCTL = os.path.basename(CONTAINER_CLI) == "nerdctl"
 
 # Which job kinds this daemon will claim. CSV; default = all.
-ALL_KINDS = ["build", "pull", "acr_backup", "distribute", "evict"]
+ALL_KINDS = [
+    "build", "pull", "acr_backup", "push", "distribute", "warm", "evict",
+    "purge_node", "purge_p2p", "purge_seed", "registry_delete", "purge_builder",
+]
 IMAGE_SERVICE_KINDS = [
     k.strip() for k in _env("IMAGE_SERVICE_KINDS", ",".join(ALL_KINDS)).split(",") if k.strip()
 ]
 
 ACR_ENTERPRISE_REGISTRY = _env("ACR_ENTERPRISE_REGISTRY", "")
+# Self-hosted LAN registry (zot) on 0042 — host:port, e.g. "10.5.10.43:5000". The push credential
+# is already present under DOCKER_CONFIG (imagesvc logged in). Empty => run_push fails fast (the
+# manager only enqueues push when its own LAN_REGISTRY is set, so this stays unreached until wired).
+LAN_REGISTRY = _env("LAN_REGISTRY", "")
+# P4 complete-delete config.
+# zot registry credentials for the manifest DELETE (registry_delete). Basic user:pass; the agent is
+# already logged in via DOCKER_CONFIG, but the DELETE is a raw curl so it needs the pair explicitly.
+ZOT_USERNAME = _env("ZOT_USERNAME", "imagesvc")
+ZOT_PASSWORD = _env("ZOT_PASSWORD", "")
+# CA cert path so curl trusts the self-signed zot TLS (also in the system trust store).
+ZOT_CA_CERT = _env("ZOT_CA_CERT", "/etc/zot/tls.crt")
+# containerd hosts.toml drop-in dir. `ctr` (unlike the CRI/kubelet path) does NOT auto-read
+# containerd's config_path, so run_warm must pass `ctr images pull --hosts-dir <this>` for the
+# per-node dfdaemon mirror (127.0.0.1:4001) to be used. Must match config_path on the nodes.
+CERTS_DIR = _env("CERTS_DIR", "/etc/containerd/certs.d")
 DISTRIBUTE_CONCURRENCY = int(_env("DISTRIBUTE_CONCURRENCY", "2"))
 CTR_NAMESPACE = _env("CTR_NAMESPACE", "k8s.io")
 NODE_SSH_USER = _env("NODE_SSH_USER", "root")
@@ -208,6 +230,44 @@ def report_node_status(node, ref, status, quarantine_seconds=None):
     if quarantine_seconds is not None:
         payload["quarantine_seconds"] = quarantine_seconds
     _request("/api/internal/nodes/status", payload)
+
+
+def send_heartbeat(job_id):
+    """Refresh a running job's lease. Best-effort; never crashes the job loop."""
+    try:
+        _request(f"/api/internal/jobs/{job_id}/heartbeat", {"agent_id": AGENT_ID})
+    except Exception as exc:
+        print(f"[agent] heartbeat failed for {job_id}: {exc}", file=sys.stderr)
+
+
+class _Heartbeat:
+    """Context manager running a daemon thread that heartbeats a job on a fixed interval.
+
+    A handler may block for many minutes inside a single ctr pull / import; the heartbeat must come
+    from a thread INDEPENDENT of that blocking call, or the long job would stall its own liveness
+    signal and be falsely reaped. Exiting the context stops the thread promptly.
+    """
+
+    def __init__(self, job_id, interval=HEARTBEAT_INTERVAL):
+        self._job_id = job_id
+        self._interval = max(1.0, float(interval))
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            send_heartbeat(self._job_id)
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._run, name=f"hb-{self._job_id}", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return False
 
 
 def _node_user_pod_count(node):
@@ -511,6 +571,207 @@ def run_acr_backup(job):
     report_result(job_id, "succeeded", {"ref": src, "acr_backup_ref": dst})
 
 
+def _run_capture(job_id, cmd, env=None, timeout=None):
+    """Run a command, tee combined output to the manager log, and RETURN (rc, output).
+
+    Unlike stream_command (which only returns a bool), run_push needs the command's stdout to
+    parse a manifest digest, so this variant captures it. Uses its own process group + timeout so
+    a stalled push/inspect can't hang the daemon."""
+    if isinstance(cmd, str):
+        push_log(job_id, "$ " + cmd + "\n")
+    else:
+        push_log(job_id, "$ " + " ".join(cmd) + "\n")
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            shell=isinstance(cmd, str),
+            start_new_session=True,
+            timeout=timeout if timeout is not None else BUILD_TIMEOUT,
+        )
+    except FileNotFoundError as exc:
+        push_log(job_id, f"Command not found: {exc}\n")
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        push_log(job_id, f"\nCommand exceeded {timeout or BUILD_TIMEOUT}s timeout; killed.\n")
+        return 124, ""
+    if proc.stdout:
+        push_log(job_id, proc.stdout)
+    return proc.returncode, proc.stdout or ""
+
+
+def _parse_repo_digest(inspect_json, lan_ref):
+    """Extract the sha256 manifest digest for lan_ref from `nerdctl image inspect` JSON output.
+
+    RepoDigests entries look like "<repo>@sha256:<hex>"; return the sha256:... for the entry whose
+    repo matches lan_ref's repo (host/path, tag stripped). Returns None if not found."""
+    try:
+        data = json.loads(inspect_json)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    repo_digests = (data or {}).get("RepoDigests") or []
+    # lan_ref = host:port/repo:tag -> repo key = host:port/repo. Strip only a trailing :tag that
+    # lives in the LAST path segment (never the host:port colon).
+    slash = lan_ref.rfind("/")
+    if slash != -1:
+        ref_repo = lan_ref[:slash + 1] + lan_ref[slash + 1:].split(":", 1)[0]
+    else:
+        ref_repo = lan_ref.split(":", 1)[0]
+    for entry in repo_digests:
+        if not isinstance(entry, str) or "@" not in entry:
+            continue
+        repo, _, digest = entry.partition("@")
+        if repo == ref_repo and digest.startswith("sha256:"):
+            return digest
+    # Fall back to the first sha256 digest present (single-repo push).
+    for entry in repo_digests:
+        if isinstance(entry, str) and "@sha256:" in entry:
+            return entry.split("@", 1)[1]
+    return None
+
+
+def _fetch_blob_ids(job_id, lan_ref, manifest_digest):
+    """Return this image's dfdaemon task-ids: the config + each layer blob digest (bare hex).
+
+    Dragonfly v1.4.0 runs task-id == blob-digest-hex, so a node/seed caches ONE task per blob and the
+    task id equals the blob's sha256 hex. We read the OCI manifest FROM ZOT (authoritative — it is
+    exactly what dfdaemon pulls) by digest, and return [config, *layers] as bare hex. Best-effort:
+    returns [] on any error (delete then falls back to ref-only; caller logs)."""
+    if not manifest_digest or "/" not in (lan_ref or ""):
+        return []
+    host, _, rest = lan_ref.partition("/")
+    slash = rest.rfind("/")
+    repo = (rest[:slash + 1] + rest[slash + 1:].split(":", 1)[0]) if slash != -1 else rest.split(":", 1)[0]
+    url = f"https://{host}/v2/{repo}/manifests/{manifest_digest}"
+    cmd = (
+        f"curl -sS --cacert {shlex.quote(ZOT_CA_CERT)} "
+        f"-u {shlex.quote(ZOT_USERNAME + ':' + ZOT_PASSWORD)} "
+        f"-H {shlex.quote('Accept: application/vnd.oci.image.manifest.v1+json')} "
+        f"{shlex.quote(url)}"
+    )
+    rc, out = _run_capture(job_id, cmd, timeout=60)
+    if rc != 0 or not out:
+        return []
+    try:
+        m = json.loads(out)
+    except (ValueError, TypeError):
+        return []
+    ids = []
+    cfg = ((m or {}).get("config") or {}).get("digest")
+    if cfg:
+        ids.append(cfg)
+    for layer in (m or {}).get("layers", []) or []:
+        d = layer.get("digest") if isinstance(layer, dict) else None
+        if d:
+            ids.append(d)
+    # bare hex, de-duped (a layer may repeat, e.g. empty-dir layers)
+    seen = set()
+    bare = []
+    for d in ids:
+        h = d.split(":", 1)[1] if ":" in d else d
+        if h and h not in seen:
+            seen.add(h)
+            bare.append(h)
+    return bare
+
+
+def run_push(job):
+    """Push a built/pulled image to the self-hosted LAN registry (zot) with OCI media types.
+
+    P1 durable-source-of-truth step. zot rejects Docker-schema2 manifests (415), so we convert to
+    OCI before pushing. The tarball is KEPT (recoverable-single-point backup + the distribute alias
+    still reads it during P3). Reports the registry manifest digest so the manager can gate "ready"
+    on registry durability and later delete by digest (P5)."""
+    job_id = job["id"]
+    src = job["ref"]
+    payload = job.get("payload") or {}
+    dst = payload.get("lan_target_ref")
+
+    if not LAN_REGISTRY:
+        push_log(job_id, "LAN_REGISTRY is not configured; cannot push.\n")
+        report_result(job_id, "failed", {"ref": src, "error": "lan_registry_unset"})
+        return
+    if not dst:
+        push_log(job_id, "payload.lan_target_ref is required for push.\n")
+        report_result(job_id, "failed", {"ref": src, "error": "lan_target_ref_missing"})
+        return
+    if not _disk_guard(job_id):
+        report_result(job_id, "failed", {"ref": src, "error": "insufficient_disk"})
+        return
+
+    # The source may only exist as an on-disk tarball (build exports type=docker,dest=tar; it is not
+    # reliably loaded into the store). Load it first so convert/push can read it. Idempotent: a
+    # second load of the same content is a no-op.
+    #
+    # push ALWAYS runs before distribute in the chain, so the tarball is present here (distribute
+    # deletes it only on its own full success, which is strictly later). If it is nonetheless
+    # missing AND the ref is not already in the local store, fail with a clear diagnostic rather
+    # than letting `convert` fail cryptically (guards a manual/out-of-order re-enqueue).
+    tar_path = _image_tar_path(src)
+    have_tar = os.path.exists(tar_path) and os.path.getsize(tar_path) > 0
+    if have_tar:
+        if not stream_command(job_id, _cli("load", "-i", tar_path)):
+            push_log(job_id, "Loading build tarball into the local store failed.\n")
+            report_result(job_id, "failed", {"ref": src, "error": "load_failed"})
+            return
+    else:
+        # No tarball: only proceed if the ref is already resolvable in the local store.
+        rc, _ = _run_capture(job_id, _cli("image", "inspect", src, "--format", "{{.ID}}"), timeout=60)
+        if rc != 0:
+            push_log(
+                job_id,
+                f"No build tarball at {tar_path} and {src} is not in the local store; "
+                "cannot push. Re-run the build/pull head step.\n",
+            )
+            report_result(job_id, "failed", {"ref": src, "error": "source_unavailable"})
+            return
+
+    # zot requires OCI media types. `nerdctl image convert --oci <src> <dst>` rewrites the manifest
+    # to OCI and tags it as the LAN ref in one step (the retained docker-format tarball is untouched,
+    # so the distribute alias still loads it during P3).
+    if _IS_NERDCTL:
+        if not stream_command(job_id, _cli("image", "convert", "--oci", src, dst)):
+            report_result(job_id, "failed", {"ref": src, "error": "oci_convert_failed"})
+            return
+    else:
+        # docker has no `image convert`; buildx/crane would be needed. Not supported in P1 (0042 is
+        # nerdctl/containerd). Fail loudly rather than push a schema2 zot rejects.
+        push_log(job_id, "OCI conversion requires nerdctl (CONTAINER_CLI=nerdctl).\n")
+        report_result(job_id, "failed", {"ref": src, "error": "oci_convert_unsupported_cli"})
+        return
+
+    # Creds come from DOCKER_CONFIG (imagesvc already logged in to zot); TLS trusted via the system
+    # CA store. Push over the LAN.
+    if not stream_command(job_id, _cli("push", dst)):
+        report_result(job_id, "failed", {"ref": src, "error": "push_failed"})
+        return
+
+    # Authoritative registry digest for the ready-gate + P5 delete-by-digest. Parse RepoDigests from
+    # the pushed ref's inspect output. Non-fatal if unparseable: report succeeded with a null digest
+    # so the push still counts, but log it (the manager then can't gate on digest for this ref).
+    rc, out = _run_capture(
+        job_id, _cli("image", "inspect", dst, "--format", "{{json .}}"), timeout=120
+    )
+    digest = _parse_repo_digest(out, dst) if rc == 0 else None
+    if not digest:
+        push_log(job_id, "WARNING: pushed OK but could not parse the registry digest.\n")
+
+    # Enumerate this image's blob task-ids from the pushed manifest so a later delete can purge
+    # exactly its P2P/seed cache tasks (task-id == blob-hex). Best-effort; empty on parse failure.
+    blob_ids = _fetch_blob_ids(job_id, dst, digest) if digest else []
+    if not blob_ids:
+        push_log(job_id, "NOTE: could not enumerate blob task-ids; delete will fall back to ref-only P2P purge.\n")
+
+    push_log(job_id, f"\nPush to LAN registry complete: {dst}{(' @ ' + digest) if digest else ''}"
+                     f" ({len(blob_ids)} blob task-id(s)).\n")
+    report_result(job_id, "succeeded", {"ref": src, "lan_target_ref": dst, "digest": digest, "blob_ids": blob_ids})
+
+
 def _ssh_base(ip):
     return [
         "ssh",
@@ -604,6 +865,12 @@ def _pick_compressor(ips):
 
 
 def run_distribute(job):
+    # RETIRED as the default transport (P5): `warm` (P2P self-pull) is now the transport for every
+    # image durable in the LAN registry. `distribute` (SSH byte-push of the tarball from 0042) is kept
+    # ONLY as the legacy fallback for pre-P1 catalog images that were never pushed to zot and thus have
+    # no digest to P2P-pull (see app.main._ensure_image_on_node / _enqueue_admin_image_chain, which
+    # emit `distribute` only when there is no LAN-registry copy). Delete this handler once no such
+    # image remains (every catalog/custom image has a recorded zot digest).
     job_id = job["id"]
     ref = job["ref"]
     payload = job.get("payload") or {}
@@ -720,6 +987,105 @@ def run_distribute(job):
     report_result(job_id, status, {"ref": ref, "nodes": results})
 
 
+def run_warm(job):
+    """P3 transport: warm an image onto nodes by triggering a per-node `ctr pull` of the LAN-registry
+    ref THROUGH each node's local Dragonfly dfdaemon mirror (127.0.0.1:4001). Bytes arrive node<-P2P;
+    0042 sends none (unlike run_distribute's save|ssh 'ctr import' byte-push).
+
+    Forks run_distribute's scaffolding EXACTLY — same ThreadPoolExecutor over targets, _node_lock
+    (the chain-ID unpack mutex is graceful, not eliminated), _containerd_responsive pre/post,
+    _handle_wedged_node, 'importing' status, and the SAME per-node results list
+    (report_result nodes=[{node,ip,loaded,size_bytes,error},...]) so the manager's warm/distribute
+    lifecycle branch writes the image_nodes 'loaded' row identically.
+
+    The ref pulled is the LAN-registry ref (payload.lan_target_ref, else the job ref). Each node's
+    containerd must have /etc/containerd/certs.d/<lan-host>/hosts.toml pointing at 127.0.0.1:4001
+    (P2 canary step) — otherwise the pull goes straight to zot (still correct, just not P2P)."""
+    job_id = job["id"]
+    ref = job["ref"]
+    payload = job.get("payload") or {}
+    targets = payload.get("targets") or []
+    # The ref that actually lives in the LAN registry (what nodes pull). Falls back to the job ref.
+    lan_ref = payload.get("lan_target_ref") or ref
+    concurrency = int(payload.get("concurrency") or DISTRIBUTE_CONCURRENCY)
+
+    if not DISTRIB_SSH_KEY:
+        push_log(job_id, "DISTRIB_SSH_KEY is not configured; cannot warm.\n")
+        report_result(job_id, "failed", {"ref": ref, "error": "distrib_ssh_key_unset"})
+        return
+    if not targets:
+        push_log(job_id, "No targets in payload; nothing to warm.\n")
+        report_result(job_id, "failed", {"ref": ref, "error": "no_targets"})
+        return
+
+    push_log(job_id, f"Warming {lan_ref} onto {len(targets)} node(s) via per-node P2P pull.\n")
+    results = []
+    lock = threading.Lock()
+
+    def _one(target):
+        node = target.get("node")
+        ip = target.get("ip")
+        entry = {"node": node, "ip": ip, "loaded": False, "size_bytes": None, "error": None}
+        if not ip:
+            entry["error"] = "missing_ip"
+            return entry
+
+        # Same per-node serialization as distribute: two unpacks of the same chain onto one node
+        # wedge containerd's chain-ID mutex. Cross-node pulls still run in parallel.
+        with _node_lock(node):
+            free_gb = _node_root_free_gb(ip)
+            if free_gb < IMAGE_NODE_MIN_FREE_DISK_GB:
+                entry["error"] = f"node_low_disk:{free_gb:.1f}GB<{IMAGE_NODE_MIN_FREE_DISK_GB}GB"
+                push_log(job_id, f"[{node}] refusing: containerd root free {free_gb:.1f}GB below floor.\n")
+                return entry
+
+            if not _containerd_responsive(ip):
+                entry["error"] = "containerd_wedged"
+                push_log(job_id, f"[{node}] containerd not responsive before pull; skipping.\n")
+                _handle_wedged_node(job_id, node, ip, ref)
+                return entry
+
+            try:
+                report_node_status(node, ref, "importing")
+            except Exception:
+                pass
+
+            # Trigger the pull ON the node. Bytes arrive via the node-local dfdaemon mirror (P2P);
+            # 0042 streams nothing. Wrap the remote ctr in `timeout -s KILL` so a stalled pull dies
+            # on its own deadline instead of blocking inside the daemon.
+            # CRITICAL: `ctr` does NOT auto-read containerd's config_path/certs.d (only the CRI/
+            # kubelet path does). Without --hosts-dir, ctr pulls DIRECTLY from zot, bypassing the
+            # dfdaemon mirror entirely — the warm "succeeds" but is NOT P2P-served, silently defeating
+            # the transport. Pass --hosts-dir so the hosts.toml (127.0.0.1:4001 + auth) is honored.
+            # (Verified live on the canary: bare ctr pull ignores certs.d; --hosts-dir routes P2P.)
+            remote = (
+                f"sudo timeout -s KILL {REMOTE_IMPORT_TIMEOUT}s "
+                f"ctr -n {CTR_NAMESPACE} images pull --hosts-dir {shlex.quote(CERTS_DIR)} {shlex.quote(lan_ref)}"
+            )
+            ok = stream_command(job_id, _ssh_base(ip) + [remote])
+            entry["loaded"] = ok
+            if ok:
+                return entry
+
+            if not _containerd_responsive(ip):
+                entry["error"] = "containerd_wedged"
+                push_log(job_id, f"[{node}] containerd unresponsive after failed pull; node wedged.\n")
+                _handle_wedged_node(job_id, node, ip, ref)
+            else:
+                entry["error"] = "pull_failed"
+            return entry
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        for entry in pool.map(_one, targets):
+            with lock:
+                results.append(entry)
+
+    all_loaded = all(e["loaded"] for e in results)
+    status = "succeeded" if all_loaded else "failed"
+    push_log(job_id, f"\nWarm {status}: {sum(e['loaded'] for e in results)}/{len(results)} loaded.\n")
+    report_result(job_id, status, {"ref": ref, "nodes": results})
+
+
 def run_evict(job):
     job_id = job["id"]
     ref = job["ref"]
@@ -764,12 +1130,173 @@ def run_evict(job):
     report_result(job_id, status, {"ref": ref, "nodes": results})
 
 
+# =============================================================================
+# P4 complete-delete purge handlers. Each targets ONE byte-surface. Golden rule everywhere:
+# "already gone" == SUCCESS (idempotent) — a purge must converge on re-run, never fail because the
+# thing was already removed. Reported failures are re-enqueued by the manager (requeue_failed_purges)
+# until they succeed, which is what makes delete complete.
+# =============================================================================
+
+def run_purge_node(job):
+    """Surface 1: node containerd layers. Per-node `ctr images rm` + content prune (serialized).
+    Mirrors run_evict; `ctr images rm` of a missing image is already a no-op success in containerd."""
+    job_id = job["id"]
+    ref = job["ref"]
+    payload = job.get("payload") or {}
+    targets = payload.get("targets") or []
+    if not DISTRIB_SSH_KEY:
+        report_result(job_id, "failed", {"ref": ref, "error": "distrib_ssh_key_unset"})
+        return
+    if not targets:
+        report_result(job_id, "failed", {"ref": ref, "error": "no_targets"})
+        return
+
+    def _one(target):
+        node = target.get("node")
+        ip = target.get("ip")
+        entry = {"node": node, "ip": ip, "removed": False, "error": None}
+        if not ip:
+            entry["error"] = "missing_ip"
+            return entry
+        # `images rm` tolerates a missing ref (no-op); content prune reclaims layers.
+        remote = (
+            f"sudo ctr -n {CTR_NAMESPACE} images rm {shlex.quote(ref)} >/dev/null 2>&1; "
+            f"sudo ctr -n {CTR_NAMESPACE} content prune >/dev/null 2>&1; "
+            f"! sudo ctr -n {CTR_NAMESPACE} images ls -q 2>/dev/null | grep -qxF {shlex.quote(ref)}"
+        )
+        # The final `! grep` makes the command succeed only when the ref is truly absent afterward.
+        ok = stream_command(job_id, _ssh_base(ip) + [remote])
+        entry["removed"] = ok
+        if not ok:
+            entry["error"] = "purge_node_failed"
+        return entry
+
+    results = [_one(t) for t in targets]
+    all_removed = all(e["removed"] for e in results)
+    status = "succeeded" if all_removed else "failed"
+    push_log(job_id, f"\nPurge_node {status}: {sum(e['removed'] for e in results)}/{len(results)} cleared.\n")
+    report_result(job_id, status, {"ref": ref, "nodes": results})
+
+
+# NOTE: purge_p2p and purge_seed are intentionally NOT implemented on the agent. The real Dragonfly
+# v1.4.0 delete primitive is `dfctl task rm <task_id>` against each daemon's LOCAL socket (dfget has
+# no delete; deletion is by task id, not URL), and the seed pods are on the cluster overlay network,
+# unreachable from this host. The MANAGER runs both surfaces in-cluster via kubectl-exec — see
+# app/purge_exec.py and scheduler.drain_manager_purges_job. The agent must not claim these kinds.
+
+
+def run_registry_delete(job):
+    """Surface 4: the LAN registry (zot) tag/manifest. DELETE /v2/<repo>/manifests/<digest>.
+    Digest comes FROM THE PAYLOAD (captured at enqueue; the DB row may already be deleted). zot's
+    online GC reclaims blobs async, so no push-lock is needed. Idempotent: 404 => already gone =>
+    success; 200/202 => deleted."""
+    job_id = job["id"]
+    ref = job["ref"]
+    payload = job.get("payload") or {}
+    digest = payload.get("digest")
+    lan_ref = payload.get("lan_target_ref")
+    # No registry copy could exist iff neither a LAN ref was ever computed NOR a digest recorded.
+    # Then there is nothing to delete on this surface -> success (do NOT block purge_meta forever).
+    # This covers pre-P1 images and idle catalog images that were never pushed to zot.
+    if not lan_ref and not digest:
+        push_log(job_id, "No LAN ref/digest for this image; no registry copy to delete (no-op).\n")
+        report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": False})
+        return
+    # Registry host: prefer the agent's configured LAN_REGISTRY, else derive from lan_ref (C4: don't
+    # no-op just because the agent env is empty while a copy demonstrably exists).
+    registry_host = LAN_REGISTRY or ((lan_ref or "").split("/", 1)[0] if "/" in (lan_ref or "") else "")
+    if not registry_host:
+        report_result(job_id, "failed", {"ref": ref, "error": "no_registry_host"})
+        return
+    # Derive the repo path (host:port/REPO:tag -> REPO) and tag from the LAN ref, else from ref.
+    src = lan_ref or ref
+    if "/" in src:
+        _host, _, rest = src.partition("/")
+        # strip a trailing :tag only in the LAST path segment (never the host:port colon)
+        slash = rest.rfind("/")
+        if slash != -1:
+            last = rest[slash + 1:]
+            repo = rest[:slash + 1] + last.split(":", 1)[0]
+        else:
+            last = rest
+            repo = rest.split(":", 1)[0]
+        tag = last.split(":", 1)[1] if ":" in last else "latest"
+    else:
+        report_result(job_id, "failed", {"ref": ref, "error": "unparseable_repo"})
+        return
+    # A LAN ref exists but no digest was recorded (pre-P1 image never pushed to zot, OR the push
+    # result lost its digest). Resolve it FROM ZOT by HEAD-ing the tag: a 404 means the tag was never
+    # pushed -> nothing to delete on this surface -> no-op SUCCESS (so purge_meta isn't stuck forever
+    # on an image that has no registry copy). A 200 yields the digest to delete by. Only a genuine
+    # reachability error fails (retryable).
+    if not digest:
+        # No digest was captured at delete time. We must NOT resolve the digest from the tag and
+        # delete by it: tags are mutable, so the tag may now point at a DIFFERENT, freshly re-added
+        # image (delete → re-add of the same ref). Deleting the tag-resolved manifest would wipe that
+        # live re-added copy. Deleting by digest is the only safe form; with no captured digest there
+        # is nothing this job can safely remove, so no-op SUCCEED (unblocks purge_meta). Any registry
+        # bytes for the truly-deleted image without a digest are left to zot's online GC / untagged
+        # cleanup rather than risk deleting a newer image under the same tag.
+        push_log(job_id, f"No digest captured for {repo}:{tag}; skipping registry delete to avoid "
+                         f"deleting a possibly re-added image under the same tag (no-op).\n")
+        report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": False, "skipped": "no_captured_digest"})
+        return
+    url = f"https://{registry_host}/v2/{repo}/manifests/{digest}"
+    cmd = (
+        f"curl -sS -o /dev/null -w '%{{http_code}}' -X DELETE "
+        f"--cacert {shlex.quote(ZOT_CA_CERT)} "
+        f"-u {shlex.quote(ZOT_USERNAME + ':' + ZOT_PASSWORD)} "
+        f"{shlex.quote(url)}"
+    )
+    rc, out = _run_capture(job_id, cmd, timeout=60)
+    code = (out or "").strip()[-3:]
+    if rc == 0 and code in ("200", "202", "404"):
+        push_log(job_id, f"\nRegistry delete OK (HTTP {code}) for {repo}@{digest}.\n")
+        report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": code != "404", "http": code})
+    else:
+        push_log(job_id, f"\nRegistry delete failed (rc={rc} HTTP {code}).\n")
+        report_result(job_id, "failed", {"ref": ref, "error": f"registry_delete_http_{code or 'err'}"})
+
+
+def run_purge_builder(job):
+    """Surface 5: the 0042 build tarball + rootless builder cache. rm the retained tarball (kept by
+    run_push as backup) + buildkit prune. 0042-local; not serialized. Missing tarball => success."""
+    job_id = job["id"]
+    ref = job["ref"]
+    tar_path = _image_tar_path(ref)
+    tar_removed = False
+    try:
+        os.remove(tar_path)
+        tar_removed = True
+    except FileNotFoundError:
+        tar_removed = True  # already gone => success
+    except OSError as exc:
+        push_log(job_id, f"Could not remove tarball {tar_path}: {exc}\n")
+        report_result(job_id, "failed", {"ref": ref, "error": "tarball_rm_failed"})
+        return
+    # buildkit prune is best-effort (reclaims dangling build cache, not keyed to this ref); a failure
+    # here should not fail the whole purge — the durable artifact (the tarball) is already gone.
+    if _IS_NERDCTL:
+        stream_command(job_id, _cli("builder", "prune", "-f"))
+    push_log(job_id, f"\nPurge_builder complete (tarball removed={tar_removed}).\n")
+    report_result(job_id, "succeeded", {"ref": ref, "tar_removed": tar_removed})
+
+
 DISPATCH = {
     "build": run_build,
     "pull": run_pull,
     "acr_backup": run_acr_backup,
+    "push": run_push,
     "distribute": run_distribute,
+    "warm": run_warm,
     "evict": run_evict,
+    "purge_node": run_purge_node,
+    # purge_p2p / purge_seed are NOT handled here: the real Dragonfly v1.4.0 delete is
+    # `dfctl task rm <task_id>` against the LOCAL daemon socket, and the seeds are overlay-only
+    # (unreachable from this host). The MANAGER drains those kinds in-cluster via kubectl-exec
+    # (see app/purge_exec.py + scheduler.drain_manager_purges_job). This agent must not claim them.
+    "registry_delete": run_registry_delete,
+    "purge_builder": run_purge_builder,
 }
 
 
@@ -832,7 +1359,8 @@ def main():
         print(f"[agent] running job id={job['id']} kind={kind} ref={job.get('ref')}")
         try:
             mark_running(job["id"])
-            handler(job)
+            with _Heartbeat(job["id"]):
+                handler(job)
         except Exception as exc:
             print(f"[agent] job error for {job.get('id')} ({kind}): {exc}", file=sys.stderr)
             try:

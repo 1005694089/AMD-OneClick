@@ -52,6 +52,11 @@ if DATABASE_URL.startswith("sqlite:///"):
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 metadata = MetaData()
 
+# Row-level locking (FOR UPDATE SKIP LOCKED) lets concurrent agents claim different pending jobs
+# without contending on the same row or scanning each other's in-flight work. Only Postgres/MySQL
+# support SKIP LOCKED; SQLite (dev/tests) does not, so gate on the dialect.
+_SUPPORTS_SKIP_LOCKED = engine.dialect.name in ("postgresql", "mysql", "mariadb")
+
 # Serializes the count-and-insert in create_custom_image within a single process so the
 # per-user cap can't be bypassed by concurrent different-name requests. Across multiple
 # Postgres workers a transaction-level advisory lock (taken inside that function) provides
@@ -97,6 +102,14 @@ images = Table(
     Column("acr_backup_ref", Text),
     Column("acr_backup_status", String(32)),
     Column("last_launched_at", String(64)),
+    # Manifest digest of the copy pushed to the LAN registry (zot). Set by the `push` job; used as
+    # the registry-durable "ready" gate (the manager has no route to the LAN registry, so presence
+    # is agent-reported: a non-NULL digest means the image is durable in the registry).
+    Column("digest", String(255)),
+    # P4: JSON array of this image's OCI blob task-ids (config+layer digests, sha256: stripped == the
+    # dfdaemon task id). Recorded by the `push` job so a delete can purge exactly this image's P2P/seed
+    # cache tasks. NULL on pre-P4 rows => delete falls back to the ref-only path for those.
+    Column("blob_list", Text),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
 )
@@ -257,6 +270,10 @@ custom_images = Table(
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
     Column("last_launched_at", String(64)),
+    # Manifest digest of the copy pushed to the LAN registry (zot); see images.digest.
+    Column("digest", String(255)),
+    # P4 blob task-ids for delete-time P2P/seed purge; see images.blob_list.
+    Column("blob_list", Text),
     UniqueConstraint("user_id", "name", name="uq_custom_image_user_name"),
 )
 
@@ -301,6 +318,11 @@ image_jobs = Table(
     Column("result", Text),
     Column("claimed_by", String(128)),
     Column("claimed_at", String(64)),
+    # Refreshed by the agent's background heartbeat thread while a long job runs (e.g. a 10-19 GB
+    # warm/pull that blocks for many minutes). The reaper measures staleness from
+    # max(claimed_at, heartbeat_at) so a live-but-slow job is not falsely reaped. NULL => use
+    # claimed_at (safe for rows written before this column existed).
+    Column("heartbeat_at", String(64)),
     Column("attempts", Integer, nullable=False, default=0),
     Column("max_attempts", Integer, nullable=False, default=3),
     Column("created_at", String(64), nullable=False),
@@ -308,8 +330,28 @@ image_jobs = Table(
     Index("ix_image_jobs_status_kind", "status", "kind"),
 )
 
-IMAGE_JOB_KINDS = ("build", "pull", "acr_backup", "distribute", "evict")
+IMAGE_JOB_KINDS = (
+    "build", "pull", "acr_backup", "push", "distribute", "warm", "evict",
+    # P4 complete-delete fan-out — one job per byte-surface (purge_meta is manager-side only).
+    "purge_node", "purge_p2p", "purge_seed", "registry_delete", "purge_builder", "purge_meta",
+)
 IMAGE_JOB_TERMINAL = ("succeeded", "failed")
+
+# P4: the per-node/seed byte-surface purges whose SUCCESS gates purge_meta (the DB-row cleanup).
+# purge_meta must run only after every one of these has SUCCEEDED for the ref — never on failure
+# (a failed purge means bytes remain, so dropping the DB handle would orphan them). Reported
+# failures are terminal and are re-enqueued by requeue_failed_purges (the stale reaper only
+# requeues leased jobs, so failures would otherwise never retry — the load-bearing P4 fix).
+PURGE_PREREQ_KINDS = ("purge_node", "purge_p2p", "purge_seed", "registry_delete", "purge_builder")
+
+# Kinds serialized per target node at claim time (the claim site defers an overlapping one; the
+# stale-job reaper strips quarantined nodes from requeued targets). Hoisted to one constant so the
+# call sites can't drift. distribute/warm/evict/purge_node do a per-node containerd unpack/remove.
+# purge_p2p (now manager-drained via dfctl-exec) is kept here so it defers while an agent warm/
+# purge_node is in-flight on the same node — cross-actor ordering safety, not a containerd unpack.
+SERIALIZED_KINDS = ("distribute", "warm", "evict", "purge_node", "purge_p2p")
+# purge_seed/registry_delete/purge_builder/purge_meta are host/manager-local (no per-node target) so
+# they are intentionally NOT serialized.
 
 # A launch that needs its image distributed to a GPU node first cannot create a pod inside the
 # request handler (the off-cluster daemon does the copy asynchronously). We persist the full
@@ -423,6 +465,36 @@ def ensure_schema_columns(conn):
         image_node_columns = {col["name"] for col in inspector.get_columns("image_nodes")}
         if "quarantined_until" not in image_node_columns:
             conn.execute(text("ALTER TABLE image_nodes ADD COLUMN quarantined_until VARCHAR(64)"))
+
+    # Additive: heartbeat for long-running jobs so a live-but-slow warm/pull is not falsely reaped.
+    if inspector.has_table("image_jobs"):
+        image_job_columns = {col["name"] for col in inspector.get_columns("image_jobs")}
+        if "heartbeat_at" not in image_job_columns:
+            conn.execute(text("ALTER TABLE image_jobs ADD COLUMN heartbeat_at VARCHAR(64)"))
+
+    # Additive: LAN-registry manifest digest (P1). NULL on old rows => not-yet-pushed, so the
+    # digest-gated readiness check treats them exactly like today (loaded-row count only) until a
+    # push job records a digest. Mirrors the acr_backup_status/heartbeat_at additive pattern.
+    if inspector.has_table("images"):
+        image_columns = {col["name"] for col in inspector.get_columns("images")}
+        if "digest" not in image_columns:
+            conn.execute(text("ALTER TABLE images ADD COLUMN digest VARCHAR(255)"))
+    if inspector.has_table("custom_images"):
+        custom_image_columns = {col["name"] for col in inspector.get_columns("custom_images")}
+        if "digest" not in custom_image_columns:
+            conn.execute(text("ALTER TABLE custom_images ADD COLUMN digest VARCHAR(255)"))
+
+    # Additive: P4 blob task-id list (JSON) for delete-time P2P/seed cache purge. NULL on old rows =>
+    # a delete of such an image can't target its blob tasks (falls back to ref-only), so the P2P/seed
+    # cache is left to Dragonfly's taskTTL. New pushes record it. Mirrors the digest additive pattern.
+    if inspector.has_table("images"):
+        image_columns = {col["name"] for col in inspector.get_columns("images")}
+        if "blob_list" not in image_columns:
+            conn.execute(text("ALTER TABLE images ADD COLUMN blob_list TEXT"))
+    if inspector.has_table("custom_images"):
+        custom_image_columns = {col["name"] for col in inspector.get_columns("custom_images")}
+        if "blob_list" not in custom_image_columns:
+            conn.execute(text("ALTER TABLE custom_images ADD COLUMN blob_list TEXT"))
 
     # Caller-supplied pod tag (hackathon/workshop/one-click). Nullable, no default -> old rows = NULL.
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
@@ -1251,13 +1323,21 @@ def upsert_image(name: str, image: str, description: str = "", enabled: bool = T
         if image_id:
             conn.execute(update(images).where(images.c.id == image_id).values(**values))
             return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
+        # Wrap the INSERT in a SAVEPOINT: on PostgreSQL an IntegrityError aborts the WHOLE
+        # transaction, so the recovery SELECT/UPDATE below would raise InFailedSqlTransaction (which
+        # is exactly what surfaced as a 500 when an admin re-added an existing image ref/name). A
+        # nested transaction rolls back only the failed INSERT and leaves the outer tx usable, so a
+        # duplicate ref/name cleanly UPDATES the existing row (upsert) instead of erroring.
         try:
-            result = conn.execute(images.insert().values(**values, created_at=now))
-            new_id = result.inserted_primary_key[0]
+            with conn.begin_nested():
+                result = conn.execute(images.insert().values(**values, created_at=now))
+                new_id = result.inserted_primary_key[0]
         except IntegrityError:
             existing = conn.execute(select(images).where(images.c.image == image)).mappings().first()
             if not existing:
                 existing = conn.execute(select(images).where(images.c.name == name)).mappings().first()
+            if not existing:
+                raise
             conn.execute(update(images).where(images.c.id == existing["id"]).values(**values))
             new_id = existing["id"]
         return row_to_dict(conn.execute(select(images).where(images.c.id == new_id)).mappings().first())
@@ -1305,6 +1385,131 @@ def set_image_acr_backup(image_id: int, ref: Optional[str], status: str) -> Opti
             .values(acr_backup_ref=ref, acr_backup_status=status, updated_at=now)
         )
         return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
+
+
+def set_image_digest(image_id: int, digest: Optional[str]) -> Optional[dict]:
+    """Record the LAN-registry manifest digest for a catalog image (guarded UPDATE)."""
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(select(images.c.id).where(images.c.id == image_id)).first()
+        if not current:
+            return None
+        conn.execute(
+            update(images).where(images.c.id == image_id).values(digest=digest, updated_at=now)
+        )
+        return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
+
+
+def set_custom_image_digest(custom_image_id: int, digest: Optional[str]) -> Optional[dict]:
+    """Record the LAN-registry manifest digest for a custom image (guarded UPDATE)."""
+    now = utc_now()
+    with engine.begin() as conn:
+        current = conn.execute(
+            select(custom_images.c.id).where(custom_images.c.id == custom_image_id)
+        ).first()
+        if not current:
+            return None
+        conn.execute(
+            update(custom_images)
+            .where(custom_images.c.id == custom_image_id)
+            .values(digest=digest, updated_at=now)
+        )
+        return row_to_dict(
+            conn.execute(select(custom_images).where(custom_images.c.id == custom_image_id)).mappings().first()
+        )
+
+
+def _normalize_blob_ids(blobs) -> list[str]:
+    """Coerce a list of blob refs to bare 64-hex dfdaemon task ids (strip an optional 'sha256:').
+    Dragonfly v1.4.0 runs task-id==blob-digest-hex, so the task id is exactly the hex digest."""
+    out: list[str] = []
+    for b in blobs or []:
+        if not b:
+            continue
+        s = str(b).strip()
+        if ":" in s:
+            s = s.split(":", 1)[1]
+        if s:
+            out.append(s)
+    # de-dup preserving order
+    seen: set[str] = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
+
+
+def set_image_blob_list(image_id: int, blobs) -> None:
+    """Record a catalog image's OCI blob task-ids (JSON array) for delete-time P2P/seed purge."""
+    ids = _normalize_blob_ids(blobs)
+    now = utc_now()
+    with engine.begin() as conn:
+        conn.execute(
+            update(images).where(images.c.id == image_id).values(blob_list=json.dumps(ids), updated_at=now)
+        )
+
+
+def set_custom_image_blob_list(custom_image_id: int, blobs) -> None:
+    """Record a custom image's OCI blob task-ids (JSON array); see set_image_blob_list."""
+    ids = _normalize_blob_ids(blobs)
+    now = utc_now()
+    with engine.begin() as conn:
+        conn.execute(
+            update(custom_images)
+            .where(custom_images.c.id == custom_image_id)
+            .values(blob_list=json.dumps(ids), updated_at=now)
+        )
+
+
+def _blob_list_for_ref(conn, image_ref: str) -> list[str]:
+    """The recorded blob task-ids for a ref (images or custom_images). [] if none/unknown."""
+    for tbl in (images, custom_images):
+        row = conn.execute(select(tbl.c.blob_list).where(tbl.c.image == image_ref)).first()
+        if row is not None and row[0]:
+            try:
+                return _normalize_blob_ids(json.loads(row[0]))
+            except (ValueError, TypeError):
+                return []
+    return []
+
+
+def unique_blob_ids_for_ref(image_ref: str) -> list[str]:
+    """Blob task-ids UNIQUE to `image_ref`: this image's blobs minus every blob referenced by any
+    OTHER (non-deleted) image or custom_image. A delete purges only these from the P2P/seed cache;
+    blobs shared with a live image are left for Dragonfly's taskTTL (deleting one would only cause a
+    re-fetch, never corruption — but unique-only avoids even that). Returns [] if the ref has no
+    recorded blob_list (pre-P4 image)."""
+    with engine.begin() as conn:
+        mine = set(_blob_list_for_ref(conn, image_ref))
+        if not mine:
+            return []
+        others: set[str] = set()
+        for tbl in (images, custom_images):
+            rows = conn.execute(
+                select(tbl.c.blob_list).where(tbl.c.image != image_ref, tbl.c.blob_list.isnot(None))
+            ).all()
+            for (bl,) in rows:
+                if not bl:
+                    continue
+                try:
+                    others.update(_normalize_blob_ids(json.loads(bl)))
+                except (ValueError, TypeError):
+                    continue
+    return [b for b in mine if b not in others]
+
+
+def image_digest_present(image_ref: str) -> bool:
+    """True if a catalog OR custom image with this ref has a recorded (non-NULL) LAN-registry
+    digest. Used as the registry-durable readiness gate. Ref is unique per table."""
+    if not image_ref:
+        return False
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(images.c.digest).where(images.c.image == image_ref)
+        ).first()
+        if row is not None:
+            return bool(row[0])
+        row = conn.execute(
+            select(custom_images.c.digest).where(custom_images.c.image == image_ref)
+        ).first()
+        return bool(row is not None and row[0])
 
 
 def delete_image(image_id: int) -> bool:
@@ -1641,13 +1846,23 @@ def requeue_custom_image_build(image_id: int, user_id: int) -> Optional[dict]:
         return dict(row)
 
 
-def list_gc_candidates() -> list[dict]:
-    """Ready node-local custom images ordered coldest first for builder-side disk GC."""
+def list_gc_candidates(mode: str = "idle") -> list[dict]:
+    """Ready node-local custom images ordered coldest first for disk GC.
+
+    Two modes, deliberately separated so the idle-delete contract and disk-pressure reclaim do not
+    share one window:
+      - "idle" (default): only images idle past CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS (the 5-day
+        auto-delete window). Drives the R2c idle reaper.
+      - "disk_pressure": ALL ready node-local images, coldest first, ignoring the idle window — so a
+        full disk can evict the coldest image even if it is younger than 5 days, instead of wedging
+        when nothing has crossed the idle threshold.
+    """
     prefix = (settings.CUSTOM_IMAGE_LOCAL_TAG_PREFIX or "").strip("/")
-    grace = int(getattr(settings, "CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", 0) or 0)
     cutoff_iso = None
-    if grace > 0:
-        cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=grace)).isoformat()
+    if mode != "disk_pressure":
+        grace = int(getattr(settings, "CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", 0) or 0)
+        if grace > 0:
+            cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=grace)).isoformat()
 
     with engine.begin() as conn:
         conditions = [
@@ -1810,7 +2025,6 @@ def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Op
     lease timeout, so the queue cannot starve permanently. Cross-node distributes still run
     concurrently.
     """
-    SERIALIZED_KINDS = ("distribute", "evict")
     with engine.begin() as conn:
         tried: list[int] = []
         while True:
@@ -1819,20 +2033,27 @@ def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Op
                 query = query.where(image_jobs.c.kind.in_(kinds))
             if tried:
                 query = query.where(image_jobs.c.id.notin_(tried))
-            pending = conn.execute(query.order_by(image_jobs.c.id).limit(1)).mappings().first()
+            query = query.order_by(image_jobs.c.id).limit(1)
+            if _SUPPORTS_SKIP_LOCKED:
+                query = query.with_for_update(skip_locked=True)
+            pending = conn.execute(query).mappings().first()
             if not pending:
                 return None
             tried.append(pending["id"])
 
-            # Supersede a stale evict: if a NEWER non-terminal distribute/build for the SAME ref
+            # Supersede a stale evict: if a NEWER non-terminal distribute/warm/build for the SAME ref
             # exists, the tag was rebuilt/redistributed after this delete, so running the evict would
             # wipe the freshly-loaded image. Drop the evict (mark superseded) instead of running it.
             # Tags are mutable and reused, so a delete's evict can otherwise race a later rebuild.
+            # "warm" must be included alongside "distribute": since P3, warm is the primary transport
+            # once a LAN registry is wired up (see _enqueue_admin_image_chain / _ensure_image_on_node
+            # in app/main.py), so a rebuild after this merge enqueues "warm", not "distribute" — an
+            # evict racing that rebuild would otherwise go undetected and wipe the freshly-warmed image.
             if pending["kind"] == "evict" and pending.get("ref"):
                 newer = conn.execute(
                     select(image_jobs.c.id).where(
                         image_jobs.c.ref == pending["ref"],
-                        image_jobs.c.kind.in_(("distribute", "build")),
+                        image_jobs.c.kind.in_(("distribute", "warm", "build")),
                         image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL),
                         image_jobs.c.id > pending["id"],
                     ).limit(1)
@@ -1847,6 +2068,33 @@ def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Op
                             updated_at=utc_now(),
                         )
                     )
+                    continue
+
+            # P4: purge_meta (the DB-row cleanup) is the LAST step of a delete fan-out. Do not hand
+            # it out until EVERY byte-surface purge for the same ref has SUCCEEDED. If any prereq is
+            # still non-terminal (in flight) OR terminally failed (bytes remain), defer purge_meta —
+            # skip it and try the next pending job. requeue_failed_purges re-enqueues failed prereqs
+            # so this converges; purge_meta only fires once bytes are truly gone. This is a claim-time
+            # gate (not enqueue-time) because all fan-out jobs are enqueued up front and claimed out
+            # of order.
+            if pending["kind"] == "purge_meta" and pending.get("ref"):
+                # A failed prereq may be re-enqueued (a new row), so evaluate the LATEST row per kind
+                # (highest id wins). purge_meta fires only when every prereq kind that was enqueued
+                # has its latest row == succeeded.
+                prereqs = conn.execute(
+                    select(image_jobs.c.id, image_jobs.c.kind, image_jobs.c.status).where(
+                        image_jobs.c.ref == pending["ref"],
+                        image_jobs.c.kind.in_(PURGE_PREREQ_KINDS),
+                    ).order_by(image_jobs.c.id)
+                ).all()
+                latest: dict = {}
+                for _id, k, s in prereqs:
+                    latest[k] = s  # id-ordered scan: last write per kind is the newest row
+                # Require EVERY prereq kind to be present AND succeeded. Iterating only existing rows
+                # would let purge_meta through when a surface job was never enqueued (partial fan-out:
+                # enqueue_purge_fanout is 6 non-atomic inserts) — dropping the DB handle while that
+                # surface's bytes remain. Assert the full set.
+                if set(latest) != set(PURGE_PREREQ_KINDS) or any(s != "succeeded" for s in latest.values()):
                     continue
 
             if pending["kind"] in SERIALIZED_KINDS:
@@ -1932,6 +2180,26 @@ def mark_image_job_running(job_id: int, agent_id: str) -> Optional[dict]:
         return row_to_dict(conn.execute(select(image_jobs).where(image_jobs.c.id == job_id)).mappings().first())
 
 
+def heartbeat_image_job(job_id: int, agent_id: str) -> bool:
+    """Refresh a job's heartbeat_at so a long-running job is not reaped as stale.
+
+    Guarded on ownership and non-terminal status, so a token-holder cannot keep a job it does not
+    own (or an already-finalized one) alive. Returns True if the heartbeat was applied.
+    """
+    now = utc_now()
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(image_jobs)
+            .where(
+                image_jobs.c.id == job_id,
+                image_jobs.c.claimed_by == agent_id,
+                image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL),
+            )
+            .values(heartbeat_at=now, updated_at=now)
+        )
+        return result.rowcount > 0
+
+
 def finish_image_job(job_id: int, status: str, agent_id: str, result: Optional[str] = None) -> Optional[dict]:
     """Finalize a job to succeeded|failed. Guarded on ownership + non-terminal state.
 
@@ -1991,23 +2259,33 @@ def reap_stale_image_jobs(timeout_seconds: int) -> int:
                 image_jobs.c.max_attempts,
                 image_jobs.c.kind,
                 image_jobs.c.payload,
+                image_jobs.c.heartbeat_at,
             ).where(image_jobs.c.status.in_(("claimed", "running")))
         ).all()
         for row in leased:
+            # Staleness is measured from the most recent liveness signal: the claim time or the
+            # last heartbeat (whichever is later). A live-but-slow job (e.g. a multi-GB warm) keeps
+            # its lease via the agent's heartbeat thread; NULL heartbeat falls back to claimed_at.
             claimed_at = row[1]
-            stale = True
-            if claimed_at:
+            heartbeat_at = row[7]
+            last_seen = None
+            for ts in (claimed_at, heartbeat_at):
+                if not ts:
+                    continue
                 try:
-                    stale = (now - datetime.fromisoformat(claimed_at)).total_seconds() > timeout_seconds
+                    parsed = datetime.fromisoformat(ts)
                 except ValueError:
-                    stale = True
+                    continue
+                if last_seen is None or parsed > last_seen:
+                    last_seen = parsed
+            stale = True if last_seen is None else (now - last_seen).total_seconds() > timeout_seconds
             if not stale:
                 continue
 
             kind = row[5]
             requeue = int(row[3]) < int(row[4])
             extra: dict = {}
-            if requeue and quarantined and kind in ("distribute", "evict"):
+            if requeue and quarantined and kind in SERIALIZED_KINDS:
                 payload_raw = row[6]
                 payload = {}
                 if isinstance(payload_raw, str):
@@ -2278,6 +2556,112 @@ def clear_image_node(image_ref: str, node_name: str) -> bool:
         return result.rowcount > 0
 
 
+def delete_orphan_image_nodes(image_ref: str) -> int:
+    """P4 purge_meta: delete ALL remaining image_nodes rows for a ref. Returns rows removed.
+
+    Called only from the purge_meta lifecycle branch, which the claim-gate guarantees runs ONLY
+    after every per-node purge_node SUCCEEDED (each successful purge already cleared its own row via
+    clear_image_node). So any rows still here belong to nodes that were NOT purged — but purge_meta
+    cannot run while a prereq is unsucceeded, so in the normal path there are none. This is the
+    final sweep for stragglers (e.g. an 'importing'/'quarantined' row never flipped to a purge
+    result). Safe because reaching purge_meta means bytes are confirmed gone fleet-wide."""
+    with engine.begin() as conn:
+        result = conn.execute(image_nodes.delete().where(image_nodes.c.image_ref == image_ref))
+        return result.rowcount
+
+
+def link_purge_meta_custom_image(image_ref: str, custom_image_id: int) -> bool:
+    """Attach custom_image_id to the pending purge_meta job for a ref (idle-delete path).
+
+    The idle reaper fans out with image_id=None, but for an idle CUSTOM image the custom_images row
+    still exists (it will be marked 'evicted', not deleted) so the FK link is valid — and purge_meta
+    needs it to call mark_custom_image_evicted. Only touches a non-terminal purge_meta row."""
+    now = utc_now()
+    with engine.begin() as conn:
+        result = conn.execute(
+            update(image_jobs)
+            .where(
+                image_jobs.c.ref == image_ref,
+                image_jobs.c.kind == "purge_meta",
+                image_jobs.c.status.notin_(IMAGE_JOB_TERMINAL),
+            )
+            .values(custom_image_id=custom_image_id, updated_at=now)
+        )
+        return result.rowcount > 0
+
+
+def get_digest_for_ref(image_ref: str) -> Optional[str]:
+    """Best-effort LAN-registry digest for a ref (images or custom_images). None if unknown/unpushed.
+    Used by the idle-delete fan-out so registry_delete can DELETE the zot manifest by digest."""
+    if not image_ref:
+        return None
+    with engine.begin() as conn:
+        row = conn.execute(select(images.c.digest).where(images.c.image == image_ref)).first()
+        if row and row[0]:
+            return row[0]
+        row = conn.execute(select(custom_images.c.digest).where(custom_images.c.image == image_ref)).first()
+        if row and row[0]:
+            return row[0]
+    return None
+
+
+def purge_prereqs_satisfied(ref: str) -> bool:
+    """True iff every P4 byte-surface purge kind for `ref` has its LATEST row == succeeded.
+
+    Mirrors the purge_meta claim-gate. Used a SECOND time at purge_meta EXECUTION (lifecycle) as a
+    re-check: a prereq can regress (requeue_failed_purges flips failed->pending) between purge_meta
+    being claimed and its result landing, so the branch must re-verify before dropping DB rows."""
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(image_jobs.c.id, image_jobs.c.kind, image_jobs.c.status).where(
+                image_jobs.c.ref == ref,
+                image_jobs.c.kind.in_(PURGE_PREREQ_KINDS),
+            ).order_by(image_jobs.c.id)
+        ).all()
+    latest: dict = {}
+    for _id, k, s in rows:
+        latest[k] = s
+    return set(latest) == set(PURGE_PREREQ_KINDS) and all(s == "succeeded" for s in latest.values())
+
+
+def requeue_failed_purges(ref: Optional[str] = None) -> int:
+    """P4 convergence: re-enqueue terminally-FAILED purge-surface jobs so a delete completes.
+
+    The stale-job reaper only requeues LEASED (claimed/running) jobs past their lease; a job that
+    REPORTED status='failed' is terminal and never retried. For delete-completeness (the hard "remove
+    every byte" rule) a failed purge_node/purge_p2p/purge_seed/registry_delete/purge_builder MUST be
+    retried until it succeeds. This flips the latest failed row per (kind, ref) back to pending,
+    bounded by max_attempts. Returns the number re-enqueued. Idempotent: a kind with a newer
+    non-terminal row is skipped (dedup semantics)."""
+    now = utc_now()
+    requeued = 0
+    with engine.begin() as conn:
+        base = select(
+            image_jobs.c.id, image_jobs.c.kind, image_jobs.c.ref, image_jobs.c.status,
+            image_jobs.c.attempts, image_jobs.c.max_attempts,
+        ).where(image_jobs.c.kind.in_(PURGE_PREREQ_KINDS))
+        if ref is not None:
+            base = base.where(image_jobs.c.ref == ref)
+        rows = conn.execute(base.order_by(image_jobs.c.id)).all()
+        # Latest row per (kind, ref); only act if that newest row is 'failed' with attempts left.
+        latest: dict = {}
+        for r in rows:
+            latest[(r[1], r[2])] = r
+        for (_kind, _ref), r in latest.items():
+            if r[3] != "failed":
+                continue
+            if int(r[4]) >= int(r[5]):
+                continue  # exhausted retries — leave failed (operator/alert territory)
+            result = conn.execute(
+                update(image_jobs)
+                .where(image_jobs.c.id == r[0], image_jobs.c.status == "failed")
+                .values(status="pending", claimed_by=None, claimed_at=None, updated_at=now)
+            )
+            if result.rowcount > 0:
+                requeued += 1
+    return requeued
+
+
 def touch_image_node(image_ref: str, node_name: str) -> None:
     """Refresh last_seen_at/loaded_at so a recently-launched image isn't reaped as outdated."""
     now = utc_now()
@@ -2313,7 +2697,14 @@ def list_outdated_images() -> list[dict]:
             if key in seen:
                 continue
             seen.add(key)
-            out.append({"image_ref": ref, "node_name": node_name, "reason": "custom_idle"})
+            # Carry custom_image_id so the evict job can flip the custom_images row to 'evicted'
+            # (mark_custom_image_evicted fires only when the job has a custom_image_id).
+            out.append({
+                "image_ref": ref,
+                "node_name": node_name,
+                "reason": "custom_idle",
+                "custom_image_id": candidate["id"],
+            })
 
     with engine.begin() as conn:
         enabled_refs = {

@@ -89,6 +89,21 @@ class AdminImageRouteTests(unittest.TestCase):
         images = res.json()["images"]
         self.assertTrue(any(img["id"] == self.image["id"] for img in images))
 
+    def test_upsert_image_duplicate_ref_updates_not_errors(self):
+        # Re-adding an existing image ref must UPDATE the existing row (upsert), not raise. The
+        # savepoint around the INSERT keeps the transaction usable after the unique-constraint hit
+        # (previously a duplicate add threw InFailedSqlTransaction -> HTTP 500 on Postgres).
+        first = store.upsert_image("orig-name", "registry/dup:tag", "first desc", True)
+        again = store.upsert_image("new-name", "registry/dup:tag", "second desc", True)
+        # Same row id (updated in place), fields reflect the second call.
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(again["image"], "registry/dup:tag")
+        self.assertEqual(again["description"], "second desc")
+        self.assertEqual(again["name"], "new-name")
+        # No duplicate row created.
+        rows = [i for i in store.list_images(enabled_only=False) if i["image"] == "registry/dup:tag"]
+        self.assertEqual(len(rows), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

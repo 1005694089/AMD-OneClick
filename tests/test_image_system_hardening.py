@@ -113,6 +113,17 @@ class ClaimSerializationTests(unittest.TestCase):
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed["kind"], "distribute")
 
+    def test_evict_superseded_by_newer_warm(self):
+        # Since P3, "warm" (not "distribute") is the transport a rebuild enqueues once a LAN
+        # registry is wired up. The supersede check must treat "warm" the same as "distribute" or
+        # a delete's evict can race a rebuild and wipe the freshly-warmed image.
+        store.enqueue_image_job(kind="evict", ref="user-1:demo", payload={"targets": [{"node": "A", "ip": "1"}]})
+        store.enqueue_image_job(kind="warm", ref="user-1:demo", payload={"targets": [{"node": "A", "ip": "1"}]})
+        claimed = store.claim_next_image_job("agent-1")
+        # The evict (lower id) is superseded and skipped; the warm is what gets claimed.
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["kind"], "warm")
+
     def test_cross_node_distribute_runs_concurrently(self):
         store.enqueue_image_job(kind="distribute", ref="img:a", payload={"targets": [{"node": "A", "ip": "1"}]})
         store.enqueue_image_job(kind="distribute", ref="img:b", payload={"targets": [{"node": "B", "ip": "2"}]})

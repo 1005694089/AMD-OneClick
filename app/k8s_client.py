@@ -82,6 +82,13 @@ class K8sClient:
         self.core_v1 = client.CoreV1Api(api_client)
         self.apps_v1 = client.AppsV1Api(api_client)
         self.namespace = settings.K8S_NAMESPACE
+        # Short-TTL cache for list_node(): target resolution + node selection call
+        # _eligible_target_nodes on a hot path (every admin status poll, every launch). Caching the
+        # API result for a few seconds removes the per-call apiserver hit that bites at 300 nodes.
+        self._node_list_cache = None
+        self._node_list_cache_ts = 0.0
+        self._node_list_cache_ttl = float(getattr(settings, "NODE_LIST_CACHE_TTL_SECONDS", 5.0))
+        self._node_list_cache_lock = threading.Lock()
 
     def _authenticated_api_client(self):
         token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -1333,6 +1340,24 @@ exit 0
                 return False
         return True
 
+    def _list_node_cached(self):
+        """list_node() with a short TTL cache shared across target-resolution call sites.
+
+        The eligibility filtering still runs per call against the cached snapshot; only the
+        apiserver round-trip is cached. TTL is small (default 5s) so node churn (NotReady, drain,
+        rejoin) is reflected within one cache window — fresh enough for image targeting."""
+        now = time.monotonic()
+        with self._node_list_cache_lock:
+            if (
+                self._node_list_cache is not None
+                and (now - self._node_list_cache_ts) < self._node_list_cache_ttl
+            ):
+                return self._node_list_cache
+            nodes = self.core_v1.list_node()
+            self._node_list_cache = nodes
+            self._node_list_cache_ts = now
+            return nodes
+
     def _eligible_target_nodes(self) -> list[dict]:
         """Nodes the Image Service should distribute images to.
 
@@ -1344,15 +1369,18 @@ exit 0
         targets: list[dict] = []
         image_service_node = settings.IMAGE_SERVICE_NODE_NAME.strip()
         try:
-            nodes = self.core_v1.list_node()
+            nodes = self._list_node_cached()
         except ApiException as e:
             if e.status == 403:
                 logger.warning("Cannot list nodes for image distribution; returning best-effort targets")
                 return targets
             raise
+        denylist = set(getattr(settings, "IMAGE_TARGET_NODE_DENYLIST", []) or [])
         for node in nodes.items:
             name = node.metadata.name
             if image_service_node and name == image_service_node:
+                continue
+            if name in denylist:
                 continue
             labels = node.metadata.labels or {}
             conditions = {cond.type: cond.status for cond in node.status.conditions or []}
@@ -1668,6 +1696,13 @@ exit 0
         desired = len(target_names)
         loaded_nodes = set(store.list_nodes_for_image(ref)) if ref else set()
         ready = len(loaded_nodes & target_names) if target_names else len(loaded_nodes)
+        # Readiness = image loaded on every eligible node. Registry durability is guaranteed
+        # STRUCTURALLY, not via a digest gate here: the chain runs push BEFORE distribute, so a node
+        # can only reach "loaded" after the push succeeded. Gating additionally on a recorded digest
+        # would (a) flip every pre-P1 image — which has digest=NULL — from ready to pulling the
+        # instant LAN_REGISTRY is set, and (b) strand an image whose digest couldn't be parsed even
+        # though it pushed fine. The digest column is still recorded (P5 delete-by-digest) but must
+        # NOT gate readiness. See tests/test_p1_registry_push.py.
         if desired > 0 and ready >= desired:
             status = "ready"
         elif desired == 0:

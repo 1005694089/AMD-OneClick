@@ -50,6 +50,7 @@ from .models import (
     BuildEvictRequest,
     ImageJobClaimRequest,
     ImageJobLogRequest,
+    ImageJobHeartbeatRequest,
     ImageJobResultRequest,
     ImageNodeStatusRequest,
 )
@@ -118,6 +119,7 @@ from .store import (
     enqueue_image_job,
     claim_next_image_job,
     append_image_job_log,
+    heartbeat_image_job,
     finish_image_job,
     upsert_image_node,
     image_loaded_on_node,
@@ -148,6 +150,8 @@ async def lifespan(app: FastAPI):
         )
     init_db()
     if settings.RUN_SCHEDULER:
+        from .leader import elector
+        elector.start()
         start_scheduler()
     else:
         logger.info("Background scheduler disabled for this manager process")
@@ -156,6 +160,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down AMD OneClick Notebook Manager")
     if settings.RUN_SCHEDULER:
         stop_scheduler()
+        from .leader import elector
+        elector.stop()
 
 
 app = FastAPI(
@@ -725,10 +731,18 @@ def _ensure_image_on_node(image: str, gpu_count: int) -> Optional[str]:
         return node
     # The Manager resolves the single node's target now; the daemon never expands scope.
     targets = k8s_client.resolve_node_targets([node])
+    # P5 transport: use warm (P2P self-pull of the zot ref) when this image is durable in the LAN
+    # registry (digest recorded by a prior push); otherwise fall back to the SSH byte-push. warm needs
+    # the zot ref, so carry lan_target_ref. Legacy images never pushed to zot keep using distribute.
+    lan_target_ref = _lan_registry_target_ref(image)
+    use_warm = bool(lan_target_ref) and store.image_digest_present(image)
+    payload = {"scope": f"node:{node}", "targets": targets}
+    if use_warm:
+        payload["lan_target_ref"] = lan_target_ref
     enqueue_image_job(
-        kind="distribute",
+        kind="warm" if use_warm else "distribute",
         ref=image,
-        payload={"scope": f"node:{node}", "targets": targets},
+        payload=payload,
     )
     return None
 
@@ -1618,11 +1632,18 @@ async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(
         # distribute falls back to `nerdctl save` (nonexistent on 0042) and the launch never lands.
         # Enqueue the RAW dockerfile — claim_image_job appends DOCKERFILE_SUFFIX at claim time
         # (do NOT append it here or it would be duplicated).
+        # When the LAN registry is wired, chain a `push` after build so a custom image is durable in
+        # zot (its "ready" gate). The build branch defers the ready flip to push in that case.
+        build_payload = {"dockerfile": dockerfile}
+        lan_target_ref = _lan_registry_target_ref(image_tag)
+        if lan_target_ref:
+            build_payload["chain"] = ["push"]
+            build_payload["lan_target_ref"] = lan_target_ref
         enqueue_image_job(
             kind="build",
             ref=image_tag,
             custom_image_id=record["id"],
-            payload={"dockerfile": dockerfile},
+            payload=build_payload,
         )
     return _custom_image_public(record)
 
@@ -1637,6 +1658,11 @@ async def custom_image_status(image_id: int, user: dict = Depends(current_user))
 
 @app.delete("/api/custom-images/{image_id}")
 async def delete_my_custom_image(image_id: int, user: dict = Depends(current_user)):
+    # Compute blobs UNIQUE to this image BEFORE deleting its row (the row's blob_list is one of the
+    # inputs; after delete_custom_image it's gone). Blobs shared with a live image are excluded so the
+    # P2P/seed cache purge never removes a still-referenced blob.
+    _pre = get_custom_image(image_id, user_id=user["id"])
+    unique_blobs = store.unique_blob_ids_for_ref(_pre.get("image")) if _pre and _pre.get("image") else []
     try:
         record = delete_custom_image(image_id, user["id"])
     except ValueError as e:
@@ -1652,15 +1678,24 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
         try:
             recorded = store.list_nodes_for_image(image_ref)
             targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
-            # Do NOT link custom_image_id: the row was already deleted above, and image_jobs has a
-            # plain FK to custom_images — a link to a missing row would raise ForeignKeyViolation.
-            enqueue_image_job(
-                kind="evict",
-                ref=image_ref,
-                payload={"scope": "all", "targets": targets},
-            )
+            # P4 complete-delete fan-out — GATED (see admin_delete_image). Until PURGE_FANOUT_ENABLED,
+            # keep the single `evict`. Do NOT link custom_image_id in either branch: the row was
+            # already deleted above, and image_jobs has a plain FK to custom_images — a link to a
+            # missing row would raise ForeignKeyViolation.
+            if settings.PURGE_FANOUT_ENABLED:
+                enqueue_purge_fanout(
+                    image_ref,
+                    targets,
+                    digest=record.get("digest"),
+                    lan_target_ref=_lan_registry_target_ref(image_ref),
+                    image_id=None,
+                    blob_ids=unique_blobs,
+                )
+            else:
+                enqueue_image_job(kind="evict", ref=image_ref,
+                                  payload={"scope": "all", "targets": targets})
         except Exception as e:
-            logger.warning("Failed to enqueue evict for custom image %s (%s): %s", image_id, image_ref, e)
+            logger.warning("Failed to enqueue purge fan-out for custom image %s (%s): %s", image_id, image_ref, e)
     return {"success": True}
 
 
@@ -1707,10 +1742,14 @@ async def report_build_result(image_id: int, req: BuildResultRequest, _agent: bo
 
 
 @app.post("/api/internal/builds/gc-candidates")
-async def build_gc_candidates(req: BuildClaimRequest, _agent: bool = Depends(verify_build_agent)):
+async def build_gc_candidates(req: BuildClaimRequest, mode: str = "idle", _agent: bool = Depends(verify_build_agent)):
+    """Custom-image GC candidates. mode='idle' (default) returns only images past the 5-day idle
+    window; mode='disk_pressure' returns all ready node-local images coldest-first so an
+    over-threshold disk can reclaim the coldest image regardless of the idle window."""
+    gc_mode = "disk_pressure" if mode == "disk_pressure" else "idle"
     candidates = [
         {"id": row["id"], "tag": row["image"], "last_launched_at": row.get("last_launched_at")}
-        for row in list_gc_candidates()
+        for row in list_gc_candidates(mode=gc_mode)
     ]
     return {"candidates": candidates}
 
@@ -1753,12 +1792,22 @@ def _enqueue_next_chain_step(job: dict, payload: dict) -> None:
     next_payload: dict = {"chain": chain}
     if payload.get("scope"):
         next_payload["scope"] = payload["scope"]
-    if next_kind == "distribute":
+    if next_kind in ("distribute", "warm"):
+        # warm forks distribute's target model exactly — Manager resolves node IPs (the daemon has
+        # no kubectl); the daemon triggers a per-node pull through the P2P mirror.
         next_payload["targets"] = _resolve_chain_targets(payload.get("scope") or "all")
     elif next_kind == "acr_backup":
         acr_target_ref = payload.get("acr_target_ref")
         if acr_target_ref:
             next_payload["acr_target_ref"] = acr_target_ref
+    elif next_kind == "push":
+        lan_target_ref = payload.get("lan_target_ref")
+        if lan_target_ref:
+            next_payload["lan_target_ref"] = lan_target_ref
+    # Carry the LAN ref forward through non-push steps too, so a later push step in the same chain
+    # (or the lifecycle's digest recording) still sees it.
+    if payload.get("lan_target_ref") and "lan_target_ref" not in next_payload:
+        next_payload["lan_target_ref"] = payload["lan_target_ref"]
     enqueue_image_job(
         kind=next_kind,
         ref=ref,
@@ -1783,17 +1832,40 @@ def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
 
     if kind == "build":
         custom_image_id = job.get("custom_image_id")
-        if custom_image_id:
-            # Flip the custom image to ready unconditionally. In IMAGE_SERVICE_ENABLED mode the
-            # custom_images row is never 'building'/claimed (the kind=build image_job owns the
-            # lifecycle; the legacy claim_build path that set 'building' is starved), so guarding on
+        if custom_image_id and "push" not in (payload.get("chain") or []):
+            # Flip the custom image to ready. In IMAGE_SERVICE_ENABLED mode the custom_images row is
+            # never 'building'/claimed (the kind=build image_job owns the lifecycle; the legacy
+            # claim_build path that set 'building' is starved), so guarding on
             # require_claimed_by=<job agent> would match 0 rows and leave it stuck 'pending'.
             # finish_image_job already verified the image_job's own ownership before we get here.
+            #
+            # When a `push` step follows in the chain (LAN registry wired), DEFER the ready flip to
+            # the push branch so "ready" means the image is durable in the registry, not merely
+            # built on 0042. The row stays 'pending' (UI renders "Building...") until push succeeds.
             update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
     elif kind in ("pull",):
         # Source bytes now exist on the Image-Service host; distribution follows as its own job.
         pass
-    elif kind == "distribute":
+    elif kind == "push":
+        # Registry-durable: record the manifest digest and flip readiness. digest is agent-reported
+        # (the manager has no route to the LAN registry). A null digest still counts as pushed but
+        # can't gate on digest for this ref (logged agent-side).
+        digest = result.get("digest")
+        blob_ids = result.get("blob_ids") or []
+        image_id = job.get("image_id")
+        if image_id is not None:
+            store.set_image_digest(image_id, digest)
+            if blob_ids:
+                store.set_image_blob_list(image_id, blob_ids)
+        custom_image_id = job.get("custom_image_id")
+        if custom_image_id:
+            store.set_custom_image_digest(custom_image_id, digest)
+            if blob_ids:
+                store.set_custom_image_blob_list(custom_image_id, blob_ids)
+            update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
+    elif kind in ("distribute", "warm"):
+        # warm writes the SAME 'loaded' rows distribute did — the per-node results contract is
+        # identical, so upload->ready-on-all counting is unchanged whichever transport ran.
         for node in result.get("nodes", []) or []:
             node_name = node.get("node") if isinstance(node, dict) else node
             if node and (not isinstance(node, dict) or node.get("loaded")):
@@ -1808,6 +1880,34 @@ def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
         custom_image_id = job.get("custom_image_id")
         if custom_image_id:
             mark_custom_image_evicted(custom_image_id)
+    elif kind == "purge_node":
+        # P4: clear the image_nodes row for each node whose layers were actually removed. A node
+        # that failed keeps its row (the durable retry handle); requeue_failed_purges retries it.
+        for node in result.get("nodes", []) or []:
+            node_name = node.get("node") if isinstance(node, dict) else node
+            if node and (not isinstance(node, dict) or node.get("removed")):
+                if node_name:
+                    clear_image_node(ref, node_name)
+    elif kind in ("purge_p2p", "purge_seed", "registry_delete", "purge_builder"):
+        # P4 byte-surface purges with no image_nodes-row effect (P2P cache / seed / registry tag /
+        # 0042 tarball). Success is recorded by the job's terminal status; the purge_meta claim-gate
+        # reads that. Nothing to write here.
+        pass
+    elif kind == "purge_meta":
+        # P4 FINAL step — drops the remaining DB handles (image_nodes rows + custom_images mark).
+        # RE-CHECK prereqs at execution time, not just at claim: requeue_failed_purges can flip a
+        # prereq failed->pending AFTER purge_meta was claimed but before this result lands. Dropping
+        # the rows then would orphan that surface's bytes. If any prereq regressed, abort by
+        # re-enqueuing purge_meta (it will defer again at claim until prereqs re-succeed).
+        if not store.purge_prereqs_satisfied(ref):
+            logger.warning("purge_meta for %s aborted: a byte-surface prereq regressed; re-enqueuing", ref)
+            enqueue_image_job(kind="purge_meta", ref=ref, custom_image_id=job.get("custom_image_id"),
+                              payload=payload)
+        else:
+            store.delete_orphan_image_nodes(ref)
+            custom_image_id = job.get("custom_image_id")
+            if custom_image_id:
+                mark_custom_image_evicted(custom_image_id)
     elif kind == "acr_backup":
         image_id = job.get("image_id")
         if image_id is not None:
@@ -1848,6 +1948,14 @@ async def claim_image_job(req: ImageJobClaimRequest, _agent: bool = Depends(veri
 @app.post("/api/internal/jobs/{job_id}/log")
 async def push_image_job_log(job_id: int, req: ImageJobLogRequest, _agent: bool = Depends(verify_build_agent)):
     if not append_image_job_log(job_id, req.log or "", agent_id=req.agent_id):
+        raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
+    return {"ok": True}
+
+
+@app.post("/api/internal/jobs/{job_id}/heartbeat")
+async def push_image_job_heartbeat(job_id: int, req: ImageJobHeartbeatRequest, _agent: bool = Depends(verify_build_agent)):
+    """Refresh a long-running job's lease so the reaper does not requeue it mid-pull."""
+    if not heartbeat_image_job(job_id, agent_id=req.agent_id):
         raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
     return {"ok": True}
 
@@ -1952,22 +2060,46 @@ async def list_outdated_image_targets(req: ImageJobClaimRequest, _agent: bool = 
     """
     outdated = list_outdated_images()
     by_ref: dict[str, list[str]] = {}
+    cid_by_ref: dict[str, int] = {}
     for row in outdated:
         ref = row.get("image_ref")
         node = row.get("node_name")
         if not ref or not node:
             continue
         by_ref.setdefault(ref, []).append(node)
+        # Carry the custom_image_id (idle custom images) so the evict job flips the row to
+        # 'evicted' via mark_custom_image_evicted; catalog rows have none.
+        cid = row.get("custom_image_id")
+        if cid is not None:
+            cid_by_ref[ref] = cid
     enqueued = 0
     for ref, node_names in by_ref.items():
         targets = k8s_client.resolve_node_targets(node_names)
-        job = enqueue_image_job(
-            kind="evict",
-            ref=ref,
-            payload={"targets": targets, "scope": "outdated"},
-        )
-        if job:
-            enqueued += 1
+        # P4: idle-delete must be a COMPLETE purge (node layers + P2P caches + seed + registry tag +
+        # 0042 tarball + rows) — the same hard "remove every byte" contract as an explicit delete,
+        # not the layers-only `evict`. Relaunch rebuilds from the stored Dockerfile. digest is looked
+        # up so registry_delete can DELETE the zot manifest. custom_image_id rides on purge_meta so
+        # mark_custom_image_evicted flips the idle custom row to 'evicted'.
+        cid = cid_by_ref.get(ref)
+        if settings.PURGE_FANOUT_ENABLED:
+            enqueue_purge_fanout(
+                ref,
+                targets,
+                digest=store.get_digest_for_ref(ref),
+                lan_target_ref=_lan_registry_target_ref(ref),
+                image_id=None,
+                blob_ids=store.unique_blob_ids_for_ref(ref),
+            )
+            if cid is not None:
+                # Re-stamp custom_image_id onto the purge_meta job (fan-out enqueued it with
+                # image_id=None; the custom mark needs the link). Safe: same-ref purge_meta is unique.
+                store.link_purge_meta_custom_image(ref, cid)
+        else:
+            # Pre-cutover: the original layers-only evict, carrying custom_image_id so an idle custom
+            # image is still marked 'evicted' (the P0/R2c behavior). Unchanged from before P4.
+            enqueue_image_job(kind="evict", ref=ref, custom_image_id=cid,
+                              payload={"targets": targets, "scope": "outdated"})
+        enqueued += 1
     return {"images": outdated, "enqueued": enqueued}
 
 
@@ -3261,6 +3393,52 @@ def _acr_backup_target_ref(ref: str) -> Optional[str]:
     return f"{registry}/{repo}"
 
 
+def enqueue_purge_fanout(ref: str, targets: list, *, digest: Optional[str] = None,
+                         lan_target_ref: Optional[str] = None, image_id: Optional[int] = None,
+                         blob_ids: Optional[list] = None) -> None:
+    """P4 complete-delete: enqueue one INDEPENDENT job per byte-surface (§ six surfaces).
+
+    Each is idempotent and — critically — its FAILURE is re-enqueued by requeue_failed_purges until
+    it succeeds (the stale reaper only requeues LEASED jobs, so a reported failure would otherwise
+    never retry and leave orphaned bytes). purge_meta (the DB-row cleanup) is enqueued too but the
+    claim-gate holds it until every byte-surface for this ref has SUCCEEDED.
+
+    digest + lan_target_ref ride in the payload (captured NOW) because the DB row may be deleted
+    before/while the purge runs — the ref string + payload are the durable handles, not the row.
+    Per-node surfaces carry the full targets[] LIST (the proven distribute/evict model) so the
+    (kind,ref) dedup can't collapse them. image_id is linked only where the caller keeps the row
+    until after enqueue (admin path); custom path passes image_id=None (row already deleted).
+
+    blob_ids are this image's dfdaemon task-ids UNIQUE to it (blobs shared with a live image are
+    excluded by the caller so we never delete a still-referenced blob). They ride on purge_p2p +
+    purge_seed so the manager's dfctl-exec handlers know exactly what to `task rm`. Empty/None =>
+    those surfaces skip the cache purge (nothing addressable; Dragonfly taskTTL reaps the tail)."""
+    base = {"ref": ref, "digest": digest, "lan_target_ref": lan_target_ref}
+    cache_base = {**base, "blob_ids": list(blob_ids or [])}
+    enqueue_image_job(kind="purge_node", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
+    enqueue_image_job(kind="purge_p2p", ref=ref, image_id=image_id, payload={**cache_base, "scope": "all", "targets": targets})
+    enqueue_image_job(kind="purge_seed", ref=ref, image_id=image_id, payload={**cache_base})
+    enqueue_image_job(kind="registry_delete", ref=ref, image_id=image_id, payload={**base})
+    enqueue_image_job(kind="purge_builder", ref=ref, image_id=image_id, payload={**base})
+    enqueue_image_job(kind="purge_meta", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
+
+
+def _lan_registry_target_ref(ref: str) -> Optional[str]:
+    """Compute the LAN-registry (zot) ref for an image: <LAN_REGISTRY>/<repo:tag>.
+
+    Returns None when LAN_REGISTRY is unset, which is the signal that P1 push is dormant (no push
+    step is chained and readiness gates on node-loaded rows only, exactly as before P1)."""
+    registry = (settings.LAN_REGISTRY or "").strip().rstrip("/")
+    if not registry:
+        return None
+    repo = ref.strip()
+    first = repo.split("/", 1)[0]
+    # Strip an existing registry host (has a dot/port or is localhost) so we re-home under zot.
+    if "." in first or ":" in first or first == "localhost":
+        repo = repo.split("/", 1)[1] if "/" in repo else repo
+    return f"{registry}/{repo}"
+
+
 def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: str) -> None:
     """Enqueue the non-blocking distribution chain for a source_type-backed admin image.
 
@@ -3275,10 +3453,24 @@ def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: st
     # Otherwise (the common case — the source is already in ACR) it would hard-fail with
     # acr_registry_unset and abort the whole chain, leaving the image stuck "pulling".
     acr_target_ref = _acr_backup_target_ref(ref)
-    chain = (["acr_backup"] if acr_target_ref else []) + ["distribute"]
+    # push is OPTIONAL too: only chain it when the LAN registry is wired. When set, push runs before
+    # distribute so "ready" means the image is durable in zot. Until P3, distribute stays the
+    # transport (it becomes warm in P3).
+    lan_target_ref = _lan_registry_target_ref(ref)
+    # P5 transport: when the LAN registry is wired, `push` puts the image in zot and the tail step is
+    # `warm` (each node self-pulls the zot ref through its local Dragonfly dfdaemon → P2P). Without a
+    # LAN registry (dormant/pre-P1), fall back to the SSH byte-push `distribute`. warm forks
+    # distribute's exact target/results contract, so readiness counting is unchanged either way.
+    transport = "warm" if lan_target_ref else "distribute"
+    chain = (
+        (["acr_backup"] if acr_target_ref else [])
+        + (["push"] if lan_target_ref else [])
+        + [transport]
+    )
     payload = {
         "image_id": image_row["id"],
         "acr_target_ref": acr_target_ref,
+        "lan_target_ref": lan_target_ref,
         "chain": chain,
         "scope": "all",
     }
@@ -3400,12 +3592,24 @@ async def admin_delete_image(image_id: int, username: str = Depends(verify_admin
         # currently recorded as holding this ref; fall back to all eligible nodes when none.
         recorded = store.list_nodes_for_image(existing["image"])
         targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
-        enqueue_image_job(
-            kind="evict",
-            ref=existing["image"],
-            image_id=image_id,
-            payload={"scope": "all", "targets": targets},
-        )
+        # P4 complete-delete fan-out (all six byte-surfaces) — GATED. Until PURGE_FANOUT_ENABLED is
+        # flipped on (post-cutover, when nodes/seed run dfdaemon), keep the pre-P4 single `evict` so
+        # production delete behaves exactly as before. digest read NOW; the subsequent delete_image()
+        # NULLs image_jobs.image_id so the images DELETE won't FK-violate either way.
+        if settings.PURGE_FANOUT_ENABLED:
+            # Blobs unique to this image (row still present here — computed before delete_image below).
+            unique_blobs = store.unique_blob_ids_for_ref(existing["image"])
+            enqueue_purge_fanout(
+                existing["image"],
+                targets,
+                digest=existing.get("digest"),
+                lan_target_ref=_lan_registry_target_ref(existing["image"]),
+                image_id=image_id,
+                blob_ids=unique_blobs,
+            )
+        else:
+            enqueue_image_job(kind="evict", ref=existing["image"], image_id=image_id,
+                              payload={"scope": "all", "targets": targets})
         try:
             k8s_client.delete_image_sync(image_id)
         except Exception as e:

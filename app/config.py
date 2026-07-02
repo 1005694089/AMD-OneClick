@@ -334,6 +334,13 @@ class Settings:
     )
 
     RUN_SCHEDULER: bool = os.getenv("RUN_SCHEDULER", "true").lower() in {"1", "true", "yes", "on"}
+    # Leader election: when manager runs >1 replica, only the Lease holder runs the scheduled jobs
+    # (billing, reapers, reconciler) so they don't double-run. Uses a coordination.k8s.io Lease.
+    # Disabled by default to preserve single-replica behaviour; enable when scaling replicas.
+    LEADER_ELECTION_ENABLED: bool = os.getenv("LEADER_ELECTION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    LEADER_LEASE_NAME: str = os.getenv("LEADER_LEASE_NAME", "amd-oneclick-manager-leader")
+    LEADER_LEASE_DURATION_SECONDS: int = int(os.getenv("LEADER_LEASE_DURATION_SECONDS", "15"))
+    LEADER_LEASE_RENEW_SECONDS: float = float(os.getenv("LEADER_LEASE_RENEW_SECONDS", "5"))
     OAUTH_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_CONNECT_TIMEOUT_SECONDS", "5"))
     OAUTH_READ_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_READ_TIMEOUT_SECONDS", "15"))
     SLOW_REQUEST_THRESHOLD_SECONDS: float = float(os.getenv("SLOW_REQUEST_THRESHOLD_SECONDS", "2"))
@@ -422,7 +429,9 @@ class Settings:
     CUSTOM_IMAGE_GC_DISK_PATH: str = os.getenv("CUSTOM_IMAGE_GC_DISK_PATH", "/disk/ssd1/containerd")
     CUSTOM_IMAGE_GC_DISK_THRESHOLD_PERCENT: float = float(os.getenv("CUSTOM_IMAGE_GC_DISK_THRESHOLD_PERCENT", "85"))
     CUSTOM_IMAGE_GC_INTERVAL_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_INTERVAL_SECONDS", "300"))
-    CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", "21600"))
+    # Idle window after a custom image's last launch before it becomes eligible for full delete
+    # (node layers + P2P caches + registry tag). Default 5 days per the auto-delete contract.
+    CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", "432000"))
 
     # Internal build-agent channel (R9700 -> manager). Token guards /api/internal/builds/*.
     BUILD_AGENT_TOKEN: str = os.getenv("BUILD_AGENT_TOKEN", "")
@@ -442,8 +451,48 @@ class Settings:
     # The Image-Service host is itself a labelled prepull node; node-target resolution must drop it
     # so it never receives distributions. Must exactly match its `kubectl get nodes` name.
     IMAGE_SERVICE_NODE_NAME: str = os.getenv("IMAGE_SERVICE_NODE_NAME", "")
+    # Nodes permanently excluded from image distribution regardless of their labels/Ready state
+    # (e.g. off-LAN nodes the daemon cannot reach over the 10.5.10.0/24 routed LAN). Comma-separated
+    # node names. Defaults to the known off-LAN node so a relabel can never make it a target.
+    IMAGE_TARGET_NODE_DENYLIST: list = [
+        n.strip() for n in os.getenv("IMAGE_TARGET_NODE_DENYLIST", "wx-ms-w7900d-0027").split(",") if n.strip()
+    ]
+    # Short TTL (seconds) for the cached list_node() result used in image target resolution.
+    NODE_LIST_CACHE_TTL_SECONDS: float = float(os.getenv("NODE_LIST_CACHE_TTL_SECONDS", "5"))
     # ACR Enterprise registry used as the admin-image backup source of truth.
     ACR_ENTERPRISE_REGISTRY: str = os.getenv("ACR_ENTERPRISE_REGISTRY", "")
+    # Self-hosted LAN registry (zot) on node 0042 — the durable source of truth for the P2P
+    # transport (host:port, e.g. "10.5.10.43:5000"). EMPTY => P1 push behavior is dormant: the
+    # `push` chain step is not inserted and readiness still gates on node-loaded rows only, so
+    # deploying P1 code before the registry env is wired is a no-op (safe/revertible). When set,
+    # admin/custom builds push here and "ready" gates on the pushed digest being recorded.
+    LAN_REGISTRY: str = os.getenv("LAN_REGISTRY", "").strip().rstrip("/")
+    # P4 complete-delete fan-out gate. FALSE (default) => delete/idle paths keep the pre-P4 single
+    # `evict` (node-layer removal), so shipping P4 code is INERT for delete and production delete
+    # keeps working exactly as before. TRUE => the 6-surface purge fan-out (purge_node/p2p/seed/
+    # registry_delete/purge_builder/purge_meta). Flip to TRUE only AFTER the P2P cutover, once every
+    # node/seed actually runs a dfdaemon (else purge_p2p/purge_seed have nothing to talk to and would
+    # stick purge_meta). This makes P3/P4 code shippable to prod with zero delete-behavior change.
+    PURGE_FANOUT_ENABLED: bool = os.getenv("PURGE_FANOUT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # P4 manager-executed purge (purge_p2p/purge_seed run via `kubectl exec dfctl task rm` into the
+    # in-cluster dfdaemon/seed pods — the 0042 agent cannot reach the overlay-only seeds, and the real
+    # v1.4.0 delete CLI is `dfctl task rm <task_id>`, socket-local). The manager drains these kinds on
+    # the scheduler leader. Namespace + workload names of the Dragonfly install:
+    DRAGONFLY_NAMESPACE: str = os.getenv("DRAGONFLY_NAMESPACE", "dragonfly-system")
+    # DaemonSet pod name prefix for the per-node client dfdaemon (label app selection is used; this is
+    # the container name to exec into).
+    DRAGONFLY_CLIENT_CONTAINER: str = os.getenv("DRAGONFLY_CLIENT_CONTAINER", "client")
+    DRAGONFLY_SEED_CONTAINER: str = os.getenv("DRAGONFLY_SEED_CONTAINER", "seed-client")
+    # Label selector to find the per-node client dfdaemon pods (DaemonSet).
+    DRAGONFLY_CLIENT_SELECTOR: str = os.getenv("DRAGONFLY_CLIENT_SELECTOR", "app=dragonfly,component=client")
+    DRAGONFLY_SEED_SELECTOR: str = os.getenv("DRAGONFLY_SEED_SELECTOR", "app=dragonfly,component=seed-client")
+    # dfctl binary path + daemon socket inside the pods (v1.4.0 defaults).
+    DRAGONFLY_DFCTL: str = os.getenv("DRAGONFLY_DFCTL", "dfctl")
+    # How many manager-side purge jobs to drain per scheduler tick (bounded so one tick can't run away).
+    PURGE_DRAIN_BATCH: int = int(os.getenv("PURGE_DRAIN_BATCH", "20"))
+    # How often the manager drains purge_p2p/purge_seed/purge_meta. Deletes are interactive, so keep
+    # this brisk. Inert unless PURGE_FANOUT_ENABLED.
+    PURGE_DRAIN_INTERVAL_SECONDS: int = int(os.getenv("PURGE_DRAIN_INTERVAL_SECONDS", "15"))
     # Optional Docker Hub pull secret for dockerhub_pull source images.
     DOCKERHUB_PULL_SECRET_NAME: str = os.getenv("DOCKERHUB_PULL_SECRET_NAME", "")
     # Optional proxy prefix for raw GitHub fetches. raw.githubusercontent.com is intermittently
