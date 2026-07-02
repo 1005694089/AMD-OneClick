@@ -26,6 +26,55 @@ secrets.
 
 ---
 
+## 2026-07-02 (latest) — Radeon beta: merge feat/dragonfly-p2p-100plus-nodes into BETA-test
+
+**Code commit:** `7ce6e4c` (merge of `feat/dragonfly-p2p-100plus-nodes` into `BETA-test`,
+merge-base `7909740`). Includes a review fix folded into the merge commit: `claim_next_image_job`'s
+stale-evict supersede check (`app/store.py`) only matched newer `distribute`/`build` jobs for the
+same ref, not `warm` — the P3+ primary transport once a LAN registry is wired up. A rebuild after a
+delete would enqueue `warm`, invisible to that check, letting a stale evict race in and wipe the
+freshly-warmed image. Fixed by adding `warm` to the supersede kinds tuple, with a regression test
+(`test_evict_superseded_by_newer_warm`). 245 tests pass (was 244; +1 new).
+
+Per `docs/DRAGONFLY_MIGRATION_RUNBOOK.md`, this merge's P0–P1 code was already live-deployed
+**dormant→active** on radeon-beta prior to this session (LAN registry `10.5.10.43:5000` wired,
+`leader.py`/`purge_exec.py` present in the running ConfigMap) — this deploy is a **manager-code
+sync** to bring the running pod onto the merged, reviewed, tested `BETA-test` HEAD (was running
+uncommitted/ahead-of-git working-tree edits), not a fresh activation. Node-0042 host-side pieces
+(zot registry, Dragonfly Helm, `image-service.service` agent) are unchanged by this deploy — those
+are `[YOU-0042]` steps outside this workspace host's network reach (no route to `10.5.10.x`).
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 | Deployment sha256 | Snapshot |
+|----------------|----------------|------------------------|--------------------|----------|
+| radeon-beta / 30444 | `crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-image-service-20260625` (image unchanged) + `code-overrides` ConfigMap | `231e848ff421afac2c10ebe4756f563c5d010439a2c99bd3b4774b9249334592` | `5fc86e36b3b43891773e63816b34443bcc1455eb750327302facc81138f226a1` | `local-deploy-history/radeon-beta/20260702-2248-dragonfly-merge-{PRE,APPLIED}-{code-overrides,deployment}.yaml` |
+
+**Deploy mechanism:** regenerated `amd-oneclick-radeon-beta-code-overrides` ConfigMap from the
+merged `BETA-test` working tree (23 keys: 13 `app/*.py` incl. new `leader.py`/`purge_exec.py`, 7
+templates, 2 static JS) via `kubectl replace` (large manifest, avoids the `apply` annotation-size
+limit). **Deliberately dropped the `data_mounts.py` key** — a live-only, never-committed-to-git
+file: confirmed via grep it is not imported by live `main.py`/`k8s_client.py` (dead server-side
+code already; only `models.py`'s `DataMountSelection` type and some frontend JS referenced the
+concept), and Pydantic's default `extra="ignore"` means the stray `data_mounts` field in existing
+frontend requests is now silently dropped rather than erroring. Removed the matching
+`data_mounts.py` subPath volumeMount and the `data-mounts-root` hostPath volume from the Deployment
+via `kubectl patch --type=json` (the stale `data_mounts.py` mount predates the `code-overrides`
+key's introduction via `kubectl apply`'s last-applied-configuration annotation, so a plain `apply`
+alone did not remove it — required an explicit JSON-patch `remove`). Then `rollout restart`.
+
+**Verification:** rollout `1/1 ready` (pod `amd-oneclick-radeon-beta-manager-7d796fc4f5-nqwxq`, 0
+restarts); NodePort `:30444/health`, HTTPS `radeon-beta.anruicloud.com/health`, and homepage `/` all
+200; `app.main`/`app.leader`/`app.purge_exec` import cleanly in-pod; `/app/app/data_mounts.py`
+confirmed absent; hackathon `--collaborative` code and the `distribute/warm/build` supersede fix
+both grep-confirmed present in the running pod's `k8s_client.py`/`store.py`; `image_jobs` table
+shows live `warm`/`distribute`/`push`/`evict`/`purge_*` activity (P3 Dragonfly transport actively
+running, not dormant); all 6 pre-existing running user instances (`u-13`, `u-18`, `u-20`, `u-57`,
+`u-58`, `u-59`) undisturbed (Running, 0 new restarts); `/api/internal/jobs/claim` and
+`/api/internal/builds/claim` returning 200 (node-0042 agent actively polling the new pod).
+
+**Rollback:** `kubectl -n amd-oneclick-radeon-beta replace -f local-deploy-history/radeon-beta/20260702-2248-dragonfly-merge-PRE-code-overrides.yaml && kubectl -n amd-oneclick-radeon-beta apply -f local-deploy-history/radeon-beta/20260702-2248-dragonfly-merge-PRE-deployment.yaml && kubectl -n amd-oneclick-radeon-beta rollout restart deployment/amd-oneclick-radeon-beta-manager` (restores the pre-merge code line + the `data_mounts.py` mount/volume).
+
+---
+
 ## 2026-06-30 (latest) — Radeon beta: GPU nodes dashboard (admin, beta-only)
 
 **Commit:** `807d286` on `BETA-test` (pushed). New admin "GPU Nodes" tab showing
