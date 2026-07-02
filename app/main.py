@@ -731,10 +731,18 @@ def _ensure_image_on_node(image: str, gpu_count: int) -> Optional[str]:
         return node
     # The Manager resolves the single node's target now; the daemon never expands scope.
     targets = k8s_client.resolve_node_targets([node])
+    # P5 transport: use warm (P2P self-pull of the zot ref) when this image is durable in the LAN
+    # registry (digest recorded by a prior push); otherwise fall back to the SSH byte-push. warm needs
+    # the zot ref, so carry lan_target_ref. Legacy images never pushed to zot keep using distribute.
+    lan_target_ref = _lan_registry_target_ref(image)
+    use_warm = bool(lan_target_ref) and store.image_digest_present(image)
+    payload = {"scope": f"node:{node}", "targets": targets}
+    if use_warm:
+        payload["lan_target_ref"] = lan_target_ref
     enqueue_image_job(
-        kind="distribute",
+        kind="warm" if use_warm else "distribute",
         ref=image,
-        payload={"scope": f"node:{node}", "targets": targets},
+        payload=payload,
     )
     return None
 
@@ -3449,10 +3457,15 @@ def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: st
     # distribute so "ready" means the image is durable in zot. Until P3, distribute stays the
     # transport (it becomes warm in P3).
     lan_target_ref = _lan_registry_target_ref(ref)
+    # P5 transport: when the LAN registry is wired, `push` puts the image in zot and the tail step is
+    # `warm` (each node self-pulls the zot ref through its local Dragonfly dfdaemon → P2P). Without a
+    # LAN registry (dormant/pre-P1), fall back to the SSH byte-push `distribute`. warm forks
+    # distribute's exact target/results contract, so readiness counting is unchanged either way.
+    transport = "warm" if lan_target_ref else "distribute"
     chain = (
         (["acr_backup"] if acr_target_ref else [])
         + (["push"] if lan_target_ref else [])
-        + ["distribute"]
+        + [transport]
     )
     payload = {
         "image_id": image_row["id"],

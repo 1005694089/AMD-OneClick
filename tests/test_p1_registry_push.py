@@ -83,21 +83,36 @@ class ChainWiringTests(unittest.TestCase):
         # Existing registry host stripped, re-homed under the LAN registry.
         self.assertEqual(ref, "10.5.10.43:5000/radeon/image:tag")
 
-    def test_admin_enqueue_chains_push_before_distribute(self):
+    def test_admin_enqueue_chains_push_then_warm_when_lan_registry(self):
+        # P5: with the LAN registry wired, the tail transport is warm (P2P self-pull), not distribute.
         settings.LAN_REGISTRY = "10.5.10.43:5000"
         img = store.upsert_image("demo", "reg/image:tag", "", True)
         main_module._enqueue_admin_image_chain(
             {"id": img["id"], "image": "reg/image:tag"}, "acr_pull", "reg/image:tag"
         )
-        # Head job is pull; its payload chain must contain push then distribute.
         with store.engine.begin() as conn:
             row = conn.execute(
                 store.image_jobs.select().where(store.image_jobs.c.ref == "reg/image:tag")
             ).mappings().first()
         import json
         payload = json.loads(row["payload"])
-        self.assertEqual(payload["chain"], ["push", "distribute"])
+        self.assertEqual(payload["chain"], ["push", "warm"])
         self.assertEqual(payload["lan_target_ref"], "10.5.10.43:5000/reg/image:tag")
+
+    def test_admin_enqueue_falls_back_to_distribute_without_lan_registry(self):
+        # Dormant (no LAN registry): no push, and the SSH byte-push distribute remains the transport.
+        settings.LAN_REGISTRY = ""
+        img = store.upsert_image("demo2", "reg/image2:tag", "", True)
+        main_module._enqueue_admin_image_chain(
+            {"id": img["id"], "image": "reg/image2:tag"}, "acr_pull", "reg/image2:tag"
+        )
+        with store.engine.begin() as conn:
+            row = conn.execute(
+                store.image_jobs.select().where(store.image_jobs.c.ref == "reg/image2:tag")
+            ).mappings().first()
+        import json
+        payload = json.loads(row["payload"])
+        self.assertEqual(payload["chain"], ["distribute"])
 
 
 class LifecycleReadyFlipTests(unittest.TestCase):
