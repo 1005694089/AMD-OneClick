@@ -1230,29 +1230,17 @@ def run_registry_delete(job):
     # on an image that has no registry copy). A 200 yields the digest to delete by. Only a genuine
     # reachability error fails (retryable).
     if not digest:
-        head_cmd = (
-            f"curl -sS -I "
-            f"--cacert {shlex.quote(ZOT_CA_CERT)} "
-            f"-u {shlex.quote(ZOT_USERNAME + ':' + ZOT_PASSWORD)} "
-            f"-H {shlex.quote('Accept: application/vnd.oci.image.manifest.v1+json')} "
-            f"-H {shlex.quote('Accept: application/vnd.docker.distribution.manifest.v2+json')} "
-            f"https://{registry_host}/v2/{repo}/manifests/{tag}"
-        )
-        rc, out = _run_capture(job_id, head_cmd, timeout=60)
-        low = (out or "").lower()
-        if rc == 0 and (" 404 " in (out or "") or "404 not found" in low):
-            push_log(job_id, f"Tag {repo}:{tag} not in zot (never pushed); no registry copy to delete (no-op).\n")
-            report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": False})
-            return
-        # Parse Docker-Content-Digest from the response headers.
-        for line in (out or "").splitlines():
-            if line.lower().startswith("docker-content-digest:"):
-                digest = line.split(":", 1)[1].strip()
-                break
-        if not digest:
-            push_log(job_id, f"Could not resolve digest for {repo}:{tag} from zot (rc={rc}); will retry.\n")
-            report_result(job_id, "failed", {"ref": ref, "error": "digest_unresolved"})
-            return
+        # No digest was captured at delete time. We must NOT resolve the digest from the tag and
+        # delete by it: tags are mutable, so the tag may now point at a DIFFERENT, freshly re-added
+        # image (delete → re-add of the same ref). Deleting the tag-resolved manifest would wipe that
+        # live re-added copy. Deleting by digest is the only safe form; with no captured digest there
+        # is nothing this job can safely remove, so no-op SUCCEED (unblocks purge_meta). Any registry
+        # bytes for the truly-deleted image without a digest are left to zot's online GC / untagged
+        # cleanup rather than risk deleting a newer image under the same tag.
+        push_log(job_id, f"No digest captured for {repo}:{tag}; skipping registry delete to avoid "
+                         f"deleting a possibly re-added image under the same tag (no-op).\n")
+        report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": False, "skipped": "no_captured_digest"})
+        return
     url = f"https://{registry_host}/v2/{repo}/manifests/{digest}"
     cmd = (
         f"curl -sS -o /dev/null -w '%{{http_code}}' -X DELETE "
