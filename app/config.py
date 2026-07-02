@@ -564,7 +564,11 @@ class Settings:
     # admin-enabled image is always offered to users; kubelet pulls on demand
     # (IfNotPresent) when a chosen node has not been pre-warmed.
     # Soft node affinity biases scheduling toward already-warmed nodes.
-    IMAGE_AFFINITY_ENABLED: bool = os.getenv("IMAGE_AFFINITY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # Default OFF: under the Dragonfly P2P image-service model every fleet node is
+    # warmed and pulls peer-to-peer, so warm-node bias is redundant; enabling it also
+    # requires nodes:patch RBAC (the label writer), which the per-service SA lacks by
+    # default. Turn on only where the manager SA is granted nodes:patch.
+    IMAGE_AFFINITY_ENABLED: bool = os.getenv("IMAGE_AFFINITY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     IMAGE_READY_NODE_LABEL_PREFIX: str = os.getenv("IMAGE_READY_NODE_LABEL_PREFIX", "amd-oneclick.io/image-ready-")
     IMAGE_AFFINITY_WEIGHT: int = int(os.getenv("IMAGE_AFFINITY_WEIGHT", "80"))
     # Fraction of eligible prepull nodes that must have pulled before the admin
