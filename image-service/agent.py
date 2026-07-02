@@ -1202,31 +1202,57 @@ def run_registry_delete(job):
         push_log(job_id, "No LAN ref/digest for this image; no registry copy to delete (no-op).\n")
         report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": False})
         return
-    # A registry copy is expected (lan_ref set) but we cannot address it without a digest. Fail so it
-    # retries — but if it never resolves, this is a genuine leak to surface, not silently pass.
-    if not digest:
-        push_log(job_id, "payload.digest missing but a LAN ref exists; cannot DELETE by digest.\n")
-        report_result(job_id, "failed", {"ref": ref, "error": "digest_missing"})
-        return
     # Registry host: prefer the agent's configured LAN_REGISTRY, else derive from lan_ref (C4: don't
     # no-op just because the agent env is empty while a copy demonstrably exists).
     registry_host = LAN_REGISTRY or ((lan_ref or "").split("/", 1)[0] if "/" in (lan_ref or "") else "")
     if not registry_host:
         report_result(job_id, "failed", {"ref": ref, "error": "no_registry_host"})
         return
-    # Derive the repo path (host:port/REPO:tag -> REPO) from the LAN ref, else from ref.
+    # Derive the repo path (host:port/REPO:tag -> REPO) and tag from the LAN ref, else from ref.
     src = lan_ref or ref
     if "/" in src:
         _host, _, rest = src.partition("/")
         # strip a trailing :tag only in the LAST path segment (never the host:port colon)
         slash = rest.rfind("/")
         if slash != -1:
-            repo = rest[:slash + 1] + rest[slash + 1:].split(":", 1)[0]
+            last = rest[slash + 1:]
+            repo = rest[:slash + 1] + last.split(":", 1)[0]
         else:
+            last = rest
             repo = rest.split(":", 1)[0]
+        tag = last.split(":", 1)[1] if ":" in last else "latest"
     else:
         report_result(job_id, "failed", {"ref": ref, "error": "unparseable_repo"})
         return
+    # A LAN ref exists but no digest was recorded (pre-P1 image never pushed to zot, OR the push
+    # result lost its digest). Resolve it FROM ZOT by HEAD-ing the tag: a 404 means the tag was never
+    # pushed -> nothing to delete on this surface -> no-op SUCCESS (so purge_meta isn't stuck forever
+    # on an image that has no registry copy). A 200 yields the digest to delete by. Only a genuine
+    # reachability error fails (retryable).
+    if not digest:
+        head_cmd = (
+            f"curl -sS -I "
+            f"--cacert {shlex.quote(ZOT_CA_CERT)} "
+            f"-u {shlex.quote(ZOT_USERNAME + ':' + ZOT_PASSWORD)} "
+            f"-H {shlex.quote('Accept: application/vnd.oci.image.manifest.v1+json')} "
+            f"-H {shlex.quote('Accept: application/vnd.docker.distribution.manifest.v2+json')} "
+            f"https://{registry_host}/v2/{repo}/manifests/{tag}"
+        )
+        rc, out = _run_capture(job_id, head_cmd, timeout=60)
+        low = (out or "").lower()
+        if rc == 0 and (" 404 " in (out or "") or "404 not found" in low):
+            push_log(job_id, f"Tag {repo}:{tag} not in zot (never pushed); no registry copy to delete (no-op).\n")
+            report_result(job_id, "succeeded", {"ref": ref, "registry_deleted": False})
+            return
+        # Parse Docker-Content-Digest from the response headers.
+        for line in (out or "").splitlines():
+            if line.lower().startswith("docker-content-digest:"):
+                digest = line.split(":", 1)[1].strip()
+                break
+        if not digest:
+            push_log(job_id, f"Could not resolve digest for {repo}:{tag} from zot (rc={rc}); will retry.\n")
+            report_result(job_id, "failed", {"ref": ref, "error": "digest_unresolved"})
+            return
     url = f"https://{registry_host}/v2/{repo}/manifests/{digest}"
     cmd = (
         f"curl -sS -o /dev/null -w '%{{http_code}}' -X DELETE "
