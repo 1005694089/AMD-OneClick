@@ -24,9 +24,70 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-02 (latest) — Radeon beta: merge feature/oauth-credit-manager (reconciler crash-loop reclaim, scheduler off event loop, shared-DB delete safety, auth hardening)
+
+**Code commit:** `2bd2ae2` on `BETA-test` (pushed), merging `feature/oauth-credit-manager`
+(`75f8953`, `c9b2fc7`, `a106567`, `4e4e1b2`, `5b6bd18`, `a253597`) via intermediate branch
+`merge-oauth-reconciler-fixes` (merge commit `3a75878`). Fixes "instance can't be deleted
+properly": the bidirectional reconciler (`reconcile_job`) now also reclaims crash-looping /
+high-restart pods (not just orphans and stuck-terminating pods), and before marking a DB
+record deleted it confirms the pod is truly gone cluster-wide via `k8s_client._pod_exists()`
+rather than only checking this manager's own label scope — preventing it from clobbering
+another manager's instances in the shared Postgres DB. `cleanup_job` and `reconcile_job` run
+as sync functions (dispatched to a worker thread by APScheduler's `AsyncIOExecutor`) instead
+of coroutines, so their blocking k8s API calls no longer starve the event loop (previously
+implicated in intermittent OAuth failures under load). Also brings in Risk1/2/3 hardening from
+`75f8953`: Redis-backed login/signup rate limiting (fails open when Redis is absent, which is
+the case here — `REDIS_URL` unset), admin session-epoch revocation, an authoritative
+background-delete-then-poll-confirm pattern for instance deletion, a ModelScope login fix
+(userinfo 404), and a stale-pod-reuse fix on launch.
+
+**Merge conflicts** (across `app/config.py`, `app/scheduler.py`, `app/k8s_client.py`,
+`app/store.py` — `main.py`/`requirements.txt` auto-merged clean): additive settings blocks
+concatenated (zero name collisions, confirmed via `sort | uniq -d`); added the
+`_skip_not_leader()` leader-election guard to `reconcile_job`/`image_sync_refresh_job`, which
+had lacked it unlike every other scheduled job, for consistency; removed the feature branch's
+now-superseded DaemonSet-based `get_image_sync_status`/`_pulled_nodes_for_image` in favor of
+HEAD's DB-backed `get_image_sync_status(image_id, image=None)` (via
+`store.list_nodes_for_image`), and rewired `reconcile_image_ready_labels()` accordingly.
+Restored `_normalize_image_ref` (a static method still depended on by `_image_ready_label_key`)
+after that dead-code removal — this was the one point where deleting "dead" code broke a live
+caller; caught by the test suite (7 failures), fixed, then 245/245 passed. 245 tests passing
+(unchanged count from before this merge; no new tests added, all pre-existing coverage green).
+
+**Deploy mechanism:** regenerated `amd-oneclick-radeon-beta-code-overrides` ConfigMap (24 keys:
+added new `redis_client.py`; refreshed `config.py`, `k8s_client.py`, `main.py`, `scheduler.py`,
+`store.py`; 18 other keys unchanged) via `kubectl replace` (avoids the `apply`
+last-applied-configuration annotation-size limit on this large manifest). Patched the
+Deployment via `kubectl patch --type=json` to add the `redis_client.py` subPath volumeMount
+(`/app/app/redis_client.py`), mirroring the existing `leader.py`/`purge_exec.py` mounts. Then
+`rollout restart`. No image rebuild (image unchanged), no Postgres change, no config-CM
+(env) change — all new settings (`RECONCILE_ENABLED`, `RATE_LIMIT_ENABLED`,
+`IMAGE_AFFINITY_ENABLED`, etc.) run on their code defaults since `REDIS_URL` is unset (rate
+limiting fails open, exactly as designed) and no override was added.
+
+| Service / Port | Image (`:tag`) | Code-overrides sha256 (PRE) | Code-overrides sha256 (APPLIED) | Snapshot |
+|----------------|----------------|------------------------------|-----------------------------------|----------|
+| radeon-beta / 30444 | `crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-image-service-20260625` (image unchanged) + `code-overrides` ConfigMap | `19f01b6671c4bfc3abc15de2d0bf47b96b45bca02e56cf9a3391dc3e195a8c6f` | `9f620add6b3aead12a4f15ae14d4aa16f4fbb258697bcb3e8fc0bb58543c0bab` | `local-deploy-history/radeon-beta/20260702-1051-oauth-merge-{PRE,APPLIED}-{code-overrides,deployment}.yaml` |
+
+**Verification:** rollout `1/1 ready` (new pod `amd-oneclick-radeon-beta-manager-797545dc4b-z5f7c`,
+0 restarts, old pod terminated cleanly). In-pod: `app.main`, `app.scheduler`, `app.k8s_client`,
+`app.store`, `app.redis_client`, `app.config` all import cleanly; `k8s_client._normalize_image_ref`
+and `k8s_client._pod_exists` both present; `settings.RECONCILE_ENABLED=True`,
+`settings.RATE_LIMIT_ENABLED=True`, `settings.REDIS_URL=''`, `settings.IMAGE_AFFINITY_ENABLED=True`
+(all code defaults, as intended — no config-CM override added). Scheduler log confirms all 8 jobs
+registered including "Reconcile cluster instances against the database" (interval 60s) and
+"Refresh image prepull status and node-ready labels" (interval 120s); reconcile job ran
+successfully post-deploy: `Reconcile done: orphans=0 terminal=0 stuck=0 db_marked=0 cluster_pods=6
+active_db=6` (steady state, no false reclaims). `https://radeon-beta.anruicloud.com/health` and
+`/` both 200. All 6 pre-existing running user instances (`u-13`, `u-18`, `u-20`, `u-57`, `u-58`,
+`u-59`) undisturbed (Running, no new restarts from this deploy).
+
+**Rollback:** `kubectl -n amd-oneclick-radeon-beta replace -f local-deploy-history/radeon-beta/20260702-1051-oauth-merge-PRE-code-overrides.yaml && kubectl -n amd-oneclick-radeon-beta apply -f local-deploy-history/radeon-beta/20260702-1051-oauth-merge-PRE-deployment.yaml && kubectl -n amd-oneclick-radeon-beta rollout restart deployment/amd-oneclick-radeon-beta-manager` (restores the pre-merge code line and removes the `redis_client.py` mount).
+
 ---
 
-## 2026-07-02 (latest) — Radeon beta: merge feat/dragonfly-p2p-100plus-nodes into BETA-test
+## 2026-07-02 — Radeon beta: merge feat/dragonfly-p2p-100plus-nodes into BETA-test
 
 **Code commit:** `7ce6e4c` (merge of `feat/dragonfly-p2p-100plus-nodes` into `BETA-test`,
 merge-base `7909740`). Includes a review fix folded into the merge commit: `claim_next_image_job`'s
