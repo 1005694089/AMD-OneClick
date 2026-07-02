@@ -315,7 +315,8 @@ findmnt "$mnt"
             raise ValueError(f"Invalid resource profile '{resource_profile}'. Allowed values: {allowed}")
         return profile, RESOURCE_PROFILES[profile]
 
-    def _service_launch_snippet(self, instance_id: str, notebook_dir: str) -> str:
+    def _service_launch_snippet(self, instance_id: str, notebook_dir: str,
+                                pod_type: Optional[str] = None) -> str:
         """Launch Jupyter Lab and OpenCode web side by side.
 
         Security model: both services are on NodePorts and both require a credential.
@@ -332,16 +333,53 @@ findmnt "$mnt"
         never masquerade as a healthy, still-billable pod kept alive by a lingering OpenCode.
         """
         base_url = self._jupyter_base_url(instance_id)
+        # Hackathon pods enable JupyterLab real-time collaboration so participants sharing a pod
+        # see each other's edits live. The flag is `--collaborative` (JupyterLab 4.x) — NOT
+        # `--collaborate`, which jupyter-lab rejects with a usage error (exit 2).
+        #
+        # CRITICAL (verified on the base image): `--collaborative` is NOT a graceful no-op when the
+        # `jupyter_collaboration` extension is missing — jupyter-lab HARD-EXITS with code 1
+        # ("cannot start, because jupyter_collaboration was configured but cannot be imported").
+        # _build_startup_script best-effort pip-installs the extension, but that fetch can fail
+        # (mirror throttling / DNS). So we must NOT pass the flag unconditionally: we gate it at
+        # launch on the extension actually being importable, computed here in shell. If the install
+        # failed, COLLAB_FLAG stays empty and Jupyter launches normally (RTC just off) instead of
+        # crash-looping the pod.
+        if pod_type == "hackathon":
+            # Gate the flag on the extension being visible to JUPYTER's own environment, checked via
+            # `jupyter labextension list` — NOT a bare `python3 -c import`. The export PATH above
+            # puts /usr/bin ahead of the venv, so `python3` can resolve to the system interpreter
+            # while `jupyter` runs from /opt/venv; a bare python import then reports the extension
+            # missing even after a successful venv install, silently disabling collaboration.
+            # `jupyter labextension list` always runs under the same interpreter `jupyter lab` will,
+            # so it reflects exactly what the server will see at startup. NOTE: it prints its listing
+            # to STDERR, not stdout — so we merge 2>&1 before grep; piping 2>/dev/null would discard
+            # the very lines we match on and the gate would always fail.
+            collab_gate = (
+                "COLLAB_FLAG=\"\"\n"
+                "if jupyter labextension list 2>&1 | grep -qi collaboration; then\n"
+                "    COLLAB_FLAG=\"--collaborative\"\n"
+                "    echo \"[oneclick] jupyter_collaboration present; enabling real-time collaboration.\"\n"
+                "else\n"
+                "    echo \"[oneclick] jupyter_collaboration missing; starting Jupyter WITHOUT collaboration.\"\n"
+                "fi\n"
+            )
+            collab_flag_ref = "$COLLAB_FLAG "
+        else:
+            collab_gate = ""
+            collab_flag_ref = ""
         return (
             "set +e\n"
             "export PATH=\"/usr/local/bin:/usr/bin:/root/.opencode/bin:$PATH\"\n"
             ": > /tmp/opencode-web.log\n"
+            f"{collab_gate}"
             # CRITICAL: start Jupyter FIRST and never block it on OpenCode. OpenCode is opt-in and
             # its installer fetches from opencode.ai/github (intermittently throttled from
             # cn-shanghai); a blocking, un-timed install there used to hang the whole startup so
             # Jupyter never launched and the instance was stuck "JupyterStarting". Jupyter is the
             # required process — launch it immediately; reconcile + run OpenCode in the background.
             f"jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root "
+            f"{collab_flag_ref}"
             f"--ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{base_url}' "
             f"--notebook-dir={notebook_dir} &\n"
             "JUPYTER_PID=$!\n"
@@ -373,7 +411,8 @@ findmnt "$mnt"
 
     def _build_startup_script(self, instance_id: str,
                               instance_type: str = "jupyter",
-                              github_info: Optional[dict] = None) -> str:
+                              github_info: Optional[dict] = None,
+                              pod_type: Optional[str] = None) -> str:
         """Build startup script based on instance type"""
         workspace = shlex.quote(settings.WORKSPACE_MOUNT_PATH)
         model_link_script = f"""
@@ -397,6 +436,21 @@ if ! command -v jupyter >/dev/null 2>&1; then
     hash -r 2>/dev/null || true
 fi
 """
+        # Hackathon pods run JupyterLab with --collaborative (real-time collaboration), which
+        # requires the `jupyter-collaboration` server extension that the base image does not ship.
+        # Install it here, best-effort, before launch. Scoped to hackathon pods so non-hackathon
+        # startups are unchanged. If this install fails (mirror/DNS), the launch snippet's runtime
+        # import gate drops the flag so Jupyter still starts instead of crash-looping.
+        collaboration_ensure = ""
+        if pod_type == "hackathon":
+            collaboration_ensure = f"""
+if ! jupyter labextension list 2>&1 | grep -qi collaboration; then
+    echo "[oneclick] Installing jupyter-collaboration for hackathon RTC via Tsinghua mirror..."
+    pip install --no-cache-dir -i {settings.PIP_INDEX_URL} --trusted-host {settings.PYPI_HOST} jupyter-collaboration 2>&1 | tail -8 || pip3 install --no-cache-dir -i {settings.PIP_INDEX_URL} --trusted-host {settings.PYPI_HOST} jupyter-collaboration 2>&1 | tail -8 || echo "[oneclick] jupyter-collaboration install failed; collaboration disabled."
+    hash -r 2>/dev/null || true
+fi
+"""
+        jupyter_ensure = jupyter_ensure + collaboration_ensure
         if github_info:
             notebook_path = github_info["path"].lstrip("/")
             notebook_filename = notebook_path.split("/")[-1]
@@ -446,7 +500,7 @@ fi
 cd {workspace}/repo
 {notebook_check}
 {jupyter_ensure}
-{self._service_launch_snippet(instance_id, f"{workspace}/repo")}"""
+{self._service_launch_snippet(instance_id, f"{workspace}/repo", pod_type=pod_type)}"""
             return f"""
 {model_link_script}
 mkdir -p {workspace}/notebooks
@@ -482,7 +536,7 @@ if [ ! -f {shlex.quote(notebook_filename)} ]; then
 fi
 
 {jupyter_ensure}
-{self._service_launch_snippet(instance_id, f"{workspace}/notebooks")}"""
+{self._service_launch_snippet(instance_id, f"{workspace}/notebooks", pod_type=pod_type)}"""
 
         if instance_type == "opencode":
             return f"""
@@ -490,7 +544,7 @@ export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 cd {workspace}
 {jupyter_ensure}
-{self._service_launch_snippet(instance_id, workspace)}"""
+{self._service_launch_snippet(instance_id, workspace, pod_type=pod_type)}"""
 
         # Default: jupyter
         return f"""
@@ -498,7 +552,7 @@ export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 cd {workspace}
 {jupyter_ensure}
-{self._service_launch_snippet(instance_id, workspace)}"""
+{self._service_launch_snippet(instance_id, workspace, pod_type=pod_type)}"""
 
     def _notebook_download_url(self, raw_url: str) -> str:
         endpoint = settings.HF_ENDPOINT.strip().rstrip("/")
@@ -667,7 +721,7 @@ exec {cmd}
                 start_command=start_command, app_port=app_port,
             )
         else:
-            startup_script = self._build_startup_script(instance_id, instance_type, github_info)
+            startup_script = self._build_startup_script(instance_id, instance_type, github_info, pod_type=pod_type)
 
         ssh_enabled = bool(ssh_enabled)
         if ssh_enabled:
