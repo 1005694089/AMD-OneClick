@@ -1323,13 +1323,21 @@ def upsert_image(name: str, image: str, description: str = "", enabled: bool = T
         if image_id:
             conn.execute(update(images).where(images.c.id == image_id).values(**values))
             return row_to_dict(conn.execute(select(images).where(images.c.id == image_id)).mappings().first())
+        # Wrap the INSERT in a SAVEPOINT: on PostgreSQL an IntegrityError aborts the WHOLE
+        # transaction, so the recovery SELECT/UPDATE below would raise InFailedSqlTransaction (which
+        # is exactly what surfaced as a 500 when an admin re-added an existing image ref/name). A
+        # nested transaction rolls back only the failed INSERT and leaves the outer tx usable, so a
+        # duplicate ref/name cleanly UPDATES the existing row (upsert) instead of erroring.
         try:
-            result = conn.execute(images.insert().values(**values, created_at=now))
-            new_id = result.inserted_primary_key[0]
+            with conn.begin_nested():
+                result = conn.execute(images.insert().values(**values, created_at=now))
+                new_id = result.inserted_primary_key[0]
         except IntegrityError:
             existing = conn.execute(select(images).where(images.c.image == image)).mappings().first()
             if not existing:
                 existing = conn.execute(select(images).where(images.c.name == name)).mappings().first()
+            if not existing:
+                raise
             conn.execute(update(images).where(images.c.id == existing["id"]).values(**values))
             new_id = existing["id"]
         return row_to_dict(conn.execute(select(images).where(images.c.id == new_id)).mappings().first())
