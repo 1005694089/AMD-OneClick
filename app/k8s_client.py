@@ -112,6 +112,43 @@ class K8sClient:
             "instance-id": instance_id,
             "email-hash": hashlib.md5(email.lower().encode()).hexdigest()[:16],
         }
+
+    def _image_ready_label_key(self, image_ref: str) -> str:
+        """Node label key marking that a specific image is warm on the node.
+
+        Derived from a hash of the normalized image ref so the affinity injector
+        (which only knows the image string) and the label reconciler compute the
+        same key without a DB round-trip. Prefix carries the domain part, the
+        suffix stays well under the 63-char label-name limit.
+        """
+        digest = hashlib.md5(self._normalize_image_ref(image_ref).encode()).hexdigest()[:16]
+        return f"{settings.IMAGE_READY_NODE_LABEL_PREFIX}{digest}"
+
+    def _image_affinity(self, image_ref: str) -> Optional[dict]:
+        """Soft (preferred) node affinity biasing scheduling toward nodes that
+        already have the image pulled. Soft is intentional: when no node is
+        pre-warmed the pod still schedules anywhere and kubelet pulls on demand.
+        """
+        if not settings.IMAGE_AFFINITY_ENABLED or not image_ref:
+            return None
+        return {
+            "nodeAffinity": {
+                "preferredDuringSchedulingIgnoredDuringExecution": [
+                    {
+                        "weight": max(1, min(100, settings.IMAGE_AFFINITY_WEIGHT)),
+                        "preference": {
+                            "matchExpressions": [
+                                {
+                                    "key": self._image_ready_label_key(image_ref),
+                                    "operator": "In",
+                                    "values": ["true"],
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
     
     def _jupyter_base_url(self, instance_id: str) -> str:
         return f"/instances/{instance_id}/"
@@ -1026,6 +1063,13 @@ findmnt "$mnt"
             spec["initContainers"] = init_containers
         if notebook_node_name:
             spec["nodeName"] = notebook_node_name
+        else:
+            # Soft-prefer nodes that already have this image warm. Skipped when
+            # the pod is pinned to a specific node (nodeName) since affinity is
+            # then moot.
+            affinity = self._image_affinity(image)
+            if affinity:
+                spec["affinity"] = affinity
 
         # A preloaded ref is served from the node's local containerd store, so no
         # registry credentials are needed (and attaching them is wrong — the ref has
@@ -1056,9 +1100,27 @@ findmnt "$mnt"
 
     def _get_service_manifest(self, email: str, instance_id: str, node_port: int,
                               opencode_node_port: Optional[int] = None,
-                              ssh_node_port: Optional[int] = None) -> dict:
+                              ssh_node_port: Optional[int] = None,
+                              owner_uid: Optional[str] = None) -> dict:
         """Generate Service manifest exposing Jupyter, OpenCode web, and optional SSH."""
         labels = self._get_labels(email, instance_id)
+        metadata = {
+            "name": f"{instance_id}-svc",
+            "namespace": self.namespace,
+            "labels": labels,
+        }
+        # Own the Service by the Pod so Kubernetes garbage-collects it whenever
+        # the Pod is deleted (including the reconciler's force-delete path,
+        # which only targets the Pod). Prevents leaked Services/NodePorts.
+        if owner_uid:
+            metadata["ownerReferences"] = [{
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "name": instance_id,
+                "uid": owner_uid,
+                "blockOwnerDeletion": False,
+                "controller": False,
+            }]
 
         ports = [
             {
@@ -1086,11 +1148,7 @@ findmnt "$mnt"
         return {
             "apiVersion": "v1",
             "kind": "Service",
-            "metadata": {
-                "name": f"{instance_id}-svc",
-                "namespace": self.namespace,
-                "labels": labels,
-            },
+            "metadata": metadata,
             "spec": {
                 "selector": labels,
                 "type": "NodePort",
@@ -1206,6 +1264,33 @@ exit 0
             "already allocated" in message or "provided port" in message
         )
 
+    @staticmethod
+    def _normalize_image_ref(ref: str) -> str:
+        """Canonicalize a docker image reference for reliable comparison.
+
+        kubelet reports container status images in fully-qualified form
+        (e.g. ``docker.io/library/nginx:latest``) while the catalog may store
+        short names (e.g. ``nginx`` or ``rocm/atom-dev:tag``). Normalize both
+        sides so the sync counter matches regardless of how it was entered.
+        """
+        if not ref:
+            return ref
+        ref = ref.strip()
+        # Separate digest if present (keep it as-is, it is already canonical).
+        digest = ""
+        if "@" in ref:
+            ref, digest = ref.split("@", 1)
+            digest = "@" + digest
+        first = ref.split("/", 1)[0]
+        has_registry = "." in first or ":" in first or first == "localhost"
+        if not has_registry:
+            if "/" not in ref:
+                ref = "library/" + ref
+            ref = "docker.io/" + ref
+        if not digest and ":" not in ref.rsplit("/", 1)[-1]:
+            ref = ref + ":latest"
+        return ref + digest
+
     def _allocate_instance_node_ports(self, used_ports: Optional[set[int]] = None,
                                       start_port: Optional[int] = None,
                                       ssh_enabled: bool = False) -> tuple[int, int, Optional[int]]:
@@ -1221,7 +1306,8 @@ exit 0
         return jupyter_port, opencode_port, ssh_node_port
 
     def _create_service_with_nodeport_retry(self, email: str, instance_id: str,
-                                            ssh_enabled: bool = False) -> tuple:
+                                            ssh_enabled: bool = False,
+                                            owner_uid: Optional[str] = None) -> tuple:
         """Create the instance Service.
 
         Returns (jupyter_node_port, opencode_node_port, created) by default to
@@ -1257,7 +1343,7 @@ exit 0
                 try:
                     self.core_v1.create_namespaced_service(
                         namespace=self.namespace,
-                        body=self._get_service_manifest(email, instance_id, node_port, opencode_port, ssh_node_port),
+                        body=self._get_service_manifest(email, instance_id, node_port, opencode_port, ssh_node_port, owner_uid=owner_uid),
                     )
                     logger.info(
                         "Created service %s-svc with NodePorts jupyter=%s opencode=%s ssh=%s",
@@ -1717,6 +1803,59 @@ exit 0
             "completed": status == "ready",
         }
 
+
+    def reconcile_image_ready_labels(self, catalog: list[dict]) -> dict:
+        """Project per-image prepull warmth onto node labels so the pod-level
+        soft affinity can steer scheduling toward already-warmed nodes.
+
+        `catalog` is a list of {"id", "image"} dicts. For each node we add the
+        image-ready label where the image is warm and remove it where it is not.
+        Requires nodes:patch RBAC; failures are logged and skipped.
+        """
+        if not settings.IMAGE_AFFINITY_ENABLED:
+            return {"updated_nodes": 0, "images": 0}
+        try:
+            nodes = self.core_v1.list_node()
+        except ApiException as e:
+            logger.warning("reconcile_image_ready_labels: cannot list nodes: %s", e)
+            return {"updated_nodes": 0, "images": 0, "error": str(e)}
+
+        # Desired label -> set(node names) it should be present on.
+        desired_by_key: dict[str, set[str]] = {}
+        managed_keys: set[str] = set()
+        for entry in catalog:
+            image_ref = entry.get("image")
+            image_id = entry.get("id")
+            if not image_ref or image_id is None:
+                continue
+            key = self._image_ready_label_key(image_ref)
+            managed_keys.add(key)
+            try:
+                desired_by_key[key] = set(store.list_nodes_for_image(image_ref))
+            except Exception as e:
+                logger.warning("reconcile_image_ready_labels: pulled nodes lookup failed for image %s: %s", image_id, e)
+                desired_by_key[key] = set()
+
+        updated = 0
+        for node in nodes.items:
+            node_name = node.metadata.name
+            current = node.metadata.labels or {}
+            patch_labels: dict[str, Optional[str]] = {}
+            for key in managed_keys:
+                should_have = node_name in desired_by_key.get(key, set())
+                has = current.get(key) == "true"
+                if should_have and not has:
+                    patch_labels[key] = "true"
+                elif has and not should_have:
+                    patch_labels[key] = None  # merge-patch null removes the label
+            if patch_labels:
+                try:
+                    self.core_v1.patch_node(node_name, {"metadata": {"labels": patch_labels}})
+                    updated += 1
+                except ApiException as e:
+                    logger.warning("reconcile_image_ready_labels: patch node %s failed: %s", node_name, e)
+        return {"updated_nodes": updated, "images": len(managed_keys)}
+
     def delete_image_sync(self, image_id: int):
         # Image-service mode: there is no prepull DaemonSet/probe to tear down. Node
         # eviction (image_nodes cleanup + ssh ctr rm) is orchestrated by the DELETE
@@ -1887,7 +2026,28 @@ exit 0
             else:
                 raise
         if existing_pod is not None and existing_pod.metadata.deletion_timestamp is None:
-            return self.get_instance_by_id(instance_id)
+            # A pod already exists for this (per-user) instance_id. Only reuse it
+            # if it matches the requested launch (idempotent double-submit of the
+            # SAME launch). If it differs (e.g. the user picked a different
+            # template/type, or it is a stale pod left over from a delete that
+            # did not fully sync), REPLACE it — otherwise we would silently hand
+            # back the old instance instead of the one the user just requested.
+            try:
+                existing_image = existing_pod.spec.containers[0].image
+            except Exception:
+                existing_image = None
+            existing_type = (existing_pod.metadata.annotations or {}).get("amd-oneclick/instance-type", "jupyter")
+            if existing_image == image and existing_type == instance_type:
+                logger.info("Reusing matching existing pod %s (image/type identical)", instance_id)
+                return self.get_instance_by_id(instance_id)
+            logger.info(
+                "Existing pod %s differs from requested launch (image %s->%s, type %s->%s); replacing",
+                instance_id, existing_image, image, existing_type, instance_type,
+            )
+            # Issue the delete without a long blocking wait; the terminating-wait
+            # loop below (breaks on 404) handles confirming removal before we
+            # recreate the pod with the requested spec.
+            self.delete_instance_by_id(instance_id, wait=False)
         if existing_pod is not None:
             logger.info("Pod %s is terminating; waiting for deletion before recreate", instance_id)
             for _ in range(30):
@@ -1926,12 +2086,14 @@ exit 0
             pod_type=pod_type,
             api_launched=api_launched,
         )
+        pod_uid = None
         for attempt in range(1, 7):
             try:
-                self.core_v1.create_namespaced_pod(
+                created_pod = self.core_v1.create_namespaced_pod(
                     namespace=self.namespace,
                     body=pod_manifest
                 )
+                pod_uid = created_pod.metadata.uid
                 logger.info(f"Created pod {instance_id} for {email} (type={instance_type})")
                 break
             except ApiException as e:
@@ -1947,6 +2109,7 @@ exit 0
                 email,
                 instance_id,
                 ssh_enabled=ssh_enabled,
+                owner_uid=pod_uid,
             )
             if ssh_enabled:
                 node_port, opencode_node_port, ssh_node_port, service_created = service_result
@@ -2050,35 +2213,78 @@ exit 0
                 return None
             raise
     
-    def delete_instance_by_id(self, instance_id: str) -> bool:
-        """Delete a notebook instance by instance ID"""
-        deleted = False
-        
-        # Delete Service
+    def _pod_exists(self, instance_id: str) -> bool:
         try:
-            self.core_v1.delete_namespaced_service(
-                name=f"{instance_id}-svc",
-                namespace=self.namespace
-            )
-            logger.info(f"Deleted service {instance_id}-svc")
-            deleted = True
+            self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+            return True
+        except ApiException as e:
+            if e.status == 404:
+                return False
+            raise
+
+    def _delete_service(self, instance_id: str, grace_period_seconds: Optional[int] = None):
+        body = None
+        if grace_period_seconds is not None:
+            body = client.V1DeleteOptions(grace_period_seconds=grace_period_seconds, propagation_policy="Background")
+        else:
+            body = client.V1DeleteOptions(propagation_policy="Background")
+        try:
+            self.core_v1.delete_namespaced_service(name=f"{instance_id}-svc", namespace=self.namespace, body=body)
+            logger.info("Requested delete of service %s-svc", instance_id)
         except ApiException as e:
             if e.status != 404:
-                logger.warning(f"Error deleting service: {e}")
-        
-        # Delete Pod
+                logger.warning("Error deleting service %s-svc: %s", instance_id, e)
+
+    def _delete_pod(self, instance_id: str, grace_period_seconds: Optional[int] = None):
+        body = client.V1DeleteOptions(propagation_policy="Background")
+        if grace_period_seconds is not None:
+            body.grace_period_seconds = grace_period_seconds
         try:
-            self.core_v1.delete_namespaced_pod(
-                name=instance_id,
-                namespace=self.namespace
-            )
-            logger.info(f"Deleted pod {instance_id}")
-            deleted = True
+            self.core_v1.delete_namespaced_pod(name=instance_id, namespace=self.namespace, body=body)
+            logger.info("Requested delete of pod %s (grace=%s)", instance_id, grace_period_seconds)
         except ApiException as e:
             if e.status != 404:
-                logger.warning(f"Error deleting pod: {e}")
-        
-        return deleted
+                logger.warning("Error deleting pod %s: %s", instance_id, e)
+
+    def delete_instance_by_id(self, instance_id: str, wait: bool = True) -> bool:
+        """Authoritatively delete a notebook instance.
+
+        Issues a graceful delete of the Service and Pod, then polls until the
+        Pod is truly gone. If the Pod is still present after
+        DELETE_CONFIRM_TIMEOUT_SECONDS (e.g. wedged on a NotReady node or a
+        finalizer), it escalates to a force delete (grace period 0).
+
+        Returns True only when the Pod is confirmed absent, so callers can rely
+        on it before marking the instance deleted in the database. A stuck Pod
+        returns False and is left for the reconciler to finalize, keeping the DB
+        consistent with cluster reality.
+        """
+        self._delete_service(instance_id)
+        self._delete_pod(instance_id)
+
+        if not wait:
+            return not self._pod_exists(instance_id)
+
+        deadline = time.monotonic() + max(0, settings.DELETE_CONFIRM_TIMEOUT_SECONDS)
+        interval = max(0.5, settings.DELETE_POLL_INTERVAL_SECONDS)
+        while time.monotonic() < deadline:
+            if not self._pod_exists(instance_id):
+                logger.info("Confirmed pod %s is gone", instance_id)
+                return True
+            time.sleep(interval)
+
+        # Escalate: force delete and give it one more short confirmation window.
+        logger.warning("Pod %s still present after graceful delete; force deleting", instance_id)
+        self._delete_pod(instance_id, grace_period_seconds=0)
+        force_deadline = time.monotonic() + max(5, int(interval * 5))
+        while time.monotonic() < force_deadline:
+            if not self._pod_exists(instance_id):
+                logger.info("Confirmed pod %s is gone after force delete", instance_id)
+                return True
+            time.sleep(interval)
+
+        logger.error("Pod %s still present after force delete; leaving for reconciler", instance_id)
+        return False
     
     def delete_instance(self, email: str) -> bool:
         """Delete a notebook instance"""
@@ -2168,6 +2374,51 @@ exit 0
                 deleted_count += 1
         
         return deleted_count
+
+    def list_managed_pod_states(self) -> list[dict]:
+        """Lightweight lifecycle view of every pod carrying our app label.
+
+        Used by the reconciler to reconcile cluster truth against the DB
+        (orphan detection, stuck-Terminating detection) without the per-pod
+        Service reads that list_instances() performs.
+        """
+        states: list[dict] = []
+        now = datetime.now(timezone.utc)
+        # Intentionally NOT swallowing errors: a failed listing must propagate so
+        # the reconciler aborts the cycle rather than mistaking an API failure
+        # for "no pods exist" and marking every instance deleted.
+        pods = self.core_v1.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector=f"app={settings.NOTEBOOK_LABEL_PREFIX}",
+        )
+        for pod in pods.items:
+            instance_id = (pod.metadata.labels or {}).get("instance-id") or pod.metadata.name
+            created = pod.metadata.creation_timestamp
+            age = int((now - created.replace(tzinfo=timezone.utc)).total_seconds()) if created else 0
+            deletion_ts = pod.metadata.deletion_timestamp
+            terminating_seconds = None
+            if deletion_ts:
+                terminating_seconds = int((now - deletion_ts.replace(tzinfo=timezone.utc)).total_seconds())
+            # Container-level signals for terminal / broken detection.
+            restart_count = 0
+            waiting_reason = ""
+            for cs in (pod.status.container_statuses or []):
+                restart_count += int(cs.restart_count or 0)
+                w = getattr(cs.state, "waiting", None) if cs.state else None
+                if w and w.reason:
+                    waiting_reason = w.reason
+            states.append({
+                "instance_id": instance_id,
+                "pod_name": pod.metadata.name,
+                "email": (pod.metadata.annotations or {}).get("amd-oneclick/email", "unknown"),
+                "phase": (pod.status.phase or "unknown").lower(),
+                "terminating": deletion_ts is not None,
+                "terminating_seconds": terminating_seconds,
+                "age_seconds": age,
+                "restart_count": restart_count,
+                "waiting_reason": waiting_reason,
+            })
+        return states
     
     def get_pod_status(self, email: str, instance_id: Optional[str] = None) -> Optional[str]:
         """Get the current status of a pod"""

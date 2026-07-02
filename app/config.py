@@ -520,6 +520,57 @@ class Settings:
     # long: the reaper will not requeue distribute/evict onto it and launches route around it. After the
     # window expires it becomes eligible again (recovery may have cleared the wedge in the meantime).
     NODE_QUARANTINE_SECONDS: int = int(os.getenv("NODE_QUARANTINE_SECONDS", "1800"))
+    # --- Risk 1: signup abuse / session revocation / rate limiting ---
+    # Credits granted to a brand-new account on first login. Kept low so a
+    # scripted throwaway OAuth account is not worth farming for GPU time.
+    SIGNUP_BONUS_CREDITS: int = int(os.getenv("SIGNUP_BONUS_CREDITS", "2"))
+    # Redis is used for login/registration rate limiting and (optionally) as a
+    # fast cache for the per-user session epoch. Everything degrades gracefully
+    # when REDIS_URL is empty or Redis is unreachable.
+    REDIS_URL: str = os.getenv("REDIS_URL", "")
+    RATE_LIMIT_ENABLED: bool = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # Per client IP. login = OAuth start/callback bursts; signup = new-account creation.
+    LOGIN_RATE_LIMIT_PER_MINUTE: int = int(os.getenv("LOGIN_RATE_LIMIT_PER_MINUTE", "20"))
+    SIGNUP_RATE_LIMIT_PER_DAY: int = int(os.getenv("SIGNUP_RATE_LIMIT_PER_DAY", "5"))
+
+    # --- Risk 2: authoritative deletion & reconciliation ---
+    # After issuing a graceful delete we poll until the pod is truly gone; if it
+    # is still present after this window we escalate to a force delete (grace 0).
+    DELETE_CONFIRM_TIMEOUT_SECONDS: int = int(os.getenv("DELETE_CONFIRM_TIMEOUT_SECONDS", "30"))
+    DELETE_POLL_INTERVAL_SECONDS: float = float(os.getenv("DELETE_POLL_INTERVAL_SECONDS", "2"))
+    # Reconciler: adopt cluster as source of truth for instance lifecycle.
+    RECONCILE_ENABLED: bool = os.getenv("RECONCILE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    RECONCILE_INTERVAL_SECONDS: int = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
+    # Circuit breaker: if a single cycle would reclaim more orphans than this,
+    # refuse and alert instead of mass-deleting (protects against a logic/DB
+    # fault that misclassifies healthy instances as orphans).
+    RECONCILE_MAX_DELETES_PER_CYCLE: int = int(os.getenv("RECONCILE_MAX_DELETES_PER_CYCLE", "10"))
+    # A pod carrying our label but with no matching active DB record for at least
+    # this long is treated as an orphan (e.g. a rogue/miner pod) and reclaimed.
+    ORPHAN_GRACE_SECONDS: int = int(os.getenv("ORPHAN_GRACE_SECONDS", "300"))
+    # A pod stuck Terminating past this window is force-deleted.
+    TERMINATING_GRACE_SECONDS: int = int(os.getenv("TERMINATING_GRACE_SECONDS", "180"))
+    # Terminal / broken instance reclamation. Failed & Succeeded pods are dead
+    # weight; CrashLoopBackOff pods keep holding their GPU while restarting
+    # forever. The billing loop never removes these (they are never "ready"), so
+    # the reconciler reclaims them. CrashLoop is only reclaimed once it has
+    # restarted at least this many times AND run past ORPHAN_GRACE_SECONDS, so a
+    # brief startup crash-loop that recovers is not killed prematurely.
+    RECLAIM_TERMINAL_ENABLED: bool = os.getenv("RECLAIM_TERMINAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    CRASHLOOP_RESTART_THRESHOLD: int = int(os.getenv("CRASHLOOP_RESTART_THRESHOLD", "10"))
+
+    # --- Risk 3: image availability vs. prepull warmth ---
+    # Prepull is a best-effort warm cache, NOT an availability gate. An
+    # admin-enabled image is always offered to users; kubelet pulls on demand
+    # (IfNotPresent) when a chosen node has not been pre-warmed.
+    # Soft node affinity biases scheduling toward already-warmed nodes.
+    IMAGE_AFFINITY_ENABLED: bool = os.getenv("IMAGE_AFFINITY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    IMAGE_READY_NODE_LABEL_PREFIX: str = os.getenv("IMAGE_READY_NODE_LABEL_PREFIX", "amd-oneclick.io/image-ready-")
+    IMAGE_AFFINITY_WEIGHT: int = int(os.getenv("IMAGE_AFFINITY_WEIGHT", "80"))
+    # Fraction of eligible prepull nodes that must have pulled before the admin
+    # UI shows the image as "ready" (display only; does not hide the image).
+    PREPULL_READY_THRESHOLD: float = float(os.getenv("PREPULL_READY_THRESHOLD", "0.8"))
+    IMAGE_SYNC_REFRESH_INTERVAL_SECONDS: int = int(os.getenv("IMAGE_SYNC_REFRESH_INTERVAL_SECONDS", "120"))
 
 
 settings = Settings()

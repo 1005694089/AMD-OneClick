@@ -28,6 +28,7 @@ import websockets
 from kubernetes.client.rest import ApiException
 
 from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
+from .redis_client import rate_limit_ok
 from .models import (
     NotebookRequest, 
     NotebookStatus, 
@@ -84,6 +85,7 @@ from .store import (
     get_template_preview_cache,
     get_user_by_provider,
     get_user,
+    bump_user_token_version,
     ensure_user_min_credits,
     grant_initial_credits_once,
     grant_user_credits,
@@ -248,12 +250,19 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials.username
 
 
+def _session_epoch_valid(request: Request, user: dict) -> bool:
+    """A session is only valid while its embedded epoch matches the user's
+    current token_version. Bumping token_version (admin revocation) invalidates
+    every outstanding cookie for that user."""
+    return int(request.session.get("sv", 0)) == int(user.get("token_version", 0))
+
+
 def current_user(request: Request) -> dict:
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Login required")
     user = get_user(int(user_id))
-    if not user:
+    if not user or not _session_epoch_valid(request, user):
         request.session.clear()
         raise HTTPException(status_code=401, detail="Login required")
     return user
@@ -263,7 +272,42 @@ def session_user(request: Request) -> Optional[dict]:
     user_id = request.session.get("user_id")
     if not user_id:
         return None
-    return get_user(int(user_id))
+    user = get_user(int(user_id))
+    if user and not _session_epoch_valid(request, user):
+        request.session.clear()
+        return None
+    return user
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP, honoring the ingress X-Forwarded-For chain."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _enforce_login_rate_limit(request: Request):
+    ip = _client_ip(request)
+    if not rate_limit_ok(f"login:{ip}", settings.LOGIN_RATE_LIMIT_PER_MINUTE, 60):
+        raise HTTPException(status_code=429, detail="Too many login attempts, please retry later")
+
+
+def _establish_session(request: Request, user: dict):
+    """Bind the browser session to a user and stamp the current session epoch."""
+    request.session.clear()
+    request.session["user_id"] = user["id"]
+    request.session["sv"] = int(user.get("token_version", 0))
+
+
+def _enforce_signup_quota(request: Request, user: dict):
+    """When a login just created a new account, cap new accounts per IP per day."""
+    if not user.get("_created"):
+        return
+    ip = _client_ip(request)
+    if not rate_limit_ok(f"signup:{ip}", settings.SIGNUP_RATE_LIMIT_PER_DAY, 86400):
+        logger.warning("Signup quota exceeded for ip=%s (new user_id=%s)", ip, user.get("id"))
+        raise HTTPException(status_code=429, detail="Too many new accounts from this network today")
 
 
 def verify_huggingface_demo_api(request: Request) -> None:
@@ -1078,6 +1122,7 @@ async def profile_page(request: Request):
 
 @app.get("/auth/github/login")
 async def github_login(request: Request):
+    _enforce_login_rate_limit(request)
     if not settings.GITHUB_CLIENT_ID:
         raise HTTPException(status_code=500, detail="GitHub OAuth is not configured")
     params = {
@@ -1091,6 +1136,7 @@ async def github_login(request: Request):
 
 @app.get("/auth/github/callback", name="github_callback")
 async def github_callback(request: Request, code: str = Query(...), state: str = Query("")):
+    _enforce_login_rate_limit(request)
     _validate_oauth_state(request, "github", state)
     try:
         async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
@@ -1126,16 +1172,18 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
     if not email:
         raise HTTPException(status_code=400, detail="GitHub account has no accessible email")
     user = get_or_create_user("github", str(profile["id"]), email, profile.get("name") or profile.get("login") or "", profile.get("avatar_url") or "")
+    _enforce_signup_quota(request, user)
     if user.get("_created"):
         from .telemetry import report_user_registered_event
 
         await report_user_registered_event(user)
-    request.session["user_id"] = user["id"]
+    _establish_session(request, user)
     return RedirectResponse("/")
 
 
 @app.get("/auth/modelscope/login")
 async def modelscope_login(request: Request):
+    _enforce_login_rate_limit(request)
     if not settings.MODELSCOPE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="ModelScope OAuth is not configured")
     params = {
@@ -1150,9 +1198,10 @@ async def modelscope_login(request: Request):
 
 @app.get("/auth/modelscope/callback", name="modelscope_callback")
 async def modelscope_callback(request: Request, code: str = Query(...), state: str = Query("")):
-    expected_state = request.session.pop("modelscope_oauth_state", None)
-    if expected_state and state and not secrets.compare_digest(expected_state, state):
-        logger.warning("ModelScope OAuth state mismatch: expected=%s got=%s; continuing because ModelScope may not echo state", expected_state, state)
+    _enforce_login_rate_limit(request)
+    # Fail closed on OAuth state, matching the GitHub path. A missing/mismatched
+    # state is a CSRF/login-fixation signal and must not be allowed through.
+    _validate_oauth_state(request, "modelscope", state)
     try:
         async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
             token_resp = await client.post(
@@ -1188,21 +1237,44 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
     except Exception:
         logger.warning("ModelScope userinfo response is not JSON: status=%s body=%s", profile_resp.status_code, profile_resp.text[:500])
         profile = {}
-    if not profile and token_data.get("id_token"):
-        try:
-            payload = token_data["id_token"].split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            profile = json.loads(base64.urlsafe_b64decode(payload))
-        except Exception as e:
-            logger.warning("Failed to decode ModelScope id_token: %s", e)
-    provider_id = str(profile.get("id") or profile.get("sub") or profile.get("username") or profile.get("email") or token_data.get("uid") or token[:12])
-    email = profile.get("email") or f"{provider_id}@modelscope.local"
-    user = get_or_create_user("modelscope", provider_id, email, profile.get("name") or profile.get("username") or provider_id, profile.get("avatar_url") or profile.get("avatar") or "")
+    # Identity comes from server-verified sources only: the userinfo response,
+    # or the id_token / uid from the token endpoint. The token endpoint is a
+    # direct server-to-server HTTPS exchange authenticated with our
+    # client_secret, so reading the id_token's claims is trustworthy even
+    # without a separate JWT signature check (the TLS channel authenticates the
+    # source). Some ModelScope apps' userinfo endpoint 404s, so the id_token is
+    # the primary identity there. We still refuse to derive identity from the
+    # raw access token (not a stable account id).
+    claims = dict(profile) if isinstance(profile, dict) else {}
+    if not (claims.get("id") or claims.get("sub") or claims.get("username")):
+        id_token = token_data.get("id_token")
+        if id_token:
+            try:
+                payload = id_token.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                decoded = json.loads(base64.urlsafe_b64decode(payload))
+                # userinfo values win over id_token when both present
+                claims = {**decoded, **claims}
+            except Exception as e:
+                logger.warning("Failed to decode ModelScope id_token: %s", e)
+    provider_id = str(
+        claims.get("id") or claims.get("sub") or claims.get("username")
+        or claims.get("email") or token_data.get("uid") or ""
+    ).strip()
+    if not provider_id:
+        logger.warning(
+            "ModelScope login: no verifiable identity. userinfo_keys=%s token_keys=%s",
+            list(profile.keys()) if isinstance(profile, dict) else None, list(token_data.keys()),
+        )
+        raise HTTPException(status_code=400, detail="ModelScope login failed: no verifiable account identity")
+    email = claims.get("email") or f"{provider_id}@modelscope.local"
+    user = get_or_create_user("modelscope", provider_id, email, claims.get("name") or claims.get("username") or provider_id, claims.get("avatar_url") or claims.get("avatar") or "")
+    _enforce_signup_quota(request, user)
     if user.get("_created"):
         from .telemetry import report_user_registered_event
 
         await report_user_registered_event(user)
-    request.session["user_id"] = user["id"]
+    _establish_session(request, user)
     return RedirectResponse("/")
 
 
@@ -1223,8 +1295,7 @@ async def workshop_login(request: Request):
         raise HTTPException(status_code=401, detail="Invalid workshop credentials")
     user = get_or_create_user("workshop", f"workshop{index}", f"workshop{index}@amd.com", f"WORKSHOP{index}", "")
     user = ensure_user_min_credits(user["id"], settings.WORKSHOP_CREDITS) or user
-    request.session.clear()
-    request.session["user_id"] = user["id"]
+    _establish_session(request, user)
     return {"user": user}
 
 
@@ -1239,8 +1310,7 @@ async def admin_login(request: Request):
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
     user = get_or_create_user("admin", "admin", "admin@radeon.local", "Radeon Cloud Admin", "")
     user = ensure_user_min_credits(user["id"], settings.ADMIN_LOGIN_CREDITS) or user
-    request.session.clear()
-    request.session["user_id"] = user["id"]
+    _establish_session(request, user)
     return {"user": user}
 
 
@@ -3233,6 +3303,17 @@ async def admin_list_users(username: str = Depends(verify_admin)):
 @app.get("/api/admin/stats")
 async def admin_stats(username: str = Depends(verify_admin)):
     return get_admin_daily_stats()
+
+
+@app.post("/api/admin/users/{user_id}/revoke-sessions")
+async def admin_revoke_sessions(user_id: int, username: str = Depends(verify_admin)):
+    """Invalidate every outstanding session for a user (e.g. to kick an abusive
+    or compromised account). Bumps the user's session epoch so all cookies that
+    were issued before now are rejected on the next request."""
+    new_version = bump_user_token_version(user_id)
+    if new_version is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"success": True, "user_id": user_id, "token_version": new_version}
 
 
 @app.post("/api/admin/users/{user_id}/credits")
