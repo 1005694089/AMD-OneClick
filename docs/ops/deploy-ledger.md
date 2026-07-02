@@ -24,7 +24,75 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-02 (latest) — Radeon beta: merge feature/oauth-credit-manager (reconciler crash-loop reclaim, scheduler off event loop, shared-DB delete safety, auth hardening)
+## 2026-07-03 (latest) — Radeon beta: revert image soft-affinity + enable Redis rate limiting (image rebuild)
+
+**Code commit:** `48c3c7c` on `BETA-test` (pushed). Two coordinated changes on top of the
+2026-07-02 oauth-credit-manager merge (`2bd2ae2`):
+
+1. **Reverted image soft-affinity** (`app/config.py`): flipped `IMAGE_AFFINITY_ENABLED` default
+   `true` → `false`. That feature (from `75f8953`) has the `image_sync_refresh_job` project
+   per-image DB node-load state onto node labels via `core_v1.patch_node`, which needs
+   `nodes:patch` RBAC. The per-service beta manager SA (`amd-oneclick-radeon-beta-manager`, bound
+   to ClusterRole `amd-oneclick-radeon-beta-node-reader`) has only `get/list/watch` on nodes, so
+   every reconcile cycle logged a 403 per node (~40 nodes × every 120s). The feature is also
+   redundant under the Dragonfly P2P image-service model (every fleet node is warmed and pulls
+   peer-to-peer; beta's fleet is 2 identically-warmed nodes 0043/0044), so warm-node scheduling
+   bias buys nothing here. With the flag off, both gated paths go dormant:
+   `reconcile_image_ready_labels()` early-returns before any `list_node`/`patch_node` (kills the
+   403 spam) and `_image_affinity()` returns `None` (no affinity injected into pods). The
+   `image_sync_refresh_job` still does its legitimate `update_image_sync_status` work. 245 tests
+   pass. Re-enable only where the manager SA is granted `nodes:patch` (e.g. mirror the live v2
+   `amd-oneclick-manager-v2-node-labeler` ClusterRole).
+
+2. **Enabled Redis-backed rate limiting** — required rebuilding the manager image. The
+   oauth-credit-manager merge added `redis>=5.0.0` to `requirements.txt` and `app/redis_client.py`
+   (lazy `import redis` inside `get_redis()`, fails open when unreachable), but every radeon-beta
+   deploy since 2026-06-24 ships code via the `code-overrides` ConfigMap with the image tag
+   unchanged — so the `redis` pip package was never installed in the running image. Setting
+   `REDIS_URL` alone would just trigger a lazy-import failure (still fail-open, rate limiting
+   inert). So this deploy **rebuilds the image** to bake in `redis`, then wires `REDIS_URL`.
+
+**New image:** built on host `zijun@10.161.176.9` (`docker build --no-cache --platform linux/amd64`
+from `BETA-test`@`48c3c7c`), pushed to the same registry/namespace as prior beta images.
+
+| Service / Port | Image (`:tag`) | Registry digest | Local image ID |
+|----------------|----------------|-----------------|----------------|
+| radeon-beta / 30444 | `crpi-07r6ldyx2gp3ntwb.cn-shanghai.personal.cr.aliyuncs.com/radeon-cloud/amd-oneclick:radeon-beta-redis-20260703-0026-48c3c7c` | `sha256:d2cfe1a916335618f46832379269b05e2e0b316e9b44b9582146eee55fb9077f` | `sha256:d2cfe1a916335618f46832379269b05e2e0b316e9b44b9582146eee55fb9077f` |
+
+**Deploy mechanism (3 coordinated changes, one rollout):**
+- Patched the `config.py` key in `amd-oneclick-radeon-beta-code-overrides` ConfigMap with the
+  affinity-off version (`kubectl patch --type merge`). Confirmed the only diff vs the prior CM
+  `config.py` was exactly the `IMAGE_AFFINITY_ENABLED` flip (comment + default) — no other drift.
+- Added `REDIS_URL: redis://amd-oneclick-redis.default:6379/1` to the `amd-oneclick-radeon-beta-config`
+  env ConfigMap. Uses the short-DNS form (beta pod DNS domain is `amd.gpu.dc`, not `cluster.local`,
+  so the `.svc.cluster.local` FQDN does not resolve) and **DB index `/1`** to isolate beta's `rl:*`
+  rate-limit counters from v2 prod's DB `/0` on the shared `amd-oneclick-redis` (default ns) cache.
+- `kubectl set image deployment/amd-oneclick-radeon-beta-manager manager=...:radeon-beta-redis-20260703-0026-48c3c7c`.
+- Default RollingUpdate (no `rollout restart` needed — the image + CM changes rolled a new pod).
+
+| Artifact | PRE sha256 | APPLIED sha256 | Snapshot |
+|----------|------------|-----------------|----------|
+| code-overrides CM | `4734b434a167fa514df86501ac9a66f0de32bed3f57497127671dca1110f9752` | `adcdc1d5ff8c7eab6d5296be33a0822dbaf415f5b3db434b0fbdce18004cce77` | `local-deploy-history/radeon-beta/20260703-0026-redis-affinity-{PRE,APPLIED}-code-overrides.yaml` |
+| deployment | `2abf783137dfa3d102cf2f3d161248357679d8e3ab6a0d8f3cc06135dc1120fe` | `62526ce12c3c03b805b12acc600b6dc6a1159ffc75a578b0075745ed0e9cb8dd` | `local-deploy-history/radeon-beta/20260703-0026-redis-affinity-{PRE,APPLIED}-deployment.yaml` |
+| config CM | (PRE snapshot) | (APPLIED snapshot) | `local-deploy-history/radeon-beta/20260703-0026-redis-affinity-{PRE,APPLIED}-config-configmap.yaml` |
+
+**Verification (live e2e):** rollout `1/1 ready` (pod `amd-oneclick-radeon-beta-manager-76dd5bbcdd-2j9km`,
+0 restarts); image in use = the new redis tag. In-pod: `redis` pkg 8.0.1 importable;
+`settings.REDIS_URL=redis://amd-oneclick-redis.default:6379/1`, `settings.RATE_LIMIT_ENABLED=True`,
+`settings.IMAGE_AFFINITY_ENABLED=False`. **Redis functional test:** `get_redis()` returns a live
+client, `ping()`→True, connected on DB index 1; `rate_limit_ok(key, limit=2, 60)` called 3× →
+`[True, True, False]` (3rd correctly blocked — rate limiting actually enforcing, no longer just
+fail-open). **403 spam gone:** across 2+ image-sync cycles (130s+) the pod logged **0** `403`s and
+`reconcile_image_ready_labels` no longer executes at all (early-returns). `image_sync_refresh_job`
+still runs its `update_image_sync_status` work. External: `https://radeon-beta.anruicloud.com/health`
+and `/` both 200. All 6 pre-existing user instances (`u-13`, `u-18`, `u-20`, `u-57`, `u-58`, `u-59`)
+undisturbed (Running, no new restarts).
+
+**Rollback:** `kubectl -n amd-oneclick-radeon-beta replace -f local-deploy-history/radeon-beta/20260703-0026-redis-affinity-PRE-code-overrides.yaml && kubectl -n amd-oneclick-radeon-beta apply -f local-deploy-history/radeon-beta/20260703-0026-redis-affinity-PRE-config-configmap.yaml && kubectl -n amd-oneclick-radeon-beta apply -f local-deploy-history/radeon-beta/20260703-0026-redis-affinity-PRE-deployment.yaml && kubectl -n amd-oneclick-radeon-beta rollout restart deployment/amd-oneclick-radeon-beta-manager` (restores prior image tag `radeon-beta-image-service-20260625`, removes `REDIS_URL`, restores the affinity-on `config.py`). Note: reverting to affinity-on brings back the 403 spam.
+
+---
+
+## 2026-07-02 — Radeon beta: merge feature/oauth-credit-manager (reconciler crash-loop reclaim, scheduler off event loop, shared-DB delete safety, auth hardening)
 
 **Code commit:** `2bd2ae2` on `BETA-test` (pushed), merging `feature/oauth-credit-manager`
 (`75f8953`, `c9b2fc7`, `a106567`, `4e4e1b2`, `5b6bd18`, `a253597`) via intermediate branch
