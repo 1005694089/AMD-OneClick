@@ -695,3 +695,57 @@ test image).
 over cluster net) to the 5 missing nodes `0004/0005/0006/0008/0042`; `0008` used
 a locally-cached base image with `imagePullPolicy: Never` (it cannot pull busybox
 from ACR).
+
+## 2026-07-02 — radeon-global (amd-oneclick-lablab) — BETA-test deploy, Image Service off, HF demo API enabled
+
+**Code commit:** `a0fe4d8` (branch `prod/radeon-global`, tip of `BETA-test`).
+
+**Target:** live namespace `amd-oneclick-lablab` on the 108-node prod cluster
+(`/home/zijun/128-nodes-config.yml`), fronted by Azure Front Door at
+`https://radeon-global.anruicloud.com` -> NodePort `36.150.116.206:30080` ->
+manager pinned to `wx-k8s-prod-s-001`.
+
+**Image build:** `docker build` from `prod/radeon-global` -> `lablab.local/amd-oneclick:a0fe4d8`
+(442MB). Side-loaded node-local onto `wx-k8s-prod-s-001` via a one-shot privileged
+`hostPath`-mounted Ubuntu pod (`ctr -n k8s.io images import`); no registry push, no pull secret.
+
+**Config changes (ConfigMap `amd-oneclick-lablab-config`):** added
+`HF_ENDPOINT=http://134.199.133.77`, `HF_HUB_DISABLE_XET=1`,
+`HF_TOKEN_SECRET_NAME/KEY=amd-oneclick-lablab-secrets/HF_TOKEN`,
+`HUGGINGFACE_DEMO_MIN_CREDITS=48`; confirmed `IMAGE_SERVICE_ENABLED=false` and
+`IMAGE_AFFINITY_ENABLED=false` (already the working default on this cluster). All
+other lablab keys (GitHub OAuth, PUBLIC_BASE_URL, SERVICE_HOST, NOTEBOOK_*, node
+ports) preserved byte-identical.
+
+**Secret changes (`amd-oneclick-lablab-secrets`):** added
+`HUGGINGFACE_DEMO_API_TOKENS` (freshly generated random bearer token — no prior
+value existed anywhere on the host or cluster). `ADMIN_PASSWORD`,
+`GITHUB_CLIENT_SECRET`, `SESSION_SECRET` preserved from the pre-change snapshot.
+
+**Incident during deploy:** the entire `amd-oneclick-lablab` namespace (including
+live user pods `u-2`, `u-6`) was deleted by the user mid-verification (intentional,
+not caused by this deploy — confirmed no app code path calls `delete_namespace`).
+Rebuilt the full namespace (RBAC, ConfigMap, Secret, Deployment, Service) from the
+PRE-change snapshots plus the new image/config, matching the original topology
+exactly (nodeName `wx-k8s-prod-s-001`, hostPath `/var/lib/amd-oneclick-lablab/data`
+for SQLite, NodePort 30080, same RBAC). Snapshots and rebuild manifest are not
+retained in git (contain secrets).
+
+**Verification:**
+- `GET /health` (public + NodePort) -> `{"status":"healthy"}`, manager `1/1`, 0 restarts.
+- `GET /api/huggingface/images` no-token -> `401` (was `503` pre-deploy: tokens were unset).
+- With token -> `200` + image catalog.
+- Full launch/status/destroy round trip via **public Front Door domain**
+  (`https://radeon-global.anruicloud.com`) and direct NodePort: notebook pod
+  scheduled by `default-scheduler` (no image-service node pinning) onto
+  `wx-k8s-prod-s-033`; kubelet found/pulled the image itself (`Pulled` event:
+  "already present on machine") — confirms the Image-Service-disabled path.
+  Destroyed cleanly after.
+- `python -m pytest tests/test_hf_api_features.py -q` -> **63 passed**.
+- Pre-existing manager RBAC (SA + Role/RoleBinding + ClusterRole/ClusterRoleBinding,
+  node get/list/watch only) recreated identically.
+
+**Rollback:** re-apply `20260702-1736-PRE-{deploy,cm,secret}.yaml` snapshots
+(local-only, not in git) to restore image `lablab.local/amd-oneclick:0706` and the
+pre-HF ConfigMap/Secret state; note the original `u-2`/`u-6` user pods cannot be
+restored (they were destroyed with the namespace, independent of this deploy).
