@@ -865,6 +865,12 @@ def _pick_compressor(ips):
 
 
 def run_distribute(job):
+    # RETIRED as the default transport (P5): `warm` (P2P self-pull) is now the transport for every
+    # image durable in the LAN registry. `distribute` (SSH byte-push of the tarball from 0042) is kept
+    # ONLY as the legacy fallback for pre-P1 catalog images that were never pushed to zot and thus have
+    # no digest to P2P-pull (see app.main._ensure_image_on_node / _enqueue_admin_image_chain, which
+    # emit `distribute` only when there is no LAN-registry copy). Delete this handler once no such
+    # image remains (every catalog/custom image has a recorded zot digest).
     job_id = job["id"]
     ref = job["ref"]
     payload = job.get("payload") or {}
