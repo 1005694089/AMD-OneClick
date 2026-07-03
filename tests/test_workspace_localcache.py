@@ -353,5 +353,217 @@ class DurableOpRetryTests(unittest.TestCase):
         self.assertLess(elapsed, 20, f"overall timeout budget not honored: {elapsed:.1f}s")
 
 
+class ManifestApproachBTests(unittest.TestCase):
+    """Approach B: the durable shard must NOT be mounted on the notebook (main) container and there
+    must be NO preStop flush on it — the flush is out-of-pod. The hydrate init container MUST still
+    mount the durable shard (it seeds the SSD copy). Guards against a regression that re-exposes the
+    uncapped NFS to the user."""
+
+    def setUp(self):
+        s = k8s_module.settings
+        self._orig = {k: getattr(s, k) for k in (
+            "WORKSPACE_VOLUME_TYPE", "WORKSPACE_DURABLE_STORAGE_CLASSES", "WORKSPACE_DURABLE_PVC_PREFIX",
+            "WORKSPACE_LOCAL_CACHE_ROOT", "WORKSPACE_QUOTA_ENABLED", "WORKSPACE_MOUNT_PATH",
+            "WORKSPACE_DURABLE_MOUNT_PATH")}
+        s.WORKSPACE_VOLUME_TYPE = "localcache"
+        s.WORKSPACE_DURABLE_STORAGE_CLASSES = list(FROZEN_SHARD_CLASSES)
+        s.WORKSPACE_DURABLE_PVC_PREFIX = "oneclick-durable"
+        s.WORKSPACE_LOCAL_CACHE_ROOT = "/nvme0/data/workspace"
+        s.WORKSPACE_QUOTA_ENABLED = True
+        s.WORKSPACE_MOUNT_PATH = "/workspace"
+        s.WORKSPACE_DURABLE_MOUNT_PATH = "/mnt/workspace-durable"
+        self.c = k8s_module.K8sClient.__new__(k8s_module.K8sClient)
+        self.c.namespace = "amd-oneclick-lablab"
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(k8s_module.settings, k, v)
+
+    def _manifest(self):
+        return self.c._get_pod_manifest("user@example.com", "nb-a1b2c3d4", "img:tag",
+                                        instance_type="jupyter", gpu_count=1)
+
+    def _containers(self, m):
+        spec = m["spec"]
+        main = spec["containers"][0]
+        inits = {c["name"]: c for c in spec.get("initContainers", [])}
+        return spec, main, inits
+
+    def test_main_container_has_no_durable_mount(self):
+        _, main, _ = self._containers(self._manifest())
+        names = {vm["name"] for vm in main["volumeMounts"]}
+        self.assertIn("workspace", names)
+        self.assertNotIn("workspace-durable", names,
+                         "notebook container must NOT mount the durable NFS shard (cap-bypass)")
+
+    def test_main_container_has_no_prestop(self):
+        _, main, _ = self._containers(self._manifest())
+        lifecycle = main.get("lifecycle") or {}
+        self.assertNotIn("preStop", lifecycle,
+                         "notebook container must have no local->durable preStop flush anymore")
+
+    def test_hydrate_init_still_mounts_durable(self):
+        _, _, inits = self._containers(self._manifest())
+        self.assertIn("workspace-hydrate", inits, "hydrate init container must exist for localcache")
+        names = {vm["name"] for vm in inits["workspace-hydrate"]["volumeMounts"]}
+        self.assertIn("workspace-durable", names, "hydrate init must mount durable to seed local")
+
+    def test_durable_volume_declared_once(self):
+        spec, _, _ = self._containers(self._manifest())
+        durable_vols = [v for v in spec["volumes"] if v["name"] == "workspace-durable"]
+        self.assertEqual(len(durable_vols), 1, "durable PVC volume must be declared exactly once")
+        self.assertEqual(durable_vols[0]["persistentVolumeClaim"]["claimName"],
+                         self.c._durable_shard_pvc("nb-a1b2c3d4"))
+
+    def test_no_forced_termination_grace(self):
+        spec, _, _ = self._containers(self._manifest())
+        self.assertNotIn("terminationGracePeriodSeconds", spec,
+                         "no long grace needed without an in-pod flush")
+
+
+class FlushPodTests(unittest.TestCase):
+    """_flush_workspace_to_durable: pinned to the recorded node, mounts durable(subPath)+local(hostPath),
+    marks flushed only on Succeeded and only when the session token matches, aborts if the pod is live,
+    and (under quota) guards the empty-but-unmounted loop case."""
+
+    def setUp(self):
+        import threading
+        s = k8s_module.settings
+        self._orig = {k: getattr(s, k) for k in (
+            "WORKSPACE_VOLUME_TYPE", "WORKSPACE_DURABLE_STORAGE_CLASSES", "WORKSPACE_DURABLE_PVC_PREFIX",
+            "WORKSPACE_LOCAL_CACHE_ROOT", "WORKSPACE_QUOTA_ENABLED")}
+        s.WORKSPACE_VOLUME_TYPE = "localcache"
+        s.WORKSPACE_DURABLE_STORAGE_CLASSES = list(FROZEN_SHARD_CLASSES)
+        s.WORKSPACE_DURABLE_PVC_PREFIX = "oneclick-durable"
+        s.WORKSPACE_LOCAL_CACHE_ROOT = "/nvme0/data/workspace"
+        s.WORKSPACE_QUOTA_ENABLED = True
+        self.c = k8s_module.K8sClient.__new__(k8s_module.K8sClient)
+        self.c.namespace = "ns"
+        self.c._notebook_tolerations = lambda: [{"operator": "Exists"}]
+        self.c._workspace_sync_image = lambda: "img"
+        self.c._flush_locks = {}
+        self.c._flush_locks_guard = threading.Lock()
+        self.c._pod_exists = lambda i: False  # default: no live pod
+        self._orig_mark = k8s_module.store.mark_workspace_flushed
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(k8s_module.settings, k, v)
+        k8s_module.store.mark_workspace_flushed = self._orig_mark
+
+    def test_skip_when_no_session_token(self):
+        # No session token → nothing to flush → True, no pod created, no mark.
+        marks = []
+        k8s_module.store.mark_workspace_flushed = lambda i, n, t: marks.append((i, n, t))
+        self.assertTrue(self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", None))
+        self.assertEqual(marks, [])
+
+    def test_aborts_when_pod_live(self):
+        # A live pod means relaunched — must not flush over the active session.
+        marks = []
+        k8s_module.store.mark_workspace_flushed = lambda i, n, t: marks.append((i, n, t)) or True
+        self.c._pod_exists = lambda i: True
+        created = []
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=lambda namespace, body: created.append(body),
+            read_namespaced_pod=lambda name, namespace: None,
+            delete_namespaced_pod=lambda name, namespace, grace_period_seconds=0: None)
+        ok = self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "T1")
+        self.assertFalse(ok, "must abort (return False) when a pod is live")
+        self.assertEqual(created, [], "must not create a flush pod when the instance is live")
+        self.assertEqual(marks, [])
+
+    def test_success_pins_node_mounts_and_marks_with_token(self):
+        marks = []
+        k8s_module.store.mark_workspace_flushed = lambda i, n, t: (marks.append((i, n, t)) or True)
+        captured = {}
+
+        def create(namespace, body):
+            captured["body"] = body
+
+        def read(name, namespace):
+            return SimpleNamespace(status=SimpleNamespace(phase="Succeeded", container_statuses=None))
+
+        def delete(name, namespace, grace_period_seconds=0):
+            raise k8s_module.ApiException(status=404)
+
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=create, read_namespaced_pod=read, delete_namespaced_pod=delete)
+        ok = self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "T-2026")
+        self.assertTrue(ok)
+        self.assertEqual(marks, [("nb-a1b2c3d4", "node-7", "T-2026")],
+                         "success must mark flushed with the exact (instance, node, session token)")
+        spec = captured["body"]["spec"]
+        self.assertEqual(spec["nodeName"], "node-7", "flush pod must be pinned to the recorded node")
+        self.assertEqual(spec["containers"][0]["securityContext"]["allowPrivilegeEscalation"], False)
+        vols = {v["name"]: v for v in spec["volumes"]}
+        self.assertEqual(vols["durable"]["persistentVolumeClaim"]["claimName"],
+                         self.c._durable_shard_pvc("nb-a1b2c3d4"))
+        self.assertEqual(vols["local"]["hostPath"]["path"],
+                         self.c._workspace_local_cache_path("nb-a1b2c3d4"))
+        mounts = {m["name"]: m for m in spec["containers"][0]["volumeMounts"]}
+        self.assertEqual(mounts["durable"]["subPath"], self.c._durable_subpath("nb-a1b2c3d4"))
+        self.assertEqual(mounts["local"]["mountPropagation"], "HostToContainer")
+        # Under quota the script must guard the empty-but-not-mounted loop case.
+        self.assertIn("mountpoint -q /local", spec["containers"][0]["args"][0])
+
+    def test_quota_off_script_has_no_mountpoint_guard(self):
+        k8s_module.settings.WORKSPACE_QUOTA_ENABLED = False
+        k8s_module.store.mark_workspace_flushed = lambda i, n, t: True
+        captured = {}
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=lambda namespace, body: captured.setdefault("body", body),
+            read_namespaced_pod=lambda name, namespace: SimpleNamespace(
+                status=SimpleNamespace(phase="Succeeded", container_statuses=None)),
+            delete_namespaced_pod=lambda name, namespace, grace_period_seconds=0: None)
+        self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "T")
+        self.assertNotIn("mountpoint -q /local", captured["body"]["spec"]["containers"][0]["args"][0])
+
+    def test_stale_token_success_returns_false(self):
+        # Pod Succeeded but the DB row's token advanced (relaunch) → mark returns False (no-op) → we
+        # must NOT report success (the current session is still unflushed).
+        k8s_module.store.mark_workspace_flushed = lambda i, n, t: False
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=lambda namespace, body: None,
+            read_namespaced_pod=lambda name, namespace: SimpleNamespace(
+                status=SimpleNamespace(phase="Succeeded", container_statuses=None)),
+            delete_namespaced_pod=lambda name, namespace, grace_period_seconds=0: None)
+        ok = self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "OLD")
+        self.assertFalse(ok, "a stale-token success must not certify the current session")
+
+    def test_failed_pod_does_not_mark(self):
+        marks = []
+        k8s_module.store.mark_workspace_flushed = lambda i, n, t: (marks.append((i, n, t)) or True)
+
+        def read(name, namespace):
+            term = SimpleNamespace(running=None, terminated=SimpleNamespace(exit_code=1))
+            return SimpleNamespace(status=SimpleNamespace(
+                phase="Failed", container_statuses=[SimpleNamespace(state=term)]))
+
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=lambda namespace, body: None, read_namespaced_pod=read,
+            delete_namespaced_pod=lambda name, namespace, grace_period_seconds=0: None)
+        ok = self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "T")
+        self.assertFalse(ok, "a Failed flush pod must return False")
+        self.assertEqual(marks, [], "a Failed flush must NOT mark flushed (reaper must not reap)")
+
+    def test_unique_pod_names_across_invocations(self):
+        # Two invocations must use DIFFERENT pod names so their cleanups don't kill each other's pod.
+        k8s_module.store.mark_workspace_flushed = lambda i, n, t: True
+        names = []
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=lambda namespace, body: names.append(body["metadata"]["name"]),
+            read_namespaced_pod=lambda name, namespace: SimpleNamespace(
+                status=SimpleNamespace(phase="Succeeded", container_statuses=None)),
+            delete_namespaced_pod=lambda name, namespace, grace_period_seconds=0: None)
+        self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "T1")
+        self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "T2")
+        self.assertEqual(len(names), 2)
+        self.assertNotEqual(names[0], names[1], "each flush invocation must use a unique pod name")
+        for n in names:
+            self.assertTrue(n.startswith("ws-flush-"))
+            self.assertLessEqual(len(n), 63)
+
+
 if __name__ == "__main__":
     unittest.main()

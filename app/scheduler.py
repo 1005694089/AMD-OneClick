@@ -320,6 +320,26 @@ async def workspace_durable_trash_purge_job():
         logger.error("Workspace durable trash purge failed: %s", e)
 
 
+async def workspace_flush_retry_job():
+    """Retry the out-of-pod local->durable flush for stopped instances whose flush never confirmed
+    (node was NotReady at delete time, or the pod was lost out-of-band). Fallback for the single-node
+    flush pin. Leader-only; inert unless localcache is enabled. DATA-SAFETY: without this an SSD copy
+    stranded by a NotReady node would stay unflushed forever (the reaper correctly refuses to reap
+    it), so the delta would never reach durable and the SSD would leak."""
+    if (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() != "localcache":
+        return
+    if _skip_not_leader("workspace_flush_retry_job"):
+        return
+    from .k8s_client import k8s_client
+
+    try:
+        flushed = await asyncio.to_thread(k8s_client.retry_unflushed_workspaces)
+        if flushed:
+            logger.info("Workspace flush-retry sweep flushed %s workspace(s)", len(flushed))
+    except Exception as e:
+        logger.error("Workspace flush-retry sweep failed: %s", e)
+
+
 def reconcile_job():
     """Bidirectional reconciliation between the cluster (source of truth) and
     the DB. Reclaims orphan/rogue pods (no owning DB record), force-finalizes
@@ -594,6 +614,14 @@ def start_scheduler():
             trigger=IntervalTrigger(hours=24),
             id="workspace_durable_trash_purge_job",
             name="Purge durable workspace .trash past retention",
+            replace_existing=True,
+            **job_defaults,
+        )
+        scheduler.add_job(
+            workspace_flush_retry_job,
+            trigger=IntervalTrigger(minutes=settings.WORKSPACE_LOCAL_CACHE_REAPER_INTERVAL_MINUTES),
+            id="workspace_flush_retry_job",
+            name="Retry unconfirmed local->durable workspace flushes",
             replace_existing=True,
             **job_defaults,
         )

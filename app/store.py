@@ -19,6 +19,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     MetaData,
+    PrimaryKeyConstraint,
     String,
     Table,
     Text,
@@ -391,6 +392,33 @@ workspace_cache_state = Table(
     Index("ix_workspace_cache_reap", "stopped_at", "node_name"),
 )
 
+# Per-(instance, node) SSD-copy ledger for the two-tier localcache workspace. A row means "instance_id
+# has a node-local SSD copy on node_name from a stopped session"; flushed_at records whether that copy
+# has been confirmed-flushed to the durable NFS shard. This is the single authority for BOTH the flush
+# retry sweep and the reaper. DATA-LOSS-CRITICAL design:
+#   * Keyed by (instance_id, node_name), NOT just instance_id — a cross-node relaunch (session ends on
+#     node A, next session runs on node B) keeps node A's row so the retry sweep still flushes it and
+#     the reaper still gates on node A. A single node_name field on cache_state would orphan it.
+#   * `session_token` (the stopped_at snapshot) fences stale flushes: a straggler flush pod still
+#     running from a prior stop can only set flushed_at on the row whose token it actually flushed;
+#     every new stop rewrites the token and resets flushed_at to NULL, so a late confirm can never
+#     falsely certify a newer, unflushed session.
+#   * The reaper frees a node's SSD copy ONLY when flushed_at IS NOT NULL for that (instance, node).
+workspace_local_copy = Table(
+    "workspace_local_copy",
+    metadata,
+    Column("instance_id", String(255), nullable=False),
+    Column("node_name", String(255), nullable=False),
+    # stopped_at snapshot of the session that produced this copy; the flush fence token AND TTL clock.
+    Column("session_token", String(64), nullable=False),
+    # ISO ts when the local->durable flush for THIS session/copy confirmed; NULL = unflushed.
+    Column("flushed_at", String(64)),
+    Column("created_at", String(64), nullable=False),
+    Column("updated_at", String(64), nullable=False),
+    PrimaryKeyConstraint("instance_id", "node_name", name="pk_workspace_local_copy"),
+    Index("ix_workspace_local_copy_node", "node_name"),
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -530,6 +558,12 @@ def ensure_schema_columns(conn):
     launch_event_columns = {col["name"] for col in inspector.get_columns("instance_launch_events")}
     if "pod_type" not in launch_event_columns:
         conn.execute(text("ALTER TABLE instance_launch_events ADD COLUMN pod_type VARCHAR(64)"))
+
+    # The per-(instance,node) workspace_local_copy ledger (out-of-pod flush tracking) is created by
+    # metadata.create_all above when absent — no ALTER needed. A pre-existing durable_flush_at column
+    # from an earlier iteration of this feature (single-column design) is harmless if it lingers; the
+    # new code reads only workspace_local_copy, so we leave any stray column in place rather than risk
+    # a destructive DROP on a live table.
 
     _backfill_hf_credit_cap(conn)
 
@@ -2932,24 +2966,67 @@ def _upsert_workspace_cache_state(instance_id: str, values: dict):
 def stamp_workspace_running(instance_id: str, node_name: Optional[str] = None):
     """Mark an instance as running (clears stopped_at so the local-delete reaper won't reap it).
     node_name is usually None at create time (scheduler picks the node); the delete path records the
-    actual node it ran on."""
+    actual node it ran on.
+
+    Does NOT touch workspace_pending_flush: a pending-flush row is keyed by (instance, node) and
+    fenced by the session's stopped_at token, so a fresh session on the SAME node is a distinct
+    working copy and the reaper's per-(instance,node) gate already protects it; a prior session's
+    unflushed copy on ANOTHER node keeps its own pending-flush row until its retry flush confirms."""
     vals = {"stopped_at": None}
     if node_name:
         vals["node_name"] = node_name
     _upsert_workspace_cache_state(instance_id, vals)
 
 
-def stamp_workspace_stopped(instance_id: str, node_name: Optional[str]):
+def _record_local_copy(instance_id: str, node_name: str, session_token: str):
+    """Insert-or-refresh the (instance, node) local-copy row with the session's fence token and
+    flushed_at reset to NULL (a new stopped session's copy starts unflushed). Called on every stop
+    transition. Portable upsert (try-insert / on-conflict-update)."""
+    if not node_name or not session_token:
+        return
+    now = utc_now()
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                workspace_local_copy.insert().values(
+                    instance_id=instance_id, node_name=node_name,
+                    session_token=session_token, flushed_at=None,
+                    created_at=now, updated_at=now,
+                )
+            )
+        return
+    except IntegrityError:
+        pass  # a copy row for this (instance, node) already exists — new session: retoken + unflush
+    with engine.begin() as conn:
+        conn.execute(
+            update(workspace_local_copy)
+            .where(
+                workspace_local_copy.c.instance_id == instance_id,
+                workspace_local_copy.c.node_name == node_name,
+            )
+            .values(session_token=session_token, flushed_at=None, updated_at=now)
+        )
+
+
+def stamp_workspace_stopped(instance_id: str, node_name: Optional[str]) -> Optional[str]:
     """Record the node the instance last ran on and the stop time, so a fast relaunch can soft-affine
-    back to it and the delayed reaper can free the local SSD copy after the TTL."""
-    _upsert_workspace_cache_state(instance_id, {"node_name": node_name, "stopped_at": utc_now()})
+    back to it and the delayed reaper can free the local SSD copy after the TTL. ALSO records a
+    per-(instance,node) local-copy row fenced by this stop's timestamp. Returns the session_token
+    (the stop timestamp) so the caller passes it to the flush and marks exactly this session's copy."""
+    token = utc_now()
+    _upsert_workspace_cache_state(instance_id, {"node_name": node_name, "stopped_at": token})
+    if node_name:
+        _record_local_copy(instance_id, node_name, token)
+    return token if node_name else None
 
 
-def stamp_workspace_stopped_keep_node(instance_id: str):
+def stamp_workspace_stopped_keep_node(instance_id: str) -> Optional[str]:
     """Mark an existing workspace_cache_state row stopped WITHOUT changing node_name. For out-of-band
     pod loss (node death / kubectl delete / eviction) caught by the reconciler, where the pod is
     already gone so its node can't be read — we still want stopped_at set so the delayed-local reaper
-    eventually frees the SSD copy on the node recorded at create/last-run. No-op if no row exists."""
+    eventually frees the SSD copy on the node recorded at create/last-run. Also records a local-copy
+    row on the recorded node so the retry sweep flushes it. No-op if no row exists. Returns the
+    session token (stop ts) when a node was recorded, else None."""
     now = utc_now()
     with engine.begin() as conn:
         conn.execute(
@@ -2960,6 +3037,73 @@ def stamp_workspace_stopped_keep_node(instance_id: str):
             )
             .values(stopped_at=now, updated_at=now)
         )
+        node = conn.execute(
+            select(workspace_cache_state.c.node_name).where(
+                workspace_cache_state.c.instance_id == instance_id
+            )
+        ).scalar()
+    if node:
+        _record_local_copy(instance_id, node, now)
+        return now
+    return None
+
+
+def mark_workspace_flushed(instance_id: str, node_name: str, session_token: str) -> bool:
+    """Confirm a flush: set flushed_at on the (instance, node) local-copy row ONLY if its session_token
+    still matches the token the flush actually flushed. DATA-LOSS-CRITICAL fence: a straggler flush pod
+    that confirms AFTER the instance was re-stopped (new token + flushed_at reset) will NOT match, so
+    it can never falsely certify a session it didn't flush. Returns True if a row was marked."""
+    if not node_name or not session_token:
+        return False
+    now = utc_now()
+    with engine.begin() as conn:
+        res = conn.execute(
+            update(workspace_local_copy)
+            .where(
+                workspace_local_copy.c.instance_id == instance_id,
+                workspace_local_copy.c.node_name == node_name,
+                workspace_local_copy.c.session_token == session_token,
+            )
+            .values(flushed_at=now, updated_at=now)
+        )
+    return (res.rowcount or 0) > 0
+
+
+def clear_local_copy_node(instance_id: str, node_name: str):
+    """Drop the local-copy row for one (instance, node) — used after the reaper frees that node's SSD
+    copy (and the durable copy is current)."""
+    with engine.begin() as conn:
+        conn.execute(
+            workspace_local_copy.delete().where(
+                workspace_local_copy.c.instance_id == instance_id,
+                workspace_local_copy.c.node_name == node_name,
+            )
+        )
+
+
+def clear_all_local_copies(instance_id: str):
+    """Drop every local-copy row for an instance (admin durable delete / full teardown)."""
+    with engine.begin() as conn:
+        conn.execute(
+            workspace_local_copy.delete().where(
+                workspace_local_copy.c.instance_id == instance_id
+            )
+        )
+
+
+def list_workspace_unflushed_copies() -> list[dict]:
+    """All (instance, node) copies awaiting a confirmed flush (flushed_at IS NULL). The reconciler
+    retry sweep re-runs the flush for these once the node is Ready. Returns
+    [{instance_id, node_name, session_token}]."""
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(
+                workspace_local_copy.c.instance_id,
+                workspace_local_copy.c.node_name,
+                workspace_local_copy.c.session_token,
+            ).where(workspace_local_copy.c.flushed_at.is_(None))
+        ).mappings().all()
+    return [dict(r) for r in rows]
 
 
 def get_workspace_last_node(instance_id: str) -> Optional[str]:
@@ -2973,19 +3117,26 @@ def get_workspace_last_node(instance_id: str) -> Optional[str]:
 
 
 def list_workspace_cache_to_reap(ttl_minutes: int) -> list[dict]:
-    """Rows whose pod stopped more than ttl_minutes ago and still have a node recorded (i.e. a local
-    SSD copy that should now be freed). Returns [{instance_id, node_name, stopped_at}]."""
+    """(instance, node) SSD copies safe to free: a local-copy row whose session stopped more than
+    ttl_minutes ago AND flushed_at IS NOT NULL (confirmed-flushed to durable). Returns
+    [{instance_id, node_name, stopped_at}] (stopped_at = the copy's session_token).
+
+    DATA-LOSS-CRITICAL: the flushed_at gate is mandatory. The flush is decoupled from pod teardown
+    (out-of-pod, manager-driven), so a copy can be past its TTL with the pod long gone yet still
+    UNFLUSHED (node was NotReady at delete time). rm -rf'ing it would destroy the only current copy of
+    the user's data. Only reap a (instance, node) whose flushed_at is set. Keyed per-node, so a
+    cross-node relaunch never orphans the old node's copy — it is reaped once its own flush confirms."""
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(0, ttl_minutes))).isoformat()
+    lc = workspace_local_copy.c
     with engine.begin() as conn:
         rows = conn.execute(
             select(
-                workspace_cache_state.c.instance_id,
-                workspace_cache_state.c.node_name,
-                workspace_cache_state.c.stopped_at,
+                lc.instance_id,
+                lc.node_name,
+                lc.session_token.label("stopped_at"),
             ).where(
-                workspace_cache_state.c.stopped_at.isnot(None),
-                workspace_cache_state.c.stopped_at < cutoff,
-                workspace_cache_state.c.node_name.isnot(None),
+                lc.session_token < cutoff,
+                lc.flushed_at.isnot(None),
             )
         ).mappings().all()
     return [dict(r) for r in rows]

@@ -1,0 +1,46 @@
+# Defense-in-depth: block user notebook pods from reaching the SFS-Turbo NFS servers directly.
+#
+# Primary fix for the /workspace cap-bypass is Approach B (the durable shard is no longer mounted in
+# the notebook container — only the hydrate init container mounts it). This NetworkPolicy is the
+# secondary layer: it stops a root user in their notebook from running their own `mount.nfs` against
+# the SFS-Turbo backends to reach the uncapped shared filesystem out-of-band.
+#
+# IMPORTANT — why this does NOT break the legitimate CSI hydrate mount:
+#   The nfs.csi.k8s.io mount for the hydrate init container is performed by kubelet/CSI in the NODE
+#   network namespace, NOT the pod's. A pod-level Egress policy only governs traffic originating from
+#   the pod's own netns, so kubelet's mount is unaffected. Verified empirically on this cluster before
+#   applying (a test pod with this policy was blocked from SFS :2049, while a normal localcache pod
+#   still hydrated). If a future CNI change ever breaks the CSI mount, delete this policy — Approach B
+#   alone (mount removal) still closes the cap-bypass.
+#
+# Selector: app=amd-oneclick (NOTEBOOK_LABEL_PREFIX) — notebook pods ONLY. The out-of-pod
+# flush/hydrate/durable-op pods carry distinct app=oneclick-workspace-* labels and are NOT selected,
+# so their NFS access is untouched.
+#
+# The four SFS-Turbo backend IPs (managed-nfs-storage-2..5) as of 2026-07-03: 10.20.100.69, .197,
+# .246, .248. A single egress rule allows all traffic EXCEPT those IPs, so DNS (8.8.8.8/8.8.4.4 —
+# these pods use dnsPolicy: None) and all normal internet egress keep working.
+#
+# Scope: amd-oneclick-lablab namespace only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: oneclick-notebook-block-sfs-egress
+  namespace: amd-oneclick-lablab
+  labels:
+    app: oneclick-workspace
+spec:
+  podSelector:
+    matchLabels:
+      app: amd-oneclick
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.20.100.69/32
+              - 10.20.100.197/32
+              - 10.20.100.246/32
+              - 10.20.100.248/32

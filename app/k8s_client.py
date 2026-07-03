@@ -89,6 +89,11 @@ class K8sClient:
         self._node_list_cache_ts = 0.0
         self._node_list_cache_ttl = float(getattr(settings, "NODE_LIST_CACHE_TTL_SECONDS", 5.0))
         self._node_list_cache_lock = threading.Lock()
+        # Per-(instance,node) flush serialization: delete-path flush and the reconciler retry sweep
+        # must never run concurrent opposite-direction rsyncs for the same copy. A single process holds
+        # both, so an in-process lock suffices (leader-only scheduler + single manager replica).
+        self._flush_locks = {}
+        self._flush_locks_guard = threading.Lock()
 
     def _authenticated_api_client(self):
         token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -650,6 +655,243 @@ class K8sClient:
                 time.sleep(1)
         raise RuntimeError(f"workspace durable-op {pod_name} exhausted candidates for shard {shard_pvc}: {last_err}")
 
+    def _flush_lock_for(self, key: str):
+        """Return a per-(instance,node) lock, created on first use. Serializes the delete-path flush
+        and the reconciler retry sweep so they never run concurrent rsyncs for the same copy."""
+        with self._flush_locks_guard:
+            lk = self._flush_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                self._flush_locks[key] = lk
+            return lk
+
+    def _flush_workspace_to_durable(self, instance_id: str, node_name: str, session_token: str,
+                                    timeout_seconds: int = 600) -> bool:
+        """Flush an instance's node-local SSD /workspace copy up to its durable NFS shard.
+
+        Replaces the old in-pod preStop hook: the notebook container no longer mounts the durable
+        shard, so the local -> durable flush is driven from the manager (delete path + reconciler
+        retry sweep) by a one-shot pod that mounts BOTH the durable shard PVC (at /durable, RW,
+        subPath per instance) AND the host-resident SSD copy (at /local, hostPath). Because the SSD
+        copy survives pod teardown (the loop mount lives in the host mount namespace, Bidirectional
+        propagation), this fires regardless of how the pod died — graceful delete, OOM, eviction, or
+        force-delete — closing the ungraceful-kill data-loss gap the preStop hook had.
+
+        PINNED to node_name unconditionally: the data exists on exactly ONE node, so unlike
+        _run_durable_shard_command there is no candidate list to fall back to. If the node is
+        NotReady/gone the pod can't start and this returns False WITHOUT marking flushed, so the
+        reaper won't reap the unflushed SSD copy and the reconciler sweep retries once the node
+        returns.
+
+        session_token FENCES the confirmation (store.mark_workspace_flushed only marks the local-copy
+        row whose token still matches), so a straggler flush that confirms after a relaunch/re-stop
+        can never falsely certify a session it didn't flush.
+
+        Uses `rsync -a --update` (newer-wins, NO --delete) — identical semantics to the retired
+        preStop and symmetric with the hydrate init, so flush and hydrate can never fight."""
+        if not node_name or not session_token:
+            logger.info("flush skip for %s: missing node/session token (nothing to flush)", instance_id)
+            return True
+        if not self._workspace_localcache_enabled():
+            return True
+        shard_pvc = self._durable_shard_pvc(instance_id)
+        durable_subpath = self._durable_subpath(instance_id)
+        local_path = self._workspace_local_cache_path(instance_id)
+        cache_root = settings.WORKSPACE_LOCAL_CACHE_ROOT.rstrip("/")
+        # Guard: only ever hostPath-mount a path strictly under the cache root.
+        if not local_path.startswith(cache_root + "/") or local_path == cache_root:
+            logger.error("Refusing to flush suspicious local cache path %s", local_path)
+            return False
+
+        lock = self._flush_lock_for(f"{instance_id}\x00{node_name}")
+        if not lock.acquire(blocking=False):
+            # Another flush for this exact copy is already running (delete path vs retry sweep). Skip;
+            # the in-flight one will mark flushed, or the sweep retries later. Not a failure.
+            logger.info("flush for %s on %s already in progress; skipping duplicate", instance_id, node_name)
+            return False
+        try:
+            # A live pod means the instance was (re)launched on this node; its hydrate-init may be
+            # rsyncing durable->local right now. Running our local->durable rsync concurrently against
+            # the same host dir would race. Abort — the copy is the active working set, not a stopped
+            # copy to flush; a later stop will re-record it.
+            if self._pod_exists(instance_id):
+                logger.info("flush for %s aborted: pod is live (relaunched); not flushing over active session",
+                            instance_id)
+                return False
+
+            # Unique per-invocation pod name so the delete-path flush and the retry sweep can never
+            # delete each other's in-flight pod (their _cleanup only targets their own name).
+            run_id = secrets.token_hex(4)
+            safe = self._safe_storage_segment(f"{instance_id}-{run_id}").lower()
+            pod_name = f"ws-flush-{safe}"[:63].rstrip("-")
+
+            # DATA-SAFETY (finding 4): under quota, /local is an ext4 loop image mounted out-of-band in
+            # the host mount namespace. If that mount is ABSENT when we run (node rebooted, host agent
+            # hasn't re-provisioned), hostPath sees an EMPTY plain dir — which must NOT be mistaken for
+            # "nothing to flush" (that would mark flushed and let the reaper destroy the real, still
+            # loop-resident data). The prep DaemonSet drops a sentinel file (.oneclick-ssd-root) at the
+            # cache-root; inside a per-instance loop mount that sentinel is NOT visible. So: if the
+            # instance dir is empty AND the root sentinel IS visible from inside /local's parent, the
+            # loop is not mounted (or there's genuinely no data) — treat an empty dir cautiously:
+            #   * quota ON  -> require the loop to be an actual mountpoint before declaring no-op; if
+            #                  /local exists, is empty, and is NOT a mountpoint => FAIL (exit 3) so we
+            #                  do not mark flushed.
+            #   * quota OFF -> /local is a plain dir; empty legitimately means no data => no-op OK.
+            quota_on = self._workspace_quota_enabled()
+            if quota_on:
+                guard = (
+                    "if [ -n \"$(ls -A /local 2>/dev/null)\" ]; then\n"
+                    "  rsync -a --update /local/ /durable/\n"
+                    "  echo WS_FLUSH_OK\n"
+                    "elif mountpoint -q /local; then\n"
+                    "  echo \"loop mounted but empty; nothing to flush\"; echo WS_FLUSH_OK\n"
+                    "else\n"
+                    "  echo \"ERROR: /local empty and NOT a mountpoint under quota — loop image not \"\n"
+                    "  echo \"mounted; refusing to mark flushed\" >&2\n"
+                    "  exit 3\n"
+                    "fi\n"
+                )
+            else:
+                guard = (
+                    "if [ -n \"$(ls -A /local 2>/dev/null)\" ]; then\n"
+                    "  rsync -a --update /local/ /durable/\n"
+                    "fi\n"
+                    "echo WS_FLUSH_OK\n"
+                )
+            script = "set -eux\n" + guard
+
+            overall_deadline = time.monotonic() + max(1, timeout_seconds)
+            start_deadline = max(30, min(90, timeout_seconds // 4))
+
+            def _read_pod():
+                last = None
+                for _ in range(3):
+                    try:
+                        return self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                    except ApiException as e:
+                        if e.status == 404:
+                            return None
+                        last = e
+                        time.sleep(1)
+                raise last if last else RuntimeError("read failed")
+
+            def _cleanup_pod():
+                try:
+                    self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
+                except ApiException as e:
+                    if e.status != 404:
+                        logger.debug("flush cleanup delete of %s: %s", pod_name, e)
+                        return
+                for _ in range(30):
+                    try:
+                        self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                        time.sleep(1)
+                    except ApiException as e:
+                        if e.status == 404:
+                            return
+                        logger.debug("flush cleanup poll of %s: %s", pod_name, e)
+                        return
+
+            body = {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": pod_name,
+                    "namespace": self.namespace,
+                    "labels": {"app": "oneclick-workspace-flush", "instance-id": instance_id},
+                },
+                "spec": {
+                    "restartPolicy": "Never",
+                    "automountServiceAccountToken": False,
+                    "nodeName": node_name,
+                    "tolerations": self._notebook_tolerations(),
+                    "securityContext": {
+                        "runAsNonRoot": False,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "containers": [
+                        {
+                            "name": "flush",
+                            "image": self._workspace_sync_image(),
+                            "imagePullPolicy": "IfNotPresent",
+                            "command": ["/bin/bash", "-lc"],
+                            "args": [script],
+                            "resources": {
+                                "requests": {"cpu": "50m", "memory": "64Mi"},
+                                "limits": {"cpu": "1", "memory": "512Mi"},
+                            },
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "capabilities": {"drop": ["ALL"]},
+                            },
+                            "volumeMounts": [
+                                {"name": "durable", "mountPath": "/durable", "subPath": durable_subpath},
+                                # HostToContainer so the loop-image contents (mounted in the host mount
+                                # namespace) are visible, mirroring the hydrate init's /workspace mount.
+                                {"name": "local", "mountPath": "/local",
+                                 "mountPropagation": "HostToContainer"},
+                            ],
+                        }
+                    ],
+                    "volumes": [
+                        {"name": "durable", "persistentVolumeClaim": {"claimName": shard_pvc}},
+                        # DirectoryOrCreate so a genuinely-reaped dir mounts empty (quota-off no-op).
+                        # Under quota the in-container mountpoint check guards the empty-but-unmounted
+                        # case before we ever mark flushed.
+                        {"name": "local", "hostPath": {"path": local_path, "type": "DirectoryOrCreate"}},
+                    ],
+                },
+            }
+            _cleanup_pod()
+            try:
+                self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
+            except ApiException as e:
+                logger.error("flush pod create failed for %s on %s: %s", instance_id, node_name, e)
+                return False
+            started = False
+            attempt_start = time.monotonic()
+            try:
+                while True:
+                    if time.monotonic() >= overall_deadline:
+                        logger.error("flush for %s on %s timed out (started=%s)", instance_id, node_name, started)
+                        return False
+                    try:
+                        pod = _read_pod()
+                    except ApiException as e:
+                        logger.error("flush read failed for %s: %s", instance_id, e)
+                        return False
+                    if pod is None:
+                        logger.error("flush pod for %s vanished on %s before completion", instance_id, node_name)
+                        return False
+                    phase = pod.status.phase
+                    cst = (pod.status.container_statuses or [])
+                    if phase == "Running" or (cst and (cst[0].state.running or cst[0].state.terminated)):
+                        started = True
+                    if phase == "Succeeded":
+                        marked = store.mark_workspace_flushed(instance_id, node_name, session_token)
+                        if marked:
+                            logger.info("Flushed workspace %s -> durable shard %s (node %s, session %s)",
+                                        instance_id, shard_pvc, node_name, session_token)
+                        else:
+                            # Session advanced (relaunch/re-stop) while we flushed — our copy was the
+                            # OLD session's; the current row keeps its own (correct) unflushed state.
+                            logger.info("flush for %s on %s succeeded but session token stale (%s); "
+                                        "not marking current row", instance_id, node_name, session_token)
+                        return marked
+                    if phase == "Failed":
+                        logger.error("flush pod for %s FAILED on %s (shard %s) — not marked",
+                                     instance_id, node_name, shard_pvc)
+                        return False
+                    if not started and (time.monotonic() - attempt_start) >= start_deadline:
+                        logger.error("flush for %s did not start on %s within %ss (node may be NotReady/"
+                                     "cannot mount shard) — not marked", instance_id, node_name, start_deadline)
+                        return False
+                    time.sleep(1)
+            finally:
+                _cleanup_pod()
+        finally:
+            lock.release()
+
     def delete_workspace_durable(self, instance_id: str) -> bool:
         """ADMIN ONLY: soft-delete an instance's durable workspace by moving its subdir into
         <shard>/.trash/<id>-<epoch>/. Reversible until the nightly trash purge. Returns True on
@@ -699,6 +941,20 @@ class K8sClient:
         try:
             self._run_durable_shard_command(f"del-{instance_id}", shard_pvc, script, timeout_seconds=180)
             logger.info("Soft-deleted durable workspace for %s on shard %s", instance_id, shard_pvc)
+            # The SSD copy (if any) is now stale AND would be resurrected by the retry sweep (which
+            # would flush it back up, undoing the trash). The pod is already gone (guarded above), so:
+            # (1) free the SSD copy on the last node, then (2) drop all copy rows so neither the retry
+            # sweep nor the reaper acts on it again.
+            try:
+                last_node = store.get_workspace_last_node(instance_id)
+                if last_node:
+                    self._cleanup_local_workspace_cache(instance_id, last_node)
+            except Exception as e:
+                logger.debug("SSD cleanup after durable delete of %s: %s", instance_id, e)
+            try:
+                store.clear_all_local_copies(instance_id)
+            except Exception as e:
+                logger.debug("clear_all_local_copies after durable delete of %s: %s", instance_id, e)
             return True
         except Exception as e:
             logger.error("delete_workspace_durable failed for %s: %s", instance_id, e)
@@ -1617,12 +1873,16 @@ findmnt "$mnt"
                 }
             })
 
-        # Two-tier localcache: mount the durable shard (subPath per instance) and hydrate the
-        # node-local /workspace from it at startup; a preStop hook (added to the main container
-        # below) flushes local -> durable on graceful stop. Independent of the quota loop-mount:
-        # with quota on, /workspace is the loop image (so the hydrate mount uses HostToContainer
-        # propagation to see it); with quota off, /workspace is the plain SSD dir.
-        workspace_prestop_flush = None
+        # Two-tier localcache: mount the durable shard (subPath per instance) ONLY on the hydrate
+        # init container to seed the node-local /workspace at startup. The durable shard is NOT
+        # mounted on the main (user) container — the flush local -> durable runs out-of-pod from the
+        # manager delete path (_flush_workspace_to_durable) against the host-resident SSD copy. This
+        # keeps the durable NFS invisible/unwritable from inside the user's notebook (they can't
+        # bypass the 100GB quota cap by writing straight to the uncapped shared NFS) and also closes
+        # the ungraceful-kill gap for free (OOM/eviction/force-delete no longer skip the flush).
+        # Independent of the quota loop-mount: with quota on, /workspace is the loop image (so the
+        # hydrate mount uses HostToContainer propagation to see it); with quota off, /workspace is
+        # the plain SSD dir.
         if workspace_is_localcache:
             shard_pvc = self._durable_shard_pvc(instance_id)
             durable_subpath = self._durable_subpath(instance_id)
@@ -1665,30 +1925,14 @@ fi
                     {"name": "workspace-durable", "mountPath": durable_mount_path, "subPath": durable_subpath},
                 ],
             })
-            # Durable shard mount on the MAIN container so the preStop flush can read/write it.
-            main_durable_mount = {
-                "name": "workspace-durable",
-                "mountPath": durable_mount_path,
-                "subPath": durable_subpath,
-            }
-            volume_mounts.append(main_durable_mount)
+            # The durable shard volume is declared once for the whole pod; only the hydrate init
+            # container mounts it (above). Init containers are not user-exec-reachable, so this does
+            # not expose the shard to the notebook user. NO mount on the main container and NO preStop
+            # flush — the flush is driven out-of-pod by the manager (_flush_workspace_to_durable).
             volumes.append({
                 "name": "workspace-durable",
                 "persistentVolumeClaim": {"claimName": shard_pvc},
             })
-            # preStop: flush local -> durable on graceful stop (delete/idle-reap are graceful, the
-            # common path). Symmetric with hydrate: `rsync -a --update` (newer-wins, NO --delete), so
-            # a flush never destroys durable content and hydrate never destroys local content — the two
-            # directions can never fight. `cp -a` fallback for user images without rsync (also
-            # accumulate-only, consistent). The whole thing is best-effort (|| true) so a flush hiccup
-            # never blocks pod teardown.
-            _ws = shlex.quote(settings.WORKSPACE_MOUNT_PATH.rstrip('/') + '/')
-            _dur = shlex.quote(durable_mount_path + '/')
-            workspace_prestop_flush = (
-                f"if command -v rsync >/dev/null 2>&1; then "
-                f"rsync -a --update {_ws} {_dur}; "
-                f"else cp -a {_ws}. {_dur} 2>/dev/null || true; fi || true"
-            )
 
         container_limits = {
             "cpu": resources["cpu_limit"],
@@ -1770,12 +2014,10 @@ fi
                 "exec": {"command": ["/bin/sh", "-c", self._ssh_poststart_script()]}
             }
 
-        # Two-tier localcache: flush the SSD working copy back to the durable NFS shard on graceful
-        # stop (delete + idle-reap are graceful). Merged with any ssh postStart above.
-        if workspace_prestop_flush:
-            notebook_container.setdefault("lifecycle", {})["preStop"] = {
-                "exec": {"command": ["/bin/sh", "-c", workspace_prestop_flush]}
-            }
+        # NOTE: no localcache preStop flush on the notebook container — the local -> durable flush is
+        # driven out-of-pod by the manager (_flush_workspace_to_durable) reading the host-resident
+        # SSD copy after the pod is gone. This makes the flush fire regardless of how the pod died
+        # (graceful delete, OOM, eviction, force-delete) and keeps the durable NFS out of the pod.
 
         spec = {
             "securityContext": {
@@ -1805,10 +2047,9 @@ fi
             "volumes": volumes,
             "restartPolicy": "Always"
         }
-        # localcache pods need a long termination grace so the preStop local->durable flush can finish
-        # (default 30s would SIGKILL a large flush mid-copy). See WORKSPACE_TERMINATION_GRACE_SECONDS.
-        if workspace_is_localcache:
-            spec["terminationGracePeriodSeconds"] = int(settings.WORKSPACE_TERMINATION_GRACE_SECONDS)
+        # No terminationGracePeriodSeconds override for localcache: with no in-pod flush there is
+        # nothing that needs a long grace window. The out-of-pod flush runs after the pod is gone and
+        # reads the host-resident SSD copy, which survives pod teardown (delayed-local-reaper design).
         if init_containers:
             spec["initContainers"] = init_containers
         if notebook_node_name:
@@ -3037,14 +3278,16 @@ exit 0
         returns False and is left for the reconciler to finalize, keeping the DB
         consistent with cluster reality.
         """
-        # Two-tier localcache: BEFORE deleting, record the node the pod ran on + stop time. The
-        # graceful delete below fires the preStop flush (local -> durable), so durable is current;
-        # the stamp lets a fast relaunch soft-affine back to this node's warm cache and lets the
-        # delayed reaper free the local SSD copy after the TTL. The local copy is intentionally kept
-        # here (not deleted) — durable persists forever regardless.
+        # Two-tier localcache: BEFORE deleting, record the node the pod ran on + stop time. The flush
+        # (local -> durable) is NOT an in-pod preStop hook anymore — it runs out-of-pod AFTER the pod
+        # is confirmed gone (see below), driven by the manager against the host-resident SSD copy. The
+        # stamp lets a fast relaunch soft-affine back to this node's warm cache and lets the delayed
+        # reaper free the local SSD copy after the TTL (only once the flush has confirmed). The local
+        # copy is intentionally kept here (not deleted) — durable persists forever regardless.
         is_localcache = self._workspace_localcache_enabled()
+        node_name = None
+        session_token = None
         if is_localcache:
-            node_name = None
             try:
                 pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
                 node_name = getattr(pod.spec, "node_name", None)
@@ -3052,7 +3295,8 @@ exit 0
                 if e.status != 404:
                     logger.debug("could not read node for %s before delete: %s", instance_id, e)
             try:
-                store.stamp_workspace_stopped(instance_id, node_name)
+                # Records the (instance, node) local-copy row + returns its session fence token.
+                session_token = store.stamp_workspace_stopped(instance_id, node_name)
             except Exception as e:
                 logger.debug("stamp_workspace_stopped failed for %s: %s", instance_id, e)
 
@@ -3060,20 +3304,22 @@ exit 0
         self._delete_pod(instance_id)
 
         if not wait:
-            return not self._pod_exists(instance_id)
+            gone = not self._pod_exists(instance_id)
+            # Even on the fire-and-forget path, kick the flush if the pod is already gone; otherwise the
+            # reconciler retry sweep will pick up the unflushed copy row later.
+            if gone:
+                self._flush_after_delete(instance_id, node_name, session_token, is_localcache)
+            return gone
 
-        # localcache pods run a preStop flush (local->durable) that can take minutes for a large
-        # workspace. Wait out the full termination grace (plus slack) before force-killing, so the
-        # manager never truncates the flush — otherwise durable would be left stale/partial and the
-        # delete would silently lose the delta. Non-localcache keeps the fast 30s confirm window.
+        # No in-pod flush to wait out anymore — the out-of-pod flush reads the host SSD copy after the
+        # pod is gone, so the normal fast confirm window applies to both localcache and legacy.
         confirm_window = settings.DELETE_CONFIRM_TIMEOUT_SECONDS
-        if is_localcache:
-            confirm_window = max(confirm_window, int(settings.WORKSPACE_TERMINATION_GRACE_SECONDS) + 30)
         deadline = time.monotonic() + max(0, confirm_window)
         interval = max(0.5, settings.DELETE_POLL_INTERVAL_SECONDS)
         while time.monotonic() < deadline:
             if not self._pod_exists(instance_id):
                 logger.info("Confirmed pod %s is gone", instance_id)
+                self._flush_after_delete(instance_id, node_name, session_token, is_localcache)
                 return True
             time.sleep(interval)
 
@@ -3084,11 +3330,26 @@ exit 0
         while time.monotonic() < force_deadline:
             if not self._pod_exists(instance_id):
                 logger.info("Confirmed pod %s is gone after force delete", instance_id)
+                self._flush_after_delete(instance_id, node_name, session_token, is_localcache)
                 return True
             time.sleep(interval)
 
         logger.error("Pod %s still present after force delete; leaving for reconciler", instance_id)
         return False
+
+    def _flush_after_delete(self, instance_id: str, node_name: Optional[str],
+                            session_token: Optional[str], is_localcache: bool):
+        """Run the out-of-pod local->durable flush once a delete has confirmed the pod is gone.
+        Best-effort: a failed flush leaves the local-copy row's flushed_at NULL, so (a) the reaper
+        won't reap the unflushed SSD copy and (b) the reconciler sweep retries it later. Never raises
+        — a flush hiccup must not turn a successful delete into a failure."""
+        if not is_localcache or not node_name or not session_token:
+            return
+        try:
+            self._flush_workspace_to_durable(instance_id, node_name, session_token)
+        except Exception as e:
+            logger.error("post-delete flush for %s on %s failed (will retry via reconciler): %s",
+                         instance_id, node_name, e)
     
     def reap_local_workspace_caches(self) -> list:
         """Delayed-local-delete: free node-local SSD copies of instances stopped longer than
@@ -3098,6 +3359,7 @@ exit 0
             return []
         reaped = []
         try:
+            # Each candidate is a (instance, node) copy that is past its TTL AND confirmed-flushed.
             candidates = store.list_workspace_cache_to_reap(settings.WORKSPACE_LOCAL_CACHE_TTL_MINUTES)
         except Exception as e:
             logger.error("reap_local_workspace_caches: candidate lookup failed: %s", e)
@@ -3105,39 +3367,85 @@ exit 0
         for row in candidates:
             instance_id = row["instance_id"]
             node_name = row.get("node_name")
-            # A pod present now means the instance was relaunched within the TTL — keep the cache.
-            # Re-stamp running using the pod's ACTUAL current node (soft affinity is only a preference,
-            # so the relaunch may have landed elsewhere). Stamping the stale stored node would clear
-            # stopped_at against the wrong node, permanently orphaning the old node's cache dir (it
-            # would never again match list_workspace_cache_to_reap). If we can't read the live node,
-            # fall back to the stored one rather than guessing.
+            if not node_name:
+                continue
+            # A live pod ON THIS NODE means the instance was relaunched here and /workspace is the
+            # ACTIVE working set — never rm it. (A live pod on a DIFFERENT node means THIS node's copy
+            # is genuinely a stopped, flushed leftover and is safe to reap.) _cleanup_local_workspace_
+            # cache also re-checks pod-on-same-node as a TOCTOU guard, but skip early to avoid the op.
             if self._pod_exists(instance_id):
-                live_node = node_name
+                live_node = None
                 try:
                     pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
-                    live_node = getattr(pod.spec, "node_name", None) or node_name
+                    live_node = getattr(pod.spec, "node_name", None)
                 except ApiException:
                     pass
-                # If the relaunch moved to a different node, the OLD node's cache is now orphaned —
-                # reap it before re-stamping to the new node, otherwise it leaks forever.
-                if live_node and node_name and live_node != node_name:
-                    logger.info("Instance %s relaunched on %s (was %s); reaping stale cache on old node",
-                                instance_id, live_node, node_name)
-                    self._cleanup_local_workspace_cache(instance_id, node_name)
-                try:
-                    store.stamp_workspace_running(instance_id, live_node)
-                except Exception:
-                    pass
-                continue
+                if live_node == node_name:
+                    continue
             if self._cleanup_local_workspace_cache(instance_id, node_name):
+                # Drop this (instance, node) copy row. Leave cache_state (affinity hint) alone — it is
+                # one bounded row per instance and gets overwritten on the next stop.
                 try:
-                    store.clear_workspace_cache_state(instance_id)
+                    store.clear_local_copy_node(instance_id, node_name)
                 except Exception as e:
-                    logger.debug("clear_workspace_cache_state failed for %s: %s", instance_id, e)
-                reaped.append(instance_id)
+                    logger.debug("clear_local_copy_node failed for %s/%s: %s", instance_id, node_name, e)
+                reaped.append(f"{instance_id}@{node_name}")
         if reaped:
             logger.info("Reaped %s local workspace cache(s): %s", len(reaped), reaped)
         return reaped
+
+    def retry_unflushed_workspaces(self) -> list:
+        """Reconciler retry sweep: re-run the out-of-pod flush for every (instance, node) local copy
+        whose flush never confirmed (flushed_at NULL). Fallback for the single-node flush pin: if the
+        node was NotReady when delete_instance_by_id fired the flush (or the pod was lost out-of-band
+        before any delete), the flush couldn't run and the copy is unflushed. Once the node is Ready
+        again this retries it, fenced by the copy's session_token so it marks exactly that session.
+        Returns the "instance@node" keys successfully flushed this sweep."""
+        if not self._workspace_localcache_enabled():
+            return []
+        try:
+            rows = store.list_workspace_unflushed_copies()
+        except Exception as e:
+            logger.error("retry_unflushed_workspaces: lookup failed: %s", e)
+            return []
+        # Only flush onto Ready nodes — a pin to a NotReady node just wastes the start_deadline.
+        ready_nodes = set()
+        try:
+            for node in self._list_node_cached().items:
+                conds = {c.type: c.status for c in (node.status.conditions or [])}
+                if conds.get("Ready") == "True":
+                    ready_nodes.add(node.metadata.name)
+        except ApiException as e:
+            logger.debug("retry_unflushed_workspaces: node listing failed: %s", e)
+            return []
+        flushed = []
+        for row in rows:
+            instance_id = row["instance_id"]
+            node_name = row.get("node_name")
+            session_token = row.get("session_token")
+            if not node_name or node_name not in ready_nodes or not session_token:
+                continue
+            # A live pod ON THIS NODE means the instance was relaunched here; its /workspace is the
+            # active working set and its hydrate-init may be rsyncing — don't flush over it (the flush
+            # method also guards this, but skip early). A live pod on ANOTHER node doesn't affect this
+            # node's stopped copy.
+            if self._pod_exists(instance_id):
+                live_node = None
+                try:
+                    pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+                    live_node = getattr(pod.spec, "node_name", None)
+                except ApiException:
+                    pass
+                if live_node == node_name:
+                    continue
+            try:
+                if self._flush_workspace_to_durable(instance_id, node_name, session_token):
+                    flushed.append(f"{instance_id}@{node_name}")
+            except Exception as e:
+                logger.error("retry flush for %s on %s failed: %s", instance_id, node_name, e)
+        if flushed:
+            logger.info("Reconciler flushed %s previously-unflushed workspace(s): %s", len(flushed), flushed)
+        return flushed
 
     def delete_instance(self, email: str) -> bool:
         """Delete a notebook instance"""
