@@ -1844,21 +1844,30 @@ set -eux
 img={shlex.quote(quota_image_path)}
 mnt={shlex.quote(settings.WORKSPACE_MOUNT_PATH)}
 mkdir -p /quota-images "$mnt"
-# Idempotency guard (robust). `findmnt -o SOURCE` on a loop mount returns the loop DEVICE
-# (/dev/loopN), NOT the image path, so the previous `grep -Fq "$img"` test could never match and
-# was effectively dead. On a pod restart where a prior pod's loop mount leaked into the host mount
-# namespace (Bidirectional propagation persists it), that dead guard fell through to a second
-# `mount -o loop`, which fails with "already mounted / busy" and (under `set -e`) crash-loops the
-# initContainer. Instead: if $mnt is already mounted, resolve the loop device(s) actually backing
-# $img and skip only when the current mount source is one of them; otherwise unmount the stale/
-# foreign mount before (re)mounting.
-if mountpoint -q "$mnt"; then
-  src="$(findmnt -n -o SOURCE "$mnt" || true)"
-  if [ -n "$src" ] && losetup -j "$img" 2>/dev/null | cut -d: -f1 | grep -qx "$src"; then
+# Idempotency guard (robust). IMPORTANT: $mnt is ALWAYS a mountpoint here — kubelet bind-mounts the
+# SSD dir in via the "workspace" volume (source shows as /dev/nvme0n1p1[/workspace/<id>]). The loop
+# image is meant to be STACKED on top of that bind (the original code did `mount -o loop` directly on
+# it, and the notebook container's HostToContainer propagation then sees the topmost = the loop). So
+# we must NOT unmount the bind base on a normal start.
+#
+# The bug the old guard had: `findmnt -o SOURCE` on a loop mount returns the loop DEVICE (/dev/loopN),
+# never the image path, so its `grep -Fq "$img"` test was dead. On a restart where OUR loop is already
+# the top mount it fell through and re-ran `mount -o loop` => "already mounted/busy" => set -e =>
+# CrashLoopBackOff. Correct logic keyed on the CURRENT top source:
+#   * top source is OUR loop (a /dev/loopN backing $img)  -> already mounted, skip (idempotent).
+#   * top source is a FOREIGN loop (/dev/loopN NOT backing $img, e.g. a leaked prior-instance mount)
+#     -> unmount it, then stack ours.
+#   * top source is the bind base (not a loop device at all) -> normal first start; DO NOT unmount,
+#     just stack our loop on top (original behavior).
+src="$(findmnt -n -o SOURCE "$mnt" 2>/dev/null || true)"
+# strip any findmnt "[/subpath]" suffix to get the bare device
+dev_only="${{src%%[*}}"
+if printf '%s' "$dev_only" | grep -q '^/dev/loop'; then
+  if losetup -j "$img" 2>/dev/null | cut -d: -f1 | grep -qx "$dev_only"; then
     echo "quota loop already mounted at $mnt from $img; nothing to do"
     df -h "$mnt"; findmnt "$mnt"; exit 0
   fi
-  echo "stale/foreign mount at $mnt (source=${{src:-none}}); unmounting before remount"
+  echo "foreign loop mounted at $mnt (source=${{src:-none}}); unmounting before remounting ours"
   umount -l "$mnt" || true
 fi
 # Detach any loop devices still bound to $img but no longer mounted anywhere, so leaked devices

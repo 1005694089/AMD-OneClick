@@ -421,24 +421,36 @@ class ManifestApproachBTests(unittest.TestCase):
                          "no long grace needed without an in-pod flush")
 
     def test_quota_guard_is_robust_not_dead_findmnt_grep(self):
-        """Regression: the quota initContainer idempotency guard must NOT use the old
-        `findmnt -o SOURCE ... | grep -Fq "$img"` test — SOURCE is /dev/loopN, never the image path,
-        so that test could never match and a leaked loop mount re-triggered `mount -o loop` →
-        CrashLoopBackOff. The fix must detect an existing mount via losetup back-file and unmount a
-        stale/foreign mount before remounting."""
+        """Regression for the quota initContainer idempotency guard. Two bugs it must avoid:
+        (1) the ORIGINAL dead guard did `findmnt -o SOURCE | grep -Fq "$img"` — SOURCE is /dev/loopN,
+            never the image path, so it never matched and a leaked loop remount hit `mount -o loop` on
+            a busy mount → CrashLoopBackOff.
+        (2) a naive fix that unconditionally unmounts any existing mount BREAKS the normal first start:
+            /workspace is ALWAYS the kubelet bind base (source /dev/nvme0n1p1[/workspace/<id>]); the
+            loop must be STACKED on top of it, NOT after unmounting it (unmounting the bind base drops
+            the quota — the notebook container then sees the uncapped SSD).
+        The correct guard keys on whether the CURRENT top source is a loop device backing $img."""
         _, _, inits = self._containers(self._manifest())
         self.assertIn("workspace-quota", inits, "quota init container must exist when quota enabled")
         script = inits["workspace-quota"]["args"][0]
-        # The dead guard was `current_source="$(findmnt -n -o SOURCE ...)"` then grep against $img.
-        # Assert that specific dead assignment is gone (ignore prose in comments).
         code_lines = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
         code = "\n".join(code_lines)
-        self.assertNotIn('current_source=', code,
-                         "the dead findmnt-SOURCE-vs-image-path guard must be removed from executable code")
-        # The robust guard must be present in executable code.
+        # The dead grep-against-$img guard must be gone.
+        self.assertNotIn('grep -Fq "$img"', code,
+                         "the dead findmnt-SOURCE-vs-image-path guard must be removed from code")
+        self.assertNotIn('current_source=', code)
+        # Must discriminate on the loop device, and resolve our loop via losetup.
         self.assertIn("losetup -j", code, "must resolve loop devices backing the image via losetup")
-        self.assertIn("mountpoint -q", code, "must check mountpoint state")
-        self.assertIn("umount", code, "must unmount a stale/foreign mount before remount")
+        self.assertIn("/dev/loop", code, "must key the guard on whether the top source is a loop dev")
+        # The final stack-mount must be present.
+        self.assertIn('mount -o loop "$img" "$mnt"', code, "must stack the loop mount on /workspace")
+        # Structural safety: any `umount` must sit INSIDE the `/dev/loop` guard branch (never at top
+        # level), so a normal first start with the bind base as top source is never unmounted.
+        for i, ln in enumerate(code_lines):
+            if "umount" in ln:
+                preceding = "\n".join(code_lines[:i])
+                self.assertIn("/dev/loop", preceding,
+                              "umount must be guarded by the loop-device check, not unconditional")
 
 
 class FlushPodTests(unittest.TestCase):
