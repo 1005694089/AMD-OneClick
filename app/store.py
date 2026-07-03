@@ -2912,7 +2912,7 @@ def mark_instance_deleting(instance_id: str):
                 instance_records.c.deleted_at.is_(None),
                 instance_records.c.status.in_(["pending", "running"]),
             )
-            .values(status="deleting", updated_at=utc_now())
+            .values(status="deleting")
         )
 
 

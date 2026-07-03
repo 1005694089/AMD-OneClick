@@ -201,5 +201,62 @@ class PodStatesNodeNameTests(unittest.TestCase):
         self.assertEqual(states[0]["node_name"], "wx-k8s-prod-s-064")
 
 
+class MarkInstanceDeletingTests(unittest.TestCase):
+    """DB-backed: mark_instance_deleting must transition a live row to 'deleting' without touching
+    columns that don't exist (regression for the 'Unconsumed column names: updated_at' bug), leave
+    deleted_at NULL, and skip already-deleted rows."""
+
+    @classmethod
+    def setUpClass(cls):
+        from app import store
+        store.init_db()
+
+    def _insert(self, instance_id, status="running", deleted_at=None):
+        from app import store
+        now = store.utc_now()
+        with store.engine.begin() as conn:
+            conn.execute(
+                store.instance_records.insert().values(
+                    user_id=1, email="e@x.com", instance_id=instance_id, image="img",
+                    instance_type="opencode", gpu_count=1, status=status,
+                    created_at=now, last_charged_at=now, billing_session_id="b-" + instance_id,
+                    deleted_at=deleted_at,
+                )
+            )
+
+    def _row(self, instance_id):
+        from app import store
+        from sqlalchemy import select
+        with store.engine.begin() as conn:
+            return conn.execute(
+                select(store.instance_records).where(
+                    store.instance_records.c.instance_id == instance_id
+                )
+            ).mappings().first()
+
+    def test_running_row_transitions_to_deleting_and_keeps_deleted_at_null(self):
+        from app import store
+        self._insert("u-1-mkdel-a", status="running")
+        store.mark_instance_deleting("u-1-mkdel-a")  # must not raise (regression: updated_at)
+        row = self._row("u-1-mkdel-a")
+        self.assertEqual(row["status"], "deleting")
+        self.assertIsNone(row["deleted_at"])
+
+    def test_deleting_row_excluded_from_active_but_present(self):
+        from app import store
+        self._insert("u-1-mkdel-b", status="running")
+        store.mark_instance_deleting("u-1-mkdel-b")
+        # A deleting row must NOT block a new launch (not "active")...
+        self.assertIsNone(store.get_active_instance_for_user(1))
+        # ...but the row still exists (visible to status polling).
+        self.assertEqual(self._row("u-1-mkdel-b")["status"], "deleting")
+
+    def test_already_deleted_row_not_resurrected(self):
+        from app import store
+        self._insert("u-1-mkdel-c", status="deleted", deleted_at=store.utc_now())
+        store.mark_instance_deleting("u-1-mkdel-c")
+        self.assertEqual(self._row("u-1-mkdel-c")["status"], "deleted")
+
+
 if __name__ == "__main__":
     unittest.main()
