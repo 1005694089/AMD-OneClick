@@ -24,7 +24,46 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-03 (latest) — Radeon beta: revert image soft-affinity + enable Redis rate limiting (image rebuild)
+## 2026-07-03 (latest) — radeon-global (amd-oneclick-lablab): two-tier persistent /workspace (localcache) cutover
+
+**Code commit:** `db3dc20` on `prod/radeon-global` (built from this tip). Adds a persistent
+per-instance `/workspace`: node-local SSD working copy (100GB ext4 loop quota cap) backed by a
+durable, sharded NFS canonical copy across 5 shared RWX PVCs (`md5(instance_id)%5` over
+`managed-nfs-storage-1..5`, per-instance `subPath` isolation). Hydrate initContainer
+(durable→local) + preStop flush (local→durable), both `rsync -a --update` (newer-wins, no
+`--delete`, accumulate-only). Delayed-local reaper frees SSD after TTL; admin soft-delete to
+`.trash` + nightly purge; data kept forever until admin delete. Also flips
+`IMAGE_SERVICE_ENABLED` default → false so pods stay unpinned and the workspace soft-affinity
+applies (lablab CM already set it false explicitly, so no behavior change).
+
+**Image:** `docker build --platform linux/amd64 --provenance=false` → `lablab.local/amd-oneclick:db3dc20`
+(84MiB). Side-loaded node-local onto `wx-k8s-prod-s-001` via a privileged pod mounting the node
+containerd socket (`ctr -n k8s.io images import`); no registry push, no pull secret (matches prior lablab deploys).
+
+**Cluster prep (additive, reversible):**
+- Applied `k8s-workspace-localssd-prep.yaml` DaemonSet (mkdir `/nvme0/data/workspace` + `-quota`, 0777). Ready 125/129 (3 control-plane masters NoSchedule+no-GPU = irrelevant; `wx-k8s-prod-s-064` slow-pulling the 90GB base image).
+- Bootstrapped 5 durable PVCs `oneclick-durable-shard-0..4` (one per SFS-Turbo SC) — all Bound.
+
+**Config (ConfigMap `amd-oneclick-lablab-config`, `kubectl patch --type merge`):**
+`WORKSPACE_VOLUME_TYPE` emptyDir→`localcache`; added `WORKSPACE_QUOTA_ENABLED=true`,
+`WORKSPACE_QUOTA_SIZE_GI=100`. All other keys byte-identical. PRE snapshot:
+`~/oneclick-cutover-rollback/cm-PRE-20260703-1721.yaml` (+ deploy snapshot).
+
+**Deploy:** `kubectl set image deployment/amd-oneclick-lablab-manager manager=lablab.local/amd-oneclick:db3dc20`. Rolled out 1/1, 0 restarts, on `wx-k8s-prod-s-001`.
+
+**Verification (live):**
+- Manager startup log: 5 durable shards ready; both new scheduler jobs registered; `/health`=healthy.
+- Pre-cutover canary (hand-applied real manifest): quota+hydrate init, `/workspace`=2GB ext4 loop on SSD, durable subPath on nfs.csi.k8s.io, preStop flush→durable, relaunch on DIFFERENT node→hydrate restored files, quota ENOSPC at cap, reaper freed SSD dir+image, admin soft-delete→.trash→purge. All clean.
+- Post-cutover E2E via real manager `create_instance`: instance `nb-e2ecut01` scheduled unpinned by default-scheduler onto `wx-k8s-prod-s-117`, `/workspace`=98G loop (100GB cap), grace 600, durable→shard-1 subPath `2e/nb-e2ecut01`; wrote marker, manager delete fired preStop flush → marker confirmed on durable shard-1; cleaned up. No user pods disturbed (none were running).
+
+**Known follow-ups (non-blocking):**
+1. **Reaper/admin op-pods have no nodeSelector** — `purge_durable_trash` shard-0 op landed on `wx-k8s-prod-s-044` which failed `mount.nfs` (exit 32) on the SFS-Turbo PVC; the op timed out (admin delete + 4/5 purges still succeeded on good nodes). Should pin op-pods to NFS-capable nodes or retry on mount failure.
+2. **`wx-k8s-prod-s-064` + any node missing the base image / nfs-common** will fail localcache init/mounts if a pod lands there — seed the base image + ensure nfs client on all schedulable GPU nodes before relying on full-fleet capacity.
+
+**Rollback:** re-apply `~/oneclick-cutover-rollback/*-PRE-20260703-1721.yaml` (restores image `1157ed2` + emptyDir CM). Durable PVCs + DaemonSet are additive and can stay (harmless) or be deleted; already-persisted workspaces remain on the NFS shards.
+
+
+## 2026-07-03 — Radeon beta: revert image soft-affinity + enable Redis rate limiting (image rebuild)
 
 **Code commit:** `48c3c7c` on `BETA-test` (pushed). Two coordinated changes on top of the
 2026-07-02 oauth-credit-manager merge (`2bd2ae2`):
