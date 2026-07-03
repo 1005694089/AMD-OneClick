@@ -5,6 +5,9 @@
 #
 # Image: the platform base image (already warm on nodes) — public registries are blocked from nodes.
 # Scope: amd-oneclick-lablab namespace only.
+# Control-plane nodes (wx-k8s-prod-m-00{1,2,3}) lack Harbor plain-HTTP trust and cannot pull this
+# image; they run no workspace workloads, so nodeAffinity excludes them (the blanket toleration is
+# kept for GPU/worker taints).
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -21,6 +24,13 @@ spec:
       labels:
         app: oneclick-workspace-localssd-prep
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
       hostPID: true
       automountServiceAccountToken: false
       tolerations:
