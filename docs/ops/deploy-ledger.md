@@ -24,7 +24,63 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-03 (latest) - radeon-global: hotfix updated_at + FIRST Harbor-registry manager deploy (no side-load)
+## 2026-07-03 (latest) - radeon-global: Approach B (hide durable NFS from user pods) + quota guard fix
+
+**Code:** copy project `~/AMD-OneClick-workspaceB` branch `feature/workspace-approach-b`, deployed
+commit `6591ca3` (image `10.5.10.89:1808/xinwei/amd-oneclick-manager:6591ca3`); NetworkPolicy label
+fix `d2cc3e4` applied as a manifest (no rebuild). NOT pushed to origin (kept off prod/radeon-global
+per operator direction; main repo clean at 51bd895).
+
+**What shipped:**
+- Approach B: the durable NFS shard is no longer mounted in the USER notebook container (only the
+  hydrate init container mounts it). Closes the 100GB-cap bypass (root user could write straight to
+  the uncapped shared NFS). The local->durable flush moved OUT of the pod to a manager-driven,
+  node-pinned one-shot pod reading the host SSD copy, so it fires however the pod died.
+- Per-(instance,node) `workspace_local_copy` flush ledger fenced by session_token (fixes 5 critical
+  data-loss races found by adversarial review): mark_workspace_flushed only marks the matching
+  session; reaper frees SSD only when flushed_at set, keyed per node (no cross-node orphan); flush
+  pod verifies the loop is mounted before a no-op; unique flush pod names + in-process lock +
+  live-pod abort; reconciler workspace_flush_retry_job retries unflushed copies.
+- NetworkPolicy `oneclick-notebook-block-sfs-egress` blocks notebook-pod egress to the 4 SFS IPs
+  (defense-in-depth). Selector fixed to the LIVE label `app=amd-oneclick-lablab` (the config default
+  `amd-oneclick` selected nothing).
+- Quota loop-mount guard fix: the deployed `76efa5c` guard did `findmnt -o SOURCE | grep -Fq "$img"`,
+  but SOURCE on a loop mount is `/dev/loopN` (never the image path) so the idempotency check was dead
+  and a leaked loop mount re-ran `mount -o loop` => busy => CrashLoopBackOff. New guard keys on the
+  current top source: our loop => skip; a foreign loop => unmount then stack; the kubelet bind base
+  (normal first start) => DO NOT unmount, stack the loop on top. (First fix attempt 4988f0f regressed
+  the normal start by unmounting the bind base; corrected in 6591ca3.)
+
+**Deploy method (fast):** kaniko build FROM the deployed manager image with a source-only COPY (no
+pip; deps unchanged) => ~3s build vs ~7min full pip build. Pushed to Harbor, `kubectl set image`.
+`/tmp/Dockerfile.fast` + `/tmp/kaniko-fast-*.yaml` saved for reuse.
+
+**Migration:** `workspace_local_copy` table auto-created at startup via metadata.create_all (verified
+present in live Postgres with all 6 columns). No ConfigMap changes needed (4 shards, DEFAULT_IMAGE,
+cache root all already correct).
+
+**E2E verification (live, throwaway nb-e2echk2):**
+- Notebook container mounts: shm, hf-cache, workspace ONLY — NO workspace-durable (cap-bypass closed).
+- `/workspace` = /dev/loop0 98G (quota enforced) — after the guard fix; the 4988f0f build had shown
+  the bare 3.5T SSD (bug caught + fixed before finalizing).
+- NetworkPolicy: SFS 10.20.100.69:2049 BLOCKED from the notebook pod; other egress OK; already-running
+  pod's hydrate mount unaffected.
+- Wrote /workspace/E2E_MARKER.txt, deleted via manager -> out-of-pod flush pod ran; ledger row got
+  session_token + flushed_at; marker confirmed on durable shard-1 (ca/nb-e2echk2/E2E_MARKER.txt).
+- Relaunched -> hydrate restored the marker from durable into a fresh 98G loop.
+- Cleaned up: instance deleted, admin durable delete trashed the data, ledger rows cleared.
+
+**Note (not a defect):** localcache delete now uses the normal 30s confirm window (the long
+WORKSPACE_TERMINATION_GRACE window was for the retired in-pod preStop flush). Pods that outlive 30s
+get force-deleted; the out-of-pod flush still runs afterward, so no data is lost — the "force
+deleting" log line is cosmetic.
+
+**PRE snapshot:** `local-deploy-history/radeon-global/20260703-2251-approachB-4988f0f-PRE-deploy.yaml`
+(image 3663700). **Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:3663700` + `kubectl delete networkpolicy
+oneclick-notebook-block-sfs-egress -n amd-oneclick-lablab`.
+
+## 2026-07-03 - radeon-global: hotfix updated_at + FIRST Harbor-registry manager deploy (no side-load)
 
 **Code commit:** `3663700` (on `prod/radeon-global`). Hotfix for a regression introduced by `aafc57a`:
 `mark_instance_deleting` set a nonexistent `updated_at` column on `instance_records`, so every delete
