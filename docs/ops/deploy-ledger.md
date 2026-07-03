@@ -24,7 +24,47 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-03 (latest) — radeon-global (amd-oneclick-lablab): two-tier persistent /workspace (localcache) cutover
+## 2026-07-03 (latest) - radeon-global: durable-op node-targeting hardening (fix #1) + shard-0 backend incident
+
+**Code commit:** `844279a` (on `prod/radeon-global`; preceded by `5135956`). Fixes review follow-up #1
+from the workspace cutover: durable-op pods (admin soft-delete + nightly trash purge) mount an
+SFS-Turbo NFS PVC and previously scheduled anywhere (tolerations Exists), so they could land on a
+node that cannot mount the backend and hang on mount.nfs exit 32. Now `_nfs_op_candidate_nodes()`
+returns an ordered candidate list (proven-NFS nodes running a durable-mounted pod, then
+sync-image-warm nodes, then cold), scoped via `_node_belongs_to_service` (excludes masters/other
+tenants), and `_run_durable_shard_command` pins each attempt to a candidate, retrying on pre-start
+stall / pre-start Failed, raising only on a container that started-then-Failed, with an overall
+wall-clock budget, read-retry before force-kill, and 409-on-create skip. Also made
+`delete_workspace_durable` atomic (single-rename mv + delete-epoch encoded in trash dir name;
+`purge_durable_trash` derives retention from that epoch, not fs mtime) - closes an mv/touch
+truncation data-loss risk found in review. Built `lablab.local/amd-oneclick:844279a`, side-loaded to
+s-001, kubectl set image, rolled out 1/1 healthy. 16 workspace + 27 existing tests pass. Adversarial
+multi-agent review run on interim `5135956`; its findings (overall-timeout, read-retry, 409,
+service-scoping, atomic-delete) folded in.
+
+**INCIDENT surfaced during live verification (NOT caused by this change):** `purge_durable_trash`
+succeeds on shards 1-4 but shard-0 fails with 'access denied by server' from EVERY node. Root cause:
+the `managed-nfs-storage-1` StorageClass was deleted out-of-band (only -2..-5 remain; -1 never
+recreated) and its backing SFS-Turbo filesystem 712f4074-...sfsturbo.internal (the shared TEST
+filesystem, also referenced by leftover default/nfs-test-pvc, nfs-limit-test/rt-test,
+default/nfs-quota-test) now denies mounts. Investigation (per user request to investigate who deleted
+it first): storage SC/filesystem management is entirely out-of-band (no git/ledger/repo yaml ever
+created managed-nfs-storage-*; only this feature consumes them), -1 was targeted (not a bulk
+teardown), and a NEW CPU-NFS stack (amd-oneclick-storage ns, oneclick-cpu-nfs-* SCs) was stood up
+2026-07-03 07:26 - i.e. an active, intentional storage re-architecture by the infra owner. shard-0
+left UNTOUCHED per user decision.
+
+**IMPACT / OPEN:** shard-0 receives md5(instance_id)%5==0 (~20% of instances); until its backend is
+restored/re-pointed, those instances cannot mount their durable workspace. Options deferred to infra
+owner: (a) recreate managed-nfs-storage-1 + repoint shard-0 PVC to a healthy SFS-Turbo filesystem
+(shard-0 is empty, no data loss), or (b) if -1 is permanently gone, drop to 4 shards - but ONLY in
+the current pre-user-data window, since a shard-list edit remaps md5%N. Code left as-is per user (no
+shard-health-gate added this round). Recommend not launching real users until shard-0 is healthy or
+the shard list is corrected.
+
+Rollback: ~/oneclick-cutover-rollback/*-PRE-20260703-1721.yaml (image 1157ed2 + emptyDir CM).
+
+## 2026-07-03 — radeon-global (amd-oneclick-lablab): two-tier persistent /workspace (localcache) cutover
 
 **Code commit:** `db3dc20` on `prod/radeon-global` (built from this tip). Adds a persistent
 per-instance `/workspace`: node-local SSD working copy (100GB ext4 loop quota cap) backed by a
