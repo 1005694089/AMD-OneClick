@@ -1844,12 +1844,28 @@ set -eux
 img={shlex.quote(quota_image_path)}
 mnt={shlex.quote(settings.WORKSPACE_MOUNT_PATH)}
 mkdir -p /quota-images "$mnt"
-current_source="$(findmnt -n -o SOURCE "$mnt" || true)"
-if printf '%s' "$current_source" | grep -Fq "$img"; then
-  df -h "$mnt"
-  findmnt "$mnt"
-  exit 0
+# Idempotency guard (robust). `findmnt -o SOURCE` on a loop mount returns the loop DEVICE
+# (/dev/loopN), NOT the image path, so the previous `grep -Fq "$img"` test could never match and
+# was effectively dead. On a pod restart where a prior pod's loop mount leaked into the host mount
+# namespace (Bidirectional propagation persists it), that dead guard fell through to a second
+# `mount -o loop`, which fails with "already mounted / busy" and (under `set -e`) crash-loops the
+# initContainer. Instead: if $mnt is already mounted, resolve the loop device(s) actually backing
+# $img and skip only when the current mount source is one of them; otherwise unmount the stale/
+# foreign mount before (re)mounting.
+if mountpoint -q "$mnt"; then
+  src="$(findmnt -n -o SOURCE "$mnt" || true)"
+  if [ -n "$src" ] && losetup -j "$img" 2>/dev/null | cut -d: -f1 | grep -qx "$src"; then
+    echo "quota loop already mounted at $mnt from $img; nothing to do"
+    df -h "$mnt"; findmnt "$mnt"; exit 0
+  fi
+  echo "stale/foreign mount at $mnt (source=${{src:-none}}); unmounting before remount"
+  umount -l "$mnt" || true
 fi
+# Detach any loop devices still bound to $img but no longer mounted anywhere, so leaked devices
+# don't accumulate across restarts (and we never remount a stale one).
+for dev in $(losetup -j "$img" 2>/dev/null | cut -d: -f1); do
+  if ! findmnt -n -S "$dev" >/dev/null 2>&1; then losetup -d "$dev" 2>/dev/null || true; fi
+done
 if [ ! -f "$img" ]; then
   truncate -s {int(settings.WORKSPACE_QUOTA_SIZE_GI)}G "$img"
   mkfs.ext4 -F "$img"
