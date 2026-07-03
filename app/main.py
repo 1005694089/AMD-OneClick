@@ -97,6 +97,7 @@ from .store import (
     set_user_editor,
     set_user_ssh_public_key,
     mark_instance_deleted,
+    mark_instance_deleting,
     mark_instance_ready_for_billing,
     record_instance,
     record_instance_launch_event,
@@ -634,6 +635,8 @@ def _notebook_status_message(status_details: Optional[dict]) -> str:
         "distributing": "Loading image onto the GPU node…",
         "initializing": "Initializing notebook environment...",
         "loading": "Loading notebook image...",
+        "terminating": "Shutting down your instance…",
+        "deleting": "Shutting down your instance…",
         "failed": "Notebook creation failed",
         "unknown": "Checking status...",
     }
@@ -1642,6 +1645,34 @@ async def notebook_logs(user: dict = Depends(current_user)):
         return {"events": [], "container": "", "status": "error"}
 
 
+def _background_delete(instance_id: str) -> None:
+    """Blocking delete + DB finalize, meant to run in a worker thread (never on the event loop).
+
+    delete_instance_by_id polls until the pod is gone (and, for localcache, runs the out-of-pod
+    flush — up to ~630s), so it MUST NOT run inline in an async handler. On success it stamps the
+    row deleted; on any failure the row stays 'deleting' and reconcile_job finalizes it."""
+    try:
+        k8s_client.delete_instance_by_id(instance_id, wait=True)
+    except Exception as e:
+        logger.error("Background delete of %s failed (reconcile will finalize): %s", instance_id, e)
+    finally:
+        try:
+            mark_instance_deleted(instance_id)
+        except Exception as e:
+            logger.error("Background delete: mark_instance_deleted(%s) failed: %s", instance_id, e)
+
+
+def _spawn_background_delete(instance_id: str) -> None:
+    """Schedule _background_delete on the default thread-pool executor without awaiting it, so the
+    calling request returns immediately. Uses the running loop's executor (bounded); reconcile_job
+    is the safety net if the process dies before the task completes."""
+    try:
+        asyncio.get_running_loop().run_in_executor(None, _background_delete, instance_id)
+    except RuntimeError:
+        # No running loop (shouldn't happen inside a handler) — fall back to a synchronous run.
+        _background_delete(instance_id)
+
+
 @app.delete("/api/notebook/current", response_model=DestroyResponse)
 async def destroy_current_notebook(user: dict = Depends(current_user)):
     """Destroy the current user's active notebook instance."""
@@ -1658,12 +1689,17 @@ async def destroy_current_notebook(user: dict = Depends(current_user)):
 
     instance_id = active["instance_id"]
     try:
-        deleted = k8s_client.delete_instance_by_id(instance_id)
-        mark_instance_deleted(instance_id)
+        # Fire-and-forget: flip the DB to 'deleting' synchronously (durable intent, and instantly
+        # frees the user to launch a replacement since get_active_instance_for_user ignores
+        # 'deleting'), then run the blocking k8s delete+flush off the event loop in the background
+        # so this handler returns immediately and never starves the liveness probe. reconcile_job is
+        # the backstop that force-finalizes if the background task dies.
+        mark_instance_deleting(instance_id)
+        _spawn_background_delete(instance_id)
         return DestroyResponse(
             success=True,
-            message=f"Instance {instance_id} {'destroyed' if deleted else 'marked deleted'}",
-            destroyed_count=1 if deleted else 0,
+            message=f"Instance {instance_id} is shutting down",
+            destroyed_count=1,
         )
     except Exception as e:
         logger.error(f"Error destroying current user instance {instance_id}: {e}")
@@ -2664,12 +2700,14 @@ async def destroy_huggingface_demo_notebook(
 
     instance_id = active["instance_id"]
     try:
-        deleted = k8s_client.delete_instance_by_id(instance_id)
-        mark_instance_deleted(instance_id)
+        # Fire-and-forget (see destroy_current_notebook): mark deleting synchronously, run the
+        # blocking delete off the event loop, return immediately.
+        mark_instance_deleting(instance_id)
+        _spawn_background_delete(instance_id)
         return DestroyResponse(
             success=True,
-            message=f"Instance {instance_id} {'destroyed' if deleted else 'marked deleted'}",
-            destroyed_count=1 if deleted else 0,
+            message=f"Instance {instance_id} is shutting down",
+            destroyed_count=1,
         )
     except Exception as e:
         logger.error("Error destroying Hugging Face demo notebook %s: %s", instance_id, e)
@@ -3728,16 +3766,19 @@ async def admin_delete_image(image_id: int, username: str = Depends(verify_admin
 async def destroy_instance(instance_id: str, username: str = Depends(verify_admin)):
     """Destroy a specific notebook instance by ID"""
     try:
-        success = k8s_client.delete_instance_by_id(instance_id)
+        # Admin single-delete: keep definitive-result semantics (report destroyed vs not-found), but
+        # run the blocking delete off the event loop so it can't starve the liveness probe.
+        mark_instance_deleting(instance_id)
+        success = await asyncio.to_thread(k8s_client.delete_instance_by_id, instance_id)
         if success:
             mark_instance_deleted(instance_id)
-        
+
         return DestroyResponse(
             success=success,
             message=f"Instance {instance_id} {'destroyed' if success else 'not found'}",
             destroyed_count=1 if success else 0
         )
-        
+
     except Exception as e:
         logger.error(f"Error destroying instance {instance_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -3747,16 +3788,17 @@ async def destroy_instance(instance_id: str, username: str = Depends(verify_admi
 async def destroy_all_instances(username: str = Depends(verify_admin)):
     """Destroy all notebook instances"""
     try:
-        count = k8s_client.delete_all_instances()
+        # Off-load the blocking delete-all so a slow teardown can't starve the liveness probe.
+        count = await asyncio.to_thread(k8s_client.delete_all_instances)
         for inst in k8s_client.list_instances():
             mark_instance_deleted(inst["id"])
-        
+
         return DestroyResponse(
             success=True,
             message=f"Destroyed {count} instances",
             destroyed_count=count
         )
-        
+
     except Exception as e:
         logger.error(f"Error destroying all instances: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -3776,21 +3818,28 @@ async def bulk_destroy_instances(req: InstanceBulkDestroyRequest, username: str 
         inst for inst in instances
         if destroy_all or needle in (inst.get("email") or "").lower()
     ]
-    destroyed = []
-    failed = []
-    for inst in matched:
-        instance_id = inst.get("id")
-        if not instance_id:
-            continue
-        try:
-            if k8s_client.delete_instance_by_id(instance_id):
-                mark_instance_deleted(instance_id)
-                destroyed.append({"id": instance_id, "email": inst.get("email")})
-            else:
-                failed.append({"id": instance_id, "email": inst.get("email"), "reason": "not found"})
-        except Exception as e:
-            logger.error("Bulk destroy failed for %s: %s", instance_id, e)
-            failed.append({"id": instance_id, "email": inst.get("email"), "reason": str(e)})
+    def _run_bulk():
+        # Runs entirely in a worker thread (via to_thread below): the whole N-instance blocking loop
+        # is off the event loop, so even N localcache deletes (N×~630s worst case) never starve the
+        # liveness probe. mark_instance_deleting is stamped per-item first so the UI reflects intent.
+        _destroyed, _failed = [], []
+        for inst in matched:
+            instance_id = inst.get("id")
+            if not instance_id:
+                continue
+            try:
+                mark_instance_deleting(instance_id)
+                if k8s_client.delete_instance_by_id(instance_id):
+                    mark_instance_deleted(instance_id)
+                    _destroyed.append({"id": instance_id, "email": inst.get("email")})
+                else:
+                    _failed.append({"id": instance_id, "email": inst.get("email"), "reason": "not found"})
+            except Exception as e:
+                logger.error("Bulk destroy failed for %s: %s", instance_id, e)
+                _failed.append({"id": instance_id, "email": inst.get("email"), "reason": str(e)})
+        return _destroyed, _failed
+
+    destroyed, failed = await asyncio.to_thread(_run_bulk)
 
     return {
         "success": not failed,

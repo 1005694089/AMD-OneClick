@@ -78,6 +78,7 @@
       if (inst.live_reason === 'ContainerCreating') return 'Preparing workspace';
       if (inst.live_reason === 'JupyterStarting') return 'Jupyter is starting';
       if (inst.live_status === 'distributing') return 'Loading image onto the GPU node';
+      if (inst.live_status === 'terminating' || inst.live_status === 'deleting') return 'Shutting down';
       if (inst.live_status === 'ready') return 'Ready';
       return inst.live_message || inst.live_status;
     }

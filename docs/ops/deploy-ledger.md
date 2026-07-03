@@ -24,7 +24,92 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-03 (latest) - radeon-global: drop dead shard, remap durable to 4 healthy backends
+## 2026-07-03 (latest) - radeon-global: hotfix updated_at + FIRST Harbor-registry manager deploy (no side-load)
+
+**Code commit:** `3663700` (on `prod/radeon-global`). Hotfix for a regression introduced by `aafc57a`:
+`mark_instance_deleting` set a nonexistent `updated_at` column on `instance_records`, so every delete
+500d with `sqlalchemy … Unconsumed column names: updated_at`. Fix drops the column from the UPDATE
+(matching `mark_instance_deleted`, which only sets `status`/`deleted_at`). Adds 3 DB-backed regression
+tests in `tests/test_reliability_fixes.py` that exercise the real UPDATE (would have caught it); 12
+reliability tests pass.
+
+**Deploy method — CHANGED (per operator direction): build in-cluster + pull from Harbor. No more
+`docker save`/`ctr import` side-load.**
+- Built with a **kaniko pod** (`manager-build-3663700`, ns `amd-oneclick-lablab`, ran on s-083) using
+  `/tmp/Dockerfile.build` (base `docker.m.daocloud.io/library/python:3.12-slim`, pip via Tsinghua
+  mirror). Source context delivered via `kubectl cp` into an initContainer that gated on `/workspace/.ready`.
+- Pushed over plain HTTP to **Harbor** `10.5.10.89:1808/xinwei/amd-oneclick-manager:3663700`
+  (`@sha256:7dbe17ebfc24bcfba9bef2fa08b1906e73e54be0b0cfa54444efeb0b76f4e5cf`), auth via secret
+  `kaniko-harbor-auth` (Harbor admin creds; TODO: replace with a scoped `xinwei` robot account).
+- Deployed with `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+  manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:3663700`. The manager node (s-001) **pulled from
+  Harbor directly** — it already has Harbor plain-HTTP trust inline in `/etc/containerd/config.toml`
+  (mirror + `insecure_skip_verify`). This is the first lablab manager deploy that goes registry→node
+  instead of workstation→node side-load.
+
+**Verification (e2e on live cluster):**
+- Rollout 1/1, 0 restarts; running image confirmed `10.5.10.89:1808/xinwei/amd-oneclick-manager:3663700`.
+- **The reported bug is fixed** — ran `mark_instance_deleting` against the real DB inside the live pod:
+  row transitions to `deleting`, `deleted_at` stays NULL, no `updated_at` error.
+- Local tests: 12 reliability tests pass (incl. the 3 new DB-backed regression tests).
+
+**PRE snapshot:** `local-deploy-history/radeon-global/20260703-2143-updatedat-fix-PRE-deploy.yaml`
+(image `lablab.local/amd-oneclick:aafc57a`).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=lablab.local/amd-oneclick:aafc57a` (still present on s-001) — but note aafc57a has the
+delete-500 bug; prefer rolling forward.
+
+## 2026-07-03 - radeon-global: reliability fixes (delete crash-loop, terminating UX, node-wedge detection)
+
+**Code commit:** `aafc57a` (on `prod/radeon-global`). Three permanent fixes to the manager:
+
+- **P1 delete crash-loop:** `delete_instance_by_id` (blocking `time.sleep` poll, up to ~630s for
+  localcache) ran unwrapped inside async handlers → starved the single event loop → 1s liveness probe
+  timed out → kubelet SIGKILLd the manager (exit 137) mid-delete. User deletes are now fire-and-forget
+  (`mark_instance_deleting` → background thread runs the delete → reconcile is the backstop); admin
+  single/all/bulk deletes run via `asyncio.to_thread`. Liveness probe loosened `timeoutSeconds 1→5`,
+  `failureThreshold 3→8` (kubectl patch) as defense-in-depth; readiness left tight.
+- **P3 terminating UX:** new `deleting` status (excluded from `get_active_instance_for_user` so a
+  delete never blocks relaunch, but surfaced to status polling) + `deletion_timestamp` short-circuit in
+  `get_pod_status_details` so a Terminating pod reports `terminating`, not a false `ready`.
+- **P2 node-wedge detection:** `reconcile_job` aggregates stuck pods per node (`list_managed_pod_states`
+  now exposes `node_name`) and DB-quarantines a node wedged across `NODE_WEDGE_CONSECUTIVE_TICKS` (2)
+  cycles via `store.quarantine_node`, so new placements route around a silently-wedged node (Ready but
+  containerd hung, as seen on s-064). App-internal only — no `kubectl cordon` (manager SA lacks node
+  RBAC). Gated by `NODE_WEDGE_DETECT_ENABLED` (default on).
+
+**Image:** `docker build --platform linux/amd64 --provenance=false` → `lablab.local/amd-oneclick:aafc57a`
+(443MB). **Image ID:** `sha256:70ef5f6e0720af9bf6b736ad30e761a04297fe5471eb9d3f9737d8bb05a7ef82`.
+Side-loaded onto `wx-k8s-prod-s-001` by piping `docker save | kubectl exec -i <localssd-prep pod> --
+chroot /host ctr -n k8s.io images import -` (workstation has no LAN route to the node, so bytes transit
+the k8s API, not the LAN); no registry push, no pull secret.
+
+**Deploy:** liveness `kubectl patch` + `kubectl -n amd-oneclick-lablab set image
+deployment/amd-oneclick-lablab-manager manager=lablab.local/amd-oneclick:aafc57a`. Recreate rollout,
+1/1, **0 restarts**.
+
+**Verification (e2e on live cluster):**
+- New pod `aafc57a` `1/1` Running on s-001, 0 restarts; liveness now `5s`/`fail=8`; `/health` 200 (~9ms
+  under a 20× concurrent hammer).
+- Reconcile job running every 60s with the new field: `Reconcile done: … wedged_quarantined=0 …`.
+- Deployed-code checks (run in the live pod): `_spawn_background_delete`/`_background_delete` present;
+  `NODE_WEDGE_DETECT_ENABLED=True min=2 ticks=2`; a pod with `deletion_timestamp` → `get_pod_status_details`
+  returns `terminating` (previously reported `ready`); `store.mark_instance_deleting` present.
+- Local tests: full suite **272 passed** (263 prior + 9 new `tests/test_reliability_fixes.py`) in a
+  scratch venv.
+- NOT exercised: a real GPU-instance delete round-trip (no live user instance to test without consuming
+  prod GPU; behavior verified at code level in-pod instead). Note WORKSPACE_VOLUME_TYPE=localcache, so
+  the ~630s flush path is exactly what the fire-and-forget change protects.
+
+**PRE snapshot:** `local-deploy-history/radeon-global/20260703-2054-reliability-PRE-deploy.yaml`
+(image `76efa5c`).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=lablab.local/amd-oneclick:76efa5c` (still present on s-001), then revert the liveness patch
+(`timeoutSeconds:1, failureThreshold:3`) or re-apply the PRE snapshot.
+
+## 2026-07-03 - radeon-global: drop dead shard, remap durable to 4 healthy backends
 
 **Code commit:** `76efa5c` (on `prod/radeon-global`). Resolves the shard-0 incident from the prior
 entry by removing the decommissioned `managed-nfs-storage-1` from `WORKSPACE_DURABLE_STORAGE_CLASSES`,

@@ -610,6 +610,23 @@ class Settings:
     # brief startup crash-loop that recovers is not killed prematurely.
     RECLAIM_TERMINAL_ENABLED: bool = os.getenv("RECLAIM_TERMINAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     CRASHLOOP_RESTART_THRESHOLD: int = int(os.getenv("CRASHLOOP_RESTART_THRESHOLD", "10"))
+    # Silently-wedged-node detection. A node whose containerd CRI lifecycle path hangs still reports
+    # Ready with fresh heartbeats, so k8s never marks it NotReady; meanwhile its pods pile up stuck
+    # Terminating (can't kill) and/or ContainerCreating (can't create). The reconciler aggregates its
+    # per-pod stuck signals by node and, when a node accumulates enough simultaneous stuck pods across
+    # consecutive cycles, DB-quarantines it (via store.quarantine_node) so new placements route around
+    # it. This is app-internal only (no kubectl cordon — the manager SA lacks node RBAC by design).
+    NODE_WEDGE_DETECT_ENABLED: bool = os.getenv("NODE_WEDGE_DETECT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # Min distinct stuck pods (Terminating past TERMINATING_GRACE_SECONDS, or ContainerCreating past
+    # NODE_WEDGE_CREATING_SECONDS) on ONE node before it is a wedge suspect. >1 avoids flagging a node
+    # for a single slow pod.
+    NODE_WEDGE_MIN_STUCK_PODS: int = int(os.getenv("NODE_WEDGE_MIN_STUCK_PODS", "2"))
+    # A pod ContainerCreating longer than this counts as stuck for wedge detection (normal creates are
+    # seconds; a large cold image pull can legitimately take minutes, so keep this generous).
+    NODE_WEDGE_CREATING_SECONDS: int = int(os.getenv("NODE_WEDGE_CREATING_SECONDS", "600"))
+    # Consecutive reconcile cycles a node must remain a suspect before it is actually quarantined.
+    # Requiring persistence guards against a transient burst being misread as a wedge.
+    NODE_WEDGE_CONSECUTIVE_TICKS: int = int(os.getenv("NODE_WEDGE_CONSECUTIVE_TICKS", "2"))
 
     # --- Risk 3: image availability vs. prepull warmth ---
     # Prepull is a best-effort warm cache, NOT an availability gate. An

@@ -2928,6 +2928,28 @@ def record_instance_launch_event(
         )
 
 
+def mark_instance_deleting(instance_id: str):
+    """Optimistically flag an instance as deleting the instant a delete is requested.
+
+    Written synchronously before the (now non-blocking) k8s delete so the intent is durable
+    even if the process dies mid-request. Distinct from 'deleted': the row is NOT stamped
+    deleted_at yet (reconcile still tracks it until the pod is confirmed gone), but 'deleting'
+    is excluded from get_active_instance_for_user's (pending/running) filter so the user can
+    immediately launch a replacement, while get_instance_by_id still surfaces it so the status
+    endpoint can show 'Terminating…'. Only transitions live rows; never resurrects a deleted one.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            update(instance_records)
+            .where(
+                instance_records.c.instance_id == instance_id,
+                instance_records.c.deleted_at.is_(None),
+                instance_records.c.status.in_(["pending", "running"]),
+            )
+            .values(status="deleting")
+        )
+
+
 def mark_instance_deleted(instance_id: str):
     with engine.begin() as conn:
         conn.execute(
