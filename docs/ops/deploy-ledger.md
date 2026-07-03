@@ -780,3 +780,49 @@ by hostname). radeon-global currently has NO such path: no tls-proxy pod, no Nod
 Fixing requires either a Front Door route for a dedicated OpenCode subdomain -> manager
 NodePort, or an in-cluster tls-proxy on a reachable edge NodePort (beta's pattern:
 `radeon.anruicloud.com:30450` -> `36.150.116.200`). Pending infra decision.
+
+## 2026-07-03 — radeon-global — OpenCode DNS URL + auto-auth (tls-proxy deployed)
+
+**Problem:** OpenCode `opencode_url` returned raw `ip:port` and required the user to
+type Basic-auth credentials. Root cause: `OPENCODE_PUBLIC_BASE_URL` unset, and no
+separate-origin network path existed for OpenCode traffic.
+
+**Fix (option 2 — in-cluster tls-proxy):** deployed `k8s-opencode-tls-proxy-global.yaml`
+into namespace `amd-oneclick-lablab`:
+- nginx (`nginx:alpine`) Deployment + ConfigMap + NodePort Service on **NodePort 30450**,
+  terminating TLS and forwarding to the manager Service DNS
+  `amd-oneclick-lablab-manager.amd-oneclick-lablab.svc.cluster.local:80`, setting
+  `X-Forwarded-Port: 30450` and `Host: $host` (the signals the manager's
+  `opencode_origin_proxy` middleware keys on).
+- TLS secret `amd-oneclick-opencode-tls` (`kubernetes.io/tls`).
+- Manager ConfigMap: set `OPENCODE_PUBLIC_BASE_URL=https://radeon-global.anruicloud.com:30450`,
+  restarted manager.
+
+**Verification (end-to-end, all pass):**
+- Launch now returns `opencode_url=https://radeon-global.anruicloud.com:30450/__opencode_auth?token=...`
+  with `opencode_username=null`, `opencode_password=null` (proxy injects creds server-side).
+- `/__opencode_auth?token=...` through the proxy -> `302 -> /` + sets `oc_session` cookie.
+- `/` with the session cookie -> `200` (OpenCode SPA, Basic-auth injected, no prompt);
+  without cookie -> `401`. proxy `/healthz` -> 200.
+- Main app UNAFFECTED: Front Door `/health` and HF API still 200 (main-domain traffic
+  arrives without `X-Forwarded-Port: 30450`, so the middleware does not hijack it).
+- Note: one transient manager liveness blip during teardown — a synchronous DELETE
+  took 30s and briefly starved the single-worker event loop; pod self-recovered to 1/1.
+
+**REMAINING EXTERNAL STEPS for browser-trusted access (not doable from the cluster):**
+1. **DNS:** create an A record so the OpenCode host resolves to the edge —
+   `radeon-global.anruicloud.com` currently resolves only to Azure Front Door (IPv6).
+   Either add an A record for `radeon-global.anruicloud.com` (or a dedicated name) ->
+   `36.150.116.206`, OR (if keeping the same host) ensure `:30450` bypasses Front Door.
+   The NodePort `36.150.116.206:30450` is confirmed reachable from the internet.
+2. **TLS cert:** currently a SELF-SIGNED placeholder cert (`*.anruicloud.com` + SAN
+   `radeon-global.anruicloud.com` + IP `36.150.116.206`). Browsers will warn until
+   replaced. Swap in the real `*.anruicloud.com` cert:
+   `kubectl -n amd-oneclick-lablab create secret tls amd-oneclick-opencode-tls
+   --cert=fullchain.pem --key=privkey.pem --dry-run=client -o yaml | kubectl apply -f -`
+   then `kubectl -n amd-oneclick-lablab rollout restart deployment/amd-oneclick-opencode-tls-proxy`.
+   No manager restart needed for the cert swap.
+
+**Rollback:** `kubectl -n amd-oneclick-lablab delete -f k8s-opencode-tls-proxy-global.yaml`,
+delete secret `amd-oneclick-opencode-tls`, unset `OPENCODE_PUBLIC_BASE_URL` in the
+ConfigMap, restart manager -> reverts to raw ip:port behavior.
