@@ -1,22 +1,22 @@
 # Hugging Face Demo API Quick Guide
 
-This guide is for frontend developers integrating with the Radeon Beta Hugging Face demo notebook API.
+This guide is for frontend developers integrating with the Radeon Global Hugging Face demo notebook API.
 
 ## Base URL
 
 ```text
-https://radeon-beta.anruicloud.com
+https://radeon-global.anruicloud.com
 ```
 
 If public DNS is not live yet, backend smoke tests can temporarily resolve the hostname to:
 
 ```text
-36.150.116.220
+36.150.116.206
 ```
 
 ## Authentication
 
-Every Hugging Face demo API call requires a Radeon Beta API bearer token:
+Every Hugging Face demo API call requires a Radeon Global API bearer token:
 
 ```http
 Authorization: Bearer <HUGGINGFACE_DEMO_API_TOKEN>
@@ -25,11 +25,11 @@ Authorization: Bearer <HUGGINGFACE_DEMO_API_TOKEN>
 Do not put this token in a public frontend bundle. The recommended frontend flow is:
 
 1. Frontend calls your own backend.
-2. Your backend attaches the Radeon Beta API bearer token.
-3. Your backend calls the Radeon Beta API.
+2. Your backend attaches the Radeon Global API bearer token.
+3. Your backend calls the Radeon Global API.
 4. Your backend returns the safe response payload to the frontend.
 
-This bearer token is separate from the upstream Hugging Face access token. The upstream `HF_TOKEN` is configured server-side in the beta deployment and is used only by notebook pods when downloading `.ipynb` files through the internal Hugging Face proxy. Frontend code should never send or know the upstream `HF_TOKEN`.
+This bearer token is separate from the upstream Hugging Face access token. The upstream `HF_TOKEN` is configured server-side in the deployment and is used only by notebook pods when downloading `.ipynb` files through the internal Hugging Face proxy. Frontend code should never send or know the upstream `HF_TOKEN`.
 
 ## Credits
 
@@ -74,8 +74,8 @@ Example response:
 
 ```json
 {
-  "total_gpus": 16,
-  "free_gpus": 15,
+  "total_gpus": 982,
+  "free_gpus": 981,
   "nodes": [
     { "node": "<node-name>", "total": 8, "free": 7, "committed": 1, "quarantined": false }
   ]
@@ -131,7 +131,7 @@ Example success response:
 {
   "status": "allocating",
   "message": "Allocating resources for the Hugging Face demo notebook...",
-  "url": "https://radeon-beta.anruicloud.com/instances/hf-4-xxxx/lab/tree/Qwen3.6-27B.ipynb?token=amd-oneclick",
+  "url": "https://radeon-global.anruicloud.com/instances/hf-4-xxxx/lab/tree/Qwen3.6-27B.ipynb?token=amd-oneclick",
   "email": "hf-xxxx@huggingface.oneclick.local",
   "instance_id": "hf-4-xxxx"
 }
@@ -181,7 +181,7 @@ Example ready response:
 {
   "status": "ready",
   "message": "The notebook is ready",
-  "url": "https://radeon-beta.anruicloud.com/instances/hf-4-xxxx/lab/tree/Qwen3.6-27B.ipynb?token=amd-oneclick",
+  "url": "https://radeon-global.anruicloud.com/instances/hf-4-xxxx/lab/tree/Qwen3.6-27B.ipynb?token=amd-oneclick",
   "email": "hf-xxxx@huggingface.oneclick.local",
   "instance_id": "hf-4-xxxx"
 }

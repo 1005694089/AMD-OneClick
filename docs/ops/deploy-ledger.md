@@ -834,3 +834,38 @@ DigiCert *.anruicloud.com cert+key, copied cluster-to-cluster from beta
 2026-08-09). Proxy restarted; :30450 now serves a browser-trusted cert (curl without -k
 returns 200 for radeon-global.anruicloud.com and opencode-radeon-global.anruicloud.com).
 ONLY remaining step: DNS A record for the OpenCode host -> 36.150.116.206.
+
+### 2026-07-03 update — enable GPU dashboard + label GPU nodes (HF /gpus fix) + HF doc
+
+Two BETA-test features were live in the deployed image (a0fe4d8 == BETA-test app tree,
+verified byte-identical) but dormant on radeon-global due to config/labeling gaps, not code:
+
+1. **Admin GPU-nodes monitor** was 404. Root cause: `GPU_DASHBOARD_ENABLED` unset
+   (defaults false); beta runs it `"true"`. Fix: patched ConfigMap
+   `amd-oneclick-lablab-config` key `GPU_DASHBOARD_ENABLED: "true"` and restarted the
+   manager. `/api/admin/gpu-nodes` now returns 401 (auth-gated, feature ON) instead of 404.
+
+2. **HF `GET /api/huggingface/gpus` reported 0 GPUs.** Root cause:
+   `gpu_capacity_summary()` scopes to `_eligible_target_nodes()`, which requires the
+   `amd-oneclick-prepull=enabled` label AND taint-symmetry (`_node_belongs_to_service`).
+   0 of 129 prod nodes carried the label (image-service era leftover); beta labels 28/29.
+   Fix: `kubectl label nodes -l feature.node.kubernetes.io/amd-gpu
+   amd-oneclick-prepull=enabled --overwrite` -> 125 nodes labeled. Global is the default
+   service (no NOTEBOOK_TOLERATION_KEY) and prod GPU nodes are untainted, so all pass the
+   symmetry check. `/api/huggingface/gpus` now reports total_gpus=982, free_gpus=981,
+   nodes=123.
+
+3. **HF API doc** `docs/huggingface-demo-api.md` updated: radeon-beta.anruicloud.com ->
+   radeon-global.anruicloud.com, fallback IP 36.150.116.220 -> 36.150.116.206, "Radeon
+   Beta" prose -> "Radeon Global", /gpus example numbers refreshed to prod scale (982).
+
+No image rebuild and no manager code change (deployed image already == BETA-test). PRE
+snapshots: local-deploy-history/radeon-global/20260702-2100-PRE-{cm,secret,deploy}.yaml.
+
+**Rollback:**
+- Dashboard: `kubectl -n amd-oneclick-lablab patch cm amd-oneclick-lablab-config --type
+  merge -p '{"data":{"GPU_DASHBOARD_ENABLED":"false"}}'` then restart manager.
+- Labels: `kubectl label nodes -l amd-oneclick-prepull=enabled amd-oneclick-prepull-`
+  (removes the label from all; reverts /gpus to 0). Only do this if the labeling causes
+  unwanted image-service targeting — but IMAGE_SERVICE_ENABLED is false, so labels only
+  affect capacity reporting + launch node-set here.
