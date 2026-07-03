@@ -869,3 +869,55 @@ snapshots: local-deploy-history/radeon-global/20260702-2100-PRE-{cm,secret,deplo
   (removes the label from all; reverts /gpus to 0). Only do this if the labeling causes
   unwanted image-service targeting — but IMAGE_SERVICE_ENABLED is false, so labels only
   affect capacity reporting + launch node-set here.
+
+## 2026-07-03 — radeon-global (amd-oneclick-lablab) — hackathon pods pip-install jupyter-server-proxy
+
+**Code commit:** `1157ed2` (branch `prod/radeon-global`), on top of `5861de5`.
+
+**Change:** `app/k8s_client.py` `_build_startup_script` now appends a best-effort
+`server_proxy_ensure` block (sibling of the existing `collaboration_ensure`),
+scoped to `pod_type == "hackathon"`, folded into `jupyter_ensure` so it runs on
+every HF launch path BEFORE `jupyter lab`. It gates on `jupyter server extension
+list 2>&1 | grep -qi server.proxy` (server extension, not lab), installs
+`jupyter-server-proxy` from the Tsinghua mirror (`PIP_INDEX_URL`/`PYPI_HOST`) with
+pip->pip3 fallback and a trailing `|| echo` so a failed fetch never aborts startup
+under `set -e`. Plus 2 unit tests in `tests/test_hf_api_features.py`
+(`StartupScriptClone`): hackathon installs before launch; None/workshop skip.
+
+**Target:** live namespace `amd-oneclick-lablab`, manager pinned to
+`wx-k8s-prod-s-001` (`nodeName`, 1 replica, Recreate), fronted by Azure Front Door
+`https://radeon-global.anruicloud.com` -> NodePort 30080.
+
+**Image build:** `docker build` on host `zijun@10.161.176.9` ->
+`lablab.local/amd-oneclick:1157ed2` (442MB). Side-loaded node-local onto
+`wx-k8s-prod-s-001` via a one-shot privileged `hostPID` pod that pipes
+`docker save 1157ed2 | ctr -n k8s.io images import -` (nsenter into PID1 mount ns);
+no registry push, no pull secret. **Scope:** manager-only image — only s-001 needs
+it (manager is nodeName-pinned; the change edits the manager-generated startup
+script, NOT the notebook image, so no all-node prewarm required). Image Service
+remains OFF.
+
+**Deploy:** `kubectl -n amd-oneclick-lablab set image
+deployment/amd-oneclick-lablab-manager manager=lablab.local/amd-oneclick:1157ed2`.
+Rollout 1/1, 0 restarts. No ConfigMap/Secret/RBAC/Service changes.
+
+**Verification (e2e on live cluster):**
+- Manager `1157ed2` `1/1` Running on s-001; logs show `GET /health -> 200 OK`.
+- **Positive:** launched `pod_type=hackathon` via public Front Door
+  (`POST /api/huggingface/notebooks`) -> pod `hf-13-99673393` on s-045. Startup
+  logs: `[oneclick] Installing jupyter-server-proxy for hackathon via Tsinghua
+  mirror...` -> `Successfully installed jupyter-server-proxy-4.5.0 simpervisor-1.0.0`
+  -> `jupyter_server_proxy | extension was successfully loaded` -> Jupyter Server
+  2.17.0 running at :8888. Existing collaboration path still works (RTC enabled).
+- **Negative:** launched `pod_type=one-click` -> pod `hf-14-aa884054` on s-033.
+  Startup did NOT install server-proxy (or collaboration); Jupyter launched normally.
+- Both test pods destroyed via `DELETE /api/huggingface/notebooks/current`. Real
+  user pod `u-6` untouched throughout.
+- Pre-push: `pytest tests/test_hf_api_features.py` -> 65 passed (scratch venv).
+
+**PRE snapshots:** `local-deploy-history/radeon-global/20260703-1547-PRE-{deploy,cm,secret}.yaml`
+(image `a0fe4d8`).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image
+deployment/amd-oneclick-lablab-manager manager=lablab.local/amd-oneclick:a0fe4d8`
+(image still present on s-001), or re-apply the PRE-deploy snapshot.
