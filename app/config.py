@@ -225,6 +225,19 @@ class Settings:
     NETWORK_DISK_IMAGE_HOST_ROOT: str = os.getenv("NETWORK_DISK_IMAGE_HOST_ROOT", "/workspace/oneclick-network-disk/images")
     NETWORK_DISK_EXPORT_HOST_ROOT: str = os.getenv("NETWORK_DISK_EXPORT_HOST_ROOT", "/workspace/oneclick-network-disk/export")
 
+    # Per-user NFS-backed /workspace. When enabled, each user's workspace is a
+    # dynamically-provisioned PVC on one of N NFS StorageClasses
+    # (WORKSPACE_NFS_STORAGE_CLASS_PREFIX + "1".."N"). The user is deterministically
+    # hashed to a fixed StorageClass so their data always lands on the same NFS
+    # disk, and the PVC is reused across the user's launches (persistent workspace).
+    # Takes precedence over WORKSPACE_VOLUME_TYPE when enabled.
+    WORKSPACE_NFS_ENABLED: bool = os.getenv("WORKSPACE_NFS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    WORKSPACE_NFS_STORAGE_CLASS_PREFIX: str = os.getenv("WORKSPACE_NFS_STORAGE_CLASS_PREFIX", "managed-nfs-storage-")
+    WORKSPACE_NFS_STORAGE_CLASS_COUNT: int = int(os.getenv("WORKSPACE_NFS_STORAGE_CLASS_COUNT", "5"))
+    WORKSPACE_NFS_SIZE: str = os.getenv("WORKSPACE_NFS_SIZE", "100Gi")
+    WORKSPACE_NFS_ACCESS_MODE: str = os.getenv("WORKSPACE_NFS_ACCESS_MODE", "ReadWriteMany")
+    WORKSPACE_NFS_PVC_PREFIX: str = os.getenv("WORKSPACE_NFS_PVC_PREFIX", "oneclick-ws")
+
     IDLE_TIMEOUT_MINUTES: int = int(os.getenv("IDLE_TIMEOUT_MINUTES", "10"))
     MAX_LIFETIME_HOURS: int = int(os.getenv("MAX_LIFETIME_HOURS", "6"))
 

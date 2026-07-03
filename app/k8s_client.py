@@ -167,6 +167,69 @@ class K8sClient:
         prefix = "/" + settings.NETWORK_DISK_NFS_PATH_PREFIX.strip("/")
         return f"{prefix}/{self._safe_storage_segment(instance_id)}"
 
+    def _workspace_nfs_enabled(self) -> bool:
+        return bool(settings.WORKSPACE_NFS_ENABLED and settings.WORKSPACE_NFS_STORAGE_CLASS_COUNT > 0)
+
+    def _workspace_user_key(self, email: str) -> str:
+        """Stable per-user key for NFS disk hashing / PVC naming."""
+        return (email or "").strip().lower() or "unknown"
+
+    def _workspace_nfs_storage_class(self, email: str) -> str:
+        """Deterministically map a user to one of the N NFS StorageClasses, so
+        their workspace always lands on the same NFS disk."""
+        n = max(1, int(settings.WORKSPACE_NFS_STORAGE_CLASS_COUNT))
+        digest = hashlib.md5(self._workspace_user_key(email).encode()).hexdigest()
+        idx = int(digest, 16) % n + 1  # 1..N
+        return f"{settings.WORKSPACE_NFS_STORAGE_CLASS_PREFIX}{idx}"
+
+    def _workspace_nfs_claim_name(self, email: str) -> str:
+        """Per-user PVC name (reused across the user's launches)."""
+        prefix = self._safe_storage_segment(settings.WORKSPACE_NFS_PVC_PREFIX).lower()
+        h = hashlib.md5(self._workspace_user_key(email).encode()).hexdigest()[:12]
+        return f"{prefix}-{h}"[:63].rstrip("-")
+
+    def _ensure_workspace_nfs_pvc(self, email: str) -> Optional[str]:
+        """Ensure the user's NFS-backed workspace PVC exists; return its name.
+
+        Idempotent: reuses the PVC across launches so the workspace persists.
+        The user is hashed to a fixed StorageClass; size is capped at
+        WORKSPACE_NFS_SIZE (enforcement depends on the provisioner)."""
+        if not self._workspace_nfs_enabled():
+            return None
+        claim = self._workspace_nfs_claim_name(email)
+        try:
+            self.core_v1.read_namespaced_persistent_volume_claim(name=claim, namespace=self.namespace)
+            return claim
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        storage_class = self._workspace_nfs_storage_class(email)
+        body = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": claim,
+                "namespace": self.namespace,
+                "labels": {
+                    "app": "amd-oneclick-workspace-nfs",
+                    "email-hash": hashlib.md5(self._workspace_user_key(email).encode()).hexdigest()[:16],
+                },
+                "annotations": {"amd-oneclick/workspace-user": self._workspace_user_key(email)},
+            },
+            "spec": {
+                "accessModes": [settings.WORKSPACE_NFS_ACCESS_MODE],
+                "storageClassName": storage_class,
+                "resources": {"requests": {"storage": settings.WORKSPACE_NFS_SIZE}},
+            },
+        }
+        try:
+            self.core_v1.create_namespaced_persistent_volume_claim(namespace=self.namespace, body=body)
+            logger.info("Created workspace NFS PVC %s (class=%s, size=%s) for %s", claim, storage_class, settings.WORKSPACE_NFS_SIZE, email)
+        except ApiException as e:
+            if e.status != 409:  # already created concurrently
+                raise
+        return claim
+
     def _workspace_quota_enabled(self) -> bool:
         return bool(settings.WORKSPACE_QUOTA_ENABLED)
 
@@ -493,6 +556,7 @@ exec {cmd}
                           resource_profile: Optional[str] = None,
                           network_disk_claim_name: Optional[str] = None,
                           workspace_quota_node_name: Optional[str] = None,
+                          workspace_nfs_claim_name: Optional[str] = None,
                           start_command: Optional[str] = None,
                           app_port: Optional[int] = None,
                           disk_size_gb: Optional[int] = None,
@@ -597,6 +661,14 @@ exec {cmd}
             })
         if is_app_type:
             pass  # no workspace volume; the app lives in the image
+        elif workspace_nfs_claim_name:
+            # Per-user NFS-backed workspace (persists across launches, follows the
+            # pod to any node). Takes precedence over emptyDir/hostPath.
+            volumes.append({
+                "name": "workspace",
+                "persistentVolumeClaim": {"claimName": workspace_nfs_claim_name},
+            })
+            annotations["amd-oneclick/workspace-nfs-claim"] = workspace_nfs_claim_name
         elif workspace_uses_empty_dir:
             workspace_empty_dir = {}
             if disk_size_gb:
@@ -1351,6 +1423,7 @@ exit 0
 
         workspace_quota_node_name = self._ensure_workspace_quota(instance_id)
         network_disk_claim_name = self._ensure_network_disk(instance_id)
+        workspace_nfs_claim_name = self._ensure_workspace_nfs_pvc(email)
         pod_manifest = self._get_pod_manifest(
             email, instance_id, image,
             instance_type=instance_type,
@@ -1359,6 +1432,7 @@ exit 0
             resource_profile=resource_profile,
             network_disk_claim_name=network_disk_claim_name,
             workspace_quota_node_name=workspace_quota_node_name,
+            workspace_nfs_claim_name=workspace_nfs_claim_name,
             start_command=start_command,
             app_port=app_port,
             disk_size_gb=disk_size_gb,
