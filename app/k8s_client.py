@@ -3263,6 +3263,8 @@ exit 0
             states.append({
                 "instance_id": instance_id,
                 "pod_name": pod.metadata.name,
+                # node the pod is bound to — used by wedge detection to aggregate stuck pods per node.
+                "node_name": getattr(pod.spec, "node_name", None),
                 "email": (pod.metadata.annotations or {}).get("amd-oneclick/email", "unknown"),
                 "phase": (pod.status.phase or "unknown").lower(),
                 "terminating": deletion_ts is not None,
@@ -3288,7 +3290,22 @@ exit 0
                 name=instance_id,
                 namespace=self.namespace
             )
-            
+
+            # A pod being deleted keeps reporting its last phase (often Running) and its container
+            # may still show ready=True until the kubelet finishes teardown — so without this guard
+            # a Terminating pod is indistinguishable from a healthy one and the UI shows "ready".
+            # Short-circuit to a terminating status so the delete never looks like a no-op.
+            if pod.metadata.deletion_timestamp is not None:
+                return {
+                    "status": "terminating",
+                    "phase": (pod.status.phase or "unknown").lower(),
+                    "reason": "Terminating",
+                    "message": "Instance is shutting down",
+                    "ready": False,
+                    "pod_scheduled": True,
+                    "jupyter_ready": False,
+                }
+
             phase = pod.status.phase.lower() if pod.status.phase else "unknown"
             reason = pod.status.reason or ""
             message = pod.status.message or ""

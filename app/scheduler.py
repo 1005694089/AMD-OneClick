@@ -21,6 +21,70 @@ scheduler = AsyncIOScheduler()
 # back onto this loop thread-safely so a slow job never blocks HTTP/OAuth.
 _main_loop: "asyncio.AbstractEventLoop | None" = None
 
+# Node-wedge detection: consecutive reconcile cycles each node has looked like a wedge suspect.
+# A node is only quarantined once its streak reaches NODE_WEDGE_CONSECUTIVE_TICKS, so a transient
+# one-cycle burst of stuck pods does not trigger a quarantine. Reset to 0 the moment a node stops
+# looking wedged. Module-level (single-replica manager) — persists across reconcile ticks.
+_node_wedge_streak: dict[str, int] = {}
+
+
+def _detect_and_quarantine_wedged_nodes(pod_states: list, stuck_threshold: int) -> list:
+    """Aggregate per-pod stuck signals by node; DB-quarantine nodes that stay wedged across ticks.
+
+    A silently-wedged node reports Ready but its containerd can neither destroy pods (they pile up
+    Terminating past stuck_threshold) nor create them (stuck ContainerCreating past the configured
+    window). When a single node carries >= NODE_WEDGE_MIN_STUCK_PODS such pods for
+    NODE_WEDGE_CONSECUTIVE_TICKS consecutive cycles, quarantine it (DB-only, via store.quarantine_node)
+    so new placements route around it. No kubectl cordon — the manager SA has no node-patch RBAC.
+    Returns the list of node names quarantined this cycle (for logging)."""
+    if not settings.NODE_WEDGE_DETECT_ENABLED:
+        return []
+    from collections import defaultdict
+    from .store import quarantine_node
+
+    stuck_by_node: dict = defaultdict(int)
+    for p in pod_states:
+        node = p.get("node_name")
+        if not node:
+            continue
+        term_stuck = p.get("terminating") and (p.get("terminating_seconds") or 0) >= stuck_threshold
+        creating_stuck = (
+            not p.get("terminating")
+            and p.get("waiting_reason") == "ContainerCreating"
+            and (p.get("age_seconds") or 0) >= settings.NODE_WEDGE_CREATING_SECONDS
+        )
+        if term_stuck or creating_stuck:
+            stuck_by_node[node] += 1
+
+    suspects = {n for n, c in stuck_by_node.items() if c >= settings.NODE_WEDGE_MIN_STUCK_PODS}
+    # Decay streaks for nodes that recovered this cycle.
+    for node in list(_node_wedge_streak.keys()):
+        if node not in suspects:
+            del _node_wedge_streak[node]
+
+    quarantined_now = []
+    for node in suspects:
+        _node_wedge_streak[node] = _node_wedge_streak.get(node, 0) + 1
+        streak = _node_wedge_streak[node]
+        if streak >= settings.NODE_WEDGE_CONSECUTIVE_TICKS:
+            try:
+                quarantine_node(node, "", settings.NODE_QUARANTINE_SECONDS)
+                quarantined_now.append(node)
+                logger.warning(
+                    "Reconcile: node %s looks WEDGED (%s stuck pods, streak=%s) — DB-quarantined for %ss "
+                    "(new placements will avoid it; no kubectl cordon)",
+                    node, stuck_by_node[node], streak, settings.NODE_QUARANTINE_SECONDS,
+                )
+            except Exception as e:
+                logger.error("Reconcile: failed to quarantine wedged node %s: %s", node, e)
+        else:
+            logger.info(
+                "Reconcile: node %s wedge-suspect (%s stuck pods, streak=%s/%s) — not quarantining yet",
+                node, stuck_by_node[node], streak, settings.NODE_WEDGE_CONSECUTIVE_TICKS,
+            )
+    return quarantined_now
+
+
 def _skip_not_leader(job_name: str) -> bool:
     """True if this replica is not the leader and should skip the job.
 
@@ -471,9 +535,14 @@ def reconcile_job():
                     logger.debug("reconcile: stamp_workspace_stopped_keep_node failed for %s: %s", instance_id, e)
             db_marked += 1
 
+        # Silently-wedged-node detection: aggregate stuck pods by node and quarantine persistent
+        # offenders so new placements avoid them. Non-destructive (DB-only), so it runs even when
+        # the orphan/terminal reclaim guards above trip.
+        wedged = _detect_and_quarantine_wedged_nodes(pod_states, stuck_threshold)
+
         logger.info(
-            "Reconcile done: orphans=%s terminal=%s stuck=%s db_marked=%s (candidates orphan=%s terminal=%s stuck=%s gone=%s) cluster_pods=%s active_db=%s",
-            orphans_removed, terminal_removed, stuck_forced, db_marked,
+            "Reconcile done: orphans=%s terminal=%s stuck=%s db_marked=%s wedged_quarantined=%s (candidates orphan=%s terminal=%s stuck=%s gone=%s) cluster_pods=%s active_db=%s",
+            orphans_removed, terminal_removed, stuck_forced, db_marked, len(wedged),
             len(orphan_candidates), len(terminal), len(stuck), len(gone), len(cluster_ids), len(active_ids),
         )
     except Exception as e:
