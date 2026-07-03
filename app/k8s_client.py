@@ -494,7 +494,20 @@ if ! jupyter labextension list 2>&1 | grep -qi collaboration; then
     hash -r 2>/dev/null || true
 fi
 """
-        jupyter_ensure = jupyter_ensure + collaboration_ensure
+        # Hackathon pods launched via the HF API also need jupyter-server-proxy so
+        # proxied services work. Install it here, best-effort, before launch. Scoped to
+        # hackathon pods so non-hackathon startups are unchanged; a failed fetch (mirror/DNS)
+        # must never abort startup (jupyter_ensure runs under `set -e` on the clone path).
+        server_proxy_ensure = ""
+        if pod_type == "hackathon":
+            server_proxy_ensure = f"""
+if ! jupyter server extension list 2>&1 | grep -qi server.proxy; then
+    echo "[oneclick] Installing jupyter-server-proxy for hackathon via Tsinghua mirror..."
+    pip install --no-cache-dir -i {settings.PIP_INDEX_URL} --trusted-host {settings.PYPI_HOST} jupyter-server-proxy 2>&1 | tail -8 || pip3 install --no-cache-dir -i {settings.PIP_INDEX_URL} --trusted-host {settings.PYPI_HOST} jupyter-server-proxy 2>&1 | tail -8 || echo "[oneclick] jupyter-server-proxy install failed; server proxy disabled."
+    hash -r 2>/dev/null || true
+fi
+"""
+        jupyter_ensure = jupyter_ensure + collaboration_ensure + server_proxy_ensure
         if github_info:
             notebook_path = github_info["path"].lstrip("/")
             notebook_filename = notebook_path.split("/")[-1]

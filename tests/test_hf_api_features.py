@@ -707,6 +707,29 @@ class StartupScriptClone(unittest.TestCase):
         self.assertIn("--branch dev", s)
         self.assertNotIn("Notebook not found", s)
 
+    def test_hackathon_installs_jupyter_server_proxy_before_launch(self):
+        gi = {"org": "o", "repo": "r", "branch": None, "path": "",
+              "raw_url": "", "repo_url": "http://github.com/o/r.git"}
+        s = self.k._build_startup_script("inst-1", "jupyter", gi, pod_type="hackathon")
+        self.assertIn("jupyter-server-proxy", s)
+        self.assertIn(
+            f"pip install --no-cache-dir -i {main_module.settings.PIP_INDEX_URL} "
+            f"--trusted-host {main_module.settings.PYPI_HOST} jupyter-server-proxy",
+            s,
+        )
+        proxy_idx = s.index("jupyter-server-proxy")
+        launch_idx = s.index("jupyter lab --ip=")
+        self.assertLess(proxy_idx, launch_idx)
+
+    def test_non_hackathon_skips_jupyter_server_proxy(self):
+        gi = {"org": "o", "repo": "r", "branch": None, "path": "",
+              "raw_url": "", "repo_url": "http://github.com/o/r.git"}
+        s_none = self.k._build_startup_script("inst-1", "jupyter", gi, pod_type=None)
+        self.assertNotIn("jupyter-server-proxy", s_none)
+
+        s_workshop = self.k._build_startup_script("inst-1", "jupyter", gi, pod_type="workshop")
+        self.assertNotIn("jupyter-server-proxy", s_workshop)
+
 
 class GpuClusterStatus(unittest.TestCase):
     """gpu_cluster_status: all service GPU nodes incl unhealthy; committed/free from own ns."""
