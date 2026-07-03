@@ -139,15 +139,16 @@ class ShardMappingTests(unittest.TestCase):
             self.assertNotIn(parts[1], {".", "..", ""})
 
 
-def _node(name, ready=True, unschedulable=False, master=False, disk_pressure=False):
+def _node(name, ready=True, unschedulable=False, master=False, disk_pressure=False, images=None):
     taints = [SimpleNamespace(key="node-role.kubernetes.io/control-plane", value=None, effect="NoSchedule")] if master else []
     conds = [SimpleNamespace(type="Ready", status="True" if ready else "False")]
     if disk_pressure:
         conds.append(SimpleNamespace(type="DiskPressure", status="True"))
+    img_objs = [SimpleNamespace(names=list(names)) for names in (images or [])]
     return SimpleNamespace(
         metadata=SimpleNamespace(name=name),
         spec=SimpleNamespace(taints=taints, unschedulable=unschedulable),
-        status=SimpleNamespace(conditions=conds),
+        status=SimpleNamespace(conditions=conds, images=img_objs),
     )
 
 
@@ -177,6 +178,7 @@ class DurableOpRetryTests(unittest.TestCase):
          k8s_module.settings.NOTEBOOK_LABEL_PREFIX) = self._orig
 
     def test_candidate_nodes_filter_and_prioritize(self):
+        self.c._workspace_sync_image = lambda: "img:tag"
         nodes = [_node("good-1"), _node("good-2"), _node("m-1", master=True),
                  _node("cordoned", unschedulable=True), _node("notready", ready=False)]
         # good-2 already runs a durable-mounted workspace pod → proven NFS-capable, ranked first.
@@ -193,6 +195,23 @@ class DurableOpRetryTests(unittest.TestCase):
         self.assertIn("good-1", cands)
         for bad in ("m-1", "cordoned", "notready"):
             self.assertNotIn(bad, cands, f"{bad} must be excluded")
+
+    def test_candidate_nodes_prefer_image_warm(self):
+        # No proven-NFS pods; warmth must order candidates (cold node last so its 90GB pull doesn't
+        # burn the retry budget).
+        self.c._workspace_sync_image = lambda: "reg/base:v1"
+        nodes = [
+            _node("cold-a"),
+            _node("warm-z", images=[["reg/base:v1", "reg/base@sha256:deadbeef"]]),
+            _node("cold-b"),
+        ]
+        self.c.core_v1 = SimpleNamespace(
+            list_node=lambda: SimpleNamespace(items=nodes),
+            list_namespaced_pod=lambda **k: SimpleNamespace(items=[]),
+        )
+        cands = self.c._nfs_op_candidate_nodes()
+        self.assertEqual(cands[0], "warm-z", "image-warm node must rank ahead of cold nodes")
+        self.assertEqual(set(cands), {"warm-z", "cold-a", "cold-b"})
 
     def test_retry_moves_past_stuck_node_then_succeeds(self):
         # Model: node A keeps the pod Pending (NFS mount stall); node B runs it to Succeeded.

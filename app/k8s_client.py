@@ -436,20 +436,24 @@ class K8sClient:
         we hand the caller a short ordered list to try in turn:
           1) FIRST, nodes that ALREADY run a Running workspace pod with a durable NFS mount — those
              have provably mounted the backend, so they are the safest bet.
-          2) THEN, other eligible nodes (this service's own, Ready, schedulable) as fallback.
+          2) THEN, eligible nodes that ALREADY have the sync image warm (node.status.images) — the
+             op pod uses the ~90GB base image, and on a cold node the pull alone exceeds the not-
+             started deadline, so an unwarmed node looks like a mount failure and wastes the budget.
+             Image-warm nodes start in seconds.
+          3) THEN, remaining eligible nodes (this service's own, Ready, schedulable) as last resort.
         Eligibility reuses _node_belongs_to_service (the same symmetric taint/tenant scoping used by
         _eligible_target_nodes) rather than a hand-rolled taint check — so an op pinned via nodeName
         (which bypasses scheduler taint admission) can never land on a master or ANOTHER tenant's
         tainted node pool. Best-effort: on API error return [] and let the caller fall back to one
         unpinned attempt."""
-        proven: list = []
-        others: list = []
         try:
             nodes = self._list_node_cached()
         except ApiException as e:
             logger.debug("candidate-node listing failed: %s", e)
             return []
+        sync_image = self._normalize_image_ref(self._workspace_sync_image())
         eligible = set()
+        warm = set()
         for node in nodes.items:
             name = node.metadata.name
             if getattr(node.spec, "unschedulable", False):
@@ -462,30 +466,37 @@ class K8sClient:
             if not self._node_belongs_to_service(node):
                 continue
             eligible.add(name)
-        # Discover nodes already running a durable-mounted workspace pod (proven NFS-capable).
+            # Is the sync image already present on this node? node.status.images[].names holds every
+            # tag/digest the node has pulled; match against the normalized sync image ref.
+            for img in (node.status.images or []):
+                if any(self._normalize_image_ref(n2) == sync_image for n2 in (img.names or [])):
+                    warm.add(name)
+                    break
+        # Nodes already running a durable-mounted workspace pod (proven NFS-capable) rank first.
+        proven: list = []
         try:
             pods = self.core_v1.list_namespaced_pod(
                 namespace=self.namespace, label_selector=f"app={settings.NOTEBOOK_LABEL_PREFIX}",
                 field_selector="status.phase=Running",
             )
+            durable_prefix = self._safe_storage_segment(settings.WORKSPACE_DURABLE_PVC_PREFIX).lower()
             for p in pods.items:
                 n = getattr(p.spec, "node_name", None)
                 if not n or n not in eligible:
                     continue
                 has_durable = any(
                     (v.persistent_volume_claim and
-                     str(v.persistent_volume_claim.claim_name or "").startswith(
-                         self._safe_storage_segment(settings.WORKSPACE_DURABLE_PVC_PREFIX).lower()))
+                     str(v.persistent_volume_claim.claim_name or "").startswith(durable_prefix))
                     for v in (p.spec.volumes or [])
                 )
                 if has_durable and n not in proven:
                     proven.append(n)
         except ApiException as e:
             logger.debug("proven-node discovery failed: %s", e)
-        for n in sorted(eligible):
-            if n not in proven:
-                others.append(n)
-        ordered = proven + others
+        proven_set = set(proven)
+        warm_only = sorted(n for n in warm if n not in proven_set)
+        cold = sorted(n for n in eligible if n not in proven_set and n not in warm)
+        ordered = proven + warm_only + cold
         return ordered[:max(1, limit)]
 
     def _run_durable_shard_command(self, pod_name_stem: str, shard_pvc: str, script: str,
