@@ -24,7 +24,43 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-03 (latest) - radeon-global: reliability fixes (delete crash-loop, terminating UX, node-wedge detection)
+## 2026-07-03 (latest) - radeon-global: hotfix updated_at + FIRST Harbor-registry manager deploy (no side-load)
+
+**Code commit:** `3663700` (on `prod/radeon-global`). Hotfix for a regression introduced by `aafc57a`:
+`mark_instance_deleting` set a nonexistent `updated_at` column on `instance_records`, so every delete
+500d with `sqlalchemy … Unconsumed column names: updated_at`. Fix drops the column from the UPDATE
+(matching `mark_instance_deleted`, which only sets `status`/`deleted_at`). Adds 3 DB-backed regression
+tests in `tests/test_reliability_fixes.py` that exercise the real UPDATE (would have caught it); 12
+reliability tests pass.
+
+**Deploy method — CHANGED (per operator direction): build in-cluster + pull from Harbor. No more
+`docker save`/`ctr import` side-load.**
+- Built with a **kaniko pod** (`manager-build-3663700`, ns `amd-oneclick-lablab`, ran on s-083) using
+  `/tmp/Dockerfile.build` (base `docker.m.daocloud.io/library/python:3.12-slim`, pip via Tsinghua
+  mirror). Source context delivered via `kubectl cp` into an initContainer that gated on `/workspace/.ready`.
+- Pushed over plain HTTP to **Harbor** `10.5.10.89:1808/xinwei/amd-oneclick-manager:3663700`
+  (`@sha256:7dbe17ebfc24bcfba9bef2fa08b1906e73e54be0b0cfa54444efeb0b76f4e5cf`), auth via secret
+  `kaniko-harbor-auth` (Harbor admin creds; TODO: replace with a scoped `xinwei` robot account).
+- Deployed with `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+  manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:3663700`. The manager node (s-001) **pulled from
+  Harbor directly** — it already has Harbor plain-HTTP trust inline in `/etc/containerd/config.toml`
+  (mirror + `insecure_skip_verify`). This is the first lablab manager deploy that goes registry→node
+  instead of workstation→node side-load.
+
+**Verification (e2e on live cluster):**
+- Rollout 1/1, 0 restarts; running image confirmed `10.5.10.89:1808/xinwei/amd-oneclick-manager:3663700`.
+- **The reported bug is fixed** — ran `mark_instance_deleting` against the real DB inside the live pod:
+  row transitions to `deleting`, `deleted_at` stays NULL, no `updated_at` error.
+- Local tests: 12 reliability tests pass (incl. the 3 new DB-backed regression tests).
+
+**PRE snapshot:** `local-deploy-history/radeon-global/20260703-2143-updatedat-fix-PRE-deploy.yaml`
+(image `lablab.local/amd-oneclick:aafc57a`).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=lablab.local/amd-oneclick:aafc57a` (still present on s-001) — but note aafc57a has the
+delete-500 bug; prefer rolling forward.
+
+## 2026-07-03 - radeon-global: reliability fixes (delete crash-loop, terminating UX, node-wedge detection)
 
 **Code commit:** `aafc57a` (on `prod/radeon-global`). Three permanent fixes to the manager:
 
