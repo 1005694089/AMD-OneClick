@@ -826,3 +826,11 @@ into namespace `amd-oneclick-lablab`:
 **Rollback:** `kubectl -n amd-oneclick-lablab delete -f k8s-opencode-tls-proxy-global.yaml`,
 delete secret `amd-oneclick-opencode-tls`, unset `OPENCODE_PUBLIC_BASE_URL` in the
 ConfigMap, restart manager -> reverts to raw ip:port behavior.
+
+### 2026-07-03 update — real cert installed
+Replaced the self-signed placeholder in secret amd-oneclick-opencode-tls with the real
+DigiCert *.anruicloud.com cert+key, copied cluster-to-cluster from beta
+(7900_cluster_config: amd-oneclick-pr1-edge-proxy/amd-oneclick-pr1-edge-tls, valid to
+2026-08-09). Proxy restarted; :30450 now serves a browser-trusted cert (curl without -k
+returns 200 for radeon-global.anruicloud.com and opencode-radeon-global.anruicloud.com).
+ONLY remaining step: DNS A record for the OpenCode host -> 36.150.116.206.
