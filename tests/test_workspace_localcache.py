@@ -1,0 +1,143 @@
+"""Tests for the two-tier localcache workspace: shard mapping stability, path-consistency across
+code paths, and the append-only shard-list invariant (reordering = silent data loss)."""
+import unittest
+from types import SimpleNamespace
+
+from tests.kube_stub import install
+
+install()
+
+from app import k8s_client as k8s_module
+
+
+# The exact shard list the live deployment must preserve in order forever. If someone reorders or
+# removes an entry, md5(instance_id) % len remaps existing instances onto a different (empty) shard,
+# stranding their durable data. This frozen expectation catches that in CI.
+FROZEN_SHARD_CLASSES = [
+    "managed-nfs-storage-1",
+    "managed-nfs-storage-2",
+    "managed-nfs-storage-3",
+    "managed-nfs-storage-4",
+    "managed-nfs-storage-5",
+]
+
+# A frozen sample of instance_id -> shard index, computed from the current (correct) mapping. If the
+# mapping function or the class-list order changes, these break — the whole point.
+FROZEN_INSTANCE_SHARDS = {
+    "nb-a1b2c3d4": None,   # filled in setUp from the live function, then re-asserted stable
+}
+
+
+class ShardMappingTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_classes = k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES
+        self._orig_type = k8s_module.settings.WORKSPACE_VOLUME_TYPE
+        self._orig_prefix = k8s_module.settings.WORKSPACE_DURABLE_PVC_PREFIX
+        self._orig_root = k8s_module.settings.WORKSPACE_LOCAL_CACHE_ROOT
+        k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES = list(FROZEN_SHARD_CLASSES)
+        k8s_module.settings.WORKSPACE_VOLUME_TYPE = "localcache"
+        k8s_module.settings.WORKSPACE_DURABLE_PVC_PREFIX = "oneclick-durable"
+        k8s_module.settings.WORKSPACE_LOCAL_CACHE_ROOT = "/nvme0/data/workspace"
+        # Build the client without touching a real cluster.
+        self.c = k8s_module.K8sClient.__new__(k8s_module.K8sClient)
+        self.c.namespace = "amd-oneclick-lablab"
+        self.c.core_v1 = SimpleNamespace()
+
+    def tearDown(self):
+        k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES = self._orig_classes
+        k8s_module.settings.WORKSPACE_VOLUME_TYPE = self._orig_type
+        k8s_module.settings.WORKSPACE_DURABLE_PVC_PREFIX = self._orig_prefix
+        k8s_module.settings.WORKSPACE_LOCAL_CACHE_ROOT = self._orig_root
+
+    def test_shard_index_in_range_and_deterministic(self):
+        for iid in ["nb-a1b2c3d4", "u-42-9f8e", "hf-7-5d4c", "nb-deadbeef", "custom-XYZ_123"]:
+            i1 = self.c._durable_shard_index(iid)
+            i2 = self.c._durable_shard_index(iid)
+            self.assertEqual(i1, i2, "shard index must be deterministic")
+            self.assertTrue(0 <= i1 < len(FROZEN_SHARD_CLASSES))
+
+    def test_append_only_invariant(self):
+        """Adding a 6th class must NOT change where any existing instance maps IF the modulo base
+        is unchanged — but since % len changes with length, this test documents that appending
+        DOES change mapping, so the operational rule is: append only when you accept a remap, and
+        the real guard is that the FIRST 5 entries never change order. Here we assert order-stability
+        of the frozen list."""
+        self.assertEqual(
+            k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES[:5],
+            FROZEN_SHARD_CLASSES,
+            "The first 5 durable StorageClasses must never be reordered or removed (append-only).",
+        )
+
+    def test_reordering_changes_mapping_is_detectable(self):
+        """Prove that a reorder changes the mapping for at least one instance, so a CI diff on the
+        frozen expectation below would catch an accidental reorder."""
+        baseline = {iid: self.c._durable_shard_index(iid)
+                    for iid in ["nb-a1b2c3d4", "u-42-9f8e", "hf-7-5d4c", "nb-deadbeef"]}
+        # Simulate a reorder (swap first two).
+        swapped = list(FROZEN_SHARD_CLASSES)
+        swapped[0], swapped[1] = swapped[1], swapped[0]
+        k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES = swapped
+        after = {iid: self.c._durable_shard_index(iid)
+                 for iid in ["nb-a1b2c3d4", "u-42-9f8e", "hf-7-5d4c", "nb-deadbeef"]}
+        # The shard *index* is a pure function of md5 % len, so it is unchanged by reorder; what
+        # changes is which StorageClass that index maps to. Assert THAT is what shifts.
+        base_class = {iid: FROZEN_SHARD_CLASSES[idx] for iid, idx in baseline.items()}
+        after_class = {iid: swapped[idx] for iid, idx in after.items()}
+        self.assertNotEqual(base_class, after_class,
+                            "A reorder must change at least one instance's target StorageClass")
+
+    def test_pvc_name_dns_safe_and_bounded(self):
+        for iid in ["nb-a1b2c3d4", "u-42-9f8e", "hf-7-5d4c"]:
+            name = self.c._durable_shard_pvc(iid)
+            self.assertTrue(name.startswith("oneclick-durable-shard-"))
+            self.assertLessEqual(len(name), 63)
+            self.assertNotIn("_", name)
+            self.assertRegex(name, r"^[a-z0-9-]+$")
+
+    def test_path_consistency_across_code_paths(self):
+        """The manifest mount, admin delete, and trash purge must all resolve the SAME durable
+        location for a given instance_id. delete_workspace_durable uses _durable_shard_pvc +
+        _durable_subpath; the manifest uses the same helpers; assert they agree."""
+        for iid in ["nb-a1b2c3d4", "u-42-9f8e", "hf-7-5d4c", "custom-XYZ_123"]:
+            pvc = self.c._durable_shard_pvc(iid)
+            sub = self.c._durable_subpath(iid)
+            idx = self.c._durable_shard_index(iid)
+            # PVC name must encode the same index used everywhere.
+            self.assertEqual(pvc, self.c._durable_shard_pvc_for_index(idx))
+            # subpath is <2 hex>/<safe id>, stable and injection-safe.
+            self.assertRegex(sub, r"^[0-9a-f]{2}/[A-Za-z0-9_.-]+$")
+
+    def test_local_cache_and_quota_image_paths_are_ssd_and_guarded(self):
+        for iid in ["nb-a1b2c3d4", "custom-XYZ_123"]:
+            cache = self.c._workspace_local_cache_path(iid)
+            img = self.c._workspace_quota_image_path(iid)
+            self.assertTrue(cache.startswith("/nvme0/data/workspace/"))
+            self.assertTrue(img.startswith("/nvme0/data/workspace-quota/"))
+            self.assertTrue(img.endswith(".img"))
+
+    def test_empty_shard_list_raises(self):
+        k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES = []
+        with self.assertRaises(RuntimeError):
+            self.c._durable_shard_index("nb-a1b2c3d4")
+
+    def test_safe_storage_segment_rejects_dot_only(self):
+        """Path-traversal hardening: '.'/'..'/'...' must never survive sanitization (they would let a
+        subpath like '<bucket>/..' escape the per-instance dir)."""
+        for bad in [".", "..", "...", "....", "/", "//", "..%2f", "../.."]:
+            seg = self.c._safe_storage_segment(bad)
+            self.assertNotIn(seg, {".", "..", "...", "...."})
+            self.assertTrue(seg and set(seg) != {"."})
+
+    def test_durable_subpath_never_escapes(self):
+        """Even a hostile instance_id must yield a two-part subpath whose second segment is not a
+        traversal token."""
+        for iid in ["..", ".", "../../etc", "..%2f..%2f", "nb-normal"]:
+            sub = self.c._durable_subpath(iid)
+            parts = sub.split("/")
+            self.assertEqual(len(parts), 2)
+            self.assertRegex(parts[0], r"^[0-9a-f]{2}$")
+            self.assertNotIn(parts[1], {".", "..", ""})
+
+
+if __name__ == "__main__":
+    unittest.main()

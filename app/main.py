@@ -151,6 +151,20 @@ async def lifespan(app: FastAPI):
             "(or SESSION_SECRET) to a strong server-only value in production."
         )
     init_db()
+    # Bootstrap the durable workspace shards (idempotent) when the two-tier localcache workspace
+    # is enabled. Best-effort: a storage hiccup must never block manager startup — launches will
+    # re-ensure defensively, and the shards can also be created out-of-band.
+    if (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() == "localcache":
+        # Run in the background so a slow/degraded NFS backend (each shard can poll up to ~60s to
+        # Bound, x5 = up to 5 min) never blocks app startup / readiness probes. Launches defensively
+        # re-ensure (create-if-missing) anyway, so serving before shards are confirmed Bound is safe.
+        async def _bootstrap_durable_shards():
+            try:
+                bound = await asyncio.to_thread(k8s_client._ensure_durable_shards)
+                logger.info("Durable workspace shards ready: %s", bound)
+            except Exception as e:
+                logger.error("Durable workspace shard bootstrap failed (continuing): %s", e)
+        asyncio.create_task(_bootstrap_durable_shards())
     if settings.RUN_SCHEDULER:
         from .leader import elector
         elector.start()

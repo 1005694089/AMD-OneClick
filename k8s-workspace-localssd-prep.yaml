@@ -1,0 +1,65 @@
+# Prepares the node-local SSD directories for the two-tier localcache workspace.
+# For every (tolerated) node it ensures the SSD cache root and the sibling quota-image root exist
+# and are world-writable, so the per-instance hostPath (DirectoryOrCreate) + ext4 loop image land on
+# /nvme0 (SSD) rather than the root LVM. Self-healing (readiness re-checks) and future-node-proof.
+#
+# Image: the platform base image (already warm on nodes) — public registries are blocked from nodes.
+# Scope: amd-oneclick-lablab namespace only.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: oneclick-workspace-localssd-prep
+  namespace: amd-oneclick-lablab
+  labels:
+    app: oneclick-workspace-localssd-prep
+spec:
+  selector:
+    matchLabels:
+      app: oneclick-workspace-localssd-prep
+  template:
+    metadata:
+      labels:
+        app: oneclick-workspace-localssd-prep
+    spec:
+      hostPID: true
+      automountServiceAccountToken: false
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: prep
+          # Warm base image (ships coreutils); replace via kubectl set image if DEFAULT_IMAGE changes.
+          image: 10.5.10.89:1808/xinwei/crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              set -eux
+              # WORKSPACE_LOCAL_CACHE_ROOT and its -quota sibling, created on the host fs.
+              chroot /host /bin/bash -lc 'mkdir -p /nvme0/data/workspace /nvme0/data/workspace-quota && chmod 0777 /nvme0/data/workspace /nvme0/data/workspace-quota && ls -ld /nvme0/data/workspace /nvme0/data/workspace-quota'
+              sleep infinity
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -lc
+                - chroot /host /bin/bash -lc 'test -d /nvme0/data/workspace && test -d /nvme0/data/workspace-quota'
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: host
+              mountPath: /host
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+            type: Directory

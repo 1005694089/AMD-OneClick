@@ -150,6 +150,41 @@ class K8sClient:
             }
         }
     
+    def _workspace_node_affinity(self, last_node: Optional[str]) -> Optional[dict]:
+        """Soft (preferred) node affinity toward the instance's last node, so a fast relaunch lands
+        where the warm local-SSD cache still lives (near-instant rehydrate). Soft only: if that node
+        is full/gone the pod schedules elsewhere and rehydrates from durable NFS."""
+        if not (settings.WORKSPACE_SOFT_AFFINITY_ENABLED and last_node):
+            return None
+        return {
+            "nodeAffinity": {
+                "preferredDuringSchedulingIgnoredDuringExecution": [
+                    {
+                        "weight": max(1, min(100, settings.WORKSPACE_SOFT_AFFINITY_WEIGHT)),
+                        "preference": {
+                            "matchExpressions": [
+                                {"key": "kubernetes.io/hostname", "operator": "In", "values": [last_node]}
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
+
+    @staticmethod
+    def _merge_node_affinity(*affinities) -> Optional[dict]:
+        """Merge several {nodeAffinity:{preferredDuringScheduling...:[...]}} dicts into one by
+        concatenating their preferred terms. Ignores None. Returns None if nothing to merge."""
+        terms = []
+        for aff in affinities:
+            if not aff:
+                continue
+            na = aff.get("nodeAffinity", {})
+            terms.extend(na.get("preferredDuringSchedulingIgnoredDuringExecution", []) or [])
+        if not terms:
+            return None
+        return {"nodeAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": terms}}
+
     def _jupyter_base_url(self, instance_id: str) -> str:
         return f"/instances/{instance_id}/"
 
@@ -158,7 +193,15 @@ class K8sClient:
         return f"{settings.WORKSPACE_HOST_ROOT.rstrip('/')}/{safe_id}"
 
     def _safe_storage_segment(self, value: str) -> str:
-        return re.sub(r"[^a-zA-Z0-9_.-]", "-", value).strip("-") or "default"
+        seg = re.sub(r"[^a-zA-Z0-9_.-]", "-", value).strip("-")
+        # Reject dot-only results (".", "..", "...") — they survive the char filter (dot is allowed,
+        # no dashes to strip) but are path-traversal segments: a subpath like "<bucket>/.." collapses
+        # to the parent, escaping the per-instance dir and (for the destructive reaper/admin-delete
+        # paths) potentially targeting a shared root. Every filesystem/subPath name in this module
+        # flows through here, so this single guard closes that class of escape centrally.
+        if not seg or set(seg) <= {"."}:
+            return "default"
+        return seg
 
     def _network_disk_sub_path(self, instance_id: str) -> str:
         prefix = settings.NETWORK_DISK_SUBPATH_PREFIX.strip("/")
@@ -180,6 +223,348 @@ class K8sClient:
     def _network_disk_nfs_path(self, instance_id: str) -> str:
         prefix = "/" + settings.NETWORK_DISK_NFS_PATH_PREFIX.strip("/")
         return f"{prefix}/{self._safe_storage_segment(instance_id)}"
+
+    # --- Two-tier localcache workspace: sharded durable NFS + node-local SSD cache ---
+
+    def _workspace_localcache_enabled(self) -> bool:
+        return (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() == "localcache"
+
+    def _durable_shard_classes(self) -> list:
+        """The append-only list of durable StorageClasses (one shared PVC per class)."""
+        return list(settings.WORKSPACE_DURABLE_STORAGE_CLASSES or [])
+
+    def _durable_shard_index(self, instance_id: str) -> int:
+        """Stable shard for an instance: md5(instance_id) % number_of_shards.
+
+        APPEND-ONLY invariant: the modulo maps by list position, so callers must never
+        reorder/remove WORKSPACE_DURABLE_STORAGE_CLASSES (doing so silently remaps existing
+        instances onto a different, empty shard = data loss). Guarded by a CI test.
+        """
+        classes = self._durable_shard_classes()
+        if not classes:
+            raise RuntimeError("WORKSPACE_DURABLE_STORAGE_CLASSES is empty; cannot shard localcache workspace")
+        digest = hashlib.md5(instance_id.encode()).hexdigest()
+        return int(digest, 16) % len(classes)
+
+    def _durable_shard_class(self, instance_id: str) -> str:
+        return self._durable_shard_classes()[self._durable_shard_index(instance_id)]
+
+    def _durable_shard_pvc(self, instance_id: str) -> str:
+        """Name of the shared durable PVC this instance lives on: <prefix>-shard-<i>."""
+        prefix = self._safe_storage_segment(settings.WORKSPACE_DURABLE_PVC_PREFIX).lower()
+        return f"{prefix}-shard-{self._durable_shard_index(instance_id)}"[:63].rstrip("-")
+
+    def _durable_shard_pvc_for_index(self, index: int) -> str:
+        prefix = self._safe_storage_segment(settings.WORKSPACE_DURABLE_PVC_PREFIX).lower()
+        return f"{prefix}-shard-{index}"[:63].rstrip("-")
+
+    def _durable_subpath(self, instance_id: str) -> str:
+        """Per-instance subdirectory on the shard PVC: <hh>/<safe_instance_id>.
+
+        Two-level (first 2 md5 hex chars as a bucket) so no single shard directory holds
+        tens of thousands of flat entries.
+        """
+        safe_id = self._safe_storage_segment(instance_id)
+        bucket = hashlib.md5(instance_id.encode()).hexdigest()[:2]
+        return f"{bucket}/{safe_id}"
+
+    def _workspace_local_cache_path(self, instance_id: str) -> str:
+        """Node-local SSD directory backing /workspace for this instance (the loop mountpoint when
+        quota is enabled, or the data dir itself when quota is off)."""
+        safe_id = self._safe_storage_segment(instance_id)
+        return f"{settings.WORKSPACE_LOCAL_CACHE_ROOT.rstrip('/')}/{safe_id}"
+
+    def _workspace_quota_image_host_root(self) -> str:
+        """Host dir holding per-instance ext4 quota images. For localcache this is SSD-resident
+        (sibling of the cache root on /nvme0) so the 100GB image consumes SSD, not the root LVM.
+        Legacy (non-localcache) keeps the configured WORKSPACE_QUOTA_IMAGE_ROOT."""
+        if self._workspace_localcache_enabled():
+            return f"{settings.WORKSPACE_LOCAL_CACHE_ROOT.rstrip('/')}-quota"
+        return settings.WORKSPACE_QUOTA_IMAGE_ROOT
+
+    def _workspace_quota_image_path(self, instance_id: str) -> str:
+        """Host path of this instance's ext4 quota image (used by cleanup to free SSD)."""
+        safe_id = self._safe_storage_segment(instance_id)
+        return f"{self._workspace_quota_image_host_root().rstrip('/')}/{safe_id}.img"
+
+    def _workspace_sync_image(self) -> str:
+        return (settings.WORKSPACE_SYNC_IMAGE or "").strip() or settings.DEFAULT_IMAGE
+
+    def _run_node_command_pod(self, pod_name_stem: str, node_name: str, script: str,
+                              timeout_seconds: int = 120):
+        """Run a privileged one-shot pod on a specific node that nsenters the host mount
+        namespace and executes `script` as root on the host. Mirrors the pattern in
+        _provision_network_disk_image. Blocks until the pod Succeeds (raises on Failed/timeout).
+
+        Used for durable soft-delete (admin) and local-cache cleanup — both host-fs operations
+        that must run on the node, not from the manager. Never operates on NFS deletion of live data.
+        """
+        safe = self._safe_storage_segment(pod_name_stem).lower()
+        pod_name = f"ws-nodeop-{safe}"[:63].rstrip("-")
+        wrapped = f"set -eux\nnsenter -t 1 -m -- /bin/bash -lc {shlex.quote(script)}\n"
+        body = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "namespace": self.namespace,
+                "labels": {"app": "oneclick-workspace-nodeop"},
+            },
+            "spec": {
+                "nodeName": node_name,
+                "hostPID": True,
+                "restartPolicy": "Never",
+                "automountServiceAccountToken": False,
+                "tolerations": [{"operator": "Exists"}],
+                "containers": [
+                    {
+                        "name": "nodeop",
+                        "image": self._workspace_sync_image(),
+                        "imagePullPolicy": "IfNotPresent",
+                        "securityContext": {"privileged": True},
+                        "command": ["/bin/bash", "-lc"],
+                        "args": [wrapped],
+                        "resources": {
+                            "requests": {"cpu": "50m", "memory": "64Mi"},
+                            "limits": {"cpu": "1", "memory": "512Mi"},
+                        },
+                        "volumeMounts": [{"name": "host", "mountPath": "/host"}],
+                    }
+                ],
+                "volumes": [{"name": "host", "hostPath": {"path": "/", "type": "Directory"}}],
+            },
+        }
+        # Clear any stale pod of the same name first.
+        try:
+            self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
+            for _ in range(30):
+                try:
+                    self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                    time.sleep(1)
+                except ApiException as e:
+                    if e.status == 404:
+                        break
+                    raise
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
+        last_phase = ""
+        for _ in range(max(1, timeout_seconds)):
+            pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+            last_phase = pod.status.phase
+            if last_phase == "Succeeded":
+                # Best-effort cleanup of the completed pod.
+                try:
+                    self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
+                except ApiException:
+                    pass
+                return
+            if last_phase == "Failed":
+                raise RuntimeError(f"workspace node-op {pod_name} failed on {node_name}")
+            time.sleep(1)
+        raise RuntimeError(f"workspace node-op {pod_name} timed out in phase {last_phase}")
+
+    def _cleanup_local_workspace_cache(self, instance_id: str, node_name: str) -> bool:
+        """Free the node-local SSD copy for an instance (durable NFS copy is untouched).
+
+        When the quota loop-mount is enabled its mount is created in the HOST mount namespace
+        (Bidirectional propagation), so kubelet does NOT unmount it on pod deletion. The cleanup
+        therefore: (1) lazily unmounts the cache dir if it is a mountpoint (else rm -rf would
+        recurse into the live loop fs and fail to free space), (2) removes the cache dir, and
+        (3) removes the SSD-resident ext4 quota image. Guarded to paths under the cache/quota roots.
+
+        No-op returning False when node_name is unknown. Best-effort: logs and returns False on
+        failure so a stuck node never blocks the reaper.
+        """
+        if not node_name:
+            return False
+        # TOCTOU guard: the caller checked _pod_exists before enqueuing us, but scheduling the node-op
+        # pod + waiting for it can take up to ~150s, during which a relaunch may recreate the pod. Only
+        # bail if the live pod is on the SAME node we are about to clean (its hydrate could be
+        # repopulating that exact dir). If the relaunch landed on a different node, cleaning THIS node's
+        # now-orphaned copy is safe and desired.
+        try:
+            pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+            live_node = getattr(pod.spec, "node_name", None)
+            if live_node == node_name:
+                logger.info("Skipping local cache cleanup for %s on %s: pod live on same node (relaunch)",
+                            instance_id, node_name)
+                return False
+        except ApiException as e:
+            if e.status != 404:
+                logger.debug("pod re-check failed for %s before cleanup: %s", instance_id, e)
+        cache_path = self._workspace_local_cache_path(instance_id)
+        image_path = self._workspace_quota_image_path(instance_id)
+        cache_root = settings.WORKSPACE_LOCAL_CACHE_ROOT.rstrip("/")
+        image_root = self._workspace_quota_image_host_root().rstrip("/")
+        # Guard: only ever act on paths strictly under the cache root and the quota-image root.
+        if not cache_path.startswith(cache_root + "/") or cache_path == cache_root:
+            logger.error("Refusing to clean suspicious local cache path %s", cache_path)
+            return False
+        if not image_path.startswith(image_root + "/") or image_path == image_root:
+            logger.error("Refusing to clean suspicious quota image path %s", image_path)
+            return False
+        # _run_node_command_pod wraps the script in `nsenter -t 1 -m`, so it executes in the HOST
+        # mount namespace where the real paths are bare (/nvme0/...), NOT under the container's /host
+        # bind mount. Use the real host paths directly, matching _provision_network_disk_image. A
+        # sentinel line ("WS_CLEANUP_OK") is printed so the caller can assert the script actually ran
+        # to completion (a path typo would otherwise silently "succeed" as a no-op).
+        script = (
+            f"target={shlex.quote(cache_path)}\n"
+            f"img={shlex.quote(image_path)}\n"
+            f"if mountpoint -q \"$target\"; then umount -l \"$target\" || true; echo unmounted \"$target\"; fi\n"
+            f"if [ -d \"$target\" ]; then rm -rf \"$target\"; echo removed \"$target\"; else echo \"no local cache at $target\"; fi\n"
+            f"if [ -f \"$img\" ]; then rm -f \"$img\"; echo removed \"$img\"; else echo \"no quota image at $img\"; fi\n"
+            f"echo WS_CLEANUP_OK\n"
+        )
+        try:
+            self._run_node_command_pod(f"lc-{instance_id}", node_name, script, timeout_seconds=120)
+            logger.info("Cleaned local workspace cache for %s on node %s", instance_id, node_name)
+            return True
+        except Exception as e:
+            logger.error("Local workspace cache cleanup failed for %s on %s: %s", instance_id, node_name, e)
+            return False
+
+    def _run_durable_shard_command(self, pod_name_stem: str, shard_pvc: str, script: str,
+                                   timeout_seconds: int = 300):
+        """Run a one-shot pod that mounts a durable shard PVC (RWX) at /durable and executes
+        `script`. Used for admin soft-delete (mv into .trash) and the nightly trash purge —
+        filesystem ops on the NFS share itself, so they run in a pod that mounts the PVC rather
+        than via host nsenter. Blocks until Succeeded (raises on Failed/timeout)."""
+        safe = self._safe_storage_segment(pod_name_stem).lower()
+        pod_name = f"ws-durable-{safe}"[:63].rstrip("-")
+        body = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "namespace": self.namespace,
+                "labels": {"app": "oneclick-workspace-durable-op"},
+            },
+            "spec": {
+                "restartPolicy": "Never",
+                "automountServiceAccountToken": False,
+                "tolerations": [{"operator": "Exists"}],
+                "containers": [
+                    {
+                        "name": "durableop",
+                        "image": self._workspace_sync_image(),
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["/bin/bash", "-lc"],
+                        "args": [f"set -eux\n{script}\n"],
+                        "resources": {
+                            "requests": {"cpu": "50m", "memory": "64Mi"},
+                            "limits": {"cpu": "1", "memory": "512Mi"},
+                        },
+                        "volumeMounts": [{"name": "durable", "mountPath": "/durable"}],
+                    }
+                ],
+                "volumes": [{"name": "durable", "persistentVolumeClaim": {"claimName": shard_pvc}}],
+            },
+        }
+        try:
+            self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
+            for _ in range(30):
+                try:
+                    self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                    time.sleep(1)
+                except ApiException as e:
+                    if e.status == 404:
+                        break
+                    raise
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
+        last_phase = ""
+        for _ in range(max(1, timeout_seconds)):
+            pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+            last_phase = pod.status.phase
+            if last_phase == "Succeeded":
+                try:
+                    self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
+                except ApiException:
+                    pass
+                return
+            if last_phase == "Failed":
+                raise RuntimeError(f"workspace durable-op {pod_name} failed on shard {shard_pvc}")
+            time.sleep(1)
+        raise RuntimeError(f"workspace durable-op {pod_name} timed out in phase {last_phase}")
+
+    def delete_workspace_durable(self, instance_id: str) -> bool:
+        """ADMIN ONLY: soft-delete an instance's durable workspace by moving its subdir into
+        <shard>/.trash/<id>-<epoch>/. Reversible until the nightly trash purge. Returns True on
+        success. Nothing automatic calls this — user data is kept forever until an admin acts."""
+        if not self._workspace_localcache_enabled():
+            logger.info("delete_workspace_durable no-op: localcache not enabled")
+            return False
+        # Refuse to trash a live instance's durable subdir: the running pod's subPath bind-mount would
+        # survive the mv (writes keep landing in the now-hidden .trash copy), and the trash purge would
+        # later delete a still-live workspace. Require the pod to be gone first.
+        if self._pod_exists(instance_id):
+            logger.error("Refusing durable delete for %s: pod still running (stop it first)", instance_id)
+            return False
+        shard_pvc = self._durable_shard_pvc(instance_id)
+        subpath = self._durable_subpath(instance_id)
+        # Defense-in-depth containment: this is an admin-triggerable destructive op against a SHARED
+        # multi-tenant shard PVC. Require the subpath to be exactly "<2-hex-bucket>/<non-dot segment>"
+        # so a crafted/typo'd instance_id can never collapse `src` to the shard root (which would mv the
+        # whole shard into .trash). _safe_storage_segment already rejects dot-only segments; this is a
+        # belt-and-suspenders check right before the mv.
+        parts = subpath.split("/")
+        if (len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{2}", parts[0])
+                or parts[1] in (".", "..", "") or "/" in parts[1]):
+            logger.error("Refusing durable delete for %s: unsafe subpath %r", instance_id, subpath)
+            return False
+        # NOTE: no Date.now — the trash suffix uses the pod-side `date +%s` so it is unique without
+        # the manager stamping time (keeps this deterministic from the manager's side).
+        script = (
+            f"src=/durable/{shlex.quote(subpath)}\n"
+            f"trash_dir=/durable/.trash\n"
+            f"mkdir -p \"$trash_dir\"\n"
+            f"if [ -d \"$src\" ]; then dst=\"$trash_dir/{shlex.quote(self._safe_storage_segment(instance_id))}-$(date +%s)\"; "
+            f"mv \"$src\" \"$dst\"; "
+            # A same-filesystem mv does NOT refresh the moved dir's mtime — it keeps whatever the last
+            # top-level change set (often days old for workspaces with nested activity). purge_durable_trash
+            # keys retention off `find -mmin`, so without this touch a stale-mtime workspace would be
+            # purged on the very next nightly run, collapsing the retention window to ~zero. Touch the
+            # trashed dir so retention is measured from the actual soft-delete time.
+            f"touch \"$dst\"; echo trashed \"$src\" '->' \"$dst\"; "
+            f"else echo \"no durable data at $src\"; fi\n"
+        )
+        try:
+            self._run_durable_shard_command(f"del-{instance_id}", shard_pvc, script, timeout_seconds=180)
+            logger.info("Soft-deleted durable workspace for %s on shard %s", instance_id, shard_pvc)
+            return True
+        except Exception as e:
+            logger.error("delete_workspace_durable failed for %s: %s", instance_id, e)
+            return False
+
+    def purge_durable_trash(self, retention_days: Optional[int] = None) -> int:
+        """Purge <shard>/.trash entries older than retention across all shards. Returns the number
+        of shards successfully processed. Best-effort per shard."""
+        if not self._workspace_localcache_enabled():
+            return 0
+        days = retention_days if retention_days is not None else settings.WORKSPACE_DURABLE_TRASH_RETENTION_DAYS
+        minutes = max(1, int(days) * 24 * 60)
+        processed = 0
+        for index in range(len(self._durable_shard_classes())):
+            shard_pvc = self._durable_shard_pvc_for_index(index)
+            script = (
+                f"trash_dir=/durable/.trash\n"
+                f"if [ -d \"$trash_dir\" ]; then "
+                f"find \"$trash_dir\" -mindepth 1 -maxdepth 1 -mmin +{minutes} -exec rm -rf {{}} + ; "
+                f"echo purged \"$trash_dir\"; else echo 'no trash dir'; fi\n"
+            )
+            try:
+                self._run_durable_shard_command(f"trash-{index}", shard_pvc, script, timeout_seconds=300)
+                processed += 1
+            except Exception as e:
+                logger.error("purge_durable_trash failed on shard %s: %s", shard_pvc, e)
+        return processed
 
     def _workspace_quota_enabled(self) -> bool:
         return bool(settings.WORKSPACE_QUOTA_ENABLED)
@@ -349,6 +734,84 @@ findmnt "$mnt"
                 return
             time.sleep(1)
         raise RuntimeError(f"network disk PVC {claim_name} did not bind")
+
+    def _ensure_durable_shards(self, wait_bound: bool = True) -> list:
+        """Bootstrap the durable tier: one shared RWX PVC per configured StorageClass, created
+        once (idempotent). Unlike the static network-disk PV/PVC, these use the CSI dynamic
+        provisioner (nfs.csi.k8s.io) — we create only the PVC with storageClassName=<shard class>
+        and the provisioner creates the backing PV on the corresponding SFS-Turbo filesystem.
+
+        wait_bound=True (startup): poll each PVC to Bound (up to ~60s each). wait_bound=False
+        (launch hot path): create-if-missing only, no Bound-poll — keeps the per-launch cost to a
+        few fast idempotent reads and never blocks the event loop for a minute per shard.
+
+        Once all shards have been observed Bound, a cached flag short-circuits subsequent calls so the
+        launch path does zero API work in the steady state. Best-effort: logs and continues on a
+        per-shard failure so a single unavailable backend does not block launches. Returns the list of
+        PVC names confirmed present (Bound when wait_bound, else created/existing)."""
+        if not self._workspace_localcache_enabled():
+            return []
+        classes = self._durable_shard_classes()
+        # Steady-state fast path: once every shard was seen Bound, don't re-hit the API on launches.
+        if getattr(self, "_durable_shards_ready", False):
+            return [self._durable_shard_pvc_for_index(i) for i in range(len(classes))]
+        size = f"{int(settings.WORKSPACE_DURABLE_PVC_SIZE_GI)}Gi"
+        bound = []
+        for index, storage_class in enumerate(classes):
+            pvc_name = self._durable_shard_pvc_for_index(index)
+            pvc_body = {
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": pvc_name,
+                    "namespace": self.namespace,
+                    "labels": {"app": "oneclick-workspace-durable", "shard": str(index)},
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteMany"],
+                    "resources": {"requests": {"storage": size}},
+                    "storageClassName": storage_class,
+                },
+            }
+            try:
+                self.core_v1.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=self.namespace)
+            except ApiException as e:
+                if e.status == 404:
+                    try:
+                        self.core_v1.create_namespaced_persistent_volume_claim(namespace=self.namespace, body=pvc_body)
+                        logger.info("Created durable shard PVC %s (class %s)", pvc_name, storage_class)
+                    except ApiException as ce:
+                        logger.error("Failed creating durable shard PVC %s (class %s): %s", pvc_name, storage_class, ce)
+                        continue
+                else:
+                    logger.error("Failed reading durable shard PVC %s: %s", pvc_name, e)
+                    continue
+            if not wait_bound:
+                # Launch hot path: PVC exists (or was just created); don't block polling for Bound.
+                bound.append(pvc_name)
+                continue
+            # Startup: confirm Bound (Immediate binding provisions right away).
+            is_bound = False
+            for _ in range(60):
+                try:
+                    pvc = self.core_v1.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=self.namespace)
+                except ApiException as e:
+                    logger.error("Failed polling durable shard PVC %s: %s", pvc_name, e)
+                    break
+                if pvc.status.phase == "Bound":
+                    is_bound = True
+                    break
+                time.sleep(1)
+            if is_bound:
+                bound.append(pvc_name)
+            else:
+                logger.error("Durable shard PVC %s did not bind (class %s)", pvc_name, storage_class)
+        # Cache readiness only when we actually confirmed all shards Bound (startup path).
+        if wait_bound and len(bound) == len(classes):
+            self._durable_shards_ready = True
+        if len(bound) != len(classes):
+            logger.warning("Durable shards ready %s/%s: %s", len(bound), len(classes), bound)
+        return bound
 
     def _resolve_resource_profile(self, gpu_count: int, resource_profile: Optional[str] = None) -> tuple[str, dict]:
         profile = (resource_profile or "auto").strip().lower()
@@ -709,7 +1172,8 @@ exec {cmd}
                           ssh_enabled: bool = False,
                           ssh_public_key: Optional[str] = None,
                           pod_type: Optional[str] = None,
-                          api_launched: bool = False) -> dict:
+                          api_launched: bool = False,
+                          workspace_last_node: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -786,6 +1250,9 @@ exec {cmd}
 
         workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
         workspace_uses_empty_dir = workspace_volume_type == "emptydir"
+        # Two-tier persistent workspace: node-local SSD /workspace backed by durable NFS shard.
+        # Only for non-app instances (app types keep their image's own /workspace).
+        workspace_is_localcache = workspace_volume_type == "localcache" and not is_app_type
         hf_cache_volume_type = (settings.HF_CACHE_VOLUME_TYPE or "emptyDir").strip().lower()
         hf_cache_uses_empty_dir = hf_cache_volume_type == "emptydir"
 
@@ -829,6 +1296,16 @@ exec {cmd}
             elif settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
                 workspace_empty_dir["sizeLimit"] = settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip()
             volumes.append({"name": "workspace", "emptyDir": workspace_empty_dir})
+        elif workspace_is_localcache:
+            # /workspace lives on the node-local SSD (fast working copy). Durable NFS shard is
+            # mounted separately below and synced in/out by init + preStop.
+            volumes.append({
+                "name": "workspace",
+                "hostPath": {
+                    "path": self._workspace_local_cache_path(instance_id),
+                    "type": "DirectoryOrCreate"
+                }
+            })
         else:
             volumes.append({
                 "name": "workspace",
@@ -924,9 +1401,13 @@ exec {cmd}
         if settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir and not is_app_type:
             safe_id = self._safe_storage_segment(instance_id)
             quota_image_path = f"/quota-images/{safe_id}.img"
+            # Use the warm base image (ships e2fsprogs/mount/rsync) instead of a public-registry
+            # ubuntu, which is blocked from the nodes. Legacy behavior preserved when localcache is
+            # off only if the warm image is still reachable; the base image is always node-local.
+            quota_image = self._workspace_sync_image() if workspace_is_localcache else "docker.m.daocloud.io/library/ubuntu:24.04"
             init_containers.append({
                 "name": "workspace-quota",
-                "image": "docker.m.daocloud.io/library/ubuntu:24.04",
+                "image": quota_image,
                 "imagePullPolicy": "IfNotPresent",
                 "securityContext": {"privileged": True},
                 "command": ["/bin/bash", "-lc"],
@@ -959,10 +1440,83 @@ findmnt "$mnt"
             volumes.append({
                 "name": "workspace-quota-images",
                 "hostPath": {
-                    "path": settings.WORKSPACE_QUOTA_IMAGE_ROOT,
+                    "path": self._workspace_quota_image_host_root(),
                     "type": "DirectoryOrCreate"
                 }
             })
+
+        # Two-tier localcache: mount the durable shard (subPath per instance) and hydrate the
+        # node-local /workspace from it at startup; a preStop hook (added to the main container
+        # below) flushes local -> durable on graceful stop. Independent of the quota loop-mount:
+        # with quota on, /workspace is the loop image (so the hydrate mount uses HostToContainer
+        # propagation to see it); with quota off, /workspace is the plain SSD dir.
+        workspace_prestop_flush = None
+        if workspace_is_localcache:
+            shard_pvc = self._durable_shard_pvc(instance_id)
+            durable_subpath = self._durable_subpath(instance_id)
+            durable_mount_path = settings.WORKSPACE_DURABLE_MOUNT_PATH.rstrip("/")
+            annotations["amd-oneclick/workspace-durable-pvc"] = shard_pvc
+            annotations["amd-oneclick/workspace-durable-subpath"] = durable_subpath
+            annotations["amd-oneclick/workspace-local-cache"] = self._workspace_local_cache_path(instance_id)
+            # Hydrate init container: merge durable INTO local using `rsync -a --update` (newer-mtime
+            # wins), NEVER `--delete`. This is the load-bearing data-safety choice:
+            #   * An ungraceful kill (OOM/eviction/force-delete) skips the preStop flush, so durable
+            #     is stale. If soft-affinity lands the relaunch on the same node, the warm local copy
+            #     is NEWER than durable. `--update` keeps those newer local files instead of clobbering
+            #     them (a plain `--delete` mirror would destroy every change since the last flush).
+            #   * `--update` also means an empty/partial durable can never wipe a good local copy.
+            # Trade-off: a file deleted on one side is not propagated as a deletion to the other (it
+            # reappears from whichever side still has it). For a "keep user data forever" system this
+            # is the correct, conservative direction — accumulate, never silently destroy. rsync writes
+            # via a temp file + atomic rename, so a mid-copy SIGKILL leaves a stray temp file, not a
+            # corrupted destination file. Runs after the quota loop-mount when quota is enabled.
+            init_containers.append({
+                "name": "workspace-hydrate",
+                "image": self._workspace_sync_image(),
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["/bin/bash", "-lc"],
+                "args": [f"""
+set -eux
+src={shlex.quote(durable_mount_path + '/')}
+dst={shlex.quote(settings.WORKSPACE_MOUNT_PATH.rstrip('/') + '/')}
+mkdir -p "$src" "$dst"
+if [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
+  rsync -a --update "$src" "$dst"
+  echo "hydrated $dst from durable (newer-wins merge)"
+else
+  echo "durable empty; keeping local cache as-is (will seed durable on flush)"
+fi
+"""],
+                "volumeMounts": [
+                    {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH,
+                     "mountPropagation": "HostToContainer"},
+                    {"name": "workspace-durable", "mountPath": durable_mount_path, "subPath": durable_subpath},
+                ],
+            })
+            # Durable shard mount on the MAIN container so the preStop flush can read/write it.
+            main_durable_mount = {
+                "name": "workspace-durable",
+                "mountPath": durable_mount_path,
+                "subPath": durable_subpath,
+            }
+            volume_mounts.append(main_durable_mount)
+            volumes.append({
+                "name": "workspace-durable",
+                "persistentVolumeClaim": {"claimName": shard_pvc},
+            })
+            # preStop: flush local -> durable on graceful stop (delete/idle-reap are graceful, the
+            # common path). Symmetric with hydrate: `rsync -a --update` (newer-wins, NO --delete), so
+            # a flush never destroys durable content and hydrate never destroys local content — the two
+            # directions can never fight. `cp -a` fallback for user images without rsync (also
+            # accumulate-only, consistent). The whole thing is best-effort (|| true) so a flush hiccup
+            # never blocks pod teardown.
+            _ws = shlex.quote(settings.WORKSPACE_MOUNT_PATH.rstrip('/') + '/')
+            _dur = shlex.quote(durable_mount_path + '/')
+            workspace_prestop_flush = (
+                f"if command -v rsync >/dev/null 2>&1; then "
+                f"rsync -a --update {_ws} {_dur}; "
+                f"else cp -a {_ws}. {_dur} 2>/dev/null || true; fi || true"
+            )
 
         container_limits = {
             "cpu": resources["cpu_limit"],
@@ -1040,8 +1594,15 @@ findmnt "$mnt"
         # command (works for custom image-defined types too) so the image's sshd
         # accepts the user's key and never a password.
         if ssh_enabled:
-            notebook_container["lifecycle"] = {
-                "postStart": {"exec": {"command": ["/bin/sh", "-c", self._ssh_poststart_script()]}}
+            notebook_container.setdefault("lifecycle", {})["postStart"] = {
+                "exec": {"command": ["/bin/sh", "-c", self._ssh_poststart_script()]}
+            }
+
+        # Two-tier localcache: flush the SSD working copy back to the durable NFS shard on graceful
+        # stop (delete + idle-reap are graceful). Merged with any ssh postStart above.
+        if workspace_prestop_flush:
+            notebook_container.setdefault("lifecycle", {})["preStop"] = {
+                "exec": {"command": ["/bin/sh", "-c", workspace_prestop_flush]}
             }
 
         spec = {
@@ -1072,15 +1633,23 @@ findmnt "$mnt"
             "volumes": volumes,
             "restartPolicy": "Always"
         }
+        # localcache pods need a long termination grace so the preStop local->durable flush can finish
+        # (default 30s would SIGKILL a large flush mid-copy). See WORKSPACE_TERMINATION_GRACE_SECONDS.
+        if workspace_is_localcache:
+            spec["terminationGracePeriodSeconds"] = int(settings.WORKSPACE_TERMINATION_GRACE_SECONDS)
         if init_containers:
             spec["initContainers"] = init_containers
         if notebook_node_name:
             spec["nodeName"] = notebook_node_name
         else:
-            # Soft-prefer nodes that already have this image warm. Skipped when
-            # the pod is pinned to a specific node (nodeName) since affinity is
-            # then moot.
-            affinity = self._image_affinity(image)
+            # Soft-prefer (a) nodes that already have this image warm, and (b) the node holding this
+            # instance's warm workspace cache. Both are preferred (soft) so scheduling stays free;
+            # skipped entirely when the pod is pinned via nodeName. Merged so neither overwrites the
+            # other (a plain dict assignment would drop whichever ran second).
+            affinity = self._merge_node_affinity(
+                self._image_affinity(image),
+                self._workspace_node_affinity(workspace_last_node),
+            )
             if affinity:
                 spec["affinity"] = affinity
 
@@ -2079,6 +2648,21 @@ exit 0
         if not notebook_node_name and settings.IMAGE_SERVICE_ENABLED:
             notebook_node_name = self._select_target_gpu_node(gpu_count)
         network_disk_claim_name = self._ensure_network_disk(instance_id)
+        # Two-tier localcache: ensure the durable shards exist (idempotent; startup already does this,
+        # this covers a shard that failed to bind then), and look up the instance's last node for the
+        # warm-cache soft affinity. Best-effort: never block a launch on either.
+        workspace_last_node = None
+        if self._workspace_localcache_enabled():
+            try:
+                # Launch hot path: create-if-missing only, no Bound-poll (startup already bound them
+                # and caches _durable_shards_ready). Keeps launches off the minute-long poll loop.
+                self._ensure_durable_shards(wait_bound=False)
+            except Exception as e:
+                logger.error("ensure durable shards at launch failed for %s (continuing): %s", instance_id, e)
+            try:
+                workspace_last_node = store.get_workspace_last_node(instance_id)
+            except Exception as e:
+                logger.debug("workspace last-node lookup failed for %s: %s", instance_id, e)
         pod_manifest = self._get_pod_manifest(
             email, instance_id, image,
             instance_type=instance_type,
@@ -2098,6 +2682,7 @@ exit 0
             ssh_public_key=ssh_public_key,
             pod_type=pod_type,
             api_launched=api_launched,
+            workspace_last_node=workspace_last_node,
         )
         pod_uid = None
         for attempt in range(1, 7):
@@ -2108,6 +2693,14 @@ exit 0
                 )
                 pod_uid = created_pod.metadata.uid
                 logger.info(f"Created pod {instance_id} for {email} (type={instance_type})")
+                # Two-tier localcache: mark running so the delayed-local-delete reaper won't reap the
+                # SSD copy while the pod is alive. The node it actually lands on is captured at delete
+                # time (soft-affinity means it usually returns to workspace_last_node anyway).
+                if self._workspace_localcache_enabled():
+                    try:
+                        store.stamp_workspace_running(instance_id, notebook_node_name)
+                    except Exception as e:
+                        logger.debug("stamp_workspace_running failed for %s: %s", instance_id, e)
                 break
             except ApiException as e:
                 if e.status == 409 and attempt < 6:
@@ -2272,13 +2865,39 @@ exit 0
         returns False and is left for the reconciler to finalize, keeping the DB
         consistent with cluster reality.
         """
+        # Two-tier localcache: BEFORE deleting, record the node the pod ran on + stop time. The
+        # graceful delete below fires the preStop flush (local -> durable), so durable is current;
+        # the stamp lets a fast relaunch soft-affine back to this node's warm cache and lets the
+        # delayed reaper free the local SSD copy after the TTL. The local copy is intentionally kept
+        # here (not deleted) — durable persists forever regardless.
+        is_localcache = self._workspace_localcache_enabled()
+        if is_localcache:
+            node_name = None
+            try:
+                pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+                node_name = getattr(pod.spec, "node_name", None)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.debug("could not read node for %s before delete: %s", instance_id, e)
+            try:
+                store.stamp_workspace_stopped(instance_id, node_name)
+            except Exception as e:
+                logger.debug("stamp_workspace_stopped failed for %s: %s", instance_id, e)
+
         self._delete_service(instance_id)
         self._delete_pod(instance_id)
 
         if not wait:
             return not self._pod_exists(instance_id)
 
-        deadline = time.monotonic() + max(0, settings.DELETE_CONFIRM_TIMEOUT_SECONDS)
+        # localcache pods run a preStop flush (local->durable) that can take minutes for a large
+        # workspace. Wait out the full termination grace (plus slack) before force-killing, so the
+        # manager never truncates the flush — otherwise durable would be left stale/partial and the
+        # delete would silently lose the delta. Non-localcache keeps the fast 30s confirm window.
+        confirm_window = settings.DELETE_CONFIRM_TIMEOUT_SECONDS
+        if is_localcache:
+            confirm_window = max(confirm_window, int(settings.WORKSPACE_TERMINATION_GRACE_SECONDS) + 30)
+        deadline = time.monotonic() + max(0, confirm_window)
         interval = max(0.5, settings.DELETE_POLL_INTERVAL_SECONDS)
         while time.monotonic() < deadline:
             if not self._pod_exists(instance_id):
@@ -2299,6 +2918,55 @@ exit 0
         logger.error("Pod %s still present after force delete; leaving for reconciler", instance_id)
         return False
     
+    def reap_local_workspace_caches(self) -> list:
+        """Delayed-local-delete: free node-local SSD copies of instances stopped longer than
+        WORKSPACE_LOCAL_CACHE_TTL_MINUTES (durable NFS copy untouched). Skips any instance whose
+        pod is currently present (a relaunch within the window). Returns the reaped instance ids."""
+        if not self._workspace_localcache_enabled():
+            return []
+        reaped = []
+        try:
+            candidates = store.list_workspace_cache_to_reap(settings.WORKSPACE_LOCAL_CACHE_TTL_MINUTES)
+        except Exception as e:
+            logger.error("reap_local_workspace_caches: candidate lookup failed: %s", e)
+            return []
+        for row in candidates:
+            instance_id = row["instance_id"]
+            node_name = row.get("node_name")
+            # A pod present now means the instance was relaunched within the TTL — keep the cache.
+            # Re-stamp running using the pod's ACTUAL current node (soft affinity is only a preference,
+            # so the relaunch may have landed elsewhere). Stamping the stale stored node would clear
+            # stopped_at against the wrong node, permanently orphaning the old node's cache dir (it
+            # would never again match list_workspace_cache_to_reap). If we can't read the live node,
+            # fall back to the stored one rather than guessing.
+            if self._pod_exists(instance_id):
+                live_node = node_name
+                try:
+                    pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+                    live_node = getattr(pod.spec, "node_name", None) or node_name
+                except ApiException:
+                    pass
+                # If the relaunch moved to a different node, the OLD node's cache is now orphaned —
+                # reap it before re-stamping to the new node, otherwise it leaks forever.
+                if live_node and node_name and live_node != node_name:
+                    logger.info("Instance %s relaunched on %s (was %s); reaping stale cache on old node",
+                                instance_id, live_node, node_name)
+                    self._cleanup_local_workspace_cache(instance_id, node_name)
+                try:
+                    store.stamp_workspace_running(instance_id, live_node)
+                except Exception:
+                    pass
+                continue
+            if self._cleanup_local_workspace_cache(instance_id, node_name):
+                try:
+                    store.clear_workspace_cache_state(instance_id)
+                except Exception as e:
+                    logger.debug("clear_workspace_cache_state failed for %s: %s", instance_id, e)
+                reaped.append(instance_id)
+        if reaped:
+            logger.info("Reaped %s local workspace cache(s): %s", len(reaped), reaped)
+        return reaped
+
     def delete_instance(self, email: str) -> bool:
         """Delete a notebook instance"""
         instance_id = self._generate_instance_id(email)

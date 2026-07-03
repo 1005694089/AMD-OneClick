@@ -375,6 +375,23 @@ launch_intents = Table(
 )
 
 
+# Two-tier localcache workspace: tracks, per instance, the node whose local SSD holds the warm
+# working copy and when the instance last stopped. Drives (a) warm-relaunch soft affinity and
+# (b) the delayed-local-delete reaper. Independent of instance_records so it survives soft-delete
+# of the instance row and is keyed purely by instance_id.
+workspace_cache_state = Table(
+    "workspace_cache_state",
+    metadata,
+    Column("instance_id", String(255), primary_key=True),
+    Column("node_name", String(255)),
+    Column("stopped_at", String(64)),   # ISO ts when the pod was last deleted; NULL while running
+    Column("updated_at", String(64), nullable=False),
+    # The reaper query filters on (stopped_at IS NOT NULL, stopped_at < cutoff, node_name IS NOT NULL);
+    # index those so it stays cheap as the table grows instead of full-scanning every 10 min.
+    Index("ix_workspace_cache_reap", "stopped_at", "node_name"),
+)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -2883,6 +2900,104 @@ def mark_instance_deleted(instance_id: str):
             update(instance_records)
             .where(instance_records.c.instance_id == instance_id, instance_records.c.deleted_at.is_(None))
             .values(status="deleted", deleted_at=utc_now())
+        )
+
+
+def _upsert_workspace_cache_state(instance_id: str, values: dict):
+    """Insert-or-update a workspace_cache_state row (portable across SQLite/Postgres).
+
+    Uses try-insert / on-conflict-update rather than check-then-insert: two concurrent stampers for
+    the same instance_id (e.g. a relaunch racing an idle-reap delete) would both see "no row" and
+    both INSERT, and the loser's write would be lost to a swallowed IntegrityError. Catching the
+    conflict and falling back to UPDATE makes the last writer win deterministically."""
+    now = utc_now()
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                workspace_cache_state.insert().values(
+                    instance_id=instance_id, updated_at=now, **values
+                )
+            )
+        return
+    except IntegrityError:
+        pass  # row already exists — fall through to update
+    with engine.begin() as conn:
+        conn.execute(
+            update(workspace_cache_state)
+            .where(workspace_cache_state.c.instance_id == instance_id)
+            .values(updated_at=now, **values)
+        )
+
+
+def stamp_workspace_running(instance_id: str, node_name: Optional[str] = None):
+    """Mark an instance as running (clears stopped_at so the local-delete reaper won't reap it).
+    node_name is usually None at create time (scheduler picks the node); the delete path records the
+    actual node it ran on."""
+    vals = {"stopped_at": None}
+    if node_name:
+        vals["node_name"] = node_name
+    _upsert_workspace_cache_state(instance_id, vals)
+
+
+def stamp_workspace_stopped(instance_id: str, node_name: Optional[str]):
+    """Record the node the instance last ran on and the stop time, so a fast relaunch can soft-affine
+    back to it and the delayed reaper can free the local SSD copy after the TTL."""
+    _upsert_workspace_cache_state(instance_id, {"node_name": node_name, "stopped_at": utc_now()})
+
+
+def stamp_workspace_stopped_keep_node(instance_id: str):
+    """Mark an existing workspace_cache_state row stopped WITHOUT changing node_name. For out-of-band
+    pod loss (node death / kubectl delete / eviction) caught by the reconciler, where the pod is
+    already gone so its node can't be read — we still want stopped_at set so the delayed-local reaper
+    eventually frees the SSD copy on the node recorded at create/last-run. No-op if no row exists."""
+    now = utc_now()
+    with engine.begin() as conn:
+        conn.execute(
+            update(workspace_cache_state)
+            .where(
+                workspace_cache_state.c.instance_id == instance_id,
+                workspace_cache_state.c.stopped_at.is_(None),
+            )
+            .values(stopped_at=now, updated_at=now)
+        )
+
+
+def get_workspace_last_node(instance_id: str) -> Optional[str]:
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(workspace_cache_state.c.node_name).where(
+                workspace_cache_state.c.instance_id == instance_id
+            )
+        ).first()
+    return row[0] if row and row[0] else None
+
+
+def list_workspace_cache_to_reap(ttl_minutes: int) -> list[dict]:
+    """Rows whose pod stopped more than ttl_minutes ago and still have a node recorded (i.e. a local
+    SSD copy that should now be freed). Returns [{instance_id, node_name, stopped_at}]."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(0, ttl_minutes))).isoformat()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            select(
+                workspace_cache_state.c.instance_id,
+                workspace_cache_state.c.node_name,
+                workspace_cache_state.c.stopped_at,
+            ).where(
+                workspace_cache_state.c.stopped_at.isnot(None),
+                workspace_cache_state.c.stopped_at < cutoff,
+                workspace_cache_state.c.node_name.isnot(None),
+            )
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def clear_workspace_cache_state(instance_id: str):
+    """Remove the row once the local copy is reaped (or on manual durable delete)."""
+    with engine.begin() as conn:
+        conn.execute(
+            workspace_cache_state.delete().where(
+                workspace_cache_state.c.instance_id == instance_id
+            )
         )
 
 

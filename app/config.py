@@ -260,6 +260,51 @@ class Settings:
     WORKSPACE_QUOTA_SIZE_GI: int = int(os.getenv("WORKSPACE_QUOTA_SIZE_GI", "20"))
     WORKSPACE_QUOTA_NODE_NAME: str = os.getenv("WORKSPACE_QUOTA_NODE_NAME", "")
     WORKSPACE_QUOTA_IMAGE_ROOT: str = os.getenv("WORKSPACE_QUOTA_IMAGE_ROOT", "/workspace/amd-oneclick-quota-images")
+
+    # --- Two-tier persistent /workspace (localcache): node-local SSD working copy backed by a
+    # durable, sharded NFS canonical copy. See the plan (ultracode-workspace-robust-dragon).
+    # WORKSPACE_VOLUME_TYPE="localcache" turns this on; "hostPath"/"emptyDir" keep legacy behavior.
+    # The pod mounts /workspace from a node-local SSD dir (WORKSPACE_LOCAL_CACHE_ROOT/<instance_id>);
+    # an initContainer hydrates it from the durable NFS shard, a preStop hook flushes it back, so data
+    # survives pod deletion and node loss (only the delta since the last flush is ever at risk).
+    WORKSPACE_LOCAL_CACHE_ROOT: str = os.getenv("WORKSPACE_LOCAL_CACHE_ROOT", "/nvme0/data/workspace")
+    # Durable tier = one shared RWX PVC per StorageClass below (created once at bootstrap). Each
+    # instance gets an isolated subdirectory on its shard, chosen by md5(instance_id) % len(list).
+    # APPEND-ONLY: never reorder or remove entries — the modulo maps existing instances to a shard by
+    # position, so changing the list silently strands live data on the wrong (empty) shard.
+    WORKSPACE_DURABLE_STORAGE_CLASSES: list = [
+        s.strip() for s in os.getenv(
+            "WORKSPACE_DURABLE_STORAGE_CLASSES",
+            "managed-nfs-storage-1,managed-nfs-storage-2,managed-nfs-storage-3,managed-nfs-storage-4,managed-nfs-storage-5",
+        ).split(",") if s.strip()
+    ]
+    WORKSPACE_DURABLE_PVC_PREFIX: str = os.getenv("WORKSPACE_DURABLE_PVC_PREFIX", "oneclick-durable")
+    # Per-shard durable PVC capacity requested at bootstrap (the SFS-Turbo backend is ~101 TiB; this
+    # is the PVC request, not a hard cap — the per-instance 100GB cap is enforced by the ext4 loop image).
+    WORKSPACE_DURABLE_PVC_SIZE_GI: int = int(os.getenv("WORKSPACE_DURABLE_PVC_SIZE_GI", "10240"))
+    # Where the durable shard PVC is mounted inside the pod (hidden from the user; /workspace is the SSD copy).
+    WORKSPACE_DURABLE_MOUNT_PATH: str = os.getenv("WORKSPACE_DURABLE_MOUNT_PATH", "/mnt/workspace-durable")
+    # Privileged helper image for node-exec (nsenter) + init/preStop sync containers. Must be warm on
+    # nodes (public registries are blocked). Empty => k8s_client falls back to DEFAULT_IMAGE (the
+    # platform base image, already on nodes, ships bash+rsync).
+    WORKSPACE_SYNC_IMAGE: str = os.getenv("WORKSPACE_SYNC_IMAGE", "")
+    # After a pod stops, its node-local SSD copy is kept for this long so a fast relaunch lands on the
+    # same node (soft affinity) and rehydrates near-instantly. After the window a reaper frees the SSD;
+    # the next relaunch rehydrates from durable NFS onto whatever node it lands on.
+    WORKSPACE_LOCAL_CACHE_TTL_MINUTES: int = int(os.getenv("WORKSPACE_LOCAL_CACHE_TTL_MINUTES", "120"))
+    # Soft (preferred) nodeAffinity toward the instance's last node, for warm-relaunch cache hits.
+    WORKSPACE_SOFT_AFFINITY_ENABLED: bool = os.getenv("WORKSPACE_SOFT_AFFINITY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    WORKSPACE_SOFT_AFFINITY_WEIGHT: int = int(os.getenv("WORKSPACE_SOFT_AFFINITY_WEIGHT", "50"))
+    # Manual (admin) durable delete soft-deletes to <shard>/.trash/<id>-<ts>/; a nightly reaper purges
+    # trash older than this. User data is otherwise kept forever until an admin deletes it.
+    WORKSPACE_DURABLE_TRASH_RETENTION_DAYS: int = int(os.getenv("WORKSPACE_DURABLE_TRASH_RETENTION_DAYS", "7"))
+    # How often the delayed-local-delete reaper runs.
+    WORKSPACE_LOCAL_CACHE_REAPER_INTERVAL_MINUTES: int = int(os.getenv("WORKSPACE_LOCAL_CACHE_REAPER_INTERVAL_MINUTES", "10"))
+    # Pod termination grace for localcache instances. The preStop hook flushes local->durable (up to
+    # 100GB over NFS) on graceful stop; the K8s default 30s would SIGKILL a large flush mid-copy. Give
+    # it real headroom. delete_instance_by_id also uses this (not DELETE_CONFIRM_TIMEOUT_SECONDS) as its
+    # confirm window for localcache pods so the manager never force-deletes before the flush finishes.
+    WORKSPACE_TERMINATION_GRACE_SECONDS: int = int(os.getenv("WORKSPACE_TERMINATION_GRACE_SECONDS", "600"))
     EPHEMERAL_STORAGE_REQUEST: str = os.getenv("EPHEMERAL_STORAGE_REQUEST", "")
     EPHEMERAL_STORAGE_LIMIT: str = os.getenv("EPHEMERAL_STORAGE_LIMIT", "")
     NETWORK_DISK_ENABLED: bool = os.getenv("NETWORK_DISK_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
@@ -445,9 +490,13 @@ class Settings:
 
     # Isolated Image Service — the sole image-management system. Image distribution goes through the
     # image_jobs queue consumed by the off-cluster daemon (save | ssh ctr import). The legacy prepull
-    # DaemonSet / pull-probe path has been removed, so this is effectively always-on; the setting is
-    # retained for one release as a safety toggle and defaults true.
-    IMAGE_SERVICE_ENABLED: bool = os.getenv("IMAGE_SERVICE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # DaemonSet / pull-probe path has been removed.
+    # Default FALSE: when enabled, create_instance resolves a target GPU node and HARD-PINS the pod via
+    # spec.nodeName so the image can be preloaded there — which also disables the pod's soft nodeAffinity
+    # (affinity is only applied to un-pinned pods). Off by default so launches stay un-pinned and the
+    # workspace warm-relaunch soft-affinity actually takes effect; set true only where the off-cluster
+    # image daemon is running and image preloading is required.
+    IMAGE_SERVICE_ENABLED: bool = os.getenv("IMAGE_SERVICE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     # The Image-Service host is itself a labelled prepull node; node-target resolution must drop it
     # so it never receives distributions. Must exactly match its `kubectl get nodes` name.
     IMAGE_SERVICE_NODE_NAME: str = os.getenv("IMAGE_SERVICE_NODE_NAME", "")

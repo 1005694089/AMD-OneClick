@@ -286,6 +286,40 @@ async def idle_reaper_job():
     except Exception as e:
         logger.error(f"Idle reaper job failed: {e}")
 
+async def workspace_local_cache_reaper_job():
+    """Delayed-local-delete: free node-local SSD workspace copies whose instance stopped longer than
+    the TTL (durable NFS copy is kept forever). Leader-only; inert unless localcache is enabled."""
+    if (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() != "localcache":
+        return
+    if _skip_not_leader("workspace_local_cache_reaper_job"):
+        return
+    from .k8s_client import k8s_client
+
+    try:
+        reaped = await asyncio.to_thread(k8s_client.reap_local_workspace_caches)
+        if reaped:
+            logger.info("Workspace local-cache reaper freed %s cache(s)", len(reaped))
+    except Exception as e:
+        logger.error("Workspace local-cache reaper failed: %s", e)
+
+
+async def workspace_durable_trash_purge_job():
+    """Nightly purge of <shard>/.trash entries older than the retention window (admin soft-deletes).
+    Leader-only; inert unless localcache is enabled."""
+    if (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() != "localcache":
+        return
+    if _skip_not_leader("workspace_durable_trash_purge_job"):
+        return
+    from .k8s_client import k8s_client
+
+    try:
+        n = await asyncio.to_thread(k8s_client.purge_durable_trash)
+        if n:
+            logger.info("Workspace durable trash purge processed %s shard(s)", n)
+    except Exception as e:
+        logger.error("Workspace durable trash purge failed: %s", e)
+
+
 def reconcile_job():
     """Bidirectional reconciliation between the cluster (source of truth) and
     the DB. Reclaims orphan/rogue pods (no owning DB record), force-finalizes
@@ -311,7 +345,21 @@ def reconcile_job():
         cluster_ids = {p["instance_id"] for p in pod_states}
 
         # --- classify (no side effects yet) ---
-        stuck = [p for p in pod_states if p["terminating"] and (p.get("terminating_seconds") or 0) >= settings.TERMINATING_GRACE_SECONDS]
+        # A localcache pod runs a preStop flush (local->durable, up to 100GB over NFS) and is given a
+        # long terminationGracePeriodSeconds (WORKSPACE_TERMINATION_GRACE_SECONDS) for it. Force-deleting
+        # it at the global 180s TERMINATING_GRACE_SECONDS would truncate that flush and lose the delta —
+        # the exact data-loss the grace-period fix prevents on the direct delete path. So a Terminating
+        # localcache pod is only "stuck" once it has exceeded its own grace (plus slack). Non-localcache
+        # keeps the standard 180s threshold.
+        is_localcache = (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() == "localcache"
+        # When localcache is on, raise the stuck threshold to cover the pod's real termination grace so
+        # a legitimately-flushing pod isn't force-killed early. app/api pods have no flush, so the
+        # longer wait is merely a harmless delay before they're reclaimed (pod_states carries no
+        # per-pod type, so we apply one threshold to all our pods rather than mis-key on a missing field).
+        stuck_threshold = settings.TERMINATING_GRACE_SECONDS
+        if is_localcache:
+            stuck_threshold = max(stuck_threshold, int(settings.WORKSPACE_TERMINATION_GRACE_SECONDS) + 60)
+        stuck = [p for p in pod_states if p["terminating"] and (p.get("terminating_seconds") or 0) >= stuck_threshold]
         orphan_candidates = [
             p for p in pod_states
             if not p["terminating"]
@@ -411,6 +459,16 @@ def reconcile_job():
         db_marked = 0
         for instance_id in gone:
             mark_instance_deleted(instance_id)
+            # Out-of-band pod loss (node death / manual delete / eviction) bypasses
+            # delete_instance_by_id, so workspace_cache_state would stay stuck at "running" and its
+            # local SSD copy would never be reaped. Stamp it stopped (keeping the recorded node) so
+            # the delayed-local reaper can eventually free it. Best-effort / localcache-only.
+            if (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() == "localcache":
+                try:
+                    from .store import stamp_workspace_stopped_keep_node
+                    stamp_workspace_stopped_keep_node(instance_id)
+                except Exception as e:
+                    logger.debug("reconcile: stamp_workspace_stopped_keep_node failed for %s: %s", instance_id, e)
             db_marked += 1
 
         logger.info(
@@ -522,6 +580,23 @@ def start_scheduler():
         name="Drain manager-side purge jobs (purge_p2p/seed/meta)",
         replace_existing=True,
     )
+    if (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() == "localcache":
+        scheduler.add_job(
+            workspace_local_cache_reaper_job,
+            trigger=IntervalTrigger(minutes=settings.WORKSPACE_LOCAL_CACHE_REAPER_INTERVAL_MINUTES),
+            id="workspace_local_cache_reaper_job",
+            name="Free node-local SSD workspace caches past their TTL",
+            replace_existing=True,
+            **job_defaults,
+        )
+        scheduler.add_job(
+            workspace_durable_trash_purge_job,
+            trigger=IntervalTrigger(hours=24),
+            id="workspace_durable_trash_purge_job",
+            name="Purge durable workspace .trash past retention",
+            replace_existing=True,
+            **job_defaults,
+        )
     scheduler.start()
     logger.info(
         "Scheduler started; cleanup 1m, template preview 2m, reconcile %ss (%s), image sync %ss, telemetry %s",
