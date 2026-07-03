@@ -1,0 +1,7 @@
+# NFS server image for per-user workspaces WITH real quota enforcement.
+# Builds on the crossmnt image and switches the export from no_root_squash to
+# root_squash so that client root (e.g. Jupyter --allow-root) is mapped to
+# nobody on the server and therefore SUBJECT TO project quota (root with
+# CAP_SYS_RESOURCE would otherwise bypass filesystem quotas).
+FROM crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/nfs-server-crossmnt:20260703
+RUN sed -i "s/no_root_squash/root_squash/g" /etc/exports
