@@ -24,7 +24,36 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-03 (latest) - radeon-global: durable-op node-targeting hardening (fix #1) + shard-0 backend incident
+## 2026-07-03 (latest) - radeon-global: drop dead shard, remap durable to 4 healthy backends
+
+**Code commit:** `76efa5c` (on `prod/radeon-global`). Resolves the shard-0 incident from the prior
+entry by removing the decommissioned `managed-nfs-storage-1` from `WORKSPACE_DURABLE_STORAGE_CLASSES`,
+leaving the 4 healthy SFS-Turbo backends (`managed-nfs-storage-2..5`). Frozen CI baseline
+(FROZEN_SHARD_CLASSES) updated to the 4-shard list; append-only rule applies from here.
+
+**Why this was safe now (verified, not assumed):** before remapping I confirmed (a) NO real durable
+data existed on any shard - only two empty orphan bucket dirs (`eb/`, `2e/`) on the old shard-1 left
+by E2E-test hydrate mkdir; (b) the ONLY live instance, `u-6-258c504b`, was a NEW pod created 10:19 by
+the localcache manager and WEDGED in Init:0/2 because its durable mount had sharded to the dead
+shard-0 (md5('u-6-258c504b')%5==0) - it had no recoverable data either. So the md5%5 -> md5%4 remap
+stranded nothing. This is the one legitimate time to change the shard list (pre-real-user-data).
+
+**Procedure:** deleted the wedged u-6 pod (force) + all 5 empty durable PVCs; committed `76efa5c`;
+built `lablab.local/amd-oneclick:76efa5c`, side-loaded to s-001, `kubectl set image`, rolled out 1/1.
+Manager startup recreated exactly 4 shards `oneclick-durable-shard-0..3` Bound to
+`managed-nfs-storage-2..5`. Deleted the 5 orphaned Released PVs from the old 5-shard era (empty; PV
+objects only, backends untouched).
+
+**Verification (live):** `purge_durable_trash()` -> processed 4/4 shards, ZERO mount failures (the
+op that failed on the dead shard-0 before). Throwaway instance `nb-remapchk` launched via real
+manager: sharded to shard-0 (now = healthy managed-nfs-storage-2 / 38cb5453...), reached Running,
+`/mnt/workspace-durable` mounted over NFS + `/workspace` = 98G SSD loop; cleaned up. Final state:
+4 durable PVCs Bound on healthy classes, manager 76efa5c 1/1 healthy, no leftover pods/PVs.
+
+**Note:** u-6's pod was deleted; on its next relaunch the manager will re-shard it onto a healthy
+backend (md5%4) and it will start normally instead of wedging. 16 workspace + 27 existing tests pass.
+
+## 2026-07-03 - radeon-global: durable-op node-targeting hardening (fix #1) + shard-0 backend incident
 
 **Code commit:** `844279a` (on `prod/radeon-global`; preceded by `5135956`). Fixes review follow-up #1
 from the workspace cutover: durable-op pods (admin soft-delete + nightly trash purge) mount an
