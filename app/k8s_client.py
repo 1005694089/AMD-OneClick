@@ -427,26 +427,130 @@ class K8sClient:
             logger.error("Local workspace cache cleanup failed for %s on %s: %s", instance_id, node_name, e)
             return False
 
+    def _nfs_op_candidate_nodes(self, limit: int = 6) -> list:
+        """Ordered candidate nodes for a durable-op pod (which must mount an SFS-Turbo NFS PVC).
+
+        Not every node can mount the NFS backend (missing nfs-common, off-LAN, transient issues) —
+        an op pod that lands on such a node hangs in ContainerCreating on `mount.nfs` (exit 32) and
+        times out. So instead of scheduling anywhere (tolerations: Exists, which even allows masters),
+        we hand the caller a short ordered list to try in turn:
+          1) FIRST, nodes that ALREADY run a Running workspace pod with a durable NFS mount — those
+             have provably mounted the backend, so they are the safest bet.
+          2) THEN, other eligible nodes (this service's own, Ready, schedulable) as fallback.
+        Eligibility reuses _node_belongs_to_service (the same symmetric taint/tenant scoping used by
+        _eligible_target_nodes) rather than a hand-rolled taint check — so an op pinned via nodeName
+        (which bypasses scheduler taint admission) can never land on a master or ANOTHER tenant's
+        tainted node pool. Best-effort: on API error return [] and let the caller fall back to one
+        unpinned attempt."""
+        proven: list = []
+        others: list = []
+        try:
+            nodes = self._list_node_cached()
+        except ApiException as e:
+            logger.debug("candidate-node listing failed: %s", e)
+            return []
+        eligible = set()
+        for node in nodes.items:
+            name = node.metadata.name
+            if getattr(node.spec, "unschedulable", False):
+                continue
+            conds = {c.type: c.status for c in (node.status.conditions or [])}
+            if conds.get("Ready") != "True" or conds.get("DiskPressure") == "True":
+                continue
+            # Symmetric service/tenant scoping (excludes masters + other tenants' tainted pools +
+            # any node whose NoSchedule/NoExecute taints this service doesn't tolerate).
+            if not self._node_belongs_to_service(node):
+                continue
+            eligible.add(name)
+        # Discover nodes already running a durable-mounted workspace pod (proven NFS-capable).
+        try:
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=self.namespace, label_selector=f"app={settings.NOTEBOOK_LABEL_PREFIX}",
+                field_selector="status.phase=Running",
+            )
+            for p in pods.items:
+                n = getattr(p.spec, "node_name", None)
+                if not n or n not in eligible:
+                    continue
+                has_durable = any(
+                    (v.persistent_volume_claim and
+                     str(v.persistent_volume_claim.claim_name or "").startswith(
+                         self._safe_storage_segment(settings.WORKSPACE_DURABLE_PVC_PREFIX).lower()))
+                    for v in (p.spec.volumes or [])
+                )
+                if has_durable and n not in proven:
+                    proven.append(n)
+        except ApiException as e:
+            logger.debug("proven-node discovery failed: %s", e)
+        for n in sorted(eligible):
+            if n not in proven:
+                others.append(n)
+        ordered = proven + others
+        return ordered[:max(1, limit)]
+
     def _run_durable_shard_command(self, pod_name_stem: str, shard_pvc: str, script: str,
                                    timeout_seconds: int = 300):
         """Run a one-shot pod that mounts a durable shard PVC (RWX) at /durable and executes
         `script`. Used for admin soft-delete (mv into .trash) and the nightly trash purge —
         filesystem ops on the NFS share itself, so they run in a pod that mounts the PVC rather
-        than via host nsenter. Blocks until Succeeded (raises on Failed/timeout)."""
+        than via host nsenter. Blocks until Succeeded (raises on Failed/exhausted-retries).
+
+        Because not every node can mount the SFS-Turbo backend, this tries a short ordered list of
+        NFS-capable candidate nodes (see _nfs_op_candidate_nodes). If a pinned attempt stalls before
+        the container starts (mount/schedule failure — the exit-32 case), it deletes that pod and
+        tries the next node. A pod that actually STARTED and then Fails is a real script error and
+        raises immediately (no pointless retries). timeout_seconds is an OVERALL wall-clock budget for
+        the whole call (across all candidate attempts), so a post-start hang can't multiply it.
+        Candidates is empty only when no eligible node exists — then one unpinned fallback attempt."""
         safe = self._safe_storage_segment(pod_name_stem).lower()
         pod_name = f"ws-durable-{safe}"[:63].rstrip("-")
-        body = {
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": pod_name,
-                "namespace": self.namespace,
-                "labels": {"app": "oneclick-workspace-durable-op"},
-            },
-            "spec": {
+        # Overall deadline for the ENTIRE call (all attempts share this budget), so total wall-clock
+        # is bounded by timeout_seconds regardless of how many candidates stall or hang post-start.
+        overall_deadline = time.monotonic() + max(1, timeout_seconds)
+        # Per-attempt not-started grace: if the container hasn't started by now the node likely can't
+        # mount — abandon and try the next. Kept small so several attempts fit in the overall budget.
+        start_deadline = max(20, min(60, timeout_seconds // 4))
+
+        def _read_pod():
+            """Read the op pod, retrying a couple of times on a transient (non-404) API error so a
+            single apiserver hiccup doesn't get misread as a stall and force-kill a healthy pod.
+            Returns the pod, None if 404 (gone), or raises 'transient' sentinel after retries."""
+            last = None
+            for _ in range(3):
+                try:
+                    return self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                except ApiException as e:
+                    if e.status == 404:
+                        return None
+                    last = e
+                    time.sleep(1)
+            raise last if last else RuntimeError("read failed")
+
+        def _cleanup_pod():
+            try:
+                self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.debug("durable-op cleanup delete of %s: %s", pod_name, e)
+                    return
+            for _ in range(30):
+                try:
+                    self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                    time.sleep(1)
+                except ApiException as e:
+                    if e.status == 404:
+                        return
+                    logger.debug("durable-op cleanup poll of %s: %s", pod_name, e)
+                    return
+
+        def _body(node_name):
+            spec = {
                 "restartPolicy": "Never",
                 "automountServiceAccountToken": False,
-                "tolerations": [{"operator": "Exists"}],
+                # Notebook tolerations (not tolerations: Exists) so an op never lands on a master or
+                # a node this service doesn't own — belt-and-suspenders with candidate scoping since a
+                # nodeName pin bypasses scheduler taint admission.
+                "tolerations": self._notebook_tolerations(),
                 "containers": [
                     {
                         "name": "durableop",
@@ -462,37 +566,78 @@ class K8sClient:
                     }
                 ],
                 "volumes": [{"name": "durable", "persistentVolumeClaim": {"claimName": shard_pvc}}],
-            },
-        }
-        try:
-            self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
-            for _ in range(30):
-                try:
-                    self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
-                    time.sleep(1)
-                except ApiException as e:
-                    if e.status == 404:
-                        break
-                    raise
-        except ApiException as e:
-            if e.status != 404:
-                raise
+            }
+            if node_name:
+                spec["nodeName"] = node_name
+            return {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": pod_name,
+                    "namespace": self.namespace,
+                    "labels": {"app": "oneclick-workspace-durable-op"},
+                },
+                "spec": spec,
+            }
 
-        self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
-        last_phase = ""
-        for _ in range(max(1, timeout_seconds)):
-            pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
-            last_phase = pod.status.phase
-            if last_phase == "Succeeded":
+        candidates = self._nfs_op_candidate_nodes() or [None]  # None => one unpinned fallback attempt
+        last_err = "no candidate nodes"
+        for node_name in candidates:
+            if time.monotonic() >= overall_deadline:
+                last_err = "overall timeout budget exhausted before all candidates tried"
+                break
+            _cleanup_pod()
+            try:
+                self.core_v1.create_namespaced_pod(namespace=self.namespace, body=_body(node_name))
+            except ApiException as e:
+                if e.status == 409:
+                    # A prior pod of this name is still Terminating (stuck on a bad node). Skip this
+                    # attempt rather than aborting the whole loop; the next iteration re-cleans.
+                    last_err = f"create 409 (stale pod terminating) targeting node {node_name}"
+                    logger.warning("durable-op %s create hit 409; will retry after cleanup", pod_name)
+                    continue
+                raise
+            started = False
+            attempt_start = time.monotonic()
+            while True:
+                if time.monotonic() >= overall_deadline:
+                    last_err = f"overall timeout in phase (started={started}) on node {node_name}"
+                    _cleanup_pod()
+                    break
                 try:
-                    self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
-                except ApiException:
-                    pass
-                return
-            if last_phase == "Failed":
-                raise RuntimeError(f"workspace durable-op {pod_name} failed on shard {shard_pvc}")
-            time.sleep(1)
-        raise RuntimeError(f"workspace durable-op {pod_name} timed out in phase {last_phase}")
+                    pod = _read_pod()
+                except ApiException as e:
+                    last_err = f"read failed after retries: {e}"
+                    _cleanup_pod()
+                    break
+                if pod is None:  # pod vanished unexpectedly (evicted before completion) → try next
+                    last_err = f"pod disappeared on node {node_name}"
+                    break
+                last_phase = pod.status.phase
+                cst = (pod.status.container_statuses or [])
+                if last_phase == "Running" or (cst and (cst[0].state.running or cst[0].state.terminated)):
+                    started = True
+                if last_phase == "Succeeded":
+                    _cleanup_pod()
+                    return
+                if last_phase == "Failed":
+                    if started:
+                        # Container actually ran and failed → real script error, don't retry nodes.
+                        _cleanup_pod()
+                        raise RuntimeError(f"workspace durable-op {pod_name} failed on shard {shard_pvc} (node {node_name})")
+                    # Failed before the container ever started (e.g. evicted / DiskPressure) → not a
+                    # script error; treat like a stall and try the next candidate.
+                    last_err = f"pod Failed pre-start on node {node_name}"
+                    _cleanup_pod()
+                    break
+                if not started and (time.monotonic() - attempt_start) >= start_deadline:
+                    last_err = f"did not start on node {node_name} within {start_deadline}s (likely NFS mount failure)"
+                    logger.warning("durable-op %s did not start on %s within %ss; retrying next node",
+                                   pod_name, node_name, start_deadline)
+                    _cleanup_pod()
+                    break
+                time.sleep(1)
+        raise RuntimeError(f"workspace durable-op {pod_name} exhausted candidates for shard {shard_pvc}: {last_err}")
 
     def delete_workspace_durable(self, instance_id: str) -> bool:
         """ADMIN ONLY: soft-delete an instance's durable workspace by moving its subdir into
@@ -519,21 +664,26 @@ class K8sClient:
                 or parts[1] in (".", "..", "") or "/" in parts[1]):
             logger.error("Refusing durable delete for %s: unsafe subpath %r", instance_id, subpath)
             return False
-        # NOTE: no Date.now — the trash suffix uses the pod-side `date +%s` so it is unique without
-        # the manager stamping time (keeps this deterministic from the manager's side).
+        # Atomic + idempotent soft-delete, safe to re-run if a prior attempt was interrupted:
+        #   - The trash dir name ENCODES the delete epoch (`<id>-<epoch>`). purge_durable_trash parses
+        #     that epoch for the retention window instead of relying on filesystem mtime, so retention
+        #     is correct regardless of what mtime the moved dir carries or whether any `touch` ran.
+        #     This removes the mv/touch-truncation data-loss risk (a kill between mv and touch used to
+        #     leave a stale-mtime dir that the next purge would delete far too early).
+        #   - The move is a SINGLE `mv "$src" "$dst"` = one same-fs rename() syscall, which is atomic:
+        #     it either fully happened (src gone, dst present) or not at all (src intact). There is no
+        #     half-moved state to split across a retry.
+        #   - Retry idempotency: if a prior attempt already completed the rename, `$src` is gone and the
+        #     `[ -d "$src" ]` guard makes this a clean no-op success (the correctly-named dst already
+        #     exists). If the rename never ran, we do it now. Either way no data is lost or duplicated.
+        safe_id = self._safe_storage_segment(instance_id)
         script = (
             f"src=/durable/{shlex.quote(subpath)}\n"
             f"trash_dir=/durable/.trash\n"
             f"mkdir -p \"$trash_dir\"\n"
-            f"if [ -d \"$src\" ]; then dst=\"$trash_dir/{shlex.quote(self._safe_storage_segment(instance_id))}-$(date +%s)\"; "
-            f"mv \"$src\" \"$dst\"; "
-            # A same-filesystem mv does NOT refresh the moved dir's mtime — it keeps whatever the last
-            # top-level change set (often days old for workspaces with nested activity). purge_durable_trash
-            # keys retention off `find -mmin`, so without this touch a stale-mtime workspace would be
-            # purged on the very next nightly run, collapsing the retention window to ~zero. Touch the
-            # trashed dir so retention is measured from the actual soft-delete time.
-            f"touch \"$dst\"; echo trashed \"$src\" '->' \"$dst\"; "
-            f"else echo \"no durable data at $src\"; fi\n"
+            f"if [ -d \"$src\" ]; then dst=\"$trash_dir/{shlex.quote(safe_id)}-$(date +%s)\"; "
+            f"mv \"$src\" \"$dst\"; echo trashed \"$src\" '->' \"$dst\"; "
+            f"else echo \"no live durable data at $src (already trashed or never existed)\"; fi\n"
         )
         try:
             self._run_durable_shard_command(f"del-{instance_id}", shard_pvc, script, timeout_seconds=180)
@@ -549,15 +699,26 @@ class K8sClient:
         if not self._workspace_localcache_enabled():
             return 0
         days = retention_days if retention_days is not None else settings.WORKSPACE_DURABLE_TRASH_RETENTION_DAYS
-        minutes = max(1, int(days) * 24 * 60)
+        max_age_secs = max(1, int(days) * 24 * 60 * 60)
         processed = 0
         for index in range(len(self._durable_shard_classes())):
             shard_pvc = self._durable_shard_pvc_for_index(index)
+            # Retention is derived from the delete epoch ENCODED in each trash entry's name
+            # (`<id>-<epoch>`), not filesystem mtime — so a same-fs mv that preserved an old mtime
+            # can't cause premature deletion. Entries whose trailing -<epoch> is older than the
+            # window are removed; names without a parseable epoch are left alone (never blindly rm'd).
             script = (
                 f"trash_dir=/durable/.trash\n"
+                f"now=$(date +%s); max_age={max_age_secs}\n"
                 f"if [ -d \"$trash_dir\" ]; then "
-                f"find \"$trash_dir\" -mindepth 1 -maxdepth 1 -mmin +{minutes} -exec rm -rf {{}} + ; "
-                f"echo purged \"$trash_dir\"; else echo 'no trash dir'; fi\n"
+                f"for e in \"$trash_dir\"/*; do "
+                f"[ -e \"$e\" ] || continue; "
+                f"base=$(basename \"$e\"); ep=${{base##*-}}; "
+                f"case \"$ep\" in ''|*[!0-9]*) echo \"skip (no epoch): $base\"; continue;; esac; "
+                f"age=$((now - ep)); "
+                f"if [ \"$age\" -gt \"$max_age\" ]; then rm -rf \"$e\" && echo \"purged $base (age ${{age}}s)\"; "
+                f"else echo \"keep $base (age ${{age}}s)\"; fi; "
+                f"done; echo purged-done \"$trash_dir\"; else echo 'no trash dir'; fi\n"
             )
             try:
                 self._run_durable_shard_command(f"trash-{index}", shard_pvc, script, timeout_seconds=300)

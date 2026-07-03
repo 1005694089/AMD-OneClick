@@ -139,5 +139,199 @@ class ShardMappingTests(unittest.TestCase):
             self.assertNotIn(parts[1], {".", "..", ""})
 
 
+def _node(name, ready=True, unschedulable=False, master=False, disk_pressure=False):
+    taints = [SimpleNamespace(key="node-role.kubernetes.io/control-plane", value=None, effect="NoSchedule")] if master else []
+    conds = [SimpleNamespace(type="Ready", status="True" if ready else "False")]
+    if disk_pressure:
+        conds.append(SimpleNamespace(type="DiskPressure", status="True"))
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name),
+        spec=SimpleNamespace(taints=taints, unschedulable=unschedulable),
+        status=SimpleNamespace(conditions=conds),
+    )
+
+
+class DurableOpRetryTests(unittest.TestCase):
+    """The durable-op pod mounts an SFS-Turbo NFS PVC; not every node can mount it. Verify candidate
+    selection excludes masters/unschedulable/NotReady and that _run_durable_shard_command retries the
+    next node when a pinned attempt stalls (mount failure), succeeds on a good node, and raises on a
+    genuine container Failure without pointless retries."""
+
+    def setUp(self):
+        self._orig = (k8s_module.settings.WORKSPACE_VOLUME_TYPE,
+                      k8s_module.settings.WORKSPACE_DURABLE_PVC_PREFIX,
+                      k8s_module.settings.NOTEBOOK_LABEL_PREFIX)
+        k8s_module.settings.WORKSPACE_VOLUME_TYPE = "localcache"
+        k8s_module.settings.WORKSPACE_DURABLE_PVC_PREFIX = "oneclick-durable"
+        self.c = k8s_module.K8sClient.__new__(k8s_module.K8sClient)
+        self.c.namespace = "ns"
+        self.c._node_list_cache = None
+        self.c._node_list_cache_ts = 0.0
+        self.c._node_list_cache_ttl = 0.0
+        import threading
+        self.c._node_list_cache_lock = threading.Lock()
+
+    def tearDown(self):
+        (k8s_module.settings.WORKSPACE_VOLUME_TYPE,
+         k8s_module.settings.WORKSPACE_DURABLE_PVC_PREFIX,
+         k8s_module.settings.NOTEBOOK_LABEL_PREFIX) = self._orig
+
+    def test_candidate_nodes_filter_and_prioritize(self):
+        nodes = [_node("good-1"), _node("good-2"), _node("m-1", master=True),
+                 _node("cordoned", unschedulable=True), _node("notready", ready=False)]
+        # good-2 already runs a durable-mounted workspace pod → proven NFS-capable, ranked first.
+        pod = SimpleNamespace(spec=SimpleNamespace(
+            node_name="good-2",
+            volumes=[SimpleNamespace(persistent_volume_claim=SimpleNamespace(claim_name="oneclick-durable-shard-3"))],
+        ))
+        self.c.core_v1 = SimpleNamespace(
+            list_node=lambda: SimpleNamespace(items=nodes),
+            list_namespaced_pod=lambda **k: SimpleNamespace(items=[pod]),
+        )
+        cands = self.c._nfs_op_candidate_nodes()
+        self.assertEqual(cands[0], "good-2", "proven NFS node must rank first")
+        self.assertIn("good-1", cands)
+        for bad in ("m-1", "cordoned", "notready"):
+            self.assertNotIn(bad, cands, f"{bad} must be excluded")
+
+    def test_retry_moves_past_stuck_node_then_succeeds(self):
+        # Model: node A keeps the pod Pending (NFS mount stall); node B runs it to Succeeded.
+        self.c._notebook_tolerations = lambda: [{"operator": "Exists"}]
+        self.c._workspace_sync_image = lambda: "img"
+        self.c._nfs_op_candidate_nodes = lambda limit=6: ["A", "B"]
+        state = {"pods": {}, "created_on": []}
+
+        def create(namespace, body):
+            node = body["spec"].get("nodeName")
+            state["created_on"].append(node)
+            # A: never starts (stuck Pending). B: immediately Succeeded.
+            state["pods"][body["metadata"]["name"]] = "pendingA" if node == "A" else "Succeeded"
+
+        def read(name, namespace):
+            st = state["pods"].get(name)
+            if st is None:
+                raise k8s_module.ApiException(status=404)
+            if st == "pendingA":
+                return SimpleNamespace(status=SimpleNamespace(phase="Pending", container_statuses=None))
+            return SimpleNamespace(status=SimpleNamespace(phase="Succeeded", container_statuses=None))
+
+        def delete(name, namespace, grace_period_seconds=0):
+            state["pods"].pop(name, None)
+
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=create, read_namespaced_pod=read, delete_namespaced_pod=delete)
+        # Short per-attempt deadline so the stuck node is abandoned fast in the test.
+        self.c._run_durable_shard_command("trash-3", "oneclick-durable-shard-3", "echo hi", timeout_seconds=90)
+        self.assertEqual(state["created_on"], ["A", "B"], "should try A (stall) then B (success)")
+
+    def test_container_failure_raises_without_extra_retries(self):
+        self.c._notebook_tolerations = lambda: [{"operator": "Exists"}]
+        self.c._workspace_sync_image = lambda: "img"
+        self.c._nfs_op_candidate_nodes = lambda limit=6: ["A", "B", "C"]
+        state = {"created_on": []}
+
+        def create(namespace, body):
+            state["created_on"].append(body["spec"].get("nodeName"))
+
+        def read(name, namespace):
+            # Container ran (terminated) and pod Failed → genuine error, must not retry other nodes.
+            term = SimpleNamespace(running=None, terminated=SimpleNamespace(exit_code=1))
+            return SimpleNamespace(status=SimpleNamespace(
+                phase="Failed", container_statuses=[SimpleNamespace(state=term)]))
+
+        def delete(name, namespace, grace_period_seconds=0):
+            pass
+
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=create, read_namespaced_pod=read, delete_namespaced_pod=delete)
+        with self.assertRaises(RuntimeError):
+            self.c._run_durable_shard_command("del-x", "oneclick-durable-shard-1", "false", timeout_seconds=90)
+        self.assertEqual(state["created_on"], ["A"], "a real container failure must not retry other nodes")
+
+    def test_failed_pre_start_retries_next_node(self):
+        # Pod Failed BEFORE the container ever ran (e.g. evicted) → not a script error, try next node.
+        self.c._notebook_tolerations = lambda: [{"operator": "Exists"}]
+        self.c._workspace_sync_image = lambda: "img"
+        self.c._nfs_op_candidate_nodes = lambda limit=6: ["A", "B"]
+        state = {"created_on": [], "pods": {}}
+
+        def create(namespace, body):
+            node = body["spec"].get("nodeName")
+            state["created_on"].append(node)
+            state["pods"][body["metadata"]["name"]] = node
+
+        def read(name, namespace):
+            node = state["pods"].get(name)
+            if node is None:
+                raise k8s_module.ApiException(status=404)
+            if node == "A":  # Failed with NO container ever started
+                return SimpleNamespace(status=SimpleNamespace(phase="Failed", container_statuses=None))
+            return SimpleNamespace(status=SimpleNamespace(phase="Succeeded", container_statuses=None))
+
+        def delete(name, namespace, grace_period_seconds=0):
+            state["pods"].pop(name, None)
+
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=create, read_namespaced_pod=read, delete_namespaced_pod=delete)
+        self.c._run_durable_shard_command("trash-1", "oneclick-durable-shard-1", "x", timeout_seconds=90)
+        self.assertEqual(state["created_on"], ["A", "B"], "pre-start Failed should retry, not abort")
+
+    def test_create_409_skips_to_next_node(self):
+        # A stale pod stuck Terminating → create raises 409; loop should skip to the next candidate.
+        self.c._notebook_tolerations = lambda: [{"operator": "Exists"}]
+        self.c._workspace_sync_image = lambda: "img"
+        self.c._nfs_op_candidate_nodes = lambda limit=6: ["A", "B"]
+        state = {"created_on": [], "pods": {}}
+
+        def create(namespace, body):
+            node = body["spec"].get("nodeName")
+            if node == "A":
+                raise k8s_module.ApiException(status=409)
+            state["created_on"].append(node)
+            state["pods"][body["metadata"]["name"]] = "Succeeded"
+
+        def read(name, namespace):
+            st = state["pods"].get(name)
+            if st is None:
+                raise k8s_module.ApiException(status=404)
+            return SimpleNamespace(status=SimpleNamespace(phase="Succeeded", container_statuses=None))
+
+        def delete(name, namespace, grace_period_seconds=0):
+            state["pods"].pop(name, None)
+
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=create, read_namespaced_pod=read, delete_namespaced_pod=delete)
+        self.c._run_durable_shard_command("trash-2", "oneclick-durable-shard-2", "x", timeout_seconds=90)
+        self.assertEqual(state["created_on"], ["B"], "409 on A should skip to B, not abort the loop")
+
+    def test_overall_timeout_budget_bounds_total_time(self):
+        # Two stuck-pending nodes with a tiny overall budget → must give up quickly, not run 2x full.
+        import time as _t
+        self.c._notebook_tolerations = lambda: [{"operator": "Exists"}]
+        self.c._workspace_sync_image = lambda: "img"
+        self.c._nfs_op_candidate_nodes = lambda limit=6: ["A", "B"]
+        state = {"pods": {}}
+
+        def create(namespace, body):
+            state["pods"][body["metadata"]["name"]] = "Pending"
+
+        def read(name, namespace):
+            if name not in state["pods"]:
+                raise k8s_module.ApiException(status=404)
+            return SimpleNamespace(status=SimpleNamespace(phase="Pending", container_statuses=None))
+
+        def delete(name, namespace, grace_period_seconds=0):
+            state["pods"].pop(name, None)
+
+        self.c.core_v1 = SimpleNamespace(
+            create_namespaced_pod=create, read_namespaced_pod=read, delete_namespaced_pod=delete)
+        t0 = _t.monotonic()
+        with self.assertRaises(RuntimeError):
+            self.c._run_durable_shard_command("trash-0", "oneclick-durable-shard-0", "x", timeout_seconds=8)
+        elapsed = _t.monotonic() - t0
+        # Overall budget is 8s; must not run anywhere near 2x8 even with 2 stuck nodes.
+        self.assertLess(elapsed, 20, f"overall timeout budget not honored: {elapsed:.1f}s")
+
+
 if __name__ == "__main__":
     unittest.main()
