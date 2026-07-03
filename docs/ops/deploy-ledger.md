@@ -749,3 +749,34 @@ retained in git (contain secrets).
 (local-only, not in git) to restore image `lablab.local/amd-oneclick:0706` and the
 pre-HF ConfigMap/Secret state; note the original `u-2`/`u-6` user pods cannot be
 restored (they were destroyed with the namespace, independent of this deploy).
+
+## 2026-07-03 — radeon-global — HF startup credits 48 -> 10
+
+**Change:** ConfigMap `amd-oneclick-lablab-config` key `HUGGINGFACE_DEMO_MIN_CREDITS`
+`48` -> `10` (`kubectl patch` merge), then `rollout restart` the manager to pick up
+the env change.
+
+**Why:** new HuggingFace demo users were being granted 48 starting credits; desired
+starting grant is 10. `HUGGINGFACE_DEMO_MIN_CREDITS` drives both the once-only
+`grant_initial_credits_once(..., "hf_initial_grant")` call (`app/main.py:2510`) and
+the `_backfill_hf_credit_cap` init-time cap (`app/store.py:520`). No code hardcodes
+48/10 — config-only change.
+
+**Scope:** affects NEW HF users only. Existing users keep their balance — the
+per-user `hf_initial_grant` marker blocks re-grant, and the one-time
+`hf_backfill_cap_v1` marker (already run at cap=48) blocks the cap from re-running.
+
+**Verification:** launched a fresh HF user post-change; DB `users` row shows
+`credits=10` for the new user (id 9), while pre-change test users (ids 7/8) retain
+47/48 — confirms once-only grant and correct new default. Manager `1/1`, public
+`/health` 200.
+
+**Known open item (NOT changed):** OpenCode `opencode_url` still returns raw
+`ip:port` and requires manual username/password. Root cause: `OPENCODE_PUBLIC_BASE_URL`
+is unset, and enabling it needs a network path for OpenCode traffic that is separate
+from the main app (the manager's origin-proxy middleware, `app/main.py:178`, hijacks
+by hostname). radeon-global currently has NO such path: no tls-proxy pod, no NodePort
+30450, and `radeon-global.anruicloud.com` resolves only to Azure Front Door (443).
+Fixing requires either a Front Door route for a dedicated OpenCode subdomain -> manager
+NodePort, or an in-cluster tls-proxy on a reachable edge NodePort (beta's pattern:
+`radeon.anruicloud.com:30450` -> `36.150.116.200`). Pending infra decision.
