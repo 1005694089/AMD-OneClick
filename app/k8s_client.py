@@ -1594,11 +1594,18 @@ exit 0
         returns False and is left for the reconciler to finalize, keeping the DB
         consistent with cluster reality.
         """
+        logger.info("Deleting instance resources instance_id=%s wait=%s", instance_id, wait)
         self._delete_service(instance_id)
         self._delete_pod(instance_id)
 
         if not wait:
-            return not self._pod_exists(instance_id)
+            gone = not self._pod_exists(instance_id)
+            logger.info(
+                "Delete issued for instance_id=%s wait=false result=%s",
+                instance_id,
+                "gone" if gone else "still_present",
+            )
+            return gone
 
         deadline = time.monotonic() + max(0, settings.DELETE_CONFIRM_TIMEOUT_SECONDS)
         interval = max(0.5, settings.DELETE_POLL_INTERVAL_SECONDS)

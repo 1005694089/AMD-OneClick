@@ -86,6 +86,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+if settings.MANAGER_LOG_PATH:
+    try:
+        os.makedirs(os.path.dirname(settings.MANAGER_LOG_PATH), exist_ok=True)
+        file_handler = logging.FileHandler(settings.MANAGER_LOG_PATH, encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        app_logger = logging.getLogger("app")
+        app_logger.setLevel(logging.INFO)
+        app_logger.addHandler(file_handler)
+        logger.info("Persistent manager log enabled at %s", settings.MANAGER_LOG_PATH)
+    except Exception as e:
+        logger.warning("Failed to enable persistent manager log at %s: %s", settings.MANAGER_LOG_PATH, e)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -955,7 +968,17 @@ async def redeem_credits(req: CouponRedeemRequest, user: dict = Depends(current_
         raise HTTPException(status_code=503, detail=settings.COUPON_REDEEM_DISABLED_MESSAGE)
     coupon = _decode_credit_coupon(req.coupon)
     try:
-        return redeem_user_coupon(user["id"], coupon)
+        result = redeem_user_coupon(user["id"], coupon)
+        logger.info(
+            "Credits redeemed user_id=%s email=%s coupon_id=%s card_hours=%s credits_added=%s new_balance=%s",
+            user["id"],
+            user.get("email"),
+            coupon.get("coupon_id"),
+            coupon.get("card_hours"),
+            result.get("credits_added"),
+            result.get("credits"),
+        )
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -988,6 +1011,13 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     if active:
         if k8s_client.get_instance_by_id(active["instance_id"]):
             raise HTTPException(status_code=400, detail="Each user can only have one active instance")
+        logger.warning(
+            "Marking stale active DB record deleted before new notebook request instance_id=%s user_id=%s email=%s status=%s",
+            active["instance_id"],
+            user["id"],
+            email,
+            active.get("status"),
+        )
         mark_instance_deleted(active["instance_id"])
 
     if int(user["credits"]) < gpu_count:
@@ -1007,6 +1037,18 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             user["id"], email, instance["id"], image, instance_type, gpu_count, instance.get("node_port")
         )
         record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count)
+        logger.info(
+            "Instance created source=notebook_request instance_id=%s user_id=%s email=%s image=%s instance_type=%s gpu_count=%s node_port=%s resource_profile=%s disk_size_gb=%s",
+            instance["id"],
+            user["id"],
+            email,
+            image,
+            instance_type,
+            gpu_count,
+            instance.get("node_port"),
+            resource_profile,
+            disk_size_gb,
+        )
         from .telemetry import report_gpu_instance_created_event
 
         await report_gpu_instance_created_event(
@@ -1104,6 +1146,13 @@ async def destroy_current_notebook(user: dict = Depends(current_user)):
     instance_id = active["instance_id"]
     try:
         deleted = k8s_client.delete_instance_by_id(instance_id)
+        logger.info(
+            "Instance delete requested source=user_current instance_id=%s user_id=%s email=%s deleted=%s",
+            instance_id,
+            user["id"],
+            user.get("email"),
+            deleted,
+        )
         mark_instance_deleted(instance_id)
         return DestroyResponse(
             success=True,
@@ -1306,6 +1355,14 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
     if active:
         if k8s_client.get_instance_by_id(active["instance_id"]):
             raise HTTPException(status_code=400, detail="Each user can only have one active instance")
+        logger.warning(
+            "Marking stale active DB record deleted before template launch instance_id=%s user_id=%s email=%s template_id=%s status=%s",
+            active["instance_id"],
+            user["id"],
+            user.get("email"),
+            template_id,
+            active.get("status"),
+        )
         mark_instance_deleted(active["instance_id"])
 
     if int(user["credits"]) < gpu_count:
@@ -1340,6 +1397,20 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
             gpu_count,
             template_id=template["id"],
             template_title=template["title"],
+        )
+        logger.info(
+            "Instance created source=template_launch instance_id=%s user_id=%s email=%s image=%s instance_type=%s gpu_count=%s node_port=%s template_id=%s template_title=%s app_port=%s ssh_enabled=%s",
+            instance["id"],
+            user["id"],
+            email,
+            template["image"],
+            template_instance_type,
+            gpu_count,
+            instance.get("node_port"),
+            template["id"],
+            template["title"],
+            template.get("app_port"),
+            bool(template.get("ssh_enabled")),
         )
         from .telemetry import report_gpu_instance_created_event
 
@@ -2022,6 +2093,12 @@ async def destroy_instance(instance_id: str, username: str = Depends(verify_admi
     """Destroy a specific notebook instance by ID"""
     try:
         success = k8s_client.delete_instance_by_id(instance_id)
+        logger.info(
+            "Instance delete requested source=admin_instance actor=%s instance_id=%s deleted=%s",
+            username,
+            instance_id,
+            success,
+        )
         if success:
             mark_instance_deleted(instance_id)
         
@@ -2040,6 +2117,13 @@ async def destroy_instance(instance_id: str, username: str = Depends(verify_admi
 async def destroy_all_instances(username: str = Depends(verify_admin)):
     """Destroy all notebook instances"""
     try:
+        before = k8s_client.list_instances()
+        logger.warning(
+            "Bulk delete requested source=admin_all actor=%s matched_count=%s instance_ids=%s",
+            username,
+            len(before),
+            [inst.get("id") for inst in before],
+        )
         count = k8s_client.delete_all_instances()
         for inst in k8s_client.list_instances():
             mark_instance_deleted(inst["id"])
@@ -2077,9 +2161,23 @@ async def bulk_destroy_instances(req: InstanceBulkDestroyRequest, username: str 
             continue
         try:
             if k8s_client.delete_instance_by_id(instance_id):
+                logger.info(
+                    "Bulk delete instance source=admin_bulk actor=%s matcher=%s instance_id=%s email=%s result=deleted",
+                    username,
+                    matcher,
+                    instance_id,
+                    inst.get("email"),
+                )
                 mark_instance_deleted(instance_id)
                 destroyed.append({"id": instance_id, "email": inst.get("email")})
             else:
+                logger.warning(
+                    "Bulk delete instance source=admin_bulk actor=%s matcher=%s instance_id=%s email=%s result=not_found",
+                    username,
+                    matcher,
+                    instance_id,
+                    inst.get("email"),
+                )
                 failed.append({"id": instance_id, "email": inst.get("email"), "reason": "not found"})
         except Exception as e:
             logger.error("Bulk destroy failed for %s: %s", instance_id, e)
