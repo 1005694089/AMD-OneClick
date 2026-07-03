@@ -13,7 +13,7 @@
 #   still hydrated). If a future CNI change ever breaks the CSI mount, delete this policy — Approach B
 #   alone (mount removal) still closes the cap-bypass.
 #
-# Selector: app=amd-oneclick (NOTEBOOK_LABEL_PREFIX) — notebook pods ONLY. The out-of-pod
+# Selector: app=<NOTEBOOK_LABEL_PREFIX> (amd-oneclick-lablab in this deployment) — notebook pods ONLY. The out-of-pod
 # flush/hydrate/durable-op pods carry distinct app=oneclick-workspace-* labels and are NOT selected,
 # so their NFS access is untouched.
 #
@@ -32,7 +32,10 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: amd-oneclick
+      # Must match the LIVE NOTEBOOK_LABEL_PREFIX (amd-oneclick-lablab in this deployment), NOT the
+      # config.py default "amd-oneclick". matchLabels is exact, so this selects notebook pods only —
+      # the manager (app=amd-oneclick-lablab-manager) and other components are distinct and untouched.
+      app: amd-oneclick-lablab
   policyTypes:
     - Egress
   egress:
