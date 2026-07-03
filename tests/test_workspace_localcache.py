@@ -13,8 +13,10 @@ from app import k8s_client as k8s_module
 # The exact shard list the live deployment must preserve in order forever. If someone reorders or
 # removes an entry, md5(instance_id) % len remaps existing instances onto a different (empty) shard,
 # stranding their durable data. This frozen expectation catches that in CI.
+# 2026-07-03: managed-nfs-storage-1 was decommissioned out-of-band (backend denies mounts) and removed
+# from the list BEFORE any real durable data existed (the only safe time to change it). Baseline is
+# now the 4 healthy backends; the append-only rule applies going forward from here.
 FROZEN_SHARD_CLASSES = [
-    "managed-nfs-storage-1",
     "managed-nfs-storage-2",
     "managed-nfs-storage-3",
     "managed-nfs-storage-4",
@@ -57,15 +59,14 @@ class ShardMappingTests(unittest.TestCase):
             self.assertTrue(0 <= i1 < len(FROZEN_SHARD_CLASSES))
 
     def test_append_only_invariant(self):
-        """Adding a 6th class must NOT change where any existing instance maps IF the modulo base
-        is unchanged — but since % len changes with length, this test documents that appending
-        DOES change mapping, so the operational rule is: append only when you accept a remap, and
-        the real guard is that the FIRST 5 entries never change order. Here we assert order-stability
-        of the frozen list."""
+        """The operational rule is append-only: the existing entries must never be reordered or
+        removed (that remaps md5%len and strands data). Assert the current baseline is exactly the
+        frozen list, in order — a future append adds entries AFTER these, never disturbing them."""
+        n = len(FROZEN_SHARD_CLASSES)
         self.assertEqual(
-            k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES[:5],
+            k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES[:n],
             FROZEN_SHARD_CLASSES,
-            "The first 5 durable StorageClasses must never be reordered or removed (append-only).",
+            f"The first {n} durable StorageClasses must never be reordered or removed (append-only).",
         )
 
     def test_reordering_changes_mapping_is_detectable(self):

@@ -272,10 +272,13 @@ class Settings:
     # instance gets an isolated subdirectory on its shard, chosen by md5(instance_id) % len(list).
     # APPEND-ONLY: never reorder or remove entries — the modulo maps existing instances to a shard by
     # position, so changing the list silently strands live data on the wrong (empty) shard.
+    # NOTE (2026-07-03): managed-nfs-storage-1 was decommissioned out-of-band (its SFS-Turbo backend
+    # denies mounts), so it was removed here BEFORE any real durable data existed — the only safe time
+    # to change this list. From now the append-only rule stands: 4 shards over the healthy backends.
     WORKSPACE_DURABLE_STORAGE_CLASSES: list = [
         s.strip() for s in os.getenv(
             "WORKSPACE_DURABLE_STORAGE_CLASSES",
-            "managed-nfs-storage-1,managed-nfs-storage-2,managed-nfs-storage-3,managed-nfs-storage-4,managed-nfs-storage-5",
+            "managed-nfs-storage-2,managed-nfs-storage-3,managed-nfs-storage-4,managed-nfs-storage-5",
         ).split(",") if s.strip()
     ]
     WORKSPACE_DURABLE_PVC_PREFIX: str = os.getenv("WORKSPACE_DURABLE_PVC_PREFIX", "oneclick-durable")
