@@ -1447,12 +1447,33 @@ exit 0
             except Exception:
                 existing_image = None
             existing_type = (existing_pod.metadata.annotations or {}).get("amd-oneclick/instance-type", "jupyter")
-            if existing_image == image and existing_type == instance_type:
-                logger.info("Reusing matching existing pod %s (image/type identical)", instance_id)
+            existing_annotations = existing_pod.metadata.annotations or {}
+            requested_template_id = str((github_info or {}).get("template_id") or "")
+            requested_repo_url = str((github_info or {}).get("repo_url") or "")
+            requested_branch = str((github_info or {}).get("branch") or "")
+            requested_path = str((github_info or {}).get("path") or "")
+            same_launch = (
+                existing_image == image
+                and existing_type == instance_type
+                and existing_annotations.get("amd-oneclick/template-id", "") == requested_template_id
+                and existing_annotations.get("amd-oneclick/github-repo-url", "") == requested_repo_url
+                and existing_annotations.get("amd-oneclick/github-branch", "") == requested_branch
+                and existing_annotations.get("amd-oneclick/github-path", "") == requested_path
+            )
+            if same_launch:
+                logger.info("Reusing matching existing pod %s (same image/type/template/path)", instance_id)
                 return self.get_instance_by_id(instance_id)
             logger.info(
-                "Existing pod %s differs from requested launch (image %s->%s, type %s->%s); replacing",
-                instance_id, existing_image, image, existing_type, instance_type,
+                "Existing pod %s differs from requested launch (image %s->%s, type %s->%s, template %s->%s, path %s->%s); replacing",
+                instance_id,
+                existing_image,
+                image,
+                existing_type,
+                instance_type,
+                existing_annotations.get("amd-oneclick/template-id", ""),
+                requested_template_id,
+                existing_annotations.get("amd-oneclick/github-path", ""),
+                requested_path,
             )
             # Issue the delete without a long blocking wait; the terminating-wait
             # loop below (breaks on 404) handles confirming removal before we
