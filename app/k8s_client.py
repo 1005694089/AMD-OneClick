@@ -146,6 +146,21 @@ class K8sClient:
     def _safe_storage_segment(self, value: str) -> str:
         return re.sub(r"[^a-zA-Z0-9_.-]", "-", value).strip("-") or "default"
 
+    def _template_repo_dir_name(self, github_info: dict) -> str:
+        """Stable repo directory under persistent workspaces.
+
+        Per-user NFS workspaces survive instance deletion. A single fixed
+        /workspace/repo lets one template's clone poison the next template launch,
+        so each template/repo gets its own cache directory.
+        """
+        template_id = str(github_info.get("template_id") or "").strip()
+        if template_id:
+            return f"template-{self._safe_storage_segment(template_id)}"
+        repo_url = github_info.get("repo_url") or github_info.get("clone_url") or "repo"
+        branch = github_info.get("branch") or "main"
+        digest = hashlib.md5(f"{repo_url}|{branch}".encode()).hexdigest()[:12]
+        return f"repo-{digest}"
+
     def _network_disk_sub_path(self, instance_id: str) -> str:
         prefix = settings.NETWORK_DISK_SUBPATH_PREFIX.strip("/")
         safe_id = self._safe_storage_segment(instance_id)
@@ -411,6 +426,12 @@ fi
             notebook_filename = notebook_path.split("/")[-1]
             repo_url = github_info.get("repo_url") or github_info.get("clone_url")
             if repo_url:
+                repo_dir = f"{settings.WORKSPACE_MOUNT_PATH}/template-repos/{self._template_repo_dir_name(github_info)}/repo"
+                repo_tmp = f"{repo_dir}.tmp"
+                repo_meta = f"{repo_dir}/.amd-oneclick-source"
+                repo_dir_q = shlex.quote(repo_dir)
+                repo_tmp_q = shlex.quote(repo_tmp)
+                repo_meta_q = shlex.quote(repo_meta)
                 repo_url_q = shlex.quote(repo_url)
                 branch_q = shlex.quote(github_info.get("branch") or "main")
                 notebook_path_q = shlex.quote(notebook_path)
@@ -419,13 +440,25 @@ set -e
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 mkdir -p {workspace}
+mkdir -p "$(dirname {repo_dir_q})"
 
-if [ ! -e {workspace}/repo ]; then
+expected_source={shlex.quote(repo_url + "|" + (github_info.get("branch") or "main"))}
+if [ -d {repo_dir_q} ] && [ "$(cat {repo_meta_q} 2>/dev/null || true)" != "$expected_source" ]; then
+    echo "Template repo source changed; refreshing {repo_dir}"
+    rm -rf {repo_dir_q}
+fi
+if [ -d {repo_dir_q} ] && [ ! -f {repo_dir_q}/{notebook_path_q} ]; then
+    echo "Template repo cache missing notebook {notebook_path}; refreshing {repo_dir}"
+    rm -rf {repo_dir_q}
+fi
+
+if [ ! -e {repo_dir_q} ]; then
     echo "Cloning {repo_url}..."
     for i in 1 2 3; do
-        rm -rf {workspace}/.repo-tmp
-        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {workspace}/.repo-tmp; then
-            mv {workspace}/.repo-tmp {workspace}/repo
+        rm -rf {repo_tmp_q}
+        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {repo_tmp_q}; then
+            printf "%s" "$expected_source" > {repo_tmp_q}/.amd-oneclick-source
+            mv {repo_tmp_q} {repo_dir_q}
             echo "Repository cloned"
             break
         fi
@@ -433,16 +466,16 @@ if [ ! -e {workspace}/repo ]; then
         sleep $((i * 3))
     done
 else
-    echo "Using existing persistent workspace at {settings.WORKSPACE_MOUNT_PATH}/repo"
+    echo "Using existing template workspace at {repo_dir}"
 fi
 
-cd {workspace}/repo
+cd {repo_dir_q}
 if [ ! -f {notebook_path_q} ]; then
     echo "Notebook not found: {notebook_path}"
     find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
 fi
 {jupyter_ensure}
-jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={workspace}/repo
+jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root --ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{self._jupyter_base_url(instance_id)}' --notebook-dir={repo_dir_q}
 """
             return f"""
 {model_link_script}
@@ -513,22 +546,37 @@ jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-ro
             repo_url = github_info.get("repo_url") or github_info.get("clone_url")
             branch_q = shlex.quote(github_info.get("branch") or "main")
             repo_url_q = shlex.quote(repo_url)
+            repo_dir = f"{settings.WORKSPACE_MOUNT_PATH}/template-repos/{self._template_repo_dir_name(github_info)}/repo"
+            repo_tmp = f"{repo_dir}.tmp"
+            repo_meta = f"{repo_dir}/.amd-oneclick-source"
+            repo_dir_q = shlex.quote(repo_dir)
+            repo_tmp_q = shlex.quote(repo_tmp)
+            repo_meta_q = shlex.quote(repo_meta)
             clone_block = f"""
-if [ ! -e {workspace}/repo ]; then
+mkdir -p "$(dirname {repo_dir_q})"
+expected_source={shlex.quote(repo_url + "|" + (github_info.get("branch") or "main"))}
+if [ -d {repo_dir_q} ] && [ "$(cat {repo_meta_q} 2>/dev/null || true)" != "$expected_source" ]; then
+    echo "Template repo source changed; refreshing {repo_dir}"
+    rm -rf {repo_dir_q}
+fi
+if [ ! -e {repo_dir_q} ]; then
     echo "Cloning {repo_url}..."
     for i in 1 2 3; do
-        rm -rf {workspace}/.repo-tmp
-        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {workspace}/.repo-tmp; then
-            mv {workspace}/.repo-tmp {workspace}/repo
+        rm -rf {repo_tmp_q}
+        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {repo_tmp_q}; then
+            printf "%s" "$expected_source" > {repo_tmp_q}/.amd-oneclick-source
+            mv {repo_tmp_q} {repo_dir_q}
             echo "Repository cloned"
             break
         fi
         echo "Git clone attempt $i failed, retrying..."
         sleep $((i * 3))
     done
+else
+    echo "Using existing template workspace at {repo_dir}"
 fi
 """
-            run_dir = f"{settings.WORKSPACE_MOUNT_PATH}/repo"
+            run_dir = repo_dir
         pip_index = settings.PIP_INDEX_URL.strip()
         pip_flag = f"-i {shlex.quote(pip_index)} " if pip_index else ""
         return f"""
