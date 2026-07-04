@@ -1201,3 +1201,20 @@ deployment/amd-oneclick-lablab-manager manager=lablab.local/amd-oneclick:a0fe4d8
 **Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:6591ca3` and set `HARBOR_MIRROR_ENABLED=false`,`PREHEAT_DS_ENABLED=false` in the ConfigMap (both default false anyway). To fully revert behavior, also set `USER_CUSTOM_BUILDS_ENABLED=true`.
 
 **TODO (separate):** replace Harbor admin creds in `kaniko-harbor-auth` with a scoped `xinwei` robot account.
+
+## 2026-07-04 (merge) - radeon-global: merge Harbor mirror with workspace Approach-B; rebuild + redeploy
+
+**Context:** the Harbor auto-mirror work (`d4abd92`) was synced from a pre-merge base and deployed as `...manager:d4abd92`, which SILENTLY REVERTED the workspace Approach-B code (`c64eb47..64e1cda`, pushed to origin while the mirror work was in review). Root-caused on push (non-fast-forward). Fixed by rebasing the mirror work onto `origin/prod/radeon-global` and rebuilding from the merged HEAD so BOTH feature sets run in one image.
+
+**Merge:** rebased mirror commits onto `64e1cda`. One trivial conflict in `app/k8s_client.py` `__init__` (both sides appended a distinct lock pair — kept both: `_flush_locks` + `_preheat_locks`). `scheduler.py`/`store.py` auto-merged. Test-suite regression found + fixed: `-> client.V1DaemonSet` return annotation was evaluated at import time and crashed under `tests/kube_stub.py` (no `V1DaemonSet`) — quoted it lazy (folded into the feature commit).
+
+**Verification (venv pytest against merged tree):** 48 passed (admin_images + workspace_flush_gating + workspace_localcache) + 12 reliability tests (writable-DB) = 60 tests green; both feature sets coexist.
+
+**Pushed to origin:** `prod/radeon-global` `64e1cda..6c88760` (feature `cefcaca` + ledger `6c88760`). First push of the mirror work to the shared remote.
+
+**Image build:** kaniko pod `manager-build-6c88760` (ns `amd-oneclick-lablab`, s-115), same `Dockerfile.fast` (daocloud base + Tsinghua apt skopeo 1.18.0 + Tsinghua pip). Pushed `10.5.10.89:1808/xinwei/amd-oneclick-manager:6c88760`.
+
+**Deploy:** `kubectl set image` d4abd92 -> 6c88760 (Recreate). Manager 1/1, 0 restarts. Verified in the running pod: mirror/preheat flags on, skopeo present, `harbor_mirror` functional, AND `image_row_exists` + workspace flush job present (Approach-B restored). 130 user/workspace pods undisturbed. Their NetworkPolicy `oneclick-notebook-block-sfs-egress` still live; live ConfigMap `WORKSPACE_VOLUME_TYPE=localcache` + quota keys intact.
+
+**PRE snapshot:** `local-deploy-history/radeon-global/20260704-2135-merged-6c88760-PRE-deploy.yaml` (image d4abd92).
+**Rollback:** `set image ...manager:6591ca3` (their last-good) + flags off; or `d4abd92` (mirror only, reverts Approach-B again — NOT recommended).
