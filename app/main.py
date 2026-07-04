@@ -8,6 +8,7 @@ import os
 import re
 import base64
 import asyncio
+import concurrent.futures
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ import websockets
 from kubernetes.client.rest import ApiException
 
 from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
+from .harbor_mirror import harbor_ref, mirror_to_harbor, MirrorError
 from .redis_client import rate_limit_ok
 from .models import (
     NotebookRequest, 
@@ -732,6 +734,24 @@ def _custom_image_public(record: dict) -> dict:
     }
 
 
+def _catalog_image_public(record: dict) -> dict:
+    """Strip internal fields from a catalog image row for NON-admin responses.
+
+    source_ref/source_type expose upstream registry topology (private ACR account names, internal
+    hosts) and sync_message can carry internal detail — none of which should reach anonymous/
+    non-admin catalog consumers. Keep only what the launch UI needs."""
+    if not record:
+        return {}
+    return {
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "image": record.get("image"),
+        "description": record.get("description"),
+        "enabled": record.get("enabled"),
+        "sync_status": record.get("sync_status"),
+    }
+
+
 def _resolve_launchable_image(user: dict, image: str) -> bool:
     """An image is launchable if it is catalog-backed or the caller's own ready/rebuildable image."""
     if get_image_by_value(image):
@@ -748,6 +768,13 @@ def _prepare_custom_image_for_launch(user: dict, image: str) -> Optional[str]:
     if not row:
         return None
     if row["build_status"] == "evicted":
+        # Requeueing an evicted image triggers a real Dockerfile rebuild. Honor the
+        # USER_CUSTOM_BUILDS_ENABLED kill-switch here too (build_custom_image guards creation, but a
+        # relaunch of a previously-evicted image would otherwise rebuild, bypassing the switch).
+        if not settings.USER_CUSTOM_BUILDS_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="Custom image builds are disabled; this image can no longer be rebuilt.")
         requeue_custom_image_build(row["id"], user["id"])
         return "rebuilding"
     mark_custom_image_launched(row["id"])
@@ -1004,6 +1031,93 @@ async def _close_httpx_stream(upstream: httpx.Response, client: httpx.AsyncClien
 _proxy_client: Optional[httpx.AsyncClient] = None
 
 
+# Dedicated bounded executors for long-running image ops, isolated off the shared default
+# ThreadPoolExecutor so they can't starve the scheduler's billing/reconcile jobs or other
+# to_thread work. THREE separate pools so operations with very different latencies never queue
+# behind each other:
+#   - mirror: slow skopeo copies (bounded by HARBOR_MIRROR_TIMEOUT_SECONDS, up to an hour)
+#   - preheat: DS create/reconcile, which can block ~100s on a Foreground-GC-stuck teardown
+#   - delete: delete-parity DS teardown, which MUST stay responsive — a delete must never wait
+#     behind in-flight mirrors or stuck preheat creates.
+_mirror_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="harbor-mirror")
+_preheat_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="preheat-op")
+_delete_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="preheat-delete")
+
+
+async def _run_mirror_op(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_mirror_executor, func, *args)
+
+
+async def _run_image_op(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_preheat_executor, func, *args)
+
+
+async def _run_delete_op(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_delete_executor, func, *args)
+
+
+# In-flight mirror/preheat keys, so two concurrent admin edits of the same image can't interleave
+# (double-mirror, racing DS create/replace) or produce two placeholder writes. Keyed by `img:<id>`
+# for updates (an existing row) and `ref:<harbor_ref>` for creates — the create key matters because
+# upsert_image collapses two same-name/same-ref creates onto one row.
+#
+# A plain SET (not a lock) checked-and-inserted with NO await in between is atomic under asyncio
+# (the event loop can't preempt synchronous code), so it is a correct, race-free 409 fast-fail —
+# unlike a lock whose acquisition is deferred into a background task. The background task discards
+# the key when done, so the set self-bounds (no unbounded lock-dict growth).
+_image_seq_inflight: set[str] = set()
+
+
+# Short-TTL cache for the pod-status read behind the friendly-503 error page. A single browser page
+# load of a down instance fires many concurrent sub-resource requests, each landing on the error
+# path; without this each would issue its own apiserver read, amplifying load exactly during an
+# outage. Cache the (details, read_failed) result per instance for a few seconds so a burst collapses
+# to one read. Value: (expiry_monotonic, details_or_None, read_failed).
+_POD_STATUS_ERROR_CACHE_TTL = 3.0
+_pod_status_error_cache: dict[str, tuple] = {}
+# Per-instance locks so concurrent cache MISSES coalesce to a single apiserver read (a page load
+# fires many sub-resource requests at once; without this each would issue its own read within the
+# in-flight window, defeating the cache's purpose during an outage).
+_pod_status_error_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _cached_pod_status_for_error_page(instance_id: str):
+    now = time.monotonic()
+    cached = _pod_status_error_cache.get(instance_id)
+    if cached and cached[0] > now:
+        return cached[1], cached[2]
+    lock = _pod_status_error_locks.get(instance_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _pod_status_error_locks[instance_id] = lock
+    async with lock:
+        # Re-check: another coroutine may have populated the cache while we waited for the lock.
+        now = time.monotonic()
+        cached = _pod_status_error_cache.get(instance_id)
+        if cached and cached[0] > now:
+            return cached[1], cached[2]
+        read_failed = False
+        try:
+            details = await asyncio.to_thread(
+                k8s_client.get_pod_status_details, "", instance_id)
+        except Exception:
+            details, read_failed = None, True
+        _pod_status_error_cache[instance_id] = (now + _POD_STATUS_ERROR_CACHE_TTL, details, read_failed)
+    # Opportunistic prune so the dicts can't grow unbounded across many instance ids.
+    if len(_pod_status_error_cache) > 512:
+        for k, v in list(_pod_status_error_cache.items()):
+            if v[0] <= now:
+                _pod_status_error_cache.pop(k, None)
+                _pod_status_error_locks.pop(k, None)
+    return details, read_failed
+
+
 def _get_proxy_client() -> httpx.AsyncClient:
     global _proxy_client
     if _proxy_client is None or _proxy_client.is_closed:
@@ -1017,6 +1131,70 @@ def _get_proxy_client() -> httpx.AsyncClient:
 
 async def _close_upstream_only(upstream: httpx.Response):
     await upstream.aclose()
+
+
+# httpx.TransportError is the common base of ALL connection-level failures — ConnectError,
+# ReadError/WriteError, every *Timeout (Connect/Read/Write/Pool), and RemoteProtocolError. Catching
+# the base means a pod that is unreachable while we CONNECT + read response HEADERS yields the
+# friendly 503 page instead of a bare 500. It does NOT include httpx.HTTPStatusError, so a
+# legitimate upstream 4xx/5xx still passes through untouched.
+# NOTE: this only covers failures during client.send() (connect + headers). A failure DURING body
+# streaming (aiter_raw) — e.g. the pod is OOMKilled mid-response — cannot be converted to a 503
+# because the 200/206 status+headers have already been flushed to the client; the connection is
+# simply aborted. That's inherent to streaming, not something this tuple can catch.
+_PROXY_UNAVAILABLE_ERRORS = (httpx.TransportError,)
+
+
+async def _friendly_unavailable_response(instance_id: str, exc: Exception) -> Response:
+    """Map an upstream connection failure to a friendly 503 page instead of a bare 500.
+
+    Inspects the pod so the message distinguishes "still starting" (pending/ContainerCreating)
+    from "failed to start" (ImagePullBackOff/CrashLoop). Falls back to a generic starting message
+    if the pod can't be read. The pod read is a blocking k8s call → dispatched via to_thread so it
+    can't stall the single uvicorn worker (this path fires on every failed proxy poll)."""
+    title = "Instance unavailable"
+    detail = "The instance is not reachable right now. Please try again in a moment."
+    retry = True
+    details, read_failed = await _cached_pod_status_for_error_page(instance_id)
+    # details is None specifically when the pod no longer exists (get_pod_status_details returns
+    # None on a 404). Distinguish that PERMANENTLY-gone case from a transient read failure so we
+    # don't auto-refresh forever on a deleted instance.
+    if details is None and not read_failed:
+        title = "Instance no longer exists"
+        detail = "This instance has been deleted. Return to your dashboard to start a new one."
+        retry = False
+        logger.warning("Proxy target pod gone for %s: %s", instance_id, exc)
+        meta_refresh = ""
+        html = (
+            f"<!doctype html><html><head><meta charset='utf-8'>{meta_refresh}"
+            f"<title>{title}</title></head><body style='font-family:system-ui,sans-serif;"
+            f"max-width:640px;margin:80px auto;text-align:center;color:#333'>"
+            f"<h2>{title}</h2><p>{detail}</p></body></html>"
+        )
+        return HTMLResponse(html, status_code=503)
+    details = details or {}
+    status = (details.get("status") or "").lower()
+    reason = (details.get("reason") or "")
+    if status in {"pending", "jupyter_starting"} or reason in {"ContainerCreating", "PodInitializing"}:
+        title = "Instance is still starting"
+        detail = "Your instance is starting up. This page will retry automatically."
+    elif "imagepull" in reason.lower() or "errimagepull" in reason.lower():
+        title = "Instance failed to start"
+        detail = "The instance image could not be pulled. Please contact an administrator."
+        retry = False
+    elif "crashloop" in reason.lower():
+        title = "Instance failed to start"
+        detail = "The instance container is crashing on startup. Please contact an administrator."
+        retry = False
+    logger.warning("Proxy upstream unavailable for %s (%s): %s", instance_id, status or "unknown", exc)
+    meta_refresh = '<meta http-equiv="refresh" content="5">' if retry else ""
+    html = (
+        f"<!doctype html><html><head><meta charset='utf-8'>{meta_refresh}"
+        f"<title>{title}</title></head><body style='font-family:system-ui,sans-serif;"
+        f"max-width:640px;margin:80px auto;text-align:center;color:#333'>"
+        f"<h2>{title}</h2><p>{detail}</p></body></html>"
+    )
+    return HTMLResponse(html, status_code=503)
 
 
 def _request_with_retries(method: str, url: str, retries: int = 3, **kwargs) -> requests.Response:
@@ -1099,7 +1277,7 @@ async def index(request: Request):
         "index.html",
         {
             "images": [img["image"] for img in images],
-            "image_catalog_json": json.dumps(images),
+            "image_catalog_json": json.dumps([_catalog_image_public(img) for img in images]),
             "notebook_templates_json": json.dumps(notebook_templates),
             "default_image": settings.DEFAULT_IMAGE,
             "instance_types_json": json.dumps(INSTANCE_TYPES),
@@ -1133,6 +1311,7 @@ async def profile_page(request: Request):
             "modelscope_enabled": bool(settings.MODELSCOPE_CLIENT_ID),
             "coupon_redeem_enabled": settings.COUPON_REDEEM_ENABLED,
             "coupon_redeem_disabled_message": settings.COUPON_REDEEM_DISABLED_MESSAGE,
+            "custom_builds_enabled": settings.USER_CUSTOM_BUILDS_ENABLED,
         },
     )
 
@@ -1720,6 +1899,11 @@ async def list_my_custom_images(user: dict = Depends(current_user)):
 
 @app.post("/api/custom-images/build")
 async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(current_user)):
+    if not settings.USER_CUSTOM_BUILDS_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="Custom image builds are disabled. Use an image from the admin-curated catalog.",
+        )
     name = (req.name or "").strip().lower()
     if not CUSTOM_IMAGE_NAME_RE.match(name):
         raise HTTPException(
@@ -2264,7 +2448,7 @@ async def profile_set_ssh_key(req: SshPublicKeyRequest, user: dict = Depends(cur
 async def profile_list_templates(user: dict = Depends(current_user)):
     return {
         "templates": list_notebook_templates(enabled_only=False, owner_user_id=user["id"]),
-        "images": list_images(enabled_only=True),
+        "images": [_catalog_image_public(img) for img in list_images(enabled_only=True)],
     }
 
 
@@ -3034,10 +3218,13 @@ async def _handle_opencode_request(request: Request) -> Response:
     headers["authorization"] = f"Basic {basic}"
 
     client = _get_proxy_client()
-    upstream = await client.send(
-        client.build_request(request.method, target_url, headers=headers, content=body),
-        stream=True,
-    )
+    try:
+        upstream = await client.send(
+            client.build_request(request.method, target_url, headers=headers, content=body),
+            stream=True,
+        )
+    except _PROXY_UNAVAILABLE_ERRORS as e:
+        return await _friendly_unavailable_response(instance_id, e)
     response_headers = {
         k: v for k, v in upstream.headers.items()
         if k.lower() not in {
@@ -3075,15 +3262,18 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
 
     body = await request.body()
     client = _get_proxy_client()
-    upstream = await client.send(
-        client.build_request(
-            request.method,
-            target_url,
-            headers=_proxy_headers(request.headers),
-            content=body,
-        ),
-        stream=True,
-    )
+    try:
+        upstream = await client.send(
+            client.build_request(
+                request.method,
+                target_url,
+                headers=_proxy_headers(request.headers),
+                content=body,
+            ),
+            stream=True,
+        )
+    except _PROXY_UNAVAILABLE_ERRORS as e:
+        return await _friendly_unavailable_response(instance_id, e)
 
     response_headers = {
         k: v for k, v in upstream.headers.items()
@@ -3225,15 +3415,18 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
 
     body = await request.body()
     client = _get_proxy_client()
-    upstream = await client.send(
-        client.build_request(
-            request.method,
-            target_url,
-            headers=fwd_headers,
-            content=body,
-        ),
-        stream=True,
-    )
+    try:
+        upstream = await client.send(
+            client.build_request(
+                request.method,
+                target_url,
+                headers=fwd_headers,
+                content=body,
+            ),
+            stream=True,
+        )
+    except _PROXY_UNAVAILABLE_ERRORS as e:
+        return await _friendly_unavailable_response(instance_id, e)
     # Keep content-encoding (we stream raw/compressed bytes); drop only hop-by-hop
     # and length/cookie headers we re-add separately.
     response_headers = {
@@ -3432,6 +3625,13 @@ async def admin_sync_template_preview(template_id: int, username: str = Depends(
 @app.get("/api/admin/images")
 async def admin_list_images(username: str = Depends(verify_admin)):
     for image in list_images(enabled_only=False):
+        # Harbor-mirror rows are tracked by the preheat DaemonSet, whose progress the scheduler's
+        # image_sync_refresh_job writes to the row. The legacy get_image_sync_status reads the
+        # image_nodes table (only the dead distribute path populated it), which is always empty for
+        # a mirror row → it would compute 0/N and clobber the scheduler's correct 'ready'. Skip the
+        # legacy refresh for mirror rows and return their stored (scheduler-maintained) status.
+        if (image.get("source_type") or "").strip() == HARBOR_MIRROR_SOURCE_TYPE:
+            continue
         try:
             sync = k8s_client.get_image_sync_status(image["id"], image["image"])
             if (
@@ -3463,6 +3663,12 @@ _ADMIN_SOURCE_HEAD_KIND = {
     "dockerhub_pull": "pull",
     "github_build": "build",
 }
+
+# Dedicated source_type for rows created by the Harbor auto-mirror path. Distinct from the
+# image-service source_types above so sync/delete can tell the two row origins apart even when
+# IMAGE_SERVICE_ENABLED and HARBOR_MIRROR_ENABLED are both on (is_image_service_row must be False
+# for these rows). Must NOT be a key in _ADMIN_SOURCE_HEAD_KIND.
+HARBOR_MIRROR_SOURCE_TYPE = "harbor_mirror"
 
 # The admin UI Select uses short labels ("registry", "github"); map them to the
 # backend source kinds. "registry" -> acr_pull (same head verb + chain as a
@@ -3614,6 +3820,181 @@ def _enqueue_admin_image_chain(image_row: dict, source_type: str, source_ref: st
     enqueue_image_job(kind=head_kind, ref=ref, image_id=image_row["id"], payload=payload)
 
 
+async def _mirror_and_preheat_admin_image(name, source_ref, description, enabled, image_id):
+    """Mirror an external ref into Harbor, store the Harbor ref as the launch image, and preheat.
+
+    Serialized so two concurrent edits cannot interleave and leave the catalog row and the running
+    preheat DaemonSet pointing at different images. Updates lock on the image_id; creates lock on
+    the destination Harbor ref (upsert_image collapses same-ref creates onto one row, so two
+    unlocked creates would double-mirror)."""
+    src = (source_ref or "").strip()
+    if not src:
+        raise HTTPException(status_code=400, detail="source_ref is required")
+    try:
+        dest = harbor_ref(src)
+    except MirrorError:
+        dest = src
+    # Reserve in-flight keys: the destination-ref key (so equivalent concurrent creates/updates that
+    # target the same Harbor image serialize — upsert_image collapses same-ref creates onto one row)
+    # and, for updates, the image-id key. Check-and-insert with NO await between = atomic under
+    # asyncio, so this is a correct 409 fast-fail (unlike a deferred-acquire lock).
+    keys = {f"ref:{dest}"}
+    if image_id is not None:
+        keys.add(f"img:{image_id}")
+    if keys & _image_seq_inflight:
+        raise HTTPException(status_code=409,
+                            detail="A mirror/preheat operation for this image is already in progress.")
+    _image_seq_inflight.update(keys)
+    # Persist a placeholder row synchronously and return it immediately, then run the (minutes-long)
+    # skopeo mirror + preheat in a BACKGROUND task. Awaiting the mirror inline would block the HTTP
+    # response past browser/reverse-proxy timeouts. The admin UI polls sync_status, which the
+    # background task (and the scheduler) advance from 'distributing' → ready/failed.
+    try:
+        if image_id is None:
+            # Create: reject if a catalog row already targets this Harbor dest. Different source-ref
+            # spellings canonicalize to the same dest, and images.image is UNIQUE — without this
+            # check, upsert_image's IntegrityError fallback would silently UPDATE (hijack) the
+            # existing row instead of creating a new one, corrupting its name/enabled/source_ref.
+            _dupe = next((img for img in list_images(enabled_only=False)
+                          if (img.get("image") or "").strip() == dest), None)
+            if _dupe is not None:
+                _image_seq_inflight.difference_update(keys)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"An image mirroring to {dest} already exists "
+                           f"(catalog entry {_dupe.get('name')!r}). Edit that entry instead.")
+            # Store the (future) Harbor ref but keep it DISABLED until the mirror confirms it exists
+            # — the launch path gates only on `enabled`, so it must not be launchable pre-mirror.
+            is_create = True
+            placeholder = _upsert_image_with_source(
+                name, dest, description or "", False, None, HARBOR_MIRROR_SOURCE_TYPE, src)
+        else:
+            # Update: leave the existing row's image/enabled intact (its current image still
+            # launches); just flag it distributing. Fetch to preserve fields we aren't changing here.
+            is_create = False
+            _ex = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
+            if not _ex:
+                raise HTTPException(status_code=404, detail="Image not found")
+            # Reject if the new dest collides with a DIFFERENT row's image (images.image is UNIQUE):
+            # the success-path upsert would otherwise hit an uncaught IntegrityError AFTER a possibly
+            # multi-GB skopeo copy, wasting it and mislabeling the row 'failed'. Fail fast instead.
+            _dupe = next((img for img in list_images(enabled_only=False)
+                          if img["id"] != image_id and (img.get("image") or "").strip() == dest), None)
+            if _dupe is not None:
+                _image_seq_inflight.difference_update(keys)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"This source already mirrors to {dest}, which belongs to another catalog "
+                           f"entry ({_dupe.get('name')!r}).")
+            placeholder = _upsert_image_with_source(
+                name, _ex.get("image") or dest, description or "", _ex.get("enabled", False),
+                image_id, HARBOR_MIRROR_SOURCE_TYPE, _ex.get("source_ref") or src)
+        if not placeholder:
+            raise HTTPException(status_code=404, detail="Image not found")
+        result = update_image_sync_status(
+            placeholder["id"], "distributing", 0, 0, "Mirroring to Harbor…", False)
+    except BaseException:
+        _image_seq_inflight.difference_update(keys)
+        raise
+
+    async def _bg():
+        try:
+            await _do_mirror_and_preheat(
+                name, source_ref, description, enabled, placeholder["id"], is_create=is_create)
+        except Exception as e:
+            logger.warning("background mirror/preheat failed for image %s: %s", placeholder["id"], e)
+            try:
+                update_image_sync_status(
+                    placeholder["id"], "failed", 0, 0, "Harbor mirror failed (see manager logs)", False)
+            except Exception:
+                pass
+        finally:
+            _image_seq_inflight.difference_update(keys)
+
+    asyncio.create_task(_bg())
+    return result
+
+
+async def _do_mirror_and_preheat(name, source_ref, description, enabled, image_id, is_create=False):
+    """Inner body of _mirror_and_preheat_admin_image; run under the per-image sequence lock.
+
+    The mirror (skopeo subprocess) runs off the event loop. On mirror failure the catalog row is
+    persisted with the ORIGINAL ref and marked failed (never silently ready). On success the launch
+    ref becomes the Harbor ref (verbatim at launch per k8s_client) and source_ref keeps the true
+    upstream ref for provenance/re-mirror. `is_create` marks a genuinely-new row (image_id here is
+    the just-inserted placeholder's id, so an existence lookup can't distinguish new from existing)."""
+    src = (source_ref or "").strip()
+    if not src:
+        raise HTTPException(status_code=400, detail="source_ref is required")
+    # Don't clobber / corrupt source_ref: if the caller resubmitted the already-mirrored Harbor ref
+    # (e.g. a read-modify-write PUT), prefer the existing row's original source_ref so future
+    # re-syncs still pull fresh bits from the true upstream, not Harbor-to-itself. If there is no
+    # prior source_ref (legacy row), store EMPTY rather than the Harbor ref — a Harbor-ref
+    # source_ref would make every future sync a self-copy no-op; empty lets sync fall back to the
+    # `image` column (which is also the Harbor ref, but at least isn't a lie about provenance).
+    existing = None
+    if image_id is not None:
+        existing = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
+    stored_source = src
+    if existing is not None:
+        # Only treat this as a no-op resubmission when `src` is THIS row's OWN current Harbor image
+        # (a read-modify-write PUT that echoed the stored ref back) — NOT any Harbor-hosted ref. A
+        # different Harbor image is a legitimate intentional repoint; preserving the old source_ref
+        # then would corrupt provenance and silently revert the row on the next sync.
+        resubmitted_own_ref = src == (existing.get("image") or "").strip()
+        if resubmitted_own_ref:
+            # Prefer the row's original source_ref so future re-syncs pull fresh upstream bits, not
+            # Harbor-to-itself. No prior source_ref (legacy row) → store EMPTY, not the Harbor ref
+            # (which would make sync a self-copy no-op).
+            stored_source = (existing.get("source_ref") or "")
+    try:
+        harbor = await _run_mirror_op(mirror_to_harbor, src)
+    except MirrorError as e:
+        logger.warning("Harbor mirror failed for %r: %s", src, e)
+        # Preserve a previously-good Harbor image on failure: overwriting an existing row's working
+        # `image` with the raw unmirrored src would destroy the launch ref (and break the row even
+        # if re-enabled). For an existing row, keep its current `image`; only a brand-new row gets
+        # the raw src stored (there's nothing to preserve). sync_message stays generic (it's exposed
+        # to non-admins); the raw skopeo detail is logged server-side only.
+        # Force enabled=False for a NEW failed row so it's never user-launchable against the raw ref;
+        # for an existing row, keep its prior `image` (still the good one). Use is_create (not
+        # existing-is-None): for a create, `existing` finds the just-inserted placeholder whose
+        # `image` is the UNVERIFIED dest ref — storing that would show a bogus Harbor path skopeo
+        # never populated. A new failed row keeps the raw src instead. Honor the caller-requested
+        # `enabled` even on failure for an existing row — a mirror failure must not silently revert
+        # an explicit admin enable/disable (a new row stays disabled regardless, since its image
+        # isn't in Harbor yet).
+        if is_create or existing is None:
+            fail_image, fail_enabled = src, False
+        else:
+            fail_image = existing.get("image") or src
+            fail_enabled = enabled
+        image = _upsert_image_with_source(
+            name, fail_image, description or "", fail_enabled, image_id,
+            HARBOR_MIRROR_SOURCE_TYPE, stored_source)
+        if not image:
+            raise HTTPException(status_code=404, detail="Image not found")
+        return update_image_sync_status(
+            image["id"], "failed", 0, 0, "Harbor mirror failed (see manager logs)", False)
+    image = _upsert_image_with_source(
+        name, harbor, description or "", enabled, image_id, HARBOR_MIRROR_SOURCE_TYPE, stored_source)
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    if settings.PREHEAT_DS_ENABLED:
+        try:
+            sync = await _run_image_op(
+                k8s_client.preheat_image_to_nodes, image["id"], harbor)
+        except Exception as e:
+            logger.warning("preheat enqueue failed for image %s: %s", image["id"], e)
+            return update_image_sync_status(
+                image["id"], "distributing", 0, 0, "Mirrored to Harbor; preheat pending", False)
+        return update_image_sync_status(
+            image["id"], sync["status"], sync["desired_count"], sync["ready_count"],
+            sync["message"], sync["completed"])
+    return update_image_sync_status(
+        image["id"], "ready", 0, 0, "Mirrored to Harbor (preheat disabled)", True)
+
+
 @app.post("/api/admin/images")
 async def admin_create_image(req: ImageRequest, username: str = Depends(verify_admin)):
     source_type = _normalize_source_type((getattr(req, "source_type", None) or "").strip())
@@ -3631,14 +4012,22 @@ async def admin_create_image(req: ImageRequest, username: str = Depends(verify_a
         _enqueue_admin_image_chain(image, source_type, source_ref)
         return update_image_sync_status(image["id"], "distributing", 0, 0, "Distribution enqueued", False)
 
-    # Legacy mode (image-service off): the admin form sends source_ref (the registry reference)
-    # but no separate `image` field, so fall back to source_ref before requiring a value.
-    image_ref = (req.image or getattr(req, "source_ref", None) or "").strip()
+    # Harbor auto-mirror path: mirror the external ref into Harbor, store the Harbor ref as the
+    # launch image, and preheat onto eligible nodes. The admin form sends source_ref (the registry
+    # reference); prefer it, falling back to req.image for older callers. (source_ref-first matches
+    # the source_type branch above and admin_sync_image, so a read-modify-write PUT that echoes the
+    # stale `image` while setting a new source_ref re-mirrors the NEW upstream.)
+    image_ref = (getattr(req, "source_ref", None) or req.image or "").strip()
     if not image_ref:
         raise HTTPException(status_code=400, detail="image is required")
+    if settings.HARBOR_MIRROR_ENABLED:
+        return await _mirror_and_preheat_admin_image(
+            req.name, image_ref, req.description, req.enabled, None)
+
+    # Legacy mode (mirror off): direct sync via the (dead) distribute path.
     image = upsert_image(req.name, image_ref, req.description or "", req.enabled)
     try:
-        sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+        sync = await asyncio.to_thread(k8s_client.sync_image_to_nodes, image["id"], image["image"])
     except ApiException as e:
         raise HTTPException(status_code=e.status or 502, detail=f"Image sync failed: {e.reason or str(e)}")
     except Exception as e:
@@ -3672,14 +4061,31 @@ async def admin_update_image(image_id: int, req: ImageRequest, username: str = D
         _enqueue_admin_image_chain(image, source_type, source_ref)
         return update_image_sync_status(image["id"], "distributing", 0, 0, "Distribution enqueued", False)
 
-    image_ref = (req.image or getattr(req, "source_ref", None) or "").strip()
+    # Prefer source_ref over image (matches the source_type branch + admin_sync_image), so a
+    # read-modify-write PUT that echoes the stale Harbor `image` while setting a new source_ref
+    # re-mirrors the NEW upstream instead of self-copying the old Harbor ref.
+    image_ref = (getattr(req, "source_ref", None) or req.image or "").strip()
     if not image_ref:
         raise HTTPException(status_code=400, detail="image is required")
+    # Route by the existing row's provenance too: an already-mirrored row must keep taking the mirror
+    # path even if HARBOR_MIRROR_ENABLED was since turned off (else the edit falls to the dead legacy
+    # distribute path and the row reports 'pulling' forever).
+    _upd_existing = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
+    _upd_src_type = (_upd_existing.get("source_type") or "").strip() if _upd_existing else ""
+    _upd_is_mirror_row = _upd_src_type == HARBOR_MIRROR_SOURCE_TYPE
+    # Never let the mirror path claim an image-service-owned row (acr_pull/dockerhub_pull/github_build):
+    # mirroring its source_ref (which may be a Dockerfile URL) would corrupt it and rewrite its
+    # source_type to harbor_mirror. Same guard as admin_sync_image/admin_delete_image.
+    _upd_is_image_service_row = _upd_src_type in _ADMIN_SOURCE_HEAD_KIND
+    if (settings.HARBOR_MIRROR_ENABLED or _upd_is_mirror_row) and not _upd_is_image_service_row:
+        return await _mirror_and_preheat_admin_image(
+            req.name, image_ref, req.description, req.enabled, image_id)
+
     image = upsert_image(req.name, image_ref, req.description or "", req.enabled, image_id=image_id)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
     try:
-        sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+        sync = await asyncio.to_thread(k8s_client.sync_image_to_nodes, image["id"], image["image"])
     except ApiException as e:
         raise HTTPException(status_code=e.status or 502, detail=f"Image sync failed: {e.reason or str(e)}")
     except Exception as e:
@@ -3699,8 +4105,29 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
     image = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
+    # A row whose source_type is an image-service head-kind (acr_pull/dockerhub_pull/github_build)
+    # was created by the build/distribute pipeline and is owned by it — its source_ref may be a
+    # Dockerfile URL (github_build) that would mis-parse as a registry ref, and its bytes are tracked
+    # in image_nodes, not a preheat DS. Classify by the ROW's own provenance, NOT the live
+    # IMAGE_SERVICE_ENABLED flag: that flag can be off (default) while such rows still exist (created
+    # in an earlier window), and routing them through the mirror path would corrupt them.
+    src_type = (image.get("source_type") or "").strip()
+    is_image_service_row = src_type in _ADMIN_SOURCE_HEAD_KIND
+    # Route by the ROW's own provenance: a row already mirrored (source_type=harbor_mirror) MUST take
+    # the mirror path even if HARBOR_MIRROR_ENABLED was since turned off — else it falls to the dead
+    # legacy distribute path and reports 'pulling' forever (mirror rows never populate image_nodes).
+    # This matches scheduler.image_sync_refresh_job's row-based routing.
+    is_mirror_row = src_type == HARBOR_MIRROR_SOURCE_TYPE
+    if (is_mirror_row or settings.HARBOR_MIRROR_ENABLED) and not is_image_service_row:
+        # Re-mirror from the original source, then re-preheat. A row's stored `image` may NOT yet be
+        # a Harbor ref (legacy row created while mirroring was off, or before this feature): prefer
+        # source_ref, fall back to the stored image. harbor_ref() is idempotent on an
+        # already-Harbor ref, so mirroring an already-mirrored row is a cheap no-op re-copy.
+        source = (image.get("source_ref") or image.get("image") or "").strip()
+        return await _mirror_and_preheat_admin_image(
+            image["name"], source, image.get("description"), image.get("enabled", True), image_id)
     try:
-        sync = k8s_client.sync_image_to_nodes(image["id"], image["image"])
+        sync = await asyncio.to_thread(k8s_client.sync_image_to_nodes, image["id"], image["image"])
     except ApiException as e:
         raise HTTPException(status_code=e.status or 502, detail=f"Image sync failed: {e.reason or str(e)}")
     except Exception as e:
@@ -3717,6 +4144,33 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
 
 @app.delete("/api/admin/images/{image_id}")
 async def admin_delete_image(image_id: int, username: str = Depends(verify_admin)):
+    # Image-service-managed rows (source_type is a build/distribute head-kind) must go through the
+    # evict/purge fan-out below so their per-node blobs and DB rows are cleaned up. Classify by the
+    # ROW's own provenance, NOT the live IMAGE_SERVICE_ENABLED flag (which may be off while such rows
+    # still exist) — else their delete would skip the purge fan-out and leak blobs. Only rows the
+    # Harbor-mirror path owns take the preheat-DS teardown branch.
+    _del_existing = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
+    _del_src_type = (_del_existing.get("source_type") or "").strip() if _del_existing else ""
+    _is_image_service_row = _del_src_type in _ADMIN_SOURCE_HEAD_KIND and _del_existing is not None
+    # A mirror-owned row takes the preheat-DS teardown branch even if HARBOR_MIRROR_ENABLED was since
+    # turned off — else its preheat DS would only be reclaimed later by the scheduler's orphan sweep.
+    _is_mirror_row = _del_src_type == HARBOR_MIRROR_SOURCE_TYPE
+    if (_is_mirror_row or settings.HARBOR_MIRROR_ENABLED) and not _is_image_service_row:
+        # Delete parity: drop the catalog row FIRST, then remove the preheat DaemonSet (kubelet GC
+        # reclaims node disk). Row-first closes the TOCTOU window: a concurrent sync/update that
+        # reads the row before deletion has its DS torn down by our remove below; one that reads
+        # after deletion finds no row and does nothing. As a backstop, the scheduler's orphan sweep
+        # removes any preheat DS whose catalog row is gone. The image stays in Harbor.
+        if not delete_image(image_id):
+            raise HTTPException(status_code=404, detail="Image not found")
+        try:
+            await _run_delete_op(k8s_client.remove_preheat_ds, image_id)
+        except Exception as e:
+            logger.warning("remove_preheat_ds failed for image %s: %s", image_id, e)
+        # (No lock-dict eviction needed: the in-flight guard is a set that the background mirror task
+        # self-clears in its finally block, so there is nothing here to reap.)
+        return {"success": True}
+
     if settings.IMAGE_SERVICE_ENABLED:
         existing = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
         if not existing:

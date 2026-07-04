@@ -519,6 +519,48 @@ class Settings:
     # deploying P1 code before the registry env is wired is a no-op (safe/revertible). When set,
     # admin/custom builds push here and "ready" gates on the pushed digest being recorded.
     LAN_REGISTRY: str = os.getenv("LAN_REGISTRY", "").strip().rstrip("/")
+    # --- Harbor auto-mirror + node preheat (in-cluster image distribution) ---
+    # Admin Add Image mirrors the external source ref into this Harbor registry via skopeo, rewrites
+    # the catalog launch ref to the Harbor ref, and preheats it onto eligible GPU nodes with an
+    # unprivileged prepull DaemonSet. This removes the launch-time dependency on public registries/DNS.
+    HARBOR_REGISTRY: str = os.getenv("HARBOR_REGISTRY", "10.5.10.89:1808").strip().rstrip("/")
+    HARBOR_PROJECT: str = os.getenv("HARBOR_PROJECT", "xinwei").strip().strip("/")
+    # Default FALSE so deploying this code is INERT (admin Add Image keeps the legacy path) until an
+    # operator explicitly opts in per environment — a controlled/dark rollout, matching the dormant
+    # defaults used by LAN_REGISTRY / PURGE_FANOUT_ENABLED elsewhere in this file.
+    HARBOR_MIRROR_ENABLED: bool = os.getenv("HARBOR_MIRROR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # Docker config.json (from secret kaniko-harbor-auth) mounted into the manager for skopeo dest auth.
+    HARBOR_AUTH_CONFIG_PATH: str = os.getenv("HARBOR_AUTH_CONFIG_PATH", "/harbor/config.json").strip()
+    # skopeo copy retry count — mandatory: large multi-GB layers flake with transient Harbor 502s.
+    HARBOR_MIRROR_RETRY_TIMES: int = int(os.getenv("HARBOR_MIRROR_RETRY_TIMES", "8"))
+    # Verify the SOURCE registry's TLS cert (default true — only disable for a known plaintext src).
+    HARBOR_MIRROR_SRC_TLS_VERIFY: bool = os.getenv("HARBOR_MIRROR_SRC_TLS_VERIFY", "true").lower() in {"1", "true", "yes", "on"}
+    HARBOR_MIRROR_TIMEOUT_SECONDS: int = int(os.getenv("HARBOR_MIRROR_TIMEOUT_SECONDS", "3600"))
+    # SSRF guard for the mirror source. Admin is an app-level shared password, not network-level
+    # trust, so an admin must not be able to point skopeo at arbitrary internal hosts. By default,
+    # reject source hosts that resolve to private/loopback/link-local addresses. An optional
+    # allowlist (comma-separated host[:port] or host suffixes) whitelists specific internal
+    # registries (e.g. the LAN Harbor itself for re-mirror). Empty allowlist = only public hosts.
+    HARBOR_MIRROR_BLOCK_PRIVATE_SRC: bool = os.getenv("HARBOR_MIRROR_BLOCK_PRIVATE_SRC", "true").lower() in {"1", "true", "yes", "on"}
+    HARBOR_MIRROR_SRC_HOST_ALLOWLIST: list = [
+        h.strip().lower() for h in os.getenv("HARBOR_MIRROR_SRC_HOST_ALLOWLIST", "").split(",") if h.strip()
+    ]
+    # Node preheat via unprivileged prepull DaemonSet (pulls the Harbor image onto every eligible
+    # node). Default FALSE — inert until opted in alongside HARBOR_MIRROR_ENABLED.
+    PREHEAT_DS_ENABLED: bool = os.getenv("PREHEAT_DS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # ephemeral-storage request for the preheat pod. Image LAYERS live in containerd's image store,
+    # NOT the pod's ephemeral-storage (which only counts the writable container layer + logs). A
+    # `sleep infinity` container writes nothing, so this only needs to cover logs. Keep it tiny —
+    # a large per-image reservation would stack across images and exhaust node scheduling capacity.
+    PREHEAT_EPHEMERAL_STORAGE: str = os.getenv("PREHEAT_EPHEMERAL_STORAGE", "64Mi").strip()
+    # Low, non-preempting priority class for preheat pods (created once; yields to real workloads).
+    PREHEAT_PRIORITY_CLASS: str = os.getenv("PREHEAT_PRIORITY_CLASS", "oneclick-preheat-low").strip()
+    # Master switch to disable user-submitted custom image builds (admin-curated catalog only).
+    # INTENTIONALLY defaults FALSE (disabled) — unlike the dark-rollout HARBOR_MIRROR_ENABLED /
+    # PREHEAT_DS_ENABLED flags, disabling custom builds is a REQUESTED behavior change to ship, not
+    # an inert code drop. Deploying this flips POST /api/custom-images/build to 403 immediately and
+    # hides the build UI; existing built images stay launchable/deletable. Set to true to re-enable.
+    USER_CUSTOM_BUILDS_ENABLED: bool = os.getenv("USER_CUSTOM_BUILDS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     # P4 complete-delete fan-out gate. FALSE (default) => delete/idle paths keep the pre-P4 single
     # `evict` (node-layer removal), so shipping P4 code is INERT for delete and production delete
     # keeps working exactly as before. TRUE => the 6-surface purge fan-out (purge_node/p2p/seed/

@@ -94,6 +94,10 @@ class K8sClient:
         # both, so an in-process lock suffices (leader-only scheduler + single manager replica).
         self._flush_locks = {}
         self._flush_locks_guard = threading.Lock()
+        # Per-image locks serializing preheat DaemonSet mutation (create/replace/remove) so two
+        # admin actions on the same image can't race the delete+recreate into an uncaught 409.
+        self._preheat_locks: dict[int, threading.Lock] = {}
+        self._preheat_locks_guard = threading.Lock()
 
     def _authenticated_api_client(self):
         token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -2464,20 +2468,25 @@ exit 0
             self._node_list_cache_ts = now
             return nodes
 
-    def _eligible_target_nodes(self) -> list[dict]:
+    def _eligible_target_nodes(self, raise_on_error: bool = False) -> list[dict]:
         """Nodes the Image Service should distribute images to.
 
         Predicate: prepull label, schedulable, Ready, no DiskPressure, AND the node's
         taints are tolerated by this manager's notebook pods (so a service only targets
         its own nodes — see `_node_tolerated_by_notebooks`). Resolves each node's
         InternalIP and excludes the Image-Service host itself (it carries the prepull
-        label). Nodes without an InternalIP are skipped (the daemon reaches them over it)."""
+        label). Nodes without an InternalIP are skipped (the daemon reaches them over it).
+
+        By default a 403 listing nodes returns an empty best-effort list. Destructive callers
+        (preheat DS create/reconcile, which delete the DS when the set is empty) pass
+        raise_on_error=True so a transient 403 does NOT masquerade as 'zero eligible nodes' and
+        tear down a healthy DaemonSet."""
         targets: list[dict] = []
         image_service_node = settings.IMAGE_SERVICE_NODE_NAME.strip()
         try:
             nodes = self._list_node_cached()
         except ApiException as e:
-            if e.status == 403:
+            if e.status == 403 and not raise_on_error:
                 logger.warning("Cannot list nodes for image distribution; returning best-effort targets")
                 return targets
             raise
@@ -2496,7 +2505,16 @@ exit 0
                 continue
             if conditions.get("Ready") != "True":
                 continue
+            # Exclude nodes under resource pressure. kubelet auto-taints these (DiskPressure /
+            # MemoryPressure / PIDPressure via TaintNodesByCondition) with NoSchedule, and the
+            # preheat pod deliberately does NOT tolerate them — so a pressured node left in the set
+            # would be pinned into the DS nodeAffinity but never actually scheduled, silently
+            # dropping out of desiredNumberScheduled and producing a false "ready" report.
             if conditions.get("DiskPressure") == "True":
+                continue
+            if conditions.get("MemoryPressure") == "True":
+                continue
+            if conditions.get("PIDPressure") == "True":
                 continue
             if not self._node_belongs_to_service(node):
                 continue
@@ -2822,6 +2840,503 @@ exit 0
             "message": f"{ready}/{desired} nodes loaded",
             "completed": status == "ready",
         }
+
+    # --- Harbor preheat via unprivileged prepull DaemonSet -------------------------------------
+    # Replaces the dead `distribute` job path: instead of an off-cluster daemon side-loading bytes,
+    # a DaemonSet whose container IS the Harbor image makes each node's kubelet pull it. Proven live.
+
+    def _preheat_ds_name(self, image_id: int) -> str:
+        return f"oneclick-preheat-{int(image_id)}"
+
+    def _preheat_tolerations(self) -> list[dict]:
+        """Scoped tolerations for the preheat pod.
+
+        The GPU-node taint(s) the notebooks tolerate (so preheat lands on exactly this service's
+        nodes) PLUS bounded not-ready/unreachable. Deliberately does NOT tolerate
+        DiskPressure/MemoryPressure — a preheat pull must never pile onto a pressured node."""
+        # NOTE: keys are the snake_case kwargs of client.V1Toleration (built via V1Toleration(**t)),
+        # NOT the camelCase manifest field names — 'toleration_seconds', not 'tolerationSeconds',
+        # or V1Toleration.__init__ raises TypeError.
+        tolerations = list(self._notebook_tolerations())
+        tolerations.append({
+            "key": "node.kubernetes.io/not-ready", "operator": "Exists",
+            "effect": "NoExecute", "toleration_seconds": 300,
+        })
+        tolerations.append({
+            "key": "node.kubernetes.io/unreachable", "operator": "Exists",
+            "effect": "NoExecute", "toleration_seconds": 300,
+        })
+        return tolerations
+
+    def _ensure_preheat_priority_class(self) -> Optional[str]:
+        """Create the low, non-preempting PriorityClass once; return its name (or None on failure).
+
+        A preheat pull is best-effort background work: it must yield to real workloads and must
+        never preempt them. Missing RBAC / any error → return None so the DS is created without a
+        priorityClassName rather than failing the whole preheat."""
+        name = (settings.PREHEAT_PRIORITY_CLASS or "").strip()
+        if not name:
+            return None
+        scheduling = client.SchedulingV1Api(self.core_v1.api_client)
+        try:
+            scheduling.read_priority_class(name=name)
+            return name
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning("Cannot read PriorityClass %s: %s; preheat runs without one", name, e)
+                return None
+        body = client.V1PriorityClass(
+            metadata=client.V1ObjectMeta(name=name),
+            value=-10,
+            global_default=False,
+            preemption_policy="Never",
+            description="Low, non-preempting priority for OneClick image preheat pods.",
+        )
+        try:
+            scheduling.create_priority_class(body=body)
+            return name
+        except ApiException as e:
+            if e.status == 409:  # created concurrently
+                return name
+            logger.warning("Cannot create PriorityClass %s: %s; preheat runs without one", name, e)
+            return None
+
+    def _preheat_ds_body(self, image_id: int, image: str, node_names: list[str]) -> "client.V1DaemonSet":
+        name = self._preheat_ds_name(image_id)
+        labels = {"app": "oneclick-preheat", "oneclick-preheat-image-id": str(int(image_id))}
+        container = client.V1Container(
+            name="preheat",
+            image=image,
+            command=["/bin/sh", "-c", "sleep infinity"],
+            # Always, not IfNotPresent: the admin re-sync path re-mirrors the SAME mutable tag
+            # (e.g. :latest) to pick up new upstream bits, and the DS is recreated to force a fresh
+            # pull. IfNotPresent would let a node that cached the old bytes under that tag skip the
+            # pull entirely, silently serving stale layers. The pull is a no-op when the digest is
+            # already current, so Always is cheap for a throwaway sleep pod.
+            image_pull_policy="Always",
+            resources=client.V1ResourceRequirements(
+                requests={
+                    "cpu": "10m",
+                    "memory": "32Mi",
+                    "ephemeral-storage": settings.PREHEAT_EPHEMERAL_STORAGE,
+                },
+                limits={
+                    "cpu": "100m",
+                    "memory": "128Mi",
+                    "ephemeral-storage": settings.PREHEAT_EPHEMERAL_STORAGE,
+                },
+            ),
+        )
+        # Pin to the EXACT eligible node set resolved by _eligible_target_nodes (which already
+        # applies tenant/service scoping via _node_belongs_to_service, the IMAGE_SERVICE_NODE_NAME
+        # exclusion, and IMAGE_TARGET_NODE_DENYLIST). A label-only affinity (prepull=enabled) would
+        # be too broad — the prepull label is shared cluster-wide across tenants — so a preheat pod
+        # could land on another service's / a denylisted node. hostname-pinning enforces the same
+        # symmetric membership every other node-targeting path in this file uses.
+        affinity = client.V1Affinity(
+            node_affinity=client.V1NodeAffinity(
+                required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
+                    node_selector_terms=[client.V1NodeSelectorTerm(
+                        match_expressions=[
+                            client.V1NodeSelectorRequirement(
+                                key="kubernetes.io/hostname", operator="In", values=list(node_names)),
+                            client.V1NodeSelectorRequirement(
+                                key="node-role.kubernetes.io/control-plane", operator="DoesNotExist"),
+                        ]
+                    )]
+                )
+            )
+        )
+        pod_spec = client.V1PodSpec(
+            containers=[container],
+            affinity=affinity,
+            tolerations=[client.V1Toleration(**t) for t in self._preheat_tolerations()],
+            restart_policy="Always",
+            termination_grace_period_seconds=0,
+            automount_service_account_token=False,
+            priority_class_name=self._ensure_preheat_priority_class(),
+        )
+        return client.V1DaemonSet(
+            metadata=client.V1ObjectMeta(name=name, namespace=self.namespace, labels=labels),
+            spec=client.V1DaemonSetSpec(
+                selector=client.V1LabelSelector(match_labels={"app": "oneclick-preheat",
+                                                              "oneclick-preheat-image-id": str(int(image_id))}),
+                template=client.V1PodTemplateSpec(
+                    metadata=client.V1ObjectMeta(labels=labels),
+                    spec=pod_spec,
+                ),
+                update_strategy=client.V1DaemonSetUpdateStrategy(type="RollingUpdate"),
+            ),
+        )
+
+    def preheat_image_to_nodes(self, image_id: int, image: str) -> dict:
+        """Create/replace the preheat DaemonSet so every eligible node pulls `image` from Harbor.
+
+        The manager SA can create/delete/get DaemonSets but NOT patch → replace = delete + create.
+        Serialized per image_id so a concurrent create/update/sync cannot race the delete+recreate.
+        Returns the initial preheat status."""
+        image = (image or "").strip()
+        if not image:
+            raise ValueError("image must not be empty")
+        # raise_on_error: a transient 403 must NOT look like "zero eligible nodes" and trigger a
+        # teardown of a healthy DS. Let the exception propagate so the caller leaves the DS intact.
+        # Exclude quarantined (containerd-wedged) nodes — the same routing every other node-targeting
+        # path applies (see _select_target_gpu_node); pinning the DS to a wedged node would keep the
+        # image forever "pulling" since that node can never complete the pull.
+        quarantined = store.quarantined_nodes()
+        node_names = [t["node"] for t in self._eligible_target_nodes(raise_on_error=True)
+                      if t["node"] not in quarantined]
+        name = self._preheat_ds_name(image_id)
+        # Hold the per-image lock across BOTH the empty-set teardown and the create/replace so a
+        # transient empty node set (e.g. the sole eligible node briefly quarantined) in one caller
+        # can't delete a healthy DS a concurrent caller just created for the same image_id.
+        with self._preheat_lock_for(image_id):
+            if not node_names:
+                # Genuinely no eligible nodes: don't create a DS with an empty hostname-In (apiserver
+                # rejects an empty values list). Remove any stale DS and report pending.
+                self._delete_preheat_ds_unlocked(image_id)
+                return {"status": "pending", "desired_count": 0, "ready_count": 0,
+                        "message": "no eligible nodes", "completed": False}
+            # Re-check under lock that the catalog row still exists: a concurrent admin_delete_image
+            # may have removed it (and torn down its DS) after our caller read a pre-delete snapshot.
+            # Without this, we would resurrect a DaemonSet for a deleted image.
+            if not store.image_row_exists(image_id):
+                logger.info("preheat skipped: image %s was deleted", image_id)
+                return {"status": "pending", "desired_count": 0, "ready_count": 0,
+                        "message": "image deleted", "completed": False}
+            body = self._preheat_ds_body(image_id, image, node_names)
+            self._create_or_replace_preheat_ds(image_id, name, body)
+        # Report status but floor desired_count at the node set we just pinned: the DS controller
+        # populates status.desiredNumberScheduled asynchronously, so an immediate read often sees 0
+        # and would misreport a fresh preheat as "pending"/"no nodes". min_desired makes the sync
+        # response say "distributing 0/N" instead of a misleading "pending 0/0".
+        return self.get_preheat_status(image_id, image, min_desired=len(node_names))
+
+    def _preheat_lock_for(self, image_id: int) -> threading.Lock:
+        with self._preheat_locks_guard:
+            lock = self._preheat_locks.get(image_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._preheat_locks[image_id] = lock
+            return lock
+
+    def _create_or_replace_preheat_ds(self, image_id: int, name: str, body) -> None:
+        try:
+            self.apps_v1.create_namespaced_daemon_set(namespace=self.namespace, body=body)
+            return
+        except ApiException as e:
+            if e.status != 409:
+                raise
+        # Already exists: delete then recreate (no patch RBAC). Wait for teardown, then create with
+        # bounded retries so a slow Foreground GC (pod stuck on an unreachable node) doesn't surface
+        # a bare 409 to the caller.
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(
+                name=name, namespace=self.namespace,
+                body=client.V1DeleteOptions(propagation_policy="Foreground"),
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        gone = False
+        for attempt in range(60):
+            try:
+                self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
+            except ApiException as read_err:
+                if read_err.status == 404:
+                    gone = True
+                    break
+                raise
+            time.sleep(1)
+        if not gone:
+            # Foreground GC is blocked because a child pod is stuck Terminating on an unreachable
+            # node. A second DS delete is a no-op once the foregroundDeletion finalizer is set, and
+            # we have no patch RBAC to clear it. The manager DOES have pod-delete RBAC, so
+            # force-delete the DS's child pods (grace 0) directly — that lets the GC controller see
+            # zero dependents and clear the finalizer. Then wait a final window for the DS to vanish.
+            self._force_delete_preheat_pods(image_id)
+            for attempt in range(20):
+                try:
+                    self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
+                except ApiException as read_err:
+                    if read_err.status == 404:
+                        gone = True
+                        break
+                    raise
+                time.sleep(1)
+            if not gone:
+                # The old DS still won't die (a child pod is wedged Terminating on an unreachable
+                # node and we lack patch RBAC to strip its finalizer). Don't burn ~20s on 10 futile
+                # 409 create attempts every call — surface a clear error so the caller/scheduler logs
+                # it and moves on; the DS will clear once the node recovers or is drained.
+                raise RuntimeError(
+                    f"preheat DaemonSet {name} is stuck terminating (a pod is wedged on an "
+                    f"unreachable node); skipping recreate until it clears")
+        # Re-check row existence right before recreating: the delete+wait above can take ~100s, and a
+        # concurrent admin_delete_image may have removed the catalog row (and its DS) during that
+        # window. Recreating now would resurrect a DaemonSet for a deleted image. Abort instead — the
+        # earlier check (before the wait) can't see a delete that lands mid-wait.
+        if not store.image_row_exists(image_id):
+            logger.info("preheat recreate aborted: image %s was deleted during teardown", image_id)
+            self._delete_preheat_ds_unlocked(image_id)
+            return
+        for attempt in range(10):
+            try:
+                self.apps_v1.create_namespaced_daemon_set(namespace=self.namespace, body=body)
+                return
+            except ApiException as e:
+                if e.status == 409 and attempt < 9:
+                    time.sleep(2)
+                    continue
+                raise
+
+    # Container waiting reasons that are only reachable AFTER the image is fully pulled: the runtime
+    # got as far as creating/starting a container (and failed for a non-pull reason). A shell-less
+    # image (distroless/scratch) with our `/bin/sh -c sleep infinity` command fails here with
+    # CreateContainerError/RunContainerError — never running/terminated — but the bytes ARE on disk.
+    _PREHEAT_POST_PULL_WAIT_REASONS = frozenset({
+        "CreateContainerError", "RunContainerError", "CreateContainerConfigError",
+        "CrashLoopBackOff", "PostStartHookError", "StartError",
+    })
+
+    @staticmethod
+    def _preheat_pod_image_pulled(pod) -> bool:
+        """True if this preheat pod's image has been pulled onto its node.
+
+        Preheat's goal is the image ON DISK, not a running container. Signals that the image is
+        present: the container is running, is/was terminated (started then exited), OR is waiting for
+        a POST-PULL reason (CreateContainerError etc.) — all of which are only reachable once kubelet
+        finished pulling. This correctly counts a shell-less image (distroless/scratch) whose exec of
+        `/bin/sh` fails during container creation (CreateContainerError), which never yields a
+        running/terminated state. It does NOT count a container waiting with a pull-phase reason
+        (ContainerCreating/PodInitializing/ImagePullBackOff/ErrImagePull) — that is before the bytes
+        land, so counting it would flip status to "ready" prematurely."""
+        statuses = (pod.status.container_statuses or []) if pod.status else []
+        if not statuses:
+            return False
+        for cs in statuses:
+            state = cs.state
+            last_state = getattr(cs, "last_state", None)
+            waiting = getattr(state, "waiting", None)
+            waiting_reason = (getattr(waiting, "reason", "") or "") if waiting is not None else ""
+            pulled = (
+                getattr(state, "running", None) is not None
+                or getattr(state, "terminated", None) is not None
+                or (last_state is not None and getattr(last_state, "terminated", None) is not None)
+                or waiting_reason in K8sClient._PREHEAT_POST_PULL_WAIT_REASONS
+            )
+            if not pulled:
+                return False
+        return True
+
+    def get_preheat_status(self, image_id: int, image: Optional[str] = None,
+                           min_desired: int = 0) -> dict:
+        """Return preheat progress for the DaemonSet.
+
+        "Ready" = the image is PULLED on every scheduled node (not that the container runs), so a
+        shell-less image whose `sleep infinity` exec fails still counts once its layers are down.
+        Falls back to numberReady if pods can't be listed. Missing DS => pending. `min_desired`
+        floors desired_count (used right after create, when the DS controller hasn't populated
+        status.desiredNumberScheduled yet, to avoid a misleading 0/0 'pending')."""
+        name = self._preheat_ds_name(image_id)
+        try:
+            ds = self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return {"status": "pending", "desired_count": 0, "ready_count": 0,
+                        "message": "preheat not started", "completed": False}
+            raise
+        st = ds.status
+        desired = max(int(getattr(st, "desired_number_scheduled", 0) or 0), int(min_desired or 0))
+        pulled = int(getattr(st, "number_ready", 0) or 0)
+        try:
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=self.namespace,
+                label_selector=f"oneclick-preheat-image-id={int(image_id)}",
+            )
+            pulled = sum(1 for p in pods.items if self._preheat_pod_image_pulled(p))
+        except ApiException as e:
+            logger.warning("Cannot list preheat pods for image %s; using numberReady: %s", image_id, e)
+        if desired > 0 and pulled >= desired:
+            status, completed = "ready", True
+        elif desired == 0:
+            status, completed = "pending", False
+        else:
+            status, completed = "pulling", False
+        return {
+            "status": status,
+            "desired_count": desired,
+            "ready_count": pulled,
+            "message": f"{pulled}/{desired} nodes preheated",
+            "completed": completed,
+        }
+
+    def sweep_orphan_preheat_ds(self, expected_image_ids) -> int:
+        """Delete every preheat DaemonSet whose image_id is NOT in `expected_image_ids`.
+
+        `expected_image_ids` must be the set of image_ids that SHOULD currently own a preheat DS —
+        i.e. the live catalog rows whose source_type is 'harbor_mirror'. Anything else with a
+        oneclick-preheat-* DS is orphaned and removed. This covers three cases with one rule:
+          - the catalog row was deleted (delete/sync TOCTOU backstop),
+          - the row's source_type was switched away from harbor_mirror (row still exists), and
+          - the row is a mirror row but preheat was globally disabled (empty expected set).
+        Returns the count deleted."""
+        expected = {int(i) for i in expected_image_ids}
+        removed = 0
+        try:
+            dss = self.apps_v1.list_namespaced_daemon_set(
+                namespace=self.namespace, label_selector="app=oneclick-preheat")
+        except ApiException as e:
+            logger.warning("Cannot list preheat DaemonSets for orphan sweep: %s", e)
+            return 0
+        for ds in dss.items:
+            labels = ds.metadata.labels or {}
+            raw = labels.get("oneclick-preheat-image-id")
+            try:
+                image_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if image_id not in expected:
+                if self.remove_preheat_ds(image_id):
+                    removed += 1
+        return removed
+
+    def _preheat_ds_pinned_nodes(self, ds) -> set:
+        """Extract the hostname set baked into a preheat DS's nodeAffinity In-list (or empty)."""
+        try:
+            terms = ds.spec.template.spec.affinity.node_affinity \
+                .required_during_scheduling_ignored_during_execution.node_selector_terms
+        except AttributeError:
+            return set()
+        for term in terms or []:
+            for expr in term.match_expressions or []:
+                if expr.key == "kubernetes.io/hostname" and expr.operator == "In":
+                    return set(expr.values or [])
+        return set()
+
+    def _preheat_ds_image(self, ds) -> Optional[str]:
+        """The container image the preheat DS is actually running (or None)."""
+        try:
+            return ds.spec.template.spec.containers[0].image
+        except (AttributeError, IndexError):
+            return None
+
+    def reconcile_preheat_ds(self, image_id: int, image: str) -> dict:
+        """Ensure the preheat DS for `image` targets the CURRENT eligible node set.
+
+        Recreates the DS only when the eligible hostname set has drifted from what the DS pins
+        (a new/reimaged node joined, or one dropped) — otherwise it's a cheap read. This is what
+        the periodic scheduler calls so newly-eligible nodes get preheated without a manual sync,
+        and so a stuck/stale DS self-heals. Returns the resulting preheat status."""
+        image = (image or "").strip()
+        if not image:
+            return self.get_preheat_status(image_id)
+        # raise_on_error: a transient 403 must not collapse `current` to empty and drive a
+        # spurious drift-triggered teardown/recreate. Let it propagate so the periodic caller
+        # (which swallows/logs) simply retries next tick, leaving the DS intact. Exclude quarantined
+        # nodes here too so `current` matches what preheat_image_to_nodes would actually pin (else
+        # drift is detected every tick and the DS is needlessly recreated).
+        quarantined = store.quarantined_nodes()
+        current = {t["node"] for t in self._eligible_target_nodes(raise_on_error=True)
+                   if t["node"] not in quarantined}
+        name = self._preheat_ds_name(image_id)
+        try:
+            ds = self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
+            pinned = self._preheat_ds_pinned_nodes(ds)
+            ds_image = self._preheat_ds_image(ds)
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            ds, pinned, ds_image = None, None, None
+        # No drift only if BOTH the pinned node set AND the running image match the desired ones.
+        # Checking the image too is essential: after an admin edits a row to a new image, if the
+        # initial preheat call failed, the old DS (same fixed name, old image) lingers; without the
+        # image check reconcile would report the OLD DS as "ready" for the NEW image and never fix it.
+        if ds is not None and pinned == current and ds_image == image:
+            return self.get_preheat_status(image_id, image)
+        # Drifted (node set or image changed) or missing: re-drive preheat onto the current set.
+        return self.preheat_image_to_nodes(image_id, image)
+
+    def remove_preheat_ds(self, image_id: int) -> bool:
+        """Delete the preheat DaemonSet (delete-parity). The image stays in Harbor.
+
+        Deleting the DS stops PINNING the image on nodes but does NOT immediately free disk: the
+        pulled layers linger in containerd's content store until kubelet's image GC evicts them
+        opportunistically (only once node disk crosses imageGCHighThresholdPercent, ~85% default).
+        Returns True if deleted, False if it did not exist.
+
+        Does NOT hold the per-image preheat lock: a delete must stay responsive and must never wait
+        out an in-flight _create_or_replace_preheat_ds's ~100s stuck-teardown loop for the same
+        image_id. The DS delete is idempotent, and if a concurrent create finishes AFTER this delete
+        (recreating the DS), the scheduler's orphan sweep removes it on the next tick (the row is
+        gone by the time delete-parity calls this). So racing create/delete converges safely without
+        serializing on the heavy create lock."""
+        return self._delete_preheat_ds_unlocked(image_id)
+
+    def _force_delete_preheat_pods(self, image_id: int) -> None:
+        """Force-delete (grace 0) the child pods of a preheat DS so a stuck Foreground deletion can
+        complete. The manager has pod-delete but not patch RBAC, so clearing the pods lets the GC
+        controller drop the DS's foregroundDeletion finalizer even when a pod is wedged Terminating
+        on an unreachable node. Best-effort; logs and swallows per-pod errors."""
+        try:
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=self.namespace,
+                label_selector=f"oneclick-preheat-image-id={int(image_id)}",
+            )
+        except ApiException as e:
+            logger.warning("listing stuck preheat pods for image %s failed: %s", image_id, e)
+            return
+        for pod in pods.items:
+            try:
+                self.core_v1.delete_namespaced_pod(
+                    name=pod.metadata.name, namespace=self.namespace,
+                    grace_period_seconds=0,
+                    body=client.V1DeleteOptions(grace_period_seconds=0, propagation_policy="Background"),
+                )
+            except ApiException as pod_err:
+                if pod_err.status != 404:
+                    logger.warning("force-delete preheat pod %s failed: %s", pod.metadata.name, pod_err)
+
+    def _delete_preheat_ds_unlocked(self, image_id: int) -> bool:
+        """Delete the preheat DS by name. Caller decides whether to hold the per-image lock.
+
+        Issues a Foreground delete, then briefly waits; if the DS is still present (a child pod
+        wedged Terminating on an unreachable node blocks GC), force-deletes the child pods so the
+        finalizer can clear. Without this, delete-parity and the orphan sweep would return a false
+        'deleted' and the DS would leak until the node recovers."""
+        name = self._preheat_ds_name(image_id)
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(
+                name=name, namespace=self.namespace,
+                body=client.V1DeleteOptions(propagation_policy="Foreground"),
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return False
+            raise
+        # Short wait for normal teardown; if it lingers, force-delete the child pods to unblock GC,
+        # then poll again so we don't return a false 'deleted' while the DS is still present.
+        for attempt in range(5):
+            try:
+                self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
+            except ApiException as read_err:
+                if read_err.status == 404:
+                    return True
+                raise
+            time.sleep(1)
+        self._force_delete_preheat_pods(image_id)
+        for attempt in range(20):
+            try:
+                self.apps_v1.read_namespaced_daemon_set(name=name, namespace=self.namespace)
+            except ApiException as read_err:
+                if read_err.status == 404:
+                    return True
+                raise
+            time.sleep(1)
+        # Still present (wedged pod / GC lag). Report not-fully-deleted so callers/sweep don't treat
+        # it as reclaimed; the next sweep tick will retry.
+        logger.warning("preheat DaemonSet %s still present after force-delete; will retry next sweep", name)
+        return False
 
 
     def reconcile_image_ready_labels(self, catalog: list[dict]) -> dict:

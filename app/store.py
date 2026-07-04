@@ -1609,6 +1609,17 @@ def get_image_by_value(image: str) -> Optional[dict]:
         )
 
 
+def image_row_exists(image_id: int) -> bool:
+    """True if a catalog row with this id still exists (regardless of enabled state).
+
+    Used by the preheat path to re-check, under lock, that an image was not concurrently deleted
+    before (re)creating its DaemonSet — closing the delete/reconcile resurrection race."""
+    with engine.begin() as conn:
+        return conn.execute(
+            select(images.c.id).where(images.c.id == image_id)
+        ).first() is not None
+
+
 def resolve_enabled_image(value: str) -> Optional[dict]:
     """Resolve an enabled catalog image by its full ref OR its admin-panel name.
 

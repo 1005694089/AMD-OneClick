@@ -35,6 +35,11 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  # Harbor preheat uses a low, non-preempting PriorityClass (cluster-scoped) so preheat pulls
+  # never preempt real notebook pods. get+create is enough (created once, then read).
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "create"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

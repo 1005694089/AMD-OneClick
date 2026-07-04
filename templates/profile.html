@@ -41,6 +41,7 @@
     const modelscopeEnabled = {{ modelscope_enabled | tojson }};
     const couponRedeemEnabled = {{ coupon_redeem_enabled | tojson }};
     const couponRedeemDisabledMessage = {{ coupon_redeem_disabled_message | tojson }};
+    const customBuildsEnabled = {{ custom_builds_enabled | tojson }};
     const JUPYTER_LOGO = 'https://cdn.jsdelivr.net/npm/simple-icons@13/icons/jupyter.svg';
     const OPENCODE_LOGO = 'https://opencode.ai/favicon.svg';
     // Render a brand logo with a small, always-visible one-word label next to it.
@@ -461,6 +462,10 @@
 
       function renderCustomImages() {
         if (!user || !user.email) return null;
+        // When builds are disabled, still show existing images (so users can launch/delete what they
+        // already built) — just hide the "Build New Image" affordance. Hide the card entirely only
+        // when builds are off AND there is nothing to show.
+        if (!customBuildsEnabled && (customImages || []).length === 0) return null;
         const statusColor = { ready:'green', building:'blue', distributing:'cyan', pending:'gold', failed:'red' };
         const activeCount = (customImages || []).filter(ci => ['pending','building','ready'].includes(ci.build_status)).length;
         const atLimit = activeCount >= customMax;
@@ -477,9 +482,9 @@
         return React.createElement(Card, {
           className:'editor-panel',
           title:`Custom Images (${activeCount}/${customMax})`,
-          extra:React.createElement(Button, {type:'primary', disabled:atLimit, title:atLimit?`Limit of ${customMax} reached. Delete one to build another.`:'', onClick:openBuildModal}, 'Build New Image')
+          extra:customBuildsEnabled?React.createElement(Button, {type:'primary', disabled:atLimit, title:atLimit?`Limit of ${customMax} reached. Delete one to build another.`:'', onClick:openBuildModal}, 'Build New Image'):null
         },
-          React.createElement(Paragraph, {type:'secondary'}, 'Write a Dockerfile and build a private image. It is pushed to your registry namespace, distributed to nodes, then launchable as a workspace. OpenCode is added automatically.'),
+          customBuildsEnabled?React.createElement(Paragraph, {type:'secondary'}, 'Write a Dockerfile and build a private image. It is pushed to your registry namespace, distributed to nodes, then launchable as a workspace. OpenCode is added automatically.'):React.createElement(Paragraph, {type:'secondary'}, 'Custom image builds are disabled. Your existing images can still be launched or deleted.'),
           React.createElement(Table, {rowKey:'id', columns:columns, dataSource:customImages, loading:customLoading, pagination:false, scroll:{x:880}, size:'middle'}),
           React.createElement(Modal, {title:'Build Custom Image', open:buildModalOpen, onCancel:()=>{setBuildModalOpen(false); buildForm.resetFields();}, footer:null, destroyOnClose:true, width:760},
             React.createElement(Form, {form:buildForm, layout:'vertical', onFinish:buildCustomImage},
