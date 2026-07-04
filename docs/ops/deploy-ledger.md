@@ -1218,3 +1218,41 @@ deployment/amd-oneclick-lablab-manager manager=lablab.local/amd-oneclick:a0fe4d8
 
 **PRE snapshot:** `local-deploy-history/radeon-global/20260704-2135-merged-6c88760-PRE-deploy.yaml` (image d4abd92).
 **Rollback:** `set image ...manager:6591ca3` (their last-good) + flags off; or `d4abd92` (mirror only, reverts Approach-B again — NOT recommended).
+
+## 2026-07-04 - radeon-global: deploy image-catalog scan + httpx pool-leak fixes (217f418)
+
+**Code commit:** `217f418` (on `prod/radeon-global`, pushed to origin). Two prod bugs, root-caused via
+multi-agent investigation and hardened through 6 rounds of adversarial review (final round clean):
+- P1: admin Image Catalog stuck 0/123 for source_type='manual' rows. New get_image_node_scan_status
+  computes readiness from each eligible node's kubelet image inventory (node.status.images) using the
+  cached list_node() snapshot. Gated by NODE_IMAGE_SCAN_ENABLED (default true). Routed for manual rows
+  in scheduler.image_sync_refresh_job + admin_list_images (both exclude mirror AND image-service rows;
+  admin path runs via asyncio.to_thread).
+- P2: httpx pooled connections leaked -> PoolTimeout -> hangs. Forward raw Set-Cookie bytes (no lossy
+  latin-1 re-encode that raised UnicodeEncodeError and leaked the connection) + wrap post-send() block
+  in try/except releasing the connection; on aclose() failure, retire the shared client by swapping the
+  module global (fresh pool next request) WITHOUT closing it (no collateral abort of concurrent streams).
+
+**Image build:** THIN build (fast) — `FROM 10.5.10.89:1808/xinwei/amd-oneclick-manager:6c88760` +
+`COPY app/ templates/ static/` (Dockerfile.thin), kaniko pod `manager-build-thin-217f418` (ns
+amd-oneclick-lablab, s-006). Reuses the live image's base+skopeo+pip layers (unchanged deps), so the
+~5 min apt+pip steps are skipped. Pushed `10.5.10.89:1808/xinwei/amd-oneclick-manager:217f418`.
+
+**Deploy:** `kubectl set image` 6c88760 -> 217f418 (Recreate). Manager 1/1, 0 restarts. Env/config
+unchanged (already set from prior deploys).
+
+**Verification (e2e on live cluster, 123 eligible nodes):**
+- P1 live: get_image_node_scan_status now returns REAL per-node counts — rows 1/3/4 ready 123/123,
+  row 2 pulling 52/123 (genuine partial: that base variant is only on 52 nodes). Was 0/123 for all.
+  Scheduler refresh job persists these to the DB (what the admin panel reads): "N/123 nodes have the
+  image".
+- P2 live: _append_raw_set_cookies forwards a non-ASCII Set-Cookie (sid=caf\xc3\xa9) as raw bytes with
+  NO exception (the old latin-1 encode raised here and leaked). _release_upstream_on_error confirmed in
+  running image to retire (null the global) rather than close the shared client. Pool health: after 20
+  pooled requests, 1 reused conn, 0 checked-out at rest — connections properly returned, no leak. No
+  PoolTimeout in logs.
+- 130 user/workspace pods still Running (rollout didn't disturb them). /health 200.
+
+**PRE snapshot:** local-deploy-history/radeon-global/20260704-2303-bugfix-217f418-PRE-deploy.yaml (image 6c88760).
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:6c88760`.
+**Note:** thin build adds one COPY layer atop 6c88760; rebuild clean from python:3.12-slim whenever requirements.txt changes.
