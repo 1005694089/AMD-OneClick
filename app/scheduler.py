@@ -662,10 +662,15 @@ def image_sync_refresh_job():
                     # Owned by the build/distribute pipeline — leave its status to that pipeline.
                     continue
                 else:
-                    # Everything else (legacy 'manual' rows, or non-mirror rows) uses the legacy
-                    # status read — regardless of the global HARBOR_MIRROR_ENABLED flag — so these
-                    # rows keep getting refreshed instead of freezing when the flag is flipped on.
-                    sync = k8s_client.get_image_sync_status(image["id"])
+                    # Everything else (legacy 'manual' rows, or non-mirror rows). These never get an
+                    # image_nodes row (no distribute job), so the legacy get_image_sync_status counts
+                    # 0/N forever. When NODE_IMAGE_SCAN_ENABLED, compute readiness from each node's
+                    # kubelet image inventory (node.status.images) instead — reflecting that the image
+                    # is genuinely resident. Pass image["image"] so the scan has a ref to match.
+                    if settings.NODE_IMAGE_SCAN_ENABLED:
+                        sync = k8s_client.get_image_node_scan_status(image["id"], image.get("image"))
+                    else:
+                        sync = k8s_client.get_image_sync_status(image["id"], image.get("image"))
                 update_image_sync_status(
                     image["id"], sync["status"], sync["desired_count"],
                     sync["ready_count"], sync["message"], sync["completed"],

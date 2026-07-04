@@ -2841,6 +2841,74 @@ exit 0
             "completed": status == "ready",
         }
 
+    def get_image_node_scan_status(self, image_id: int, image: Optional[str] = None) -> dict:
+        """Readiness for a 'manual' catalog row by scanning kubelet's own image inventory.
+
+        Legacy manual rows (base images pre-mirrored into Harbor by hand, no distribute job) never
+        populate the image_nodes table, so get_image_sync_status counts 0/N forever even though the
+        image is genuinely on the nodes (instances launch from it). Instead of a DB table nothing
+        writes, count eligible nodes whose node.status.images already lists this ref. This is free
+        data: it comes from the same cached list_node() snapshot used for target resolution — no
+        extra apiserver calls, no per-node reads, no dependency on the dead ctr-import daemon.
+
+        A node's status.images entries each carry `names` (repo:tag + repoDigests). We match on the
+        normalized ref so 'nginx' and 'docker.io/library/nginx:latest' compare equal. Best-effort:
+        on a node-list error, fall back to the legacy DB read so status is never worse than before."""
+        ref = (image or "").strip()
+        if not ref:
+            return self.get_image_sync_status(image_id, image)
+        try:
+            targets = self._eligible_target_nodes(raise_on_error=True)
+        except ApiException as e:
+            logger.warning("get_image_node_scan_status: node list failed (%s); using legacy read", e)
+            return self.get_image_sync_status(image_id, image)
+        target_names = {t["node"] for t in targets}
+        desired = len(target_names)
+        want = self._normalize_image_ref(ref)
+        # Build node_name -> set(normalized image names) from the cached snapshot. _eligible_target_nodes
+        # already consumed _list_node_cached(), so this hits the same cache window (no new API call).
+        try:
+            nodes = self._list_node_cached()
+        except ApiException as e:
+            logger.warning("get_image_node_scan_status: node images read failed (%s); using legacy read", e)
+            return self.get_image_sync_status(image_id, image)
+        # kubelet caps node.status.images at NodeStatusMaxImages (default 50), sorting by size DESC and
+        # keeping the largest — so truncation only ever drops the SMALLEST images. The catalog images
+        # this scans are multi-GB container images (base/model images, ~17-20GB — the largest on any
+        # node), so they sort to the very top of that list and are not the ones a cap would drop. No
+        # DB fallback for truncation: for 'manual' rows (the only callers) the image_nodes table is
+        # empty by definition (that omission is the P1 root cause), so such a fallback would be dead
+        # code. Worst case, if a large image ever WERE truncated, the count under-reports (node shows
+        # 'pulling' though ready) — a visible, safe-side error, never a false 'ready'.
+        ready = 0
+        for node in nodes.items:
+            name = node.metadata.name
+            if name not in target_names:
+                continue
+            present = False
+            for img in (node.status.images or []):
+                for n in (img.names or []):
+                    if self._normalize_image_ref(n) == want:
+                        present = True
+                        break
+                if present:
+                    break
+            if present:
+                ready += 1
+        if desired > 0 and ready >= desired:
+            status = "ready"
+        elif desired == 0:
+            status = "pending"
+        else:
+            status = "pulling"
+        return {
+            "status": status,
+            "desired_count": desired,
+            "ready_count": ready,
+            "message": f"{ready}/{desired} nodes have the image",
+            "completed": status == "ready",
+        }
+
     # --- Harbor preheat via unprivileged prepull DaemonSet -------------------------------------
     # Replaces the dead `distribute` job path: instead of an off-cluster daemon side-loading bytes,
     # a DaemonSet whose container IS the Harbor image makes each node's kubelet pull it. Proven live.

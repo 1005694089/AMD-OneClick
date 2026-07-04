@@ -511,6 +511,14 @@ class Settings:
     ]
     # Short TTL (seconds) for the cached list_node() result used in image target resolution.
     NODE_LIST_CACHE_TTL_SECONDS: float = float(os.getenv("NODE_LIST_CACHE_TTL_SECONDS", "5"))
+    # Legacy 'manual' catalog rows (base images pre-mirrored into Harbor by an admin, no distribute
+    # job ever created) have no image_nodes rows, so the old get_image_sync_status counts 0/N forever.
+    # When enabled, their readiness is instead computed by scanning each eligible node's kubelet image
+    # inventory (node.status.images) — free per-node data already in the cached list_node() snapshot —
+    # so the admin catalog reflects reality (the image IS on the nodes; instances launch from it).
+    # Default TRUE: this only affects the previously-broken 0/N manual rows. Mirror rows (preheat DS)
+    # and image-service rows are unaffected — they keep their own status paths.
+    NODE_IMAGE_SCAN_ENABLED: bool = os.getenv("NODE_IMAGE_SCAN_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     # ACR Enterprise registry used as the admin-image backup source of truth.
     ACR_ENTERPRISE_REGISTRY: str = os.getenv("ACR_ENTERPRISE_REGISTRY", "")
     # Self-hosted LAN registry (zot) on node 0042 — the durable source of truth for the P2P

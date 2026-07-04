@@ -1133,6 +1133,52 @@ async def _close_upstream_only(upstream: httpx.Response):
     await upstream.aclose()
 
 
+async def _release_upstream_on_error(upstream: httpx.Response, client: httpx.AsyncClient) -> None:
+    """Release a checked-out pooled connection after a post-send() error, self-healing if close fails.
+
+    Normal release is upstream.aclose(). But httpcore removes the connection from the pool's bookkeeping
+    only AFTER the transport-level socket close succeeds — so if aclose() itself raises (a broken
+    socket/TLS close can throw OSError/SSLError), the pool slot is NOT freed and would leak, eventually
+    starving the pool (PoolTimeout). We cannot recover that single slot in place.
+
+    On an aclose() failure we must NOT close the shared client: _proxy_client is a single process-wide
+    pool shared by every concurrent instance/space stream, and client.aclose() would tear down the whole
+    pool — aborting unrelated in-flight streams for other users. Instead we RETIRE the current client by
+    swapping the module global to None (so _get_proxy_client() lazily builds a fresh pool on the next
+    request) WITHOUT closing the old one: existing streams on the old client keep running to completion,
+    and the old client (with its one stuck slot) is garbage-collected once its last stream finishes. This
+    bounds the leak to at most the connections of one retired-but-draining client, with zero collateral
+    disruption. Best-effort throughout — never masks the original error."""
+    global _proxy_client
+    try:
+        await upstream.aclose()
+        return
+    except Exception:
+        logger.warning(
+            "upstream.aclose() failed after proxy error; retiring shared proxy client (fresh pool on "
+            "next request, existing streams undisturbed)", exc_info=True)
+    # Retire only if the global still points at the client whose connection just failed to close, so we
+    # don't discard a fresh pool that another coroutine already rotated in.
+    if _proxy_client is client:
+        _proxy_client = None
+
+
+def _append_raw_set_cookies(response: StreamingResponse, upstream: httpx.Response) -> None:
+    """Forward upstream Set-Cookie headers onto `response` using their ORIGINAL bytes.
+
+    upstream.headers.raw is a list of (name, value) byte tuples straight off the wire. Forwarding the
+    raw bytes verbatim avoids a decode+re-encode round-trip: the previous code did
+    ``cookie.encode("latin-1")`` on ``headers.get_list("set-cookie")``, but httpx decodes header bytes
+    with utf-8 when they are valid utf-8, so a non-ASCII cookie value (common from Gradio/Streamlit
+    apps) became a str with codepoints > U+00FF that ``.encode("latin-1")`` could not represent —
+    raising UnicodeEncodeError AFTER the connection was checked out, which leaked the pooled
+    connection permanently. Passing bytes through untouched cannot raise and preserves the exact
+    cookie the app set."""
+    for name, value in upstream.headers.raw:
+        if name.lower() == b"set-cookie":
+            response.raw_headers.append((b"set-cookie", value))
+
+
 # httpx.TransportError is the common base of ALL connection-level failures — ConnectError,
 # ReadError/WriteError, every *Timeout (Connect/Read/Write/Pool), and RemoteProtocolError. Catching
 # the base means a pod that is unreachable while we CONNECT + read response HEADERS yields the
@@ -3225,31 +3271,41 @@ async def _handle_opencode_request(request: Request) -> Response:
         )
     except _PROXY_UNAVAILABLE_ERRORS as e:
         return await _friendly_unavailable_response(instance_id, e)
-    response_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in {
-            "transfer-encoding",
-            "connection",
-            "content-length",
-            "set-cookie",
-            "www-authenticate",
-            "proxy-authenticate",
+    # From here `upstream` is a CHECKED-OUT pooled connection; its only release is the StreamingResponse's
+    # BackgroundTask. Any exception in the response-construction block below would discard the response
+    # (BackgroundTask never runs) and leak the connection forever. Guard with try/except → aclose.
+    try:
+        response_headers = {
+            k: v for k, v in upstream.headers.items()
+            if k.lower() not in {
+                "transfer-encoding",
+                "connection",
+                "content-length",
+                "set-cookie",
+                "www-authenticate",
+                "proxy-authenticate",
+            }
         }
-    }
-    response = StreamingResponse(
-        upstream.aiter_raw(),
-        status_code=upstream.status_code,
-        headers=response_headers,
-        background=BackgroundTask(_close_upstream_only, upstream),
-    )
-    csp = response.headers.get("content-security-policy", "")
-    theme_script_hash = "'sha256-QI23YWMJrD/tljM6/82tpL8EwqdBoptwZfycFHA9IiQ='"
-    if csp and theme_script_hash not in csp:
-        response.headers["content-security-policy"] = csp.replace(
-            "script-src 'self' 'wasm-unsafe-eval'",
-            f"script-src 'self' 'wasm-unsafe-eval' {theme_script_hash}",
+        response = StreamingResponse(
+            upstream.aiter_raw(),
+            status_code=upstream.status_code,
+            headers=response_headers,
+            background=BackgroundTask(_close_upstream_only, upstream),
         )
-    return response
+        csp = response.headers.get("content-security-policy", "")
+        theme_script_hash = "'sha256-QI23YWMJrD/tljM6/82tpL8EwqdBoptwZfycFHA9IiQ='"
+        if csp and theme_script_hash not in csp:
+            response.headers["content-security-policy"] = csp.replace(
+                "script-src 'self' 'wasm-unsafe-eval'",
+                f"script-src 'self' 'wasm-unsafe-eval' {theme_script_hash}",
+            )
+        return response
+    except Exception:
+        # Release the checked-out pooled connection. If aclose() itself fails (which would otherwise
+        # leak the pool slot, since httpcore frees it only after a successful transport close), this
+        # resets the whole shared pool as a fallback. Never masks the original exception.
+        await _release_upstream_on_error(upstream, client)
+        raise
 
 
 @app.api_route("/instances/{instance_id}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
@@ -3275,21 +3331,29 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
     except _PROXY_UNAVAILABLE_ERRORS as e:
         return await _friendly_unavailable_response(instance_id, e)
 
-    response_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length", "set-cookie"}
-    }
-    if "location" in response_headers:
-        response_headers["location"] = _rewrite_location(response_headers["location"], instance_id, target_base)
-    response = StreamingResponse(
-        upstream.aiter_raw(),
-        status_code=upstream.status_code,
-        headers=response_headers,
-        background=BackgroundTask(_close_upstream_only, upstream),
-    )
-    for cookie in upstream.headers.get_list("set-cookie"):
-        response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
-    return response
+    # `upstream` is now a checked-out pooled connection; guarantee release even if header
+    # post-processing raises (else the connection leaks and the pool eventually starves).
+    try:
+        response_headers = {
+            k: v for k, v in upstream.headers.items()
+            if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length", "set-cookie"}
+        }
+        if "location" in response_headers:
+            response_headers["location"] = _rewrite_location(response_headers["location"], instance_id, target_base)
+        response = StreamingResponse(
+            upstream.aiter_raw(),
+            status_code=upstream.status_code,
+            headers=response_headers,
+            background=BackgroundTask(_close_upstream_only, upstream),
+        )
+        _append_raw_set_cookies(response, upstream)
+        return response
+    except Exception:
+        # Release the checked-out pooled connection. If aclose() itself fails (which would otherwise
+        # leak the pool slot, since httpcore frees it only after a successful transport close), this
+        # resets the whole shared pool as a fallback. Never masks the original exception.
+        await _release_upstream_on_error(upstream, client)
+        raise
 
 
 @app.websocket("/instances/{instance_id}/{path:path}")
@@ -3427,21 +3491,29 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
         )
     except _PROXY_UNAVAILABLE_ERRORS as e:
         return await _friendly_unavailable_response(instance_id, e)
-    # Keep content-encoding (we stream raw/compressed bytes); drop only hop-by-hop
-    # and length/cookie headers we re-add separately.
-    response_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in {"transfer-encoding", "connection", "content-length", "set-cookie"}
-    }
-    response = StreamingResponse(
-        upstream.aiter_raw(),
-        status_code=upstream.status_code,
-        headers=response_headers,
-        background=BackgroundTask(_close_upstream_only, upstream),
-    )
-    for cookie in upstream.headers.get_list("set-cookie"):
-        response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
-    return response
+    # `upstream` is now a checked-out pooled connection; guarantee release even if header
+    # post-processing raises (else the connection leaks and the pool eventually starves).
+    try:
+        # Keep content-encoding (we stream raw/compressed bytes); drop only hop-by-hop
+        # and length/cookie headers we re-add separately.
+        response_headers = {
+            k: v for k, v in upstream.headers.items()
+            if k.lower() not in {"transfer-encoding", "connection", "content-length", "set-cookie"}
+        }
+        response = StreamingResponse(
+            upstream.aiter_raw(),
+            status_code=upstream.status_code,
+            headers=response_headers,
+            background=BackgroundTask(_close_upstream_only, upstream),
+        )
+        _append_raw_set_cookies(response, upstream)
+        return response
+    except Exception:
+        # Release the checked-out pooled connection. If aclose() itself fails (which would otherwise
+        # leak the pool slot, since httpcore frees it only after a successful transport close), this
+        # resets the whole shared pool as a fallback. Never masks the original exception.
+        await _release_upstream_on_error(upstream, client)
+        raise
 
 
 @app.websocket(f"{settings.SPACES_PATH_PREFIX}/{{instance_id}}/{{port}}/{{path:path}}")
@@ -3625,15 +3697,35 @@ async def admin_sync_template_preview(template_id: int, username: str = Depends(
 @app.get("/api/admin/images")
 async def admin_list_images(username: str = Depends(verify_admin)):
     for image in list_images(enabled_only=False):
+        row_source_type = (image.get("source_type") or "").strip()
         # Harbor-mirror rows are tracked by the preheat DaemonSet, whose progress the scheduler's
         # image_sync_refresh_job writes to the row. The legacy get_image_sync_status reads the
         # image_nodes table (only the dead distribute path populated it), which is always empty for
         # a mirror row → it would compute 0/N and clobber the scheduler's correct 'ready'. Skip the
         # legacy refresh for mirror rows and return their stored (scheduler-maintained) status.
-        if (image.get("source_type") or "").strip() == HARBOR_MIRROR_SOURCE_TYPE:
+        if row_source_type == HARBOR_MIRROR_SOURCE_TYPE:
+            continue
+        # Image-service rows (acr_pull/dockerhub_pull/github_build) are owned by the build/distribute
+        # pipeline, which writes their status via its own update_image_sync_status calls. Mirror the
+        # scheduler's is_image_service_row exclusion here: the node-scan below matches by image
+        # name/tag (not digest) and would clobber the pipeline's accurate, digest-aware status on
+        # every admin poll. Leave these rows to the pipeline; only 'manual'/other rows get refreshed.
+        if row_source_type in _ADMIN_SOURCE_HEAD_KIND:
             continue
         try:
-            sync = k8s_client.get_image_sync_status(image["id"], image["image"])
+            # Legacy 'manual' rows have no image_nodes rows (nothing writes them), so the DB-backed
+            # get_image_sync_status returns 0/N forever. Prefer the kubelet image-inventory scan so
+            # the catalog reflects that the image is actually resident on the nodes.
+            # Both branches do BLOCKING k8s/DB work (get_image_node_scan_status can take the shared
+            # node-list lock and issue a blocking list_node() apiserver call, contending with the
+            # scheduler thread). This is an async endpoint on the single uvicorn worker, so run it in
+            # a thread to avoid stalling the event loop (matches the sync_image_to_nodes call sites).
+            if settings.NODE_IMAGE_SCAN_ENABLED:
+                sync = await asyncio.to_thread(
+                    k8s_client.get_image_node_scan_status, image["id"], image["image"])
+            else:
+                sync = await asyncio.to_thread(
+                    k8s_client.get_image_sync_status, image["id"], image["image"])
             if (
                 image.get("sync_status") != sync["status"]
                 or image.get("desired_count") != sync["desired_count"]
