@@ -11,14 +11,13 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse, parse_qsl
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from starlette.background import BackgroundTask
 from starlette.middleware.sessions import SessionMiddleware
 import secrets
 import httpx
@@ -619,6 +618,10 @@ def _proxy_headers(headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in skip}
 
 
+def _query_has_token(query: str) -> bool:
+    return any(key == "token" for key, _ in parse_qsl(query or "", keep_blank_values=True))
+
+
 def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
     public_prefix = f"/instances/{instance_id}/"
     if location.startswith(target_base):
@@ -627,32 +630,179 @@ def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
         return location
     return location
 
-
-async def _close_httpx_stream(upstream: httpx.Response, client: httpx.AsyncClient):
-    await upstream.aclose()
-    await client.aclose()
-
-
 # Shared pooled client for the instance/app (spaces) HTTP proxies. A new client
 # per request (with a 1-hour timeout) leaked connections and overwhelmed
 # single-threaded backends (e.g. ComfyUI aiohttp) under the browser's burst of
 # concurrent asset requests. A bounded shared pool reuses/limits connections.
+_PROXY_MAX_CONNECTIONS = 64
+_PROXY_MAX_KEEPALIVE_CONNECTIONS = 32
+_PROXY_KEEPALIVE_EXPIRY_SECONDS = 30.0
+_PROXY_CONNECT_TIMEOUT_SECONDS = 10.0
+_PROXY_READ_TIMEOUT_SECONDS = 120.0
+_PROXY_WRITE_TIMEOUT_SECONDS = 120.0
+_PROXY_POOL_TIMEOUT_SECONDS = 30.0
+_PROXY_RETIRED_CLIENT_GRACE_SECONDS = _PROXY_READ_TIMEOUT_SECONDS + 30.0
+
 _proxy_client: Optional[httpx.AsyncClient] = None
+_proxy_client_generation = 0
+_proxy_reset_lock: Optional[asyncio.Lock] = None
+
+
+def _new_proxy_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        follow_redirects=False,
+        timeout=httpx.Timeout(
+            connect=_PROXY_CONNECT_TIMEOUT_SECONDS,
+            read=_PROXY_READ_TIMEOUT_SECONDS,
+            write=_PROXY_WRITE_TIMEOUT_SECONDS,
+            pool=_PROXY_POOL_TIMEOUT_SECONDS,
+        ),
+        limits=httpx.Limits(
+            max_connections=_PROXY_MAX_CONNECTIONS,
+            max_keepalive_connections=_PROXY_MAX_KEEPALIVE_CONNECTIONS,
+            keepalive_expiry=_PROXY_KEEPALIVE_EXPIRY_SECONDS,
+        ),
+    )
 
 
 def _get_proxy_client() -> httpx.AsyncClient:
-    global _proxy_client
+    global _proxy_client, _proxy_client_generation
     if _proxy_client is None or _proxy_client.is_closed:
-        _proxy_client = httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=30.0),
-            limits=httpx.Limits(max_connections=64, max_keepalive_connections=32, keepalive_expiry=30.0),
-        )
+        _proxy_client = _new_proxy_client()
+        _proxy_client_generation += 1
     return _proxy_client
 
 
-async def _close_upstream_only(upstream: httpx.Response):
-    await upstream.aclose()
+def _proxy_log_url(url: str) -> str:
+    return url.split("?", 1)[0]
+
+
+def _get_proxy_reset_lock() -> asyncio.Lock:
+    global _proxy_reset_lock
+    if _proxy_reset_lock is None:
+        _proxy_reset_lock = asyncio.Lock()
+    return _proxy_reset_lock
+
+
+async def _close_proxy_client_later(
+    client: httpx.AsyncClient,
+    generation: int,
+    delay_seconds: float = _PROXY_RETIRED_CLIENT_GRACE_SECONDS,
+):
+    await asyncio.sleep(delay_seconds)
+    if not client.is_closed:
+        await client.aclose()
+        logger.warning("Closed retired proxy client generation=%s after %.1fs grace period", generation, delay_seconds)
+
+
+async def _replace_proxy_client(reason: str, failed_client: httpx.AsyncClient):
+    global _proxy_client, _proxy_client_generation
+    async with _get_proxy_reset_lock():
+        if _proxy_client is not failed_client:
+            return
+        old_generation = _proxy_client_generation
+        _proxy_client = _new_proxy_client()
+        _proxy_client_generation += 1
+        logger.warning(
+            "Replaced shared proxy client reason=%s old_generation=%s new_generation=%s max_connections=%s pool_timeout=%.1fs",
+            reason,
+            old_generation,
+            _proxy_client_generation,
+            _PROXY_MAX_CONNECTIONS,
+            _PROXY_POOL_TIMEOUT_SECONDS,
+        )
+        asyncio.create_task(_close_proxy_client_later(failed_client, old_generation))
+
+
+async def _proxy_upstream_stream(upstream: httpx.Response):
+    try:
+        async for chunk in upstream.aiter_raw():
+            yield chunk
+    finally:
+        await upstream.aclose()
+
+
+async def _send_proxy_request(
+    *,
+    route: str,
+    instance_id: str,
+    path: str,
+    method: str,
+    target_url: str,
+    headers: dict,
+    body: bytes,
+) -> httpx.Response:
+    for attempt in (1, 2):
+        client = _get_proxy_client()
+        try:
+            return await client.send(
+                client.build_request(
+                    method,
+                    target_url,
+                    headers=headers,
+                    content=body,
+                ),
+                stream=True,
+            )
+        except httpx.PoolTimeout as e:
+            logger.error(
+                "Proxy pool timeout route=%s instance_id=%s path=/%s attempt=%s target=%s max_connections=%s pool_timeout=%.1fs: %s",
+                route,
+                instance_id,
+                path,
+                attempt,
+                _proxy_log_url(target_url),
+                _PROXY_MAX_CONNECTIONS,
+                _PROXY_POOL_TIMEOUT_SECONDS,
+                e,
+            )
+            await _replace_proxy_client(f"pool_timeout route={route}", client)
+            if attempt == 1:
+                continue
+            raise HTTPException(status_code=503, detail="Proxy connection pool exhausted; please retry")
+        except httpx.ConnectTimeout as e:
+            logger.error(
+                "Proxy connect timeout route=%s instance_id=%s path=/%s target=%s connect_timeout=%.1fs: %s",
+                route,
+                instance_id,
+                path,
+                _proxy_log_url(target_url),
+                _PROXY_CONNECT_TIMEOUT_SECONDS,
+                e,
+            )
+            raise HTTPException(status_code=504, detail="Instance proxy connect timeout")
+        except httpx.ReadTimeout as e:
+            logger.error(
+                "Proxy read timeout route=%s instance_id=%s path=/%s target=%s read_timeout=%.1fs: %s",
+                route,
+                instance_id,
+                path,
+                _proxy_log_url(target_url),
+                _PROXY_READ_TIMEOUT_SECONDS,
+                e,
+            )
+            raise HTTPException(status_code=504, detail="Instance proxy read timeout")
+        except httpx.ConnectError as e:
+            logger.error(
+                "Proxy connect error route=%s instance_id=%s path=/%s target=%s: %s",
+                route,
+                instance_id,
+                path,
+                _proxy_log_url(target_url),
+                e,
+            )
+            raise HTTPException(status_code=502, detail="Instance proxy connect error")
+        except httpx.HTTPError as e:
+            logger.error(
+                "Proxy HTTP error route=%s instance_id=%s path=/%s target=%s error_type=%s: %s",
+                route,
+                instance_id,
+                path,
+                _proxy_log_url(target_url),
+                type(e).__name__,
+                e,
+            )
+            raise HTTPException(status_code=502, detail="Instance proxy error")
 
 
 def _request_with_retries(method: str, url: str, retries: int = 3, **kwargs) -> requests.Response:
@@ -1658,15 +1808,14 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
         target_url += f"?{request.url.query}"
 
     body = await request.body()
-    client = _get_proxy_client()
-    upstream = await client.send(
-        client.build_request(
-            request.method,
-            target_url,
-            headers=_proxy_headers(request.headers),
-            content=body,
-        ),
-        stream=True,
+    upstream = await _send_proxy_request(
+        route="instances",
+        instance_id=instance_id,
+        path=path,
+        method=request.method,
+        target_url=target_url,
+        headers=_proxy_headers(request.headers),
+        body=body,
     )
 
     response_headers = {
@@ -1676,10 +1825,9 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
     if "location" in response_headers:
         response_headers["location"] = _rewrite_location(response_headers["location"], instance_id, target_base)
     response = StreamingResponse(
-        upstream.aiter_raw(),
+        _proxy_upstream_stream(upstream),
         status_code=upstream.status_code,
         headers=response_headers,
-        background=BackgroundTask(_close_upstream_only, upstream),
     )
     for cookie in upstream.headers.get_list("set-cookie"):
         response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
@@ -1693,8 +1841,11 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
     try:
         target_base = _instance_service_base(instance_id).replace("http://", "ws://")
         target_url = f"{target_base}/instances/{instance_id}/{path}"
-        if websocket.url.query:
-            target_url += f"?{websocket.url.query}"
+        query = websocket.url.query
+        if query:
+            target_url += f"?{query}"
+        if settings.NOTEBOOK_TOKEN and not _query_has_token(query):
+            target_url += ("&" if query else "?") + urlencode({"token": settings.NOTEBOOK_TOKEN})
 
         headers = []
         if websocket.headers.get("cookie"):
@@ -1808,15 +1959,14 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
     fwd_headers["X-Forwarded-Prefix"] = f"{settings.SPACES_PATH_PREFIX}/{instance_id}/{app_port}"
 
     body = await request.body()
-    client = _get_proxy_client()
-    upstream = await client.send(
-        client.build_request(
-            request.method,
-            target_url,
-            headers=fwd_headers,
-            content=body,
-        ),
-        stream=True,
+    upstream = await _send_proxy_request(
+        route="spaces",
+        instance_id=instance_id,
+        path=f"{app_port}/{path}",
+        method=request.method,
+        target_url=target_url,
+        headers=fwd_headers,
+        body=body,
     )
     # Keep content-encoding (we stream raw/compressed bytes); drop only hop-by-hop
     # and length/cookie headers we re-add separately.
@@ -1825,10 +1975,9 @@ async def proxy_space_http(instance_id: str, port: str, path: str, request: Requ
         if k.lower() not in {"transfer-encoding", "connection", "content-length", "set-cookie"}
     }
     response = StreamingResponse(
-        upstream.aiter_raw(),
+        _proxy_upstream_stream(upstream),
         status_code=upstream.status_code,
         headers=response_headers,
-        background=BackgroundTask(_close_upstream_only, upstream),
     )
     for cookie in upstream.headers.get_list("set-cookie"):
         response.raw_headers.append((b"set-cookie", cookie.encode("latin-1")))
