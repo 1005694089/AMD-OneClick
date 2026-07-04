@@ -1170,3 +1170,34 @@ Rollout 1/1, 0 restarts. No ConfigMap/Secret/RBAC/Service changes.
 **Rollback:** `kubectl -n amd-oneclick-lablab set image
 deployment/amd-oneclick-lablab-manager manager=lablab.local/amd-oneclick:a0fe4d8`
 (image still present on s-001), or re-apply the PRE-deploy snapshot.
+
+## 2026-07-04 - radeon-global: Harbor auto-mirror + node preheat (Add Image), disable user builds, delete parity, lab-proxy 503 UX
+
+**Code commit:** `d4abd92` (on `prod/radeon-global`) — `feat(images): Harbor auto-mirror + node preheat for admin Add Image`. New `app/harbor_mirror.py` + changes to `main.py`, `k8s_client.py`, `scheduler.py`, `store.py`, `config.py`, `Dockerfile`, both k8s RBAC yamls, `templates/profile.html`. Validated via 28 rounds of adversarial multi-agent review to zero findings.
+
+**Image build:** kaniko pod `manager-build-d4abd92` (ns `amd-oneclick-lablab`, ran on s-115), `Dockerfile.fast` (base `docker.m.daocloud.io/library/python:3.12-slim`, apt via Tsinghua mirror for **skopeo 1.18.0**, pip via Tsinghua). Context via `kubectl cp` into the init-container gate. Pushed to Harbor `10.5.10.89:1808/xinwei/amd-oneclick-manager:d4abd92`.
+
+**RBAC / PriorityClass (applied to LIVE cluster, not just repo yaml):**
+- Pre-created cluster-scoped `PriorityClass oneclick-preheat-low` (value -10, `preemptionPolicy: Never`).
+- Additively patched live ClusterRole `amd-oneclick-lablab-node-reader` with `scheduling.k8s.io/priorityclasses: [get, create]` (live role name differs from the repo beta yaml's `amd-oneclick-radeon-beta-node-reader`).
+
+**Deploy (two-stage, blast-radius contained):**
+- Stage 1: rolled image `d4abd92` with `HARBOR_MIRROR_ENABLED=false`, `PREHEAT_DS_ENABLED=false` (inert dark), `USER_CUSTOM_BUILDS_ENABLED=false`; mounted secret `kaniko-harbor-auth` config.json at `/harbor/config.json`. Manager 1/1, 0 restarts, healthy. Proves no regression from the new code.
+- Stage 2: flipped `HARBOR_MIRROR_ENABLED=true`, `PREHEAT_DS_ENABLED=true` in ConfigMap `amd-oneclick-lablab-config`, `rollout restart`. Manager 1/1, 0 restarts. Confirmed env + `/harbor/config.json` mount + skopeo present in the running pod.
+
+**Verification (e2e on live cluster, 123 eligible nodes):**
+- `harbor_ref()` rewrites correct across dockerhub-canonicalization / host-preserving ACR / idempotent already-Harbor.
+- **Mirror negative:** `mirror_to_harbor('docker.io/...busybox')` → clean `MirrorError` after retries (Docker Hub unreachable from manager), NOT a false ready.
+- **Mirror positive:** `mirror_to_harbor('docker.m.daocloud.io/library/busybox')` → copied into Harbor at host-preserving ref.
+- **Preheat:** DS `oneclick-preheat-5` (test harbor_mirror row) converged **123/123 numberReady**; `get_preheat_status` → ready/completed. DS spec verified: `priorityClassName=oneclick-preheat-low`, scoped tolerations (gpu NoSchedule + not-ready/unreachable 300s, NO Disk/Memory pressure), ephemeral-storage 64Mi req=lim, no amd.com/gpu, `automountServiceAccountToken=false`, hostname-pinned to 123 nodes, no imagePullSecrets.
+- **Delete parity:** `remove_preheat_ds(5)` → DS gone, image STILL in Harbor (skopeo inspect ok).
+- **Race guard:** `preheat_image_to_nodes(9999,...)` (no catalog row) correctly refused ("image deleted").
+- **Disable builds:** `POST /api/custom-images/build` (authed non-admin) → **403**; `/profile` renders `customBuildsEnabled=false`.
+- **Lab-proxy UX:** `_friendly_unavailable_response` on a ConnectError → **503** HTML page (not bare 500).
+- Test artifacts cleaned: build/inspect pods deleted, test row 5 removed (catalog back to [1,2,3,4]), test busybox deleted from Harbor (project xinwei clean, 5 real repos).
+
+**PRE snapshots:** `local-deploy-history/radeon-global/20260704-2053-harbor-mirror-PRE-{deploy,cm}.yaml` (image `...manager:6591ca3`).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:6591ca3` and set `HARBOR_MIRROR_ENABLED=false`,`PREHEAT_DS_ENABLED=false` in the ConfigMap (both default false anyway). To fully revert behavior, also set `USER_CUSTOM_BUILDS_ENABLED=true`.
+
+**TODO (separate):** replace Harbor admin creds in `kaniko-harbor-auth` with a scoped `xinwei` robot account.
