@@ -26,6 +26,76 @@ secrets.
 
 ---
 
+## 2026-07-04 — v2 proxy recovery, websocket token fix, NFS workspace rollout
+
+**Code commit:** `4f80868881283b9f293cbed3b04cd56d34384e2f`
+("Match template metadata before reusing pods"), built on top of:
+`d3b0c7c` ("Isolate template repos in persistent workspaces") and
+`1ee5dce` ("Fix instance proxy recovery and websocket auth").
+
+| Service / Port | Image (`:tag`) | Digest / ID | Local yaml + sha256 | Snapshot |
+|----------------|----------------|-------------|---------------------|----------|
+| v2 test / 30288 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-proxy-recover-ws-nfs-20260704-1224` | digest `sha256:752c0b288f1e6e3afbab7259738ecc773d8f04893176b9dcac7197d8fd491158` / id `sha256:1807fd60da326835d6d178977e751d316ee307f7209b5bad8ad611ee260332c3` | `k8s-manager-v2-test.local.yaml` sha256 `b87d845af37494be494b39d697642413d2bd93e8a4fbd9f2c822692a24d88535` | `local-deploy-history/v2-test/2026-07-04-1224-v2-test-proxy-recover-ws-nfs.local.yaml` |
+| v2 prod / 30088 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-proxy-recover-ws-nfs-20260704-1224` | digest `sha256:752c0b288f1e6e3afbab7259738ecc773d8f04893176b9dcac7197d8fd491158` / id `sha256:1807fd60da326835d6d178977e751d316ee307f7209b5bad8ad611ee260332c3` | `k8s-manager-v2-manager-only.local.yaml` sha256 `554c1d082f2142490d0bbae4faea8fd380287399040ce29a35264ef148ade06d` | `local-deploy-history/v2-manager-only/2026-07-04-1231-v2-prod-proxy-recover-ws-nfs.local.yaml` |
+
+**Changes:**
+- Jupyter websocket proxy now appends `NOTEBOOK_TOKEN` to upstream websocket
+  URLs when the browser request lacks a token, preventing Jupyter WS 403s after
+  the HTML/API load succeeds.
+- Shared `httpx.AsyncClient` for `/instances` and `/spaces` now logs
+  `PoolTimeout` explicitly, replaces the shared client, retries once, and closes
+  upstream streams in `finally` so one exhausted pool does not stall all instance
+  traffic.
+- NFS-backed persistent `/workspace` no longer reuses a single fixed
+  `/workspace/repo`: template repos are isolated under
+  `/workspace/template-repos/template-<id>/repo`, and a missing notebook/path
+  mismatch forces a re-clone.
+- Existing-pod reuse now compares image, instance type, template id, repo URL,
+  branch, and notebook path. A different template with the same image/type is no
+  longer silently reused during launch/delete races.
+- Production `amd-oneclick-manager-v2` now has per-user workspace NFS enabled:
+  `WORKSPACE_NFS_ENABLED=true`, prefix `oneclick-newprod-nfs-`, count `4`, size
+  `10Gi`, access mode `ReadWriteMany`, PVC prefix `oneclick-ws`.
+- The temporary production `main.py` ConfigMap hotfix mount
+  `amd-oneclick-v2-ws-token-hotfix` was removed because the WS token fix is now
+  part of the image.
+
+**Process note:** `v2 test` was first validated with the same final image. The
+`v2 prod` rollout was then patched live with the final image/NFS env/hotfix
+mount removal after test validation; the user later confirmed prod functionality
+was normal and requested no re-release. This entry and the snapshots above
+normalize the paper trail after that non-standard patch. The rule
+`.cursor/rules/deploy-ledger-commit.mdc` was tightened so future formal
+production releases must be manifest-backed before applying, except for explicit
+emergencies.
+
+**Verification:**
+- `radeon-test`: rollout `1/1 ready`; `https://radeon-test.anruicloud.com/health`
+  200; existing instance APIs for `u-1-258c504b` and `u-1292-add8c9f2`
+  returned 200; generated startup scripts for templates 257 and 320 use
+  `/workspace/template-repos/template-<id>/repo` and no longer contain fixed
+  `/workspace/repo`.
+- Proxy stress on `radeon-test` before the final NFS repo-isolation commit:
+  70 concurrent slow requests intentionally filled the 64-connection pool,
+  produced `Proxy pool timeout`, logged
+  `Replaced shared proxy client old_generation=1 new_generation=2`, and a real
+  Jupyter API request still returned 200 in ~0.72s. A 240-request / 40-concurrent
+  real Jupyter API run had 0 failures (p99 ~1.13s).
+- `radeon`: after rollout, `https://radeon.anruicloud.com/health` 200 and the
+  homepage 200; deployment `amd-oneclick-manager-v2` `1/1 ready`; new image and
+  NFS env present; `ws-token-hotfix` volume/mount absent. Recent proxy logs had
+  no `Traceback`, proxy 500, or pool timeout. Existing template preview 404s for
+  templates 878/942 are unrelated upstream template-source errors.
+
+**Rollback:**
+- Test: `kubectl -n default rollout undo deployment/amd-oneclick-manager-v2-test`.
+- Prod: `kubectl -n default rollout undo deployment/amd-oneclick-manager-v2`.
+  This restores the previous Deployment template, including the old image and
+  prior hotfix mount/env state. If rolling back only the NFS enablement, unset
+  the six `WORKSPACE_NFS_*` env vars instead of rolling back the image.
+
+---
+
 ## 2026-07-03 — new-prod NFS per-user REAL hard quota (route A: project quota + root_squash)
 
 **Scope:** storage layer only (NFS servers in new-prod cluster

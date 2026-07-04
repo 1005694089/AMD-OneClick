@@ -13,15 +13,21 @@ leave a committed, pushed paper trail. Do not skip this even under time pressure
 1. **Commit & push the deployed code FIRST.** The image must be built from a
    committed, pushed commit. Record that exact git SHA. Never deploy an image
    built from uncommitted working-tree changes without committing them.
-2. **Add a ledger entry** in `docs/ops/deploy-ledger.md` (this file IS tracked and
+2. **Prepare and snapshot the exact manifest before changing production-like services.**
+   For formal manager releases, do not use ad-hoc `kubectl patch`/`set env` as the
+   release mechanism unless it is explicitly an emergency mitigation. Generate or
+   update the `*.local.yaml`, save a `local-deploy-history/...` snapshot, and run
+   `kubectl diff` before apply. If an emergency patch is unavoidable, record that
+   fact in the ledger immediately and normalize back to a manifest-backed state.
+3. **Add a ledger entry** in `docs/ops/deploy-ledger.md` (this file IS tracked and
    MUST be committed & pushed). Each entry strictly records, per service:
    - code commit SHA (+ short message)
    - image full ref `:tag`, registry digest `sha256:…`, and image id `sha256:…`
    - local yaml file applied **and its `sha256`**
    - snapshot path under `local-deploy-history/`
    - verification result (health + key checks)
-3. **Snapshot** the applied manifest into `local-deploy-history/<service>/<ts>-<slug>.local.yaml`.
-4. **Commit & push** the ledger + any rule/doc/code changes before considering the
+4. **Snapshot** the applied manifest into `local-deploy-history/<service>/<ts>-<slug>.local.yaml`.
+5. **Commit & push** the ledger + any rule/doc/code changes before considering the
    deploy done.
 
 ## Never commit secrets
@@ -37,3 +43,12 @@ a separate (ignored) Secret manifest first.
 Run `kubectl --kubeconfig=cluster.yaml diff -f <manifest>` and confirm the only
 intended change (usually the image tag) — never blindly apply a stale local
 manifest, as local files may lag behind live config.
+
+## Production guardrail
+
+If a user asks for a formal production release, the order is mandatory:
+code commit/push → image build/push → node pre-import if needed → manifest
+snapshot + diff → apply/rollout → verification → ledger/rule/doc commit/push.
+Do not promote a test fix to `radeon.anruicloud.com` with a one-off patch and
+only afterwards reconstruct the manifest, except during an explicitly named
+emergency.
