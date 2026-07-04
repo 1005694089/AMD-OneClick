@@ -9,6 +9,7 @@ import re
 import base64
 import asyncio
 import concurrent.futures
+import functools
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -991,15 +992,29 @@ def _validate_oauth_state(request: Request, provider: str, state: str):
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
 
-def _instance_service_base(instance_id: str, port: Optional[int] = None) -> str:
-    try:
-        svc = k8s_client.core_v1.read_namespaced_service(
-            name=f"{instance_id}-svc",
-            namespace=k8s_client.namespace,
-        )
-    except Exception:
+# Proxy hot-path service-IP resolution is cached in k8s_client (see resolve_service_ip),
+# where the cache is invalidated at the single delete chokepoint (_delete_service) so every
+# delete path -- admin, bulk, idle-cleanup, scheduler reconcile -- drops the entry and a
+# reallocated ClusterIP can never route a tenant's traffic to another pod.
+def _invalidate_service_ip(instance_id: str) -> None:
+    k8s_client.invalidate_service_ip(instance_id)
+
+
+def _resolve_service_ip(instance_id: str) -> str:
+    ip = k8s_client.resolve_service_ip(instance_id)
+    if ip is None:
         raise HTTPException(status_code=404, detail="Instance service not found")
-    return f"http://{svc.spec.cluster_ip}:{port or settings.NOTEBOOK_PORT}"
+    return ip
+
+
+def _instance_service_base(instance_id: str, port: Optional[int] = None) -> str:
+    ip = _resolve_service_ip(instance_id)
+    return f"http://{ip}:{port or settings.NOTEBOOK_PORT}"
+
+
+async def _instance_service_base_async(instance_id: str, port: Optional[int] = None) -> str:
+    ip = await asyncio.to_thread(_resolve_service_ip, instance_id)
+    return f"http://{ip}:{port or settings.NOTEBOOK_PORT}"
 
 
 def _proxy_headers(headers) -> dict:
@@ -1045,6 +1060,12 @@ _preheat_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="preheat-op")
 _delete_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=2, thread_name_prefix="preheat-delete")
+# Launch pool: create_instance makes several sequential blocking k8s calls (~1-3s+ each)
+# incl. a global-locked NodePort scan. Running it on the event loop froze the whole
+# single-worker process (all users + proxied traffic + health probe) for the duration.
+# A dedicated bounded pool keeps launches off the loop without starving delete/reconcile.
+_launch_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="launch-op")
 
 
 async def _run_mirror_op(func, *args):
@@ -1060,6 +1081,11 @@ async def _run_image_op(func, *args):
 async def _run_delete_op(func, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_delete_executor, func, *args)
+
+
+async def _run_launch_op(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_launch_executor, func, *args)
 
 
 # In-flight mirror/preheat keys, so two concurrent admin edits of the same image can't interleave
@@ -1579,7 +1605,8 @@ async def _provision_notebook_instance(user: dict, email: str, image: str, param
     gpu_count = params["gpu_count"]
     pod_type = params.get("pod_type")
     instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
-    instance = k8s_client.create_instance(
+    instance = await _run_launch_op(functools.partial(
+        k8s_client.create_instance,
         email, image,
         instance_type=instance_type,
         gpu_count=gpu_count,
@@ -1587,7 +1614,8 @@ async def _provision_notebook_instance(user: dict, email: str, image: str, param
         resource_profile=params.get("resource_profile", "auto"),
         disk_size_gb=params.get("disk_size_gb"),
         pod_type=pod_type,
-    )
+    ))
+    _invalidate_service_ip(instance["id"])
     _stamp_launch(user, image, target_node or None)
     record_instance(
         user["id"], email, instance["id"], image, instance_type, gpu_count,
@@ -1613,7 +1641,8 @@ async def _provision_template_instance(user: dict, email: str, template: dict, p
     github_info = _template_github_info(template) or None
     template_instance_type = (template.get("instance_type") or "").strip() or "opencode"
     instance_id = f"u-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
-    instance = k8s_client.create_instance(
+    instance = await _run_launch_op(functools.partial(
+        k8s_client.create_instance,
         email,
         template["image"],
         instance_type=template_instance_type,
@@ -1628,7 +1657,8 @@ async def _provision_template_instance(user: dict, email: str, template: dict, p
         model_source=template.get("model_source"),
         ssh_enabled=bool(template.get("ssh_enabled")),
         ssh_public_key=user.get("ssh_public_key"),
-    )
+    ))
+    _invalidate_service_ip(instance["id"])
     _stamp_launch(user, template["image"], target_node or None)
     record_instance(
         user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count,
@@ -1802,7 +1832,7 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
                     message="No notebook instance found for this user",
                     email=email
                 )
-        instance = k8s_client.get_instance_by_id(active["instance_id"])
+        instance = await asyncio.to_thread(k8s_client.get_instance_by_id, active["instance_id"])
         
         if not instance:
             mark_instance_deleted(active["instance_id"])
@@ -1812,14 +1842,16 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
                 email=email
             )
         
-        status_details = k8s_client.get_pod_status_details(email, instance_id=active["instance_id"]) or {}
+        status_details = await asyncio.to_thread(
+            functools.partial(k8s_client.get_pod_status_details, email, instance_id=active["instance_id"])
+        ) or {}
         status = status_details.get("status")
         if status == "ready" and active.get("status") != "running":
             active = mark_instance_ready_for_billing(active["instance_id"]) or active
         
         if status not in ("ready", "failed") and not status_details.get("message"):
             try:
-                detail = k8s_client.get_startup_detail(active["instance_id"])
+                detail = await asyncio.to_thread(k8s_client.get_startup_detail, active["instance_id"])
             except Exception as e:
                 logger.debug("get_startup_detail failed for %s: %s", active["instance_id"], e)
                 detail = None
@@ -1876,6 +1908,7 @@ def _background_delete(instance_id: str) -> None:
     delete_instance_by_id polls until the pod is gone (and, for localcache, runs the out-of-pod
     flush — up to ~630s), so it MUST NOT run inline in an async handler. On success it stamps the
     row deleted; on any failure the row stays 'deleting' and reconcile_job finalizes it."""
+    _invalidate_service_ip(instance_id)
     try:
         k8s_client.delete_instance_by_id(instance_id, wait=True)
     except Exception as e:
@@ -2802,7 +2835,8 @@ async def launch_huggingface_demo_notebook(
 
     try:
         instance_id = f"hf-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
-        instance = k8s_client.create_instance(
+        instance = await _run_launch_op(functools.partial(
+            k8s_client.create_instance,
             email,
             image,
             instance_type="jupyter",
@@ -2812,7 +2846,7 @@ async def launch_huggingface_demo_notebook(
             resource_profile="auto",
             pod_type=pod_type,
             api_launched=True,
-        )
+        ))
         _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,
                         instance.get("node_port"), instance.get("opencode_node_port"),
@@ -3107,12 +3141,13 @@ async def create_github_notebook(
         # Use a placeholder email for GitHub notebooks
         email = f"github-{instance_id}@oneclick.local"
         
-        instance = k8s_client.create_instance(
+        instance = await _run_launch_op(functools.partial(
+            k8s_client.create_instance,
             email=email,
             image=settings.DEFAULT_IMAGE,
             github_info=github_info,
             custom_instance_id=instance_id
-        )
+        ))
         if settings.IMAGE_SERVICE_ENABLED:
             try:
                 node_name = k8s_client._select_target_gpu_node()
@@ -3250,7 +3285,7 @@ async def _handle_opencode_request(request: Request) -> Response:
             media_type="text/plain",
         )
 
-    target_base = _instance_service_base(instance_id, port=settings.OPENCODE_WEB_PORT)
+    target_base = await _instance_service_base_async(instance_id, port=settings.OPENCODE_WEB_PORT)
     target_url = f"{target_base}{request.url.path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
@@ -3311,7 +3346,7 @@ async def _handle_opencode_request(request: Request) -> Response:
 @app.api_route("/instances/{instance_id}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_instance_http(instance_id: str, path: str, request: Request):
     """Proxy HTTP traffic to a Jupyter instance using its path-based base_url."""
-    target_base = _instance_service_base(instance_id)
+    target_base = await _instance_service_base_async(instance_id)
     target_url = f"{target_base}/instances/{instance_id}/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
@@ -3361,7 +3396,7 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
     """Proxy WebSocket traffic for Jupyter terminals/kernels under /instances/<id>/."""
     await websocket.accept()
     try:
-        target_base = _instance_service_base(instance_id).replace("http://", "ws://")
+        target_base = (await _instance_service_base_async(instance_id)).replace("http://", "ws://")
         target_url = f"{target_base}/instances/{instance_id}/{path}"
         if websocket.url.query:
             target_url += f"?{websocket.url.query}"

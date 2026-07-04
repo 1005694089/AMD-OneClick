@@ -82,6 +82,16 @@ class K8sClient:
         self.core_v1 = client.CoreV1Api(api_client)
         self.apps_v1 = client.AppsV1Api(api_client)
         self.namespace = settings.K8S_NAMESPACE
+        # Proxy hot-path cache: ClusterIP per instance_id, short TTL. Invalidated at the
+        # single delete chokepoint (_delete_service) so EVERY delete path -- admin, bulk,
+        # idle-cleanup, and scheduler reconcile force-delete -- drops the entry, preventing
+        # a reallocated ClusterIP from routing a tenant's proxied traffic to another pod.
+        # _svc_ip_epoch guards the check-then-set race: an in-flight read that started before
+        # an invalidation must not repopulate a stale IP.
+        self._svc_ip_cache = {}
+        self._svc_ip_epoch = {}
+        self._svc_ip_ttl = 15.0
+        self._svc_ip_lock = threading.Lock()
         # Short-TTL cache for list_node(): target resolution + node selection call
         # _eligible_target_nodes on a hot path (every admin status poll, every launch). Caching the
         # API result for a few seconds removes the per-call apiserver hit that bites at 300 nodes.
@@ -3849,7 +3859,46 @@ exit 0
                 return False
             raise
 
+    def invalidate_service_ip(self, instance_id: str) -> None:
+        """Drop cached ClusterIP + bump epoch so any in-flight resolve cannot repopulate it.
+
+        The epoch must stay monotonic (never reset) so a slow read that snapshotted an
+        older generation can never match again and re-cache a stale IP. The epoch map is
+        naturally bounded: instance_ids are deterministic per user (u-<uid>-<hash>), so its
+        size tracks the distinct-user count, not request volume.
+        """
+        with self._svc_ip_lock:
+            self._svc_ip_cache.pop(instance_id, None)
+            self._svc_ip_epoch[instance_id] = self._svc_ip_epoch.get(instance_id, 0) + 1
+
+    def resolve_service_ip(self, instance_id: str):
+        """Return the ClusterIP for an instance Service, cached for a short TTL.
+
+        Blocking (reads the Service on a miss) -- callers on the event loop must
+        dispatch via asyncio.to_thread. Returns None if the Service is absent. The lock
+        makes the snapshot-epoch and the compare-then-write atomic against concurrent
+        invalidation from delete paths / other worker threads (the blocking k8s read
+        itself runs OUTSIDE the lock so it never serializes proxy traffic).
+        """
+        import time as _time
+        with self._svc_ip_lock:
+            hit = self._svc_ip_cache.get(instance_id)
+            if hit and hit[1] > _time.monotonic():
+                return hit[0]
+            epoch_at_read = self._svc_ip_epoch.get(instance_id, 0)
+        try:
+            svc = self.core_v1.read_namespaced_service(
+                name=f"{instance_id}-svc", namespace=self.namespace)
+        except Exception:
+            return None
+        ip = svc.spec.cluster_ip
+        with self._svc_ip_lock:
+            if self._svc_ip_epoch.get(instance_id, 0) == epoch_at_read:
+                self._svc_ip_cache[instance_id] = (ip, _time.monotonic() + self._svc_ip_ttl)
+        return ip
+
     def _delete_service(self, instance_id: str, grace_period_seconds: Optional[int] = None):
+        self.invalidate_service_ip(instance_id)
         body = None
         if grace_period_seconds is not None:
             body = client.V1DeleteOptions(grace_period_seconds=grace_period_seconds, propagation_policy="Background")
