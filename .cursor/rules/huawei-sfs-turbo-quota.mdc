@@ -1,0 +1,13 @@
+---
+description: Huawei SFS Turbo quota testing and credential handling
+alwaysApply: true
+---
+
+# Huawei SFS Turbo Quota Notes
+
+- Never commit or document Huawei Cloud AK/SK values. Use local `env.sh` only; it is git-ignored and should remain `chmod 600`.
+- In this repo, `new_cluster.yaml` currently has no StorageClass. The Huawei SFS Turbo classes are in `new_cluster_prod.yaml`.
+- `managed-nfs-storage-2..5` use `nfs.csi.k8s.io` with servers like `<share_id>.sfsturbo.internal` and `share: /`; historical PVs also reference `managed-nfs-storage-1`.
+- Kubernetes PVC `requests.storage` only becomes PV metadata for these SFS Turbo mounts. It does not enforce quota by itself; Pod `df` can show the whole ~100T filesystem.
+- For a dynamically provisioned PVC, read the PV's `spec.csi.volumeAttributes.server` and `subdir`. The SFSTurbo directory quota API should target `share_id=<server prefix>` and `path=/<subdir>`.
+- Verify quota by writing past the configured capacity from a test Pod and expecting `No space left on device`/EDQUOT, then clean up the test Pod/PVC.
