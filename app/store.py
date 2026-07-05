@@ -50,7 +50,7 @@ if DATABASE_URL.startswith("sqlite:///"):
     db_path = DATABASE_URL.removeprefix("sqlite:///")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=1800)
 metadata = MetaData()
 
 # Row-level locking (FOR UPDATE SKIP LOCKED) lets concurrent agents claim different pending jobs
