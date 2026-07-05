@@ -163,8 +163,39 @@ def cleanup_job():
     try:
         cleaned = []
         now = datetime.now(timezone.utc)
+        # Batch: one LIST of all managed pods instead of a per-instance GET just to
+        # discover which pods are gone/terminating. At 500 instances this replaces up to
+        # 500 blocking read_namespaced_pod calls per 60s cycle with a single list call.
+        # The expensive, TCP-readiness-based get_pod_status_details is still called per
+        # instance for pods that ARE present and not terminating, so the billing "ready"
+        # gate is byte-for-byte unchanged; the LIST only lets us cheaply short-circuit the
+        # terminating case (skip billing without a GET). Absence in the snapshot still falls
+        # through to the authoritative GET, so a just-launched pod is never wrongly deleted.
+        try:
+            pod_index = {}
+            for ps in k8s_client.list_managed_pod_states():
+                iid = ps["instance_id"]
+                prev = pod_index.get(iid)
+                # On duplicate instance_id (pod-recreate race), prefer the live pod over a
+                # terminating one so a live replacement is never shadowed by its dying predecessor.
+                if prev is None or (prev.get("terminating") and not ps.get("terminating")):
+                    pod_index[iid] = ps
+        except Exception as e:
+            # If the LIST fails, fall back to the original per-instance path (index empty
+            # means every instance takes the GET branch) rather than mis-billing.
+            logger.warning("cleanup_job: list_managed_pod_states failed (%s); per-instance fallback", e)
+            pod_index = None
         for record in list_active_instances():
             try:
+                if pod_index is not None:
+                    ps = pod_index.get(record["instance_id"])
+                    # Only the terminating fast-path skips the authoritative GET (reconcile_job
+                    # finalizes terminating pods and billing is skipped for them regardless).
+                    # Absence in the single pre-loop snapshot is NOT proof of deletion — a pod
+                    # launched during/after the LIST would be missing yet live — so we fall
+                    # through to the fresh per-instance GET, which alone can mark_instance_deleted.
+                    if ps is not None and ps.get("terminating"):
+                        continue
                 status_details = k8s_client.get_pod_status_details(record["email"], instance_id=record["instance_id"])
                 if status_details is None:
                     mark_instance_deleted(record["instance_id"])
@@ -522,6 +553,19 @@ def reconcile_job():
             logger.warning(
                 "Reconcile: %d orphan candidate(s) but active DB set is EMPTY; skipping orphan reclamation (guard)",
                 len(orphan_candidates),
+            )
+            orphan_candidates = []
+        # Proportional guard: the empty-active_ids check above only catches TOTAL DB
+        # blindness. A PARTIAL/stale active_ids read (replica lag, mis-scoped query)
+        # can make a large fraction of live pods look orphaned while active_ids is
+        # still non-empty — invisible to that guard and, since the delete cap was
+        # raised, now able to reclaim many healthy pods. If orphans exceed half of all
+        # managed cluster pods, treat it as a systemic fault and refuse the whole batch.
+        if orphan_candidates and cluster_ids and len(orphan_candidates) > (len(cluster_ids) // 2):
+            logger.error(
+                "Reconcile: %d orphan candidate(s) exceed 50%% of %d cluster pods; refusing (systemic-fault guard). ids=%s",
+                len(orphan_candidates), len(cluster_ids),
+                [p["instance_id"] for p in orphan_candidates],
             )
             orphan_candidates = []
         if len(orphan_candidates) > settings.RECONCILE_MAX_DELETES_PER_CYCLE:

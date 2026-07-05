@@ -34,25 +34,31 @@ _node_port_lock = threading.Lock()
 # full node of single-GPU pods still bin-packs (8x8 CPU = 64 <= 128; 8x48 GiB = 384 <= 1007).
 RESOURCE_PROFILES = {
     "standard": {
-        "label": "16 CPU / 110Gi memory",
+        "label": "16 CPU / 55Gi memory",
         "cpu_request": "8",
         "cpu_limit": "16",
         "memory_request": "48Gi",
-        "memory_limit": "110Gi",
+        # Real GPU nodes are 503.5GiB / 8 GPU = 62.9GiB/GPU. 8 x 110Gi (old) = 880Gi >> 503Gi
+        # -> ~1.75x memory oversubscription and an OOM tail under GPU-packed load. Limit set to
+        # ~88% of the real per-GPU share so 8 single-GPU pods fit node RAM with system headroom.
+        # Requests are unchanged so scheduler bin-packing (GPU-bound) is unaffected.
+        "memory_limit": "55Gi",
     },
     "large": {
-        "label": "32 CPU / 220Gi memory",
+        "label": "32 CPU / 110Gi memory",
         "cpu_request": "16",
         "cpu_limit": "32",
         "memory_request": "96Gi",
-        "memory_limit": "220Gi",
+        # 2 GPU -> 2 x 55Gi
+        "memory_limit": "110Gi",
     },
     "xlarge": {
-        "label": "64 CPU / 440Gi memory",
+        "label": "64 CPU / 220Gi memory",
         "cpu_request": "32",
         "cpu_limit": "64",
         "memory_request": "192Gi",
-        "memory_limit": "440Gi",
+        # 4 GPU -> 4 x 55Gi
+        "memory_limit": "220Gi",
     },
 }
 

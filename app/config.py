@@ -645,8 +645,12 @@ class Settings:
     RECONCILE_INTERVAL_SECONDS: int = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "60"))
     # Circuit breaker: if a single cycle would reclaim more orphans than this,
     # refuse and alert instead of mass-deleting (protects against a logic/DB
-    # fault that misclassifies healthy instances as orphans).
-    RECONCILE_MAX_DELETES_PER_CYCLE: int = int(os.getenv("RECONCILE_MAX_DELETES_PER_CYCLE", "10"))
+    # fault that misclassifies healthy instances as orphans). Raised 10->50 after
+    # the Postgres cutover removed the SQLite write bottleneck the low cap partly
+    # protected: at 500-user scale a legitimate delete burst should not be throttled
+    # to 600/hr, while 50/cycle still trips well below a catastrophic "hundreds look
+    # orphaned" fault. Override via env for incident response.
+    RECONCILE_MAX_DELETES_PER_CYCLE: int = int(os.getenv("RECONCILE_MAX_DELETES_PER_CYCLE", "50"))
     # A pod carrying our label but with no matching active DB record for at least
     # this long is treated as an orphan (e.g. a rogue/miner pod) and reclaimed.
     ORPHAN_GRACE_SECONDS: int = int(os.getenv("ORPHAN_GRACE_SECONDS", "300"))
