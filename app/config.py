@@ -389,6 +389,14 @@ class Settings:
     LEADER_LEASE_NAME: str = os.getenv("LEADER_LEASE_NAME", "amd-oneclick-manager-leader")
     LEADER_LEASE_DURATION_SECONDS: int = int(os.getenv("LEADER_LEASE_DURATION_SECONDS", "15"))
     LEADER_LEASE_RENEW_SECONDS: float = float(os.getenv("LEADER_LEASE_RENEW_SECONDS", "5"))
+    # Fencing deadline: a process stops ACTING as leader once its last successful lease renew is
+    # older than this, EVEN IF its cached _is_leader flag is still True (e.g. the renew daemon
+    # thread was starved of CPU under load and never got to self-demote). MUST be strictly less
+    # than LEADER_LEASE_DURATION_SECONDS: peers declare the lease expired at renew_time+duration,
+    # so an old leader must abdicate acting at a strictly earlier instant to guarantee at most one
+    # active leader (the gap absorbs clock skew + peer read/act latency). Mirrors client-go's
+    # RenewDeadline(10s) < LeaseDuration(15s).
+    LEADER_LEASE_RENEW_DEADLINE_SECONDS: float = float(os.getenv("LEADER_LEASE_RENEW_DEADLINE_SECONDS", "10"))
     OAUTH_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_CONNECT_TIMEOUT_SECONDS", "5"))
     OAUTH_READ_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_READ_TIMEOUT_SECONDS", "15"))
     SLOW_REQUEST_THRESHOLD_SECONDS: float = float(os.getenv("SLOW_REQUEST_THRESHOLD_SECONDS", "2"))

@@ -43,6 +43,15 @@ class LeaderElector:
         # first blip (which would briefly leave zero leaders). Only a confirmed loss (a peer holds
         # a fresh lease) flips us to follower.
         self._last_renew_ok = None
+        # Monotonic counterpart of _last_renew_ok, used for the is_leader() time fence. Wall
+        # clock (datetime.now) can be stepped backward by NTP/VM-resume, which would DEFEAT a
+        # wall-clock fence (age computes too small -> a stale leader keeps acting). monotonic()
+        # never goes backward, so the fence holds regardless of clock discipline.
+        self._last_renew_ok_mono = None
+        # True only on the start() fail-safe (k8s client uninitializable): act as sole leader
+        # without a lease. Explicit flag so the fence's "no renew timestamp" case can mean
+        # "NOT leader" everywhere else, never an accidental unconditional bypass.
+        self._fail_safe_leader = False
 
     @property
     def identity(self) -> str:
@@ -52,7 +61,40 @@ class LeaderElector:
         # Election disabled -> always act as leader (single-replica / dev / tests).
         if not settings.LEADER_ELECTION_ENABLED:
             return True
-        return self._is_leader
+        if not self._is_leader:
+            return False
+        # Explicit fail-safe (k8s client could not be initialized in start()): no lease exists to
+        # contend, so act as the sole leader. Intended single-process behaviour.
+        if self._fail_safe_leader:
+            return True
+        # Time fence: the cached _is_leader flag is set once by the renew daemon thread and only
+        # cleared when that thread RUNS and observes a loss. Under CPU starvation (exactly what a
+        # load spike causes) the thread may not run for many seconds, leaving _is_leader stale-True
+        # while a peer has already taken over the expired lease. Independently cap how long we act:
+        # refuse once our last successful renew is older than the fencing deadline (strictly < lease
+        # duration, so we stop acting before any peer is entitled to take over). MONOTONIC clock so a
+        # wall-clock step-back cannot hold the fence open.
+        last_mono = self._last_renew_ok_mono
+        if last_mono is None:
+            # _is_leader True, no successful renew recorded, and not the fail-safe path: a torn/unknown
+            # state (e.g. observed mid-transition). Fail safe toward NOT leader; self-heals next renew.
+            return False
+        age = time.monotonic() - last_mono
+        if age > float(settings.LEADER_LEASE_RENEW_DEADLINE_SECONDS):
+            logger.warning(
+                "Leader fence: last renew %.1fs ago exceeds deadline %.1fs; NOT acting as leader",
+                age, float(settings.LEADER_LEASE_RENEW_DEADLINE_SECONDS),
+            )
+            return False
+        return True
+
+    def _mark_leader(self, now):
+        # Record renew timestamps BEFORE flipping the flag: a reader that observes _is_leader True is
+        # then guaranteed (CPython atomic attribute writes + GIL program order) to also see a fresh
+        # renew timestamp, so is_leader() never sees a torn True/None window.
+        self._last_renew_ok = now
+        self._last_renew_ok_mono = time.monotonic()
+        self._is_leader = True
 
     def start(self):
         if not settings.LEADER_ELECTION_ENABLED:
@@ -70,6 +112,7 @@ class LeaderElector:
             # Can't reach k8s — fail SAFE toward single-leader behaviour rather than zero leaders.
             logger.warning("Leader election init failed (%s); acting as leader", exc)
             self._is_leader = True
+            self._fail_safe_leader = True
             return
         self._thread = threading.Thread(target=self._run, name="leader-elector", daemon=True)
         self._thread.start()
@@ -103,8 +146,8 @@ class LeaderElector:
                 duration = float(settings.LEADER_LEASE_DURATION_SECONDS)
                 if (
                     self._is_leader
-                    and self._last_renew_ok is not None
-                    and (_now() - self._last_renew_ok).total_seconds() < duration
+                    and self._last_renew_ok_mono is not None
+                    and (time.monotonic() - self._last_renew_ok_mono) < duration
                 ):
                     logger.warning("Leader renew transient error (holding lease): %s", exc)
                 else:
@@ -141,8 +184,7 @@ class LeaderElector:
             )
             try:
                 self._coord.create_namespaced_lease(self._namespace, body)
-                self._is_leader = True
-                self._last_renew_ok = now
+                self._mark_leader(now)
                 return
             except ApiException as e:
                 if e.status == 409:
@@ -170,8 +212,7 @@ class LeaderElector:
             spec.renew_time = now
             spec.lease_duration_seconds = duration
             self._coord.replace_namespaced_lease(name, self._namespace, lease)
-            self._is_leader = True
-            self._last_renew_ok = now
+            self._mark_leader(now)
         elif holder is None or expired:
             # Vacant or stale: take over.
             spec.holder_identity = self._identity
@@ -179,8 +220,7 @@ class LeaderElector:
             spec.renew_time = now
             spec.lease_duration_seconds = duration
             self._coord.replace_namespaced_lease(name, self._namespace, lease)
-            self._is_leader = True
-            self._last_renew_ok = now
+            self._mark_leader(now)
         else:
             # Someone else holds a fresh lease: confirmed loss.
             self._is_leader = False

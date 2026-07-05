@@ -185,8 +185,12 @@ def cleanup_job():
             # means every instance takes the GET branch) rather than mis-billing.
             logger.warning("cleanup_job: list_managed_pod_states failed (%s); per-instance fallback", e)
             pod_index = None
+        from .leader import is_leader
         for record in list_active_instances():
             try:
+                if not is_leader():
+                    logger.warning("cleanup_job: lost leadership mid-cycle; stopping billing sweep")
+                    break
                 if pod_index is not None:
                     ps = pod_index.get(record["instance_id"])
                     # Only the terminating fast-path skips the authoritative GET (reconcile_job
@@ -577,13 +581,24 @@ def reconcile_job():
             )
             orphan_candidates = []
 
+        from .leader import is_leader
+        if not is_leader():
+            logger.warning("Reconcile: not leader after classification; skipping all destructive actions this cycle")
+            return
+
         orphans_removed = 0
         stuck_forced = 0
         for p in stuck:
+            if not is_leader():
+                logger.warning("Reconcile: lost leadership mid stuck-pod loop; stopping (forced=%d)", stuck_forced)
+                break
             logger.warning("Reconcile: force-deleting stuck-terminating pod %s (%ss)", p["instance_id"], p.get("terminating_seconds"))
             k8s_client._delete_pod(p["instance_id"], grace_period_seconds=0)
             stuck_forced += 1
         for p in orphan_candidates:
+            if not is_leader():
+                logger.warning("Reconcile: lost leadership mid orphan loop; stopping (removed=%d)", orphans_removed)
+                break
             logger.warning(
                 "Reconcile: reclaiming orphan pod %s (email=%s age=%ss, no active DB record)",
                 p["instance_id"], p.get("email"), p["age_seconds"],
@@ -605,6 +620,9 @@ def reconcile_job():
             )
             terminal = terminal[:settings.RECONCILE_MAX_DELETES_PER_CYCLE]
         for p in terminal:
+            if not is_leader():
+                logger.warning("Reconcile: lost leadership mid terminal loop; stopping (removed=%d)", terminal_removed)
+                break
             logger.warning(
                 "Reconcile: reclaiming terminal/broken pod %s (phase=%s waiting=%s restarts=%s age=%ss)",
                 p["instance_id"], p["phase"], p.get("waiting_reason"), p.get("restart_count"), p["age_seconds"],
@@ -615,6 +633,9 @@ def reconcile_job():
 
         db_marked = 0
         for instance_id in gone:
+            if not is_leader():
+                logger.warning("Reconcile: lost leadership mid gone loop; stopping (marked=%d)", db_marked)
+                break
             mark_instance_deleted(instance_id)
             # Out-of-band pod loss (node death / manual delete / eviction) bypasses
             # delete_instance_by_id, so workspace_cache_state would stay stuck at "running" and its
