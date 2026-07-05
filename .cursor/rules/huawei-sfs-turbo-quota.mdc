@@ -7,7 +7,9 @@ alwaysApply: true
 
 - Never commit or document Huawei Cloud AK/SK values. Use local `env.sh` only; it is git-ignored and should remain `chmod 600`.
 - In this repo, `new_cluster.yaml` currently has no StorageClass. The Huawei SFS Turbo classes are in `new_cluster_prod.yaml`.
+- CIDC SFS Turbo API uses region `CIDC-RP-12`, project id `f7878b039c0a4f92a10edf20e323200c`, and endpoint `https://sfs-turbo.cidc-rp-12.joint.cmecloud.cn`.
 - `managed-nfs-storage-2..5` use `nfs.csi.k8s.io` with servers like `<share_id>.sfsturbo.internal` and `share: /`; historical PVs also reference `managed-nfs-storage-1`.
 - Kubernetes PVC `requests.storage` only becomes PV metadata for these SFS Turbo mounts. It does not enforce quota by itself; Pod `df` can show the whole ~100T filesystem.
 - For a dynamically provisioned PVC, read the PV's `spec.csi.volumeAttributes.server` and `subdir`. The SFSTurbo directory quota API should target `share_id=<server prefix>` and `path=/<subdir>`.
-- Verify quota by writing past the configured capacity from a test Pod and expecting `No space left on device`/EDQUOT, then clean up the test Pod/PVC.
+- Verified on 2026-07-05: setting a 128MB quota on `managed-nfs-storage-2` changed Pod `df` from ~101T to 128M, and an over-limit write failed with `Disk quota exceeded`.
+- Verify quota by writing past the configured capacity from a test Pod and expecting `No space left on device`/EDQUOT, then delete files before deleting the directory quota; SFS Turbo refuses deleting quota on a non-empty path.
