@@ -578,6 +578,11 @@ def _instance_public_url(request: Request, instance_id: str, notebook_path: Opti
     return f"{_request_public_origin(request)}{path}?token={settings.NOTEBOOK_TOKEN}"
 
 
+# Curated port a hackathon user's own Streamlit app must run on to be reachable via
+# the Spaces proxy (see APP_PORTS / SPACES_PATH_PREFIX in config.py).
+STREAMLIT_APP_PORT = settings.APP_PORTS.get("streamlit", 8501)
+
+
 def _ready_instance_url(request: Request, instance: Optional[dict], status: Optional[str]) -> Optional[str]:
     if status != "ready" or not instance:
         return None
@@ -2943,6 +2948,19 @@ async def huggingface_demo_notebook_status(
             if detail:
                 message = detail
 
+        streamlit_url = None
+        # Streamlit-via-/spaces/ is a hackathon-only capability (matches the
+        # jupyter-server-proxy install + Streamlit env auto-config in k8s_client, both
+        # scoped to pod_type=hackathon). Probe only once ready — there is nothing to
+        # find before then, and the pod may not even have an IP yet.
+        if status == "ready" and (active.get("pod_type") or "").strip().lower() == "hackathon":
+            try:
+                if await asyncio.to_thread(k8s_client.is_pod_port_live, instance["id"], STREAMLIT_APP_PORT, 0.5):
+                    origin = _request_public_origin(request)
+                    streamlit_url = f"{origin}{settings.SPACES_PATH_PREFIX}/{instance['id']}/{STREAMLIT_APP_PORT}/"
+            except Exception as e:
+                logger.debug("streamlit probe failed for %s: %s", instance["id"], e)
+
         return NotebookStatus(
             status=status or "unknown",
             message=message,
@@ -2952,6 +2970,7 @@ async def huggingface_demo_notebook_status(
             opencode_password=instance.get("opencode_password"),
             email=email,
             instance_id=instance["id"],
+            streamlit_url=streamlit_url,
         )
     except Exception as e:
         logger.error("Error checking Hugging Face demo notebook for %s: %s", email, e)

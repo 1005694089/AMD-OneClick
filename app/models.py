@@ -200,6 +200,9 @@ class NotebookStatus(BaseModel):
     api_base_url: Optional[str] = None
     api_key: Optional[str] = None
     api_model: Optional[str] = None
+    # /spaces/<id>/8501/ once a hackathon user's Streamlit app is live; None otherwise
+    # (never set for non-hackathon pod_type, even if something is listening on 8501).
+    streamlit_url: Optional[str] = None
     ssh_host: Optional[str] = None
     ssh_port: Optional[int] = None
     ssh_username: Optional[str] = None

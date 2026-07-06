@@ -4623,7 +4623,25 @@ exit 0
         except Exception as e:
             logger.debug(f"TCP health check failed for {host}:{port}: {e}")
             return False
-    
+
+    def is_pod_port_live(self, instance_id: str, port: int, timeout: float = 0.5) -> bool:
+        """True if something is accepting TCP connections on the pod's <port> right now.
+
+        Used to detect a user-started app (e.g. `streamlit run` on the curated 8501 port)
+        that the manager never launched itself, so there is no readiness probe for it —
+        this is a point-in-time check, not a cached/gated status. Short default timeout
+        since this is called from a request path (status polling) and a closed port
+        returns immediately (RST); the timeout only bounds a dropped-packet edge case.
+        """
+        try:
+            pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+        except ApiException:
+            return False
+        pod_ip = pod.status.pod_ip if pod and pod.status else None
+        if not pod_ip:
+            return False
+        return self._check_tcp_ready(pod_ip, port, timeout=timeout)
+
     def check_pod_activity(self, email: str, instance_id: Optional[str] = None) -> Optional[datetime]:
         """Check last activity of a pod by examining logs.
 

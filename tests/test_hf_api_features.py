@@ -52,6 +52,11 @@ class _FakeK8s:
     def __init__(self):
         self.created = []
         self.existing_ids = {}
+        # Status-poll stand-ins (huggingface_demo_notebook_status).
+        self.pod_status = "ready"
+        self.startup_detail = None
+        self.live_ports = set()  # instance_ids for which is_pod_port_live() returns True
+        self.port_probes = []  # (instance_id, port) log of every is_pod_port_live() call
 
     def get_instance_by_id(self, instance_id):
         return self.existing_ids.get(instance_id)
@@ -66,6 +71,16 @@ class _FakeK8s:
 
     def delete_instance_by_id(self, instance_id):
         return True
+
+    def get_pod_status(self, email, instance_id=None):
+        return self.pod_status
+
+    def get_startup_detail(self, instance_id):
+        return self.startup_detail
+
+    def is_pod_port_live(self, instance_id, port, timeout=0.5):
+        self.port_probes.append((instance_id, port))
+        return instance_id in self.live_ports
 
 
 class HFLaunchTestBase(unittest.IsolatedAsyncioTestCase):
@@ -429,6 +444,71 @@ class Feature5PodType(HFLaunchTestBase):
             main_module._normalize_pod_type("nope")
         self.assertIsNone(main_module._normalize_pod_type(""))
         self.assertEqual(main_module._normalize_pod_type(" Workshop "), "workshop")
+
+
+class FeatureStreamlitUrl(HFLaunchTestBase):
+    """Status poll surfaces streamlit_url only for pod_type=hackathon once 8501 is live."""
+
+    def _launch_and_activate(self, user_name, pod_type=None):
+        body = {"user_name": user_name, "image": "registry/image:tag"}
+        if pod_type is not None:
+            body["pod_type"] = pod_type
+        resp = self.client.post("/api/huggingface/notebooks", json=body, headers=BEARER)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        instance_id = self.fake.created[-1]["custom_instance_id"]
+        # get_instance_by_id must resolve the instance for the status poll to proceed.
+        self.fake.existing_ids[instance_id] = {"id": instance_id}
+        return instance_id
+
+    def _poll(self, user_name):
+        resp = self.client.get(
+            "/api/huggingface/notebooks/current",
+            params={"user_name": user_name}, headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp.json()
+
+    def test_hackathon_ready_and_live_returns_streamlit_url(self):
+        instance_id = self._launch_and_activate("sl-hack-live", pod_type="hackathon")
+        self.fake.pod_status = "ready"
+        self.fake.live_ports = {instance_id}
+        body = self._poll("sl-hack-live")
+        self.assertEqual(body["streamlit_url"], f"http://testserver/spaces/{instance_id}/8501/")
+        self.assertIn((instance_id, main_module.STREAMLIT_APP_PORT), self.fake.port_probes)
+        # The jupyter url is unaffected by the new field.
+        self.assertIn(f"/instances/{instance_id}/lab", body["url"])
+
+    def test_hackathon_ready_but_not_live_returns_none(self):
+        instance_id = self._launch_and_activate("sl-hack-notlive", pod_type="hackathon")
+        self.fake.pod_status = "ready"
+        self.fake.live_ports = set()  # nothing listening on 8501 yet
+        body = self._poll("sl-hack-notlive")
+        self.assertIsNone(body["streamlit_url"])
+        self.assertIn((instance_id, main_module.STREAMLIT_APP_PORT), self.fake.port_probes)
+
+    def test_workshop_pod_type_never_gets_streamlit_url(self):
+        instance_id = self._launch_and_activate("sl-workshop", pod_type="workshop")
+        self.fake.pod_status = "ready"
+        self.fake.live_ports = {instance_id}  # even with something listening on 8501...
+        body = self._poll("sl-workshop")
+        self.assertIsNone(body["streamlit_url"])  # ...the non-hackathon gate wins
+        self.assertEqual(self.fake.port_probes, [])  # and the probe is never even attempted
+
+    def test_no_pod_type_never_gets_streamlit_url(self):
+        instance_id = self._launch_and_activate("sl-notag", pod_type=None)
+        self.fake.pod_status = "ready"
+        self.fake.live_ports = {instance_id}
+        body = self._poll("sl-notag")
+        self.assertIsNone(body["streamlit_url"])
+        self.assertEqual(self.fake.port_probes, [])
+
+    def test_hackathon_not_ready_skips_probe(self):
+        instance_id = self._launch_and_activate("sl-hack-pending", pod_type="hackathon")
+        self.fake.pod_status = "pending"
+        self.fake.live_ports = {instance_id}  # would be live, but status isn't ready yet
+        body = self._poll("sl-hack-pending")
+        self.assertIsNone(body["streamlit_url"])
+        self.assertEqual(self.fake.port_probes, [])
 
 
 class Feature2And6Endpoints(unittest.TestCase):

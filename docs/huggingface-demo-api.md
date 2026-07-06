@@ -218,6 +218,55 @@ Example ready response:
 }
 ```
 
+For `pod_type: "hackathon"` instances, once `status` is `ready` the response also carries a
+`streamlit_url` field — see **Run A Streamlit App** below.
+
+## Run A Streamlit App (Hackathon Pods Only)
+
+Hackathon instances (`pod_type: "hackathon"` at launch) can also run a user-started Streamlit
+app alongside Jupyter, reachable through the same reverse proxy ComfyUI/Gradio app instances use
+(`/spaces/<instance_id>/<port>/`). This is opt-in from inside the notebook — the manager does not
+start Streamlit for you, it only prepares the pod so a bare `streamlit run` works and, once the
+app answers on its port, tells you the URL.
+
+**From a JupyterLab terminal in a hackathon instance:**
+
+```bash
+pip install streamlit   # if not already present in the image
+streamlit run app.py --server.port 8501 --server.headless true \
+  --server.enableCORS false --server.enableXsrfProtection false --server.fileWatcherType poll
+```
+
+Notes:
+
+- The app **must** listen on port **8501** — it is the only port the proxy and the status API
+  recognize for Streamlit. A different `--server.port` will not be reachable or reported.
+- Hackathon pods pre-set `STREAMLIT_SERVER_ADDRESS`, `STREAMLIT_SERVER_PORT`, and
+  `STREAMLIT_SERVER_BASE_URL_PATH` in the environment, so the flags above are for
+  belt-and-suspenders clarity — a bare `streamlit run app.py` already binds correctly and serves
+  under the right base path.
+- `--server.fileWatcherType poll` avoids inotify issues on the notebook's mounted filesystem;
+  keep it if your app hot-reloads on file changes.
+
+**From your integration:** poll `GET /api/huggingface/notebooks/current` as usual. Once Streamlit
+is actually accepting connections, the response includes:
+
+```json
+{
+  "status": "ready",
+  "streamlit_url": "https://radeon-global.anruicloud.com/spaces/hf-15-1cd747c1/8501/"
+}
+```
+
+- `streamlit_url` is `null`/absent until the app is actually listening on 8501 — it is a live
+  check on every poll, not a static URL derived from the instance id. It can flip back to `null`
+  if the app stops (e.g. the user kills it or an error crashes the process).
+- `streamlit_url` is **only ever populated for `pod_type: "hackathon"`** instances. Workshop,
+  one-click, and untagged instances never get this field, even if something happens to be
+  listening on 8501 inside them.
+- The trailing `/` matters — Streamlit's static assets and its live-update WebSocket are resolved
+  relative to that base path. Always open/redirect to the URL exactly as returned.
+
 ## Delete A Notebook
 
 ```http
@@ -265,6 +314,7 @@ export type NotebookStatus = {
   url?: string;
   email?: string;
   instance_id?: string;
+  streamlit_url?: string; // pod_type "hackathon" only; set once the user's Streamlit app (port 8501) is live, else omitted/null
 };
 
 export type DestroyResponse = {
@@ -302,3 +352,4 @@ export type GpuAvailability = {
 - If status is `failed`, show an error and offer retry or cleanup.
 - If the notebook URL opens but the expected `.ipynb` is missing, report it as a backend download issue. Frontend clients should not retry direct Hugging Face downloads themselves.
 - Always call delete when the user explicitly ends the demo session.
+- `streamlit_url` only ever appears for `pod_type: "hackathon"` launches, and only once the user has actually started Streamlit on port 8501 inside the instance — keep polling status and show/hide a "Open Streamlit app" action based on whether the field is present, rather than assuming it will show up right after launch.
