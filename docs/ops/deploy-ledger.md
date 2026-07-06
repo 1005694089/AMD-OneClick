@@ -24,7 +24,52 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-03 (latest) - radeon-global: Approach B (hide durable NFS from user pods) + quota guard fix
+## 2026-07-06 (latest) - radeon-global: HF unlimited_credits launch flag + startup-migration race hardening
+
+**Code:** `prod/radeon-global` commits `b3522da` (feature) + `e4ecfac` (migration lock). Committed
+locally, **NOT yet pushed to origin** (operator handles the push; origin still at `7dd5132`). Deployed
+image built from `e4ecfac`.
+
+**What shipped:**
+- HF demo API `unlimited_credits` launch flag: `POST /api/huggingface/notebooks` accepts
+  `unlimited_credits: true`; the demo user is marked unlimited (sticky boolean `users.unlimited_credits`)
+  and `charge_usage_unit` records a 0-credit usage row without decrementing, so the balance freezes at
+  the one-time grant (10). Billing-only — the 8h idle reaper still applies. The flag is persisted only
+  AFTER launch validation, so a rejected launch (active instance / credits gate) leaves no side effect.
+  (Caller-controlled by design: auth is a single shared bearer token with no privilege tiers.)
+- Migration hardening (`e4ecfac`): `ensure_schema_columns` now takes a transaction-scoped
+  `pg_advisory_xact_lock` before the additive ALTERs. The first rollout (`b3522da`) exposed a
+  pre-existing race — under `--workers 2` both workers ran the new `unlimited_credits` ALTER
+  concurrently, one crashed with `DuplicateColumn`, and one replica restarted once before self-healing.
+  The lock serializes migrators so future additive columns roll out cleanly.
+
+**Deploy method (fast kaniko):** build FROM the currently-deployed image + source-only `COPY`
+app/templates/static (no pip; ~3-4s), push to Harbor, `kubectl set image`.
+- `b3522da`: `10.5.10.89:1808/xinwei/amd-oneclick-manager:b3522da` @ `sha256:4d119c07a4337df45979484b5c94ff0c830d813f4fa38fba165a9d83325c2af6` (FROM `fence1-w2`).
+- `e4ecfac` (DEPLOYED): `10.5.10.89:1808/xinwei/amd-oneclick-manager:e4ecfac` @ `sha256:b336580221d171dc29aa9ae90b2d551d4676059f56225cedeb21ee117b7d35c4` (FROM `b3522da`).
+
+**Migration:** `users.unlimited_credits BOOLEAN NOT NULL DEFAULT FALSE` added to live Postgres (verified
+present). Additive/backward-compatible; existing rows default false.
+
+**Rollout:** `b3522da` self-healed after 1 restart (the race above); `e4ecfac` clean — both replicas
+1/1, **0 restarts**.
+
+**E2E verification (live, throwaway user `zzz-e2e-unlimited-verify`, fully cleaned up):**
+- `POST /api/huggingface/notebooks {unlimited_credits:true}` → `200 allocating` (instance `hf-31-...`).
+- Live DB: user `unlimited_credits=True`, `credits=10`.
+- `charge_usage_unit` x2 (gpu_count=4) → both `charged`, credits `10 → 10` (unchanged), usage rows
+  written with `credits=0` (billing skipped / balance frozen).
+- `DELETE` → 200 (GPU released). Throwaway user + all rows wiped; `/health` 200; both pods 0 restarts.
+
+**PRE snapshot:** `local-deploy-history/radeon-global/20260706-1356-b3522da-unlimited-PRE-deploy.yaml`
+sha256 `6454276d63d45e46b9e89d04cf1876322ebe4a9eb6c87355b36cad8324f0dfb3` (image `fence1-w2`).
+**APPLIED snapshot:** `local-deploy-history/radeon-global/20260706-1410-e4ecfac-unlimited-APPLIED-deploy.yaml`
+sha256 `1f79de3c5a3fc3d8acc4b239d9e874f60130ac4c067305df2f4575f4d75071af`.
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:fence1-w2` (the new column is additive, so the old
+image runs fine against the migrated DB).
+
+## 2026-07-03 - radeon-global: Approach B (hide durable NFS from user pods) + quota guard fix
 
 **Code:** copy project `~/AMD-OneClick-workspaceB` branch `feature/workspace-approach-b`, deployed
 commit `6591ca3` (image `10.5.10.89:1808/xinwei/amd-oneclick-manager:6591ca3`); NetworkPolicy label
