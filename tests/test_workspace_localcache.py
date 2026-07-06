@@ -15,7 +15,10 @@ from app import k8s_client as k8s_module
 # stranding their durable data. This frozen expectation catches that in CI.
 # 2026-07-03: managed-nfs-storage-1 was decommissioned out-of-band (backend denies mounts) and removed
 # from the list BEFORE any real durable data existed (the only safe time to change it). Baseline is
-# now the 4 healthy backends; the append-only rule applies going forward from here.
+# the 4 healthy backends; the append-only rule applies going forward from here.
+# 2026-07-06: a 5th shard (managed-nfs-storage-1) append was DEFERRED — appending remaps ~4/5 of
+# instances (md5%4 -> md5%5), safe only on empty shards, and real durable data now exists. Baseline
+# stays at 4 until a confirmed idle window allows a wipe + append.
 FROZEN_SHARD_CLASSES = [
     "managed-nfs-storage-2",
     "managed-nfs-storage-3",
@@ -60,13 +63,29 @@ class ShardMappingTests(unittest.TestCase):
 
     def test_append_only_invariant(self):
         """The operational rule is append-only: the existing entries must never be reordered or
-        removed (that remaps md5%len and strands data). Assert the current baseline is exactly the
-        frozen list, in order — a future append adds entries AFTER these, never disturbing them."""
-        n = len(FROZEN_SHARD_CLASSES)
+        removed (that remaps md5%len and strands data). Assert the REAL, UNMOCKED config default
+        matches the frozen list in order — a future append adds entries AFTER these, never disturbing
+        them. NOTE: this deliberately reads a fresh Settings() from the actual config (NOT the mocked
+        k8s_module.settings that setUp overwrites), so it genuinely guards the live shard order — the
+        old version compared the mock against itself and could never fail."""
+        import os
+        from importlib import reload
+        from app import config as config_module
+        # Read the config default with no env override in effect, so we test the code default, not
+        # whatever WORKSPACE_DURABLE_STORAGE_CLASSES happens to be set in this shell.
+        saved = os.environ.pop("WORKSPACE_DURABLE_STORAGE_CLASSES", None)
+        try:
+            reload(config_module)
+            live_default = list(config_module.Settings().WORKSPACE_DURABLE_STORAGE_CLASSES)
+        finally:
+            if saved is not None:
+                os.environ["WORKSPACE_DURABLE_STORAGE_CLASSES"] = saved
+            reload(config_module)
         self.assertEqual(
-            k8s_module.settings.WORKSPACE_DURABLE_STORAGE_CLASSES[:n],
+            live_default,
             FROZEN_SHARD_CLASSES,
-            f"The first {n} durable StorageClasses must never be reordered or removed (append-only).",
+            "The live durable StorageClass default must be exactly the frozen append-only list, in "
+            "order (existing entries never reordered/removed; new shards appended LAST).",
         )
 
     def test_reordering_changes_mapping_is_detectable(self):

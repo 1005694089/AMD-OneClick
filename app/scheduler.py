@@ -468,6 +468,58 @@ async def workspace_flush_retry_job():
         logger.error("Workspace flush-retry sweep failed: %s", e)
 
 
+async def workspace_durable_dirquota_reconcile_job():
+    """Ensure every live instance's durable subdir has a per-user SFS dir-quota (best-effort backstop).
+
+    SOLE applier of the quota (there is no inline create-hook: at create-time the durable subdir does
+    not exist yet, so the SFS call would fail 100% of the time). Leader-only; inert unless localcache
+    AND the dir-quota flag are on. Marker-gated + batch-capped so steady-state ticks are cheap no-ops
+    and SFS API fan-out is bounded. Never raises; a per-instance failure just retries next tick."""
+    if (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() != "localcache":
+        return
+    if not settings.WORKSPACE_DURABLE_DIRQUOTA_ENABLED:
+        return
+    if _skip_not_leader("workspace_durable_dirquota_reconcile_job"):
+        return
+
+    def _sweep() -> tuple:
+        from . import workspace_dirquota
+        from .store import list_active_instance_ids
+
+        applied = 0
+        attempted = 0
+        active = list_active_instance_ids()
+        # Keep the in-memory applied-marker set bounded by the live fleet: the delete-hook's
+        # mark_unapplied usually runs on a non-leader process, so the leader's set would otherwise
+        # accumulate ids of deleted instances across the freeze. Prune each sweep against live ids.
+        workspace_dirquota.prune_applied(active)
+        # Budget bounds ATTEMPTS, not successes: during an SFS incident (or an unbound shard) every
+        # apply fails and is not marked, so a success-only cap would let the loop fan out over the
+        # whole fleet (up to 2 SFS calls each) every tick. Charging attempts keeps per-tick SFS load
+        # bounded regardless of failure rate; unreached instances just get their turn on a later tick.
+        budget = max(1, int(settings.WORKSPACE_DURABLE_DIRQUOTA_BATCH_PER_TICK))
+        for iid in sorted(active):
+            if attempted >= budget:
+                break
+            if workspace_dirquota.is_applied(iid):
+                continue  # already set this lifetime — don't spend the budget or an SFS call
+            attempted += 1
+            try:
+                if workspace_dirquota.ensure_dir_quota_for_instance(iid):
+                    applied += 1
+            except Exception as e:
+                logger.debug("dirquota reconcile for %s failed (non-fatal): %s", iid, e)
+        return applied, attempted
+
+    try:
+        applied, attempted = await asyncio.to_thread(_sweep)
+        if attempted:
+            logger.info("Durable dir-quota reconcile: %s/%s instance(s) applied this tick",
+                        applied, attempted)
+    except Exception as e:
+        logger.error("Durable dir-quota reconcile failed: %s", e)
+
+
 def reconcile_job():
     """Bidirectional reconciliation between the cluster (source of truth) and
     the DB. Reclaims orphan/rogue pods (no owning DB record), force-finalizes
@@ -869,6 +921,15 @@ def start_scheduler():
             replace_existing=True,
             **job_defaults,
         )
+        if settings.WORKSPACE_DURABLE_DIRQUOTA_ENABLED:
+            scheduler.add_job(
+                workspace_durable_dirquota_reconcile_job,
+                trigger=IntervalTrigger(minutes=settings.WORKSPACE_DURABLE_DIRQUOTA_RECONCILE_MINUTES),
+                id="workspace_durable_dirquota_reconcile_job",
+                name="Ensure per-user durable dir-quota (SFS Turbo backstop)",
+                replace_existing=True,
+                **job_defaults,
+            )
     scheduler.start()
     logger.info(
         "Scheduler started; cleanup 1m, template preview 2m, reconcile %ss (%s), image sync %ss, telemetry %s",

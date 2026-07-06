@@ -1,6 +1,8 @@
 """
 Configuration settings for AMD OneClick Notebook Manager
 """
+import json
+import logging
 import os
 from typing import Optional
 from urllib.parse import urlparse
@@ -181,6 +183,36 @@ ENV PATH="/root/.opencode/bin:${PATH}"
 """
 
 
+def _parse_sfs_backends(raw: str) -> list:
+    """Parse the WORKSPACE_DURABLE_SHARD_SFS_BACKENDS JSON. Fail-safe: a malformed override degrades
+    the dir-quota feature (returns []) instead of crashing the manager at import through the freeze."""
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            raise ValueError("expected a JSON array")
+        return parsed
+    except Exception as e:
+        logging.getLogger(__name__).error(
+            "WORKSPACE_DURABLE_SHARD_SFS_BACKENDS is malformed (%s); dir-quota disabled", e)
+        return []
+
+
+def _int_env(name: str, default: int) -> int:
+    """Fail-safe int env read: a malformed override (e.g. "100Gi", "15s", "") falls back to the
+    default instead of raising ValueError at import time. Import-time crashes are unrecoverable during
+    the change freeze (no API serves, no hotfix window), so the new dir-quota numeric settings — which
+    an operator is actively wiring tonight — go through this rather than a bare int(os.getenv(...))."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except (ValueError, TypeError):
+        logging.getLogger(__name__).error(
+            "%s=%r is not a valid integer; falling back to %s", name, raw, default)
+        return default
+
+
 class Settings:
     K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "default")
 
@@ -275,6 +307,10 @@ class Settings:
     # NOTE (2026-07-03): managed-nfs-storage-1 was decommissioned out-of-band (its SFS-Turbo backend
     # denies mounts), so it was removed here BEFORE any real durable data existed — the only safe time
     # to change this list. From now the append-only rule stands: 4 shards over the healthy backends.
+    # NOTE (2026-07-06): a 5th shard (managed-nfs-storage-1) was PLANNED to be appended here, but the
+    # append was DEFERRED — appending remaps ~4/5 of instances (md5%4 -> md5%5), safe only on empty
+    # shards, and real user durable data now exists. Do NOT append until a confirmed idle window
+    # (0 running instances) allows a wipe. Staying at 4 shards keeps existing placement correct.
     WORKSPACE_DURABLE_STORAGE_CLASSES: list = [
         s.strip() for s in os.getenv(
             "WORKSPACE_DURABLE_STORAGE_CLASSES",
@@ -287,6 +323,47 @@ class Settings:
     WORKSPACE_DURABLE_PVC_SIZE_GI: int = int(os.getenv("WORKSPACE_DURABLE_PVC_SIZE_GI", "10240"))
     # Where the durable shard PVC is mounted inside the pod (hidden from the user; /workspace is the SSD copy).
     WORKSPACE_DURABLE_MOUNT_PATH: str = os.getenv("WORKSPACE_DURABLE_MOUNT_PATH", "/mnt/workspace-durable")
+
+    # --- Durable per-user dir-quota backstop (SFS Turbo CreateFsDirQuota) ---------------------------
+    # Best-effort per-instance cap on the durable tier so one user can't fill a whole 10Ti shard.
+    # Applied out-of-band by the reconciler (app/workspace_dirquota.py) — never gates create/delete.
+    WORKSPACE_DURABLE_DIRQUOTA_ENABLED: bool = os.getenv(
+        "WORKSPACE_DURABLE_DIRQUOTA_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # Per-user durable cap. 100Gi (102400 MB) mirrors the node-local SSD cap so the two tiers match.
+    WORKSPACE_DURABLE_DIRQUOTA_CAPACITY_MB: int = _int_env("WORKSPACE_DURABLE_DIRQUOTA_CAPACITY_MB", 102400)
+    WORKSPACE_DURABLE_DIRQUOTA_INODE_COUNT: int = _int_env("WORKSPACE_DURABLE_DIRQUOTA_INODE_COUNT", 2000000)
+    # How often the reconciler sweeps live instances to ensure their durable dir-quota is set (minutes).
+    WORKSPACE_DURABLE_DIRQUOTA_RECONCILE_MINUTES: int = _int_env("WORKSPACE_DURABLE_DIRQUOTA_RECONCILE_MINUTES", 10)
+    # Max quota upserts per reconciler tick, to bound SFS API fan-out on a cold start / big backlog.
+    WORKSPACE_DURABLE_DIRQUOTA_BATCH_PER_TICK: int = _int_env("WORKSPACE_DURABLE_DIRQUOTA_BATCH_PER_TICK", 25)
+    # Static {share_id, subdir} SFS backend per shard, PARALLEL-INDEXED to WORKSPACE_DURABLE_STORAGE_CLASSES.
+    # share_id = the SFS-Turbo share UUID; subdir = the CSI-provisioned PV directory (pvc-<uuid>) inside it.
+    # Static (not a live PV read) because the manager ServiceAccount has NO RBAC on persistentvolumes —
+    # a live read would 403 and, fail-open, silently disable the whole feature. PVs are Retain, so these
+    # pairs are stable. Overridable via env as a JSON array of {"share_id","subdir"} objects.
+    # MUST stay parallel-indexed to WORKSPACE_DURABLE_STORAGE_CLASSES (4 entries, shards 0-3). When the
+    # 5th shard (managed-nfs-storage-1) is eventually appended in a real idle window, append its
+    # {share_id, subdir} here at index 4 (share 712f4074-688c-4143-8130-6e4181a31813, subdir filled in
+    # from its bound PVC). Until then a *_PENDING subdir is treated as unresolved by _resolve_path.
+    WORKSPACE_DURABLE_SHARD_SFS_BACKENDS: list = _parse_sfs_backends(os.getenv(
+        "WORKSPACE_DURABLE_SHARD_SFS_BACKENDS",
+        json.dumps([
+            {"share_id": "38cb5453-92e5-4f00-a4e8-a71dec09b855", "subdir": "pvc-b589e1c1-7611-458f-9d53-8f80c85cf49c"},
+            {"share_id": "8b8ff68f-e2cf-4ad5-a800-687332ba0145", "subdir": "pvc-2e39f2bf-715d-4895-8070-1d0838500b14"},
+            {"share_id": "8e37933a-f1cd-432d-ad83-d5bad06de76f", "subdir": "pvc-5e0c82a4-89a2-4c87-bae4-39fd840752c1"},
+            {"share_id": "ac8711bc-6819-4c71-a28c-6befd494ca81", "subdir": "pvc-48e73c6d-d433-4c63-8021-e60654e42701"},
+        ]),
+    ))
+    # SFS Turbo API endpoint / region / project (private CMECloud region CIDC-RP-12).
+    SFS_TURBO_ENDPOINT: str = os.getenv("SFS_TURBO_ENDPOINT", "https://sfs-turbo.cidc-rp-12.joint.cmecloud.cn")
+    SFS_TURBO_REGION: str = os.getenv("SFS_TURBO_REGION", "CIDC-RP-12")
+    SFS_TURBO_PROJECT_ID: str = os.getenv("SFS_TURBO_PROJECT_ID", "f7878b039c0a4f92a10edf20e323200c")
+    # AK/SK come from the amd-oneclick-sfs-turbo k8s Secret (envFrom). NEVER hard-code / log these.
+    SFS_TURBO_AK: str = os.getenv("SFS_TURBO_AK", "")
+    SFS_TURBO_SK: str = os.getenv("SFS_TURBO_SK", "")
+    # SFS SDK HTTP timeout (seconds). Short because the delete-hook runs inline on the admin-delete
+    # path; the SDK default is 120s and would stall a delete for 2 min on an SFS blackhole/throttle.
+    SFS_TURBO_TIMEOUT_SECONDS: int = _int_env("SFS_TURBO_TIMEOUT_SECONDS", 15)
     # Privileged helper image for node-exec (nsenter) + init/preStop sync containers. Must be warm on
     # nodes (public registries are blocked). Empty => k8s_client falls back to DEFAULT_IMAGE (the
     # platform base image, already on nodes, ships bash+rsync).

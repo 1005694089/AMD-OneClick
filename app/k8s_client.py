@@ -958,6 +958,16 @@ class K8sClient:
             f"mv \"$src\" \"$dst\"; echo trashed \"$src\" '->' \"$dst\"; "
             f"else echo \"no live durable data at $src (already trashed or never existed)\"; fi\n"
         )
+        # Best-effort: drop the SFS dir-quota BEFORE the trash-move, while the subdir still exists at
+        # its original path. The move is an mv (rename) — afterward the path is GONE (not "emptied"),
+        # and SFS refuses delete_fs_dir_quota on a non-empty dir, so this is the only correct ordering.
+        # Never raises / never blocks the delete; an orphan rule on a vanished path costs nothing.
+        try:
+            from . import workspace_dirquota
+            workspace_dirquota.delete_dir_quota_for_instance(instance_id)
+            workspace_dirquota.mark_unapplied(instance_id)
+        except Exception as e:
+            logger.debug("dirquota delete hook for %s failed (non-fatal): %s", instance_id, e)
         try:
             self._run_durable_shard_command(f"del-{instance_id}", shard_pvc, script, timeout_seconds=180)
             logger.info("Soft-deleted durable workspace for %s on shard %s", instance_id, shard_pvc)

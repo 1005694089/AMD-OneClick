@@ -24,7 +24,74 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-06 (latest) - radeon-global: HF unlimited_credits launch flag + startup-migration race hardening
+## 2026-07-06 (latest) - radeon-global: durable per-user SFS dir-quota backstop (quota-only; 5th-shard DROPPED)
+
+**Code:** `prod/radeon-global`, working tree (dir-quota feature). Committed locally per operator; new
+files `app/workspace_dirquota.py`, `tests/test_workspace_dirquota.py`, `Dockerfile.build`; edits to
+`app/config.py`, `app/k8s_client.py`, `app/scheduler.py`, `requirements.txt`,
+`tests/test_workspace_localcache.py`.
+
+**What changed:** best-effort per-user cap on the durable workspace tier (shared RWX SFS-Turbo shards)
+via Huawei SFS Turbo directory-quota API (`create/update/delete_fs_dir_quota`), 100Gi / 2M inodes,
+mirroring the SSD cap. Applied out-of-band by a NEW leader-gated reconciler
+(`workspace_durable_dirquota_reconcile_job`, 10-min, batch cap 25/tick charged per-ATTEMPT,
+marker-gated + pruned to live fleet). Delete-hook in `delete_workspace_durable` drops the quota before
+the trash-move. ALL SFS calls fail-open (log, never AK/SK, return bool, never raise); SDK imported
+lazily; 15s SFS HTTP timeout. Config parse fail-safe (`_parse_sfs_backends`, `_int_env`).
+
+**DROPPED from original plan (operator decision):** the shard WIPE and the 5th-shard append
+(`managed-nfs-storage-1`). Reason: real user instances went LIVE mid-change (u-22-90adedfe /
+532203651@qq.com, u-6-258c504b / vivienfanghua@163.com), voiding the "0 instances, clean DB"
+precondition. Appending a 5th shard remaps ~4/5 of instances (md5%4->md5%5) and would strand live
+durable data. Shard list stays at 4; `WORKSPACE_DURABLE_SHARD_SFS_BACKENDS` has 4 parallel-indexed
+{share_id, subdir} pairs. 5th shard deferred to a confirmed idle window.
+
+**Ultracode review:** two adversarial multi-agent passes (find -> refute). 7 confirmed findings,
+fixed pre-deploy: `SHARD4_*_PENDING` sentinel skip; reconciler budget per-attempt (bounds SFS fan-out
+on failure); `_resolve_path` hardened (non-dict backend, full-body guard); `_applied` leak pruned each
+sweep; `_int_env` fail-safe casts; SFS 15s timeout; the tautological `test_append_only_invariant`
+rewritten to read the real unmocked config. 51 tests green (13 dirquota + 38 localcache).
+
+**Image build:** FULL kaniko build (requirements gained the SDK) — pod `manager-build-dirquota`
+(ns `amd-oneclick-lablab`, s-001), `Dockerfile.build` (base `docker.m.daocloud.io/library/python:3.12-slim`,
+Tsinghua apt+pip). Context via `kubectl cp` into an initContainer gated on `/workspace/.ready`. Pushed
+`10.5.10.89:1808/xinwei/amd-oneclick-manager:dirquota`
+(`@sha256:df3bfa71753a67187d18413c679cfa4fe75b70de8236baeed61688b66435ff5b`). SDK+module import
+verified inside the image before rolling.
+
+**Harbor routing gotcha:** only s-001 can reach Harbor (10.5.10.89). The manager's
+`requiredDuringScheduling` anti-affinity spreads its 2 replicas across {s-001,s-002,s-003}, so the new
+replicas on s-002/s-003 hit `ErrImagePull: no route to host`. Fix: side-loaded `:dirquota` from s-001
+to s-002 AND s-003 via `ctr -n k8s.io images export - | ctr images import -` through the
+`oneclick-workspace-localssd-prep` daemonset pods (chroot /host). Then the `IfNotPresent` pods started.
+**For any future manager deploy, pre-load the image to all three manager-eligible nodes.**
+
+**Deploy:** k8s Secret `amd-oneclick-sfs-turbo` (SFS_TURBO_AK/SK) created + added to manager `envFrom`;
+`WORKSPACE_DURABLE_DIRQUOTA_ENABLED=true` in configmap `amd-oneclick-lablab-config`;
+`kubectl set image ... manager=...:dirquota`. RollingUpdate (maxSurge=0/maxUnavailable=1) kept 1
+replica serving throughout — no outage.
+
+**Verification (live):** rollout 2/2 on `:dirquota`, 0 restarts, leader `...-d65tc`. Reconciler job
+registered. Applied quota to both live users via the real SFS API; `ShowFsDirQuota` confirms
+capacity=102400MB, inode=2000000 on both (u-6 used 365MB/14603, u-22 used 34516MB/29475). Fail-open
+verified (blank SK -> False, no raise). Idempotent re-apply (create->update) verified. Delete on a
+POPULATED dir returns `SFS.TURBO.0115 path not empty` -> False (fail-open) — EMPIRICALLY CONFIRMS the
+"delete fails on non-empty dir" premise (the delete-hook's pre-mv ordering is a best-effort no-op for
+populated dirs; orphan quota rules are harmless and accepted). Pre-check confirmed both users well
+under caps before enabling. Both live instances stayed Running (95m/98m) across the roll.
+
+**PRE snapshot:** `local-deploy-history/radeon-global/20260706-1635-dirquota-PRE-deploy.yaml`
+(image `e4ecfac`). **APPLIED:** `local-deploy-history/radeon-global/20260706-1648-dirquota-APPLIED-deploy.yaml`
+(sha256 `69bf0e3b35301cf01fd84602b2a74bc25df522b9f5caa4d504231417cbf5e800`).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:e4ecfac` (cached on s-001; side-load to
+s-002/s-003 if a replica lands there). To disable the feature only:
+`WORKSPACE_DURABLE_DIRQUOTA_ENABLED=false` in the configmap + rolling restart. Existing dir-quota rules
+persist harmlessly.
+
+
+## 2026-07-06 - radeon-global: HF unlimited_credits launch flag + startup-migration race hardening
 
 **Code:** `prod/radeon-global` commits `b3522da` (feature) + `e4ecfac` (migration lock). Committed
 locally, **NOT yet pushed to origin** (operator handles the push; origin still at `7dd5132`). Deployed
