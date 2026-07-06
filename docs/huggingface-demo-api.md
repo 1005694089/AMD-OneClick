@@ -35,6 +35,8 @@ This bearer token is separate from the upstream Hugging Face access token. The u
 
 Each demo user is granted a small starting credit balance the first time they launch (one-time grant; it is **not** refilled on later launches). Running instances are metered at **1 credit per GPU per hour**. When a user's balance is exhausted, their running instance is automatically destroyed. A launch is rejected with `400 Insufficient credits` if the balance is below the requested `gpu_count`.
 
+Passing `"unlimited_credits": true` on a launch marks that `user_name` as unlimited: their balance is frozen at whatever it is at that moment (normally the starting grant) and the billing loop stops decrementing it — usage is still recorded, but never charged, and the instance is never destroyed for insufficient credits. This is sticky: once set it is not undone by a later launch that omits the flag. Unlimited does **not** exempt the instance from the idle reaper — it is still auto-destroyed after 8h with no activity (see **Poll Notebook Status** / idle behavior).
+
 ## List Available Images
 
 Discover the images a notebook can launch with. This is the same enabled catalog the admin panel shows.
@@ -107,7 +109,8 @@ Optional fields:
 ```json
 {
   "image": "<allowed-notebook-image>",
-  "pod_type": "hackathon"
+  "pod_type": "hackathon",
+  "unlimited_credits": false
 }
 ```
 
@@ -123,6 +126,7 @@ Rules:
 - `image` is optional. Pass either the friendly `name` or the full `image` ref from `GET /api/huggingface/images` (name match is case-insensitive); anything not in the enabled catalog is rejected with `400 Invalid image selected`. Defaults to `default_image`.
 - `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
 - `gpu_count` must be `1`, `2`, or `4`. Default is `1`. CPU and memory scale automatically with the GPU count (see **GPU Sizing** below). Each GPU costs 1 credit/hour, so a 4-GPU instance consumes credits 4x as fast. Check `GET /api/huggingface/gpus` for free capacity before requesting `2` or `4`.
+- `unlimited_credits` is optional, defaults to `false`. When `true`, this `user_name` is marked unlimited and its credit balance is frozen going forward (see **Credits** above). Sticky — cannot be unset by a later launch that omits it.
 - Each `user_name` can have only one active notebook.
 
 Example success response:
@@ -223,6 +227,7 @@ export type LaunchRequest = {
   gpu_count?: 1 | 2 | 4;
   image?: string; // a value from GET /api/huggingface/images
   pod_type?: "hackathon" | "workshop" | "one-click";
+  unlimited_credits?: boolean; // sticky: freezes this user_name's credit balance (billing-only; idle reaper still applies)
 };
 
 export type NotebookStatus = {

@@ -46,6 +46,7 @@ Launch request highlights:
 - `image` accepts either the admin-panel **name** (e.g. `Huggingface`, case-insensitive) or the full registry ref; omit to use the API default.
 - `gpu_count` is `1`, `2`, or `4` (default `1`). CPU/memory scale automatically with the GPU count.
 - `pod_type` is an optional tag: `hackathon`, `workshop`, or `one-click`.
+- `unlimited_credits` (optional, default `false`) sticky-freezes that `user_name`'s credit balance — the billing loop stops decrementing it. Does not exempt the instance from the idle reaper.
 
 Notebook **templates** (admin/Gallery) may likewise point at a GitHub repo with no notebook path — the repo is cloned and JupyterLab opens at its root.
 

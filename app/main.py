@@ -99,6 +99,7 @@ from .store import (
     list_users,
     set_user_editor,
     set_user_ssh_public_key,
+    set_user_unlimited,
     mark_instance_deleted,
     mark_instance_deleting,
     mark_instance_ready_for_billing,
@@ -2830,8 +2831,17 @@ async def launch_huggingface_demo_notebook(
             raise HTTPException(status_code=400, detail="Each user can only have one active instance")
         mark_instance_deleted(active["instance_id"])
 
-    if int(user["credits"]) < gpu_count:
+    # Caller opt-in: freeze this user's balance (the billing loop stops decrementing it) at whatever
+    # it is right now — normally the just-granted floor. Sticky: once set, later launches that omit
+    # the flag do not revoke it. The flag is persisted only AFTER the validation above so a launch
+    # rejected here (an existing active instance, or the credits gate) never leaves the sticky flag
+    # behind on a user whose launch did not actually happen. The gate honors the requested flag too,
+    # so a first-time unlimited launch is not spuriously blocked before the flag is written.
+    unlimited = bool(user["unlimited_credits"] or req.unlimited_credits)
+    if not unlimited and int(user["credits"]) < gpu_count:
         raise HTTPException(status_code=400, detail="Insufficient credits")
+    if req.unlimited_credits and not user["unlimited_credits"]:
+        user = set_user_unlimited(user["id"], True) or user
 
     try:
         instance_id = f"hf-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"

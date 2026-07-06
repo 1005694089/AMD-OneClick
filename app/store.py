@@ -78,6 +78,9 @@ users = Table(
     Column("avatar_url", Text),
     Column("credits", Integer, nullable=False, default=100),
     Column("is_editor", Boolean, nullable=False, default=False),
+    # Sticky flag: when true, charge_usage_unit skips deduction so the balance freezes at
+    # whatever it was when the flag was set. Does not exempt the instance from the idle reaper.
+    Column("unlimited_credits", Boolean, nullable=False, default=False),
     Column("ssh_public_key", Text),
     # Session epoch. Every issued session cookie embeds the value that was
     # current at login; bumping this invalidates all outstanding sessions for
@@ -445,6 +448,8 @@ def ensure_schema_columns(conn):
         conn.execute(text("ALTER TABLE users ADD COLUMN ssh_public_key TEXT"))
     if "token_version" not in user_columns:
         conn.execute(text("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"))
+    if "unlimited_credits" not in user_columns:
+        conn.execute(text("ALTER TABLE users ADD COLUMN unlimited_credits BOOLEAN NOT NULL DEFAULT FALSE"))
 
     instance_columns = {col["name"] for col in inspector.get_columns("instance_records")}
     if "billing_session_id" not in instance_columns:
@@ -831,6 +836,24 @@ def grant_initial_credits_once(user_id: int, amount: int, marker: str) -> Option
             credit_ledger.insert().values(
                 user_id=user_id, delta=delta, reason=marker, instance_id=None, created_at=now,
             )
+        )
+        return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+
+
+def set_user_unlimited(user_id: int, unlimited: bool = True) -> Optional[dict]:
+    """Stick the unlimited-credits flag on a user.
+
+    Sticky and one-directional in normal use: it does not itself change the credit balance, it
+    only tells charge_usage_unit to stop decrementing it — so the balance freezes at whatever it
+    is at the moment this is called (typically right after grant_initial_credits_once).
+    """
+    with engine.begin() as conn:
+        user = conn.execute(select(users).where(users.c.id == user_id)).mappings().first()
+        if not user:
+            return None
+        conn.execute(
+            update(users).where(users.c.id == user_id)
+            .values(unlimited_credits=unlimited, updated_at=utc_now())
         )
         return row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
 
@@ -3240,6 +3263,33 @@ def charge_usage_unit(user_id: int, instance_id: str, billing_session_id: str, b
         user = conn.execute(select(users).where(users.c.id == user_id).with_for_update()).mappings().first()
         if not user:
             raise ValueError(f"User {user_id} not found")
+
+        # Unlimited users are never charged: record the usage unit for audit/telemetry (and to
+        # satisfy the (billing_session_id, billing_unit) idempotency key) but skip the deduction,
+        # so the balance stays frozen at whatever it was when unlimited_credits was set.
+        if user["unlimited_credits"]:
+            conn.execute(
+                usage_charges.insert().values(
+                    user_id=user_id,
+                    instance_id=instance_id,
+                    billing_session_id=billing_session_id,
+                    billing_unit=billing_unit,
+                    gpu_count=gpu_count,
+                    credits=0,
+                    created_at=now,
+                )
+            )
+            conn.execute(
+                credit_ledger.insert().values(
+                    user_id=user_id,
+                    delta=0,
+                    reason=f"unlimited unit {billing_unit} x {gpu_count} GPU",
+                    instance_id=instance_id,
+                    created_at=now,
+                )
+            )
+            return "charged"
+
         if int(user["credits"]) < credits:
             return "insufficient"
 

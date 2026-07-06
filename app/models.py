@@ -87,6 +87,10 @@ class HuggingFaceNotebookLaunchRequest(BaseModel):
     gpu_count: int = 1
     image: Optional[str] = None
     pod_type: Optional[str] = None
+    # When true, the demo user is marked unlimited: their credit balance is frozen (never
+    # decremented by the billing loop) at whatever it is when this flag is applied. Does not
+    # exempt the instance from the API idle reaper (still destroyed after 8h idle).
+    unlimited_credits: bool = False
 
 
 class CustomImageBuildRequest(BaseModel):

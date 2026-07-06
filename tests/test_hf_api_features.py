@@ -1,4 +1,4 @@
-"""Regression tests for the 6 HuggingFace / external-API features.
+"""Regression tests for the 7 HuggingFace / external-API features.
 
 Covers:
   - F1: blank notebook_path launches a bare Jupyter (github_info=None, root URL).
@@ -7,6 +7,7 @@ Covers:
   - F4: cleanup_idle_instances targets custom-id API pods and leaves non-API pods alone.
   - F5: pod_type validation (restricted set) + persistence to instance_records.
   - F6: GPU availability endpoint returns free/total shape.
+  - F7: unlimited_credits launch flag freezes the user's balance (billing loop skips deduction).
 """
 import os
 import tempfile
@@ -270,6 +271,101 @@ class Feature3Credits(HFLaunchTestBase):
                 "SELECT COUNT(*) FROM credit_ledger WHERE reason='hf_backfill_cap_v1'"
             ).scalar()
         self.assertEqual(markers, 1)
+
+
+class Feature7UnlimitedCredits(HFLaunchTestBase):
+    def test_launch_with_flag_marks_user_unlimited_and_freezes_at_grant(self):
+        cap = main_module.settings.HUGGINGFACE_DEMO_MIN_CREDITS
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "uli", "image": "registry/image:tag", "unlimited_credits": True},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        user = store.get_user_by_provider(main_module.HF_DEMO_PROVIDER, "uli")
+        self.assertTrue(user["unlimited_credits"])
+        self.assertEqual(user["credits"], cap)
+
+    def test_launch_without_flag_stays_metered(self):
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "metered-uli", "image": "registry/image:tag"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        user = store.get_user_by_provider(main_module.HF_DEMO_PROVIDER, "metered-uli")
+        self.assertFalse(user["unlimited_credits"])
+
+    def test_charge_usage_unit_skips_deduction_for_unlimited_user(self):
+        u = store.get_or_create_external_user(main_module.HF_DEMO_PROVIDER, "unl-charge", "unl-charge@hf.local")
+        _set_credits(u["id"], 10)
+        store.set_user_unlimited(u["id"], True)
+        result = store.charge_usage_unit(u["id"], "hf-instance-unl", "session-unl", 1, 4)
+        self.assertEqual(result, "charged")
+        self.assertEqual(store.get_user(u["id"])["credits"], 10)
+        with store.engine.begin() as conn:
+            charged = conn.exec_driver_sql(
+                "SELECT credits FROM usage_charges WHERE billing_session_id=? AND billing_unit=1",
+                ("session-unl",),
+            ).scalar()
+        self.assertEqual(charged, 0)
+
+    def test_charge_usage_unit_still_deducts_for_metered_user(self):
+        # Regression: the unlimited short-circuit must not affect normal users.
+        u = store.get_or_create_external_user(main_module.HF_DEMO_PROVIDER, "reg-charge", "reg-charge@hf.local")
+        _set_credits(u["id"], 10)
+        result = store.charge_usage_unit(u["id"], "hf-instance-reg", "session-reg", 1, 2)
+        self.assertEqual(result, "charged")
+        self.assertEqual(store.get_user(u["id"])["credits"], 8)
+
+    def test_launch_bypasses_insufficient_credits_gate_when_unlimited(self):
+        cap = main_module.settings.HUGGINGFACE_DEMO_MIN_CREDITS
+        u = store.get_or_create_external_user(main_module.HF_DEMO_PROVIDER, "brokeuser", "brokeuser@hf.local")
+        # Set the grant marker first so the launch below does not re-top the balance, then force
+        # credits under gpu_count to isolate the gate-bypass behavior from the grant itself.
+        store.grant_initial_credits_once(u["id"], cap, "hf_initial_grant")
+        store.set_user_unlimited(u["id"], True)
+        _set_credits(u["id"], 0)
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "brokeuser", "image": "registry/image:tag"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_rejected_launch_does_not_persist_unlimited_flag(self):
+        # A launch rejected by the "one active instance" guard must not leave the sticky unlimited
+        # flag behind — otherwise the already-running pod silently stops being billed.
+        r1 = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "stale", "image": "registry/image:tag"},
+            headers=BEARER,
+        )
+        self.assertEqual(r1.status_code, 200, r1.text)
+        iid = self.fake.created[-1]["custom_instance_id"]
+        # Make the cluster report the instance as still live so the relaunch is rejected.
+        self.fake.existing_ids[iid] = {"id": iid}
+        r2 = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "stale", "image": "registry/image:tag", "unlimited_credits": True},
+            headers=BEARER,
+        )
+        self.assertEqual(r2.status_code, 400, r2.text)
+        user = store.get_user_by_provider(main_module.HF_DEMO_PROVIDER, "stale")
+        self.assertFalse(user["unlimited_credits"])
+
+    def test_launch_still_rejected_when_metered_user_has_no_credits(self):
+        # Contrast case: without the flag, the pre-existing gate is unchanged.
+        cap = main_module.settings.HUGGINGFACE_DEMO_MIN_CREDITS
+        u = store.get_or_create_external_user(main_module.HF_DEMO_PROVIDER, "brokeuser2", "brokeuser2@hf.local")
+        store.grant_initial_credits_once(u["id"], cap, "hf_initial_grant")
+        _set_credits(u["id"], 0)
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "brokeuser2", "image": "registry/image:tag"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
 
 
 class Feature5PodType(HFLaunchTestBase):
