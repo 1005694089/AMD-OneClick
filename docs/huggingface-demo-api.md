@@ -33,9 +33,26 @@ This bearer token is separate from the upstream Hugging Face access token. The u
 
 ## Credits
 
-Each demo user is granted a small starting credit balance the first time they launch (one-time grant; it is **not** refilled on later launches). Running instances are metered at **1 credit per GPU per hour**. When a user's balance is exhausted, their running instance is automatically destroyed. A launch is rejected with `400 Insufficient credits` if the balance is below the requested `gpu_count`.
+Each demo user is granted a small starting credit balance the first time they launch (one-time grant; it is **not** refilled on later launches). In production the starting grant is **10** credits (`HUGGINGFACE_DEMO_MIN_CREDITS`). Running instances are metered at **1 credit per GPU per hour**. When a user's balance is exhausted, their running instance is automatically destroyed. A launch is rejected with `400 Insufficient credits` if the balance is below the requested `gpu_count`.
 
-Passing `"unlimited_credits": true` on a launch marks that `user_name` as unlimited: their balance is frozen at whatever it is at that moment (normally the starting grant) and the billing loop stops decrementing it — usage is still recorded, but never charged, and the instance is never destroyed for insufficient credits. This is sticky: once set it is not undone by a later launch that omits the flag. Unlimited does **not** exempt the instance from the idle reaper — it is still auto-destroyed after 8h with no activity (see **Poll Notebook Status** / idle behavior).
+### Metered vs unlimited
+
+| | Metered (default) | Unlimited (`unlimited_credits: true`) |
+|---|---|---|
+| Starting balance | One-time grant (10 in prod) | Same one-time grant |
+| Billing | 1 credit / GPU / hour deducted | **No deduction** — balance stays frozen |
+| Destroy on zero credits | Yes | **No** |
+| Launch when balance < `gpu_count` | Rejected (`400 Insufficient credits`) | **Allowed** (once flagged) |
+| Idle reaper (8h no activity) | Yes | **Yes** — still applies |
+| Revoke via API | N/A | **No** — sticky; omitting the flag on a later launch does not turn billing back on |
+
+Pass `"unlimited_credits": true` on **`POST /api/huggingface/notebooks`** to mark that `user_name` as unlimited. The flag is written only after launch validation succeeds (active-instance guard, credits gate, etc.), so a rejected launch does **not** leave the flag behind. Usage is still recorded server-side (0-credit billing rows) for audit/telemetry, but the user's balance never decreases and the instance is never torn down for insufficient credits.
+
+**When to use:** pass `unlimited_credits: true` for demo users who should run without a credit cap (e.g. internal testers, workshop hosts). The flag is **caller-controlled** — any holder of the shared API bearer token can set it for any `user_name`. There is no separate privileged token.
+
+**Sticky behavior:** the first successful launch with `unlimited_credits: true` permanently marks that `user_name`. Later launches that omit the field remain unlimited. There is no API to revoke unlimited status.
+
+**What unlimited does not do:** it does not bypass GPU capacity limits, the one-active-instance rule, or the **8-hour idle reaper** (`API_IDLE_TIMEOUT_MINUTES=480`). Idle instances are still auto-destroyed after 8h with no activity.
 
 ## List Available Images
 
@@ -94,7 +111,7 @@ Content-Type: application/json
 Authorization: Bearer <token>
 ```
 
-Request body:
+Request body (metered — default):
 
 ```json
 {
@@ -104,7 +121,18 @@ Request body:
 }
 ```
 
-Optional fields:
+Request body (unlimited credits — balance frozen, billing skipped):
+
+```json
+{
+  "user_name": "vip-workshop-host",
+  "notebook_path": "https://huggingface.co/Qwen/Qwen3.6-27B.ipynb",
+  "gpu_count": 1,
+  "unlimited_credits": true
+}
+```
+
+Optional fields (may be combined with either body above):
 
 ```json
 {
@@ -113,7 +141,6 @@ Optional fields:
   "unlimited_credits": false
 }
 ```
-
 Rules:
 
 - `user_name` is required and is used as the stable demo user identity.
@@ -125,8 +152,8 @@ Rules:
 - Hugging Face notebook URLs are downloaded server-side through the configured internal Hugging Face proxy and server-side `HF_TOKEN`.
 - `image` is optional. Pass either the friendly `name` or the full `image` ref from `GET /api/huggingface/images` (name match is case-insensitive); anything not in the enabled catalog is rejected with `400 Invalid image selected`. Defaults to `default_image`.
 - `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
-- `gpu_count` must be `1`, `2`, or `4`. Default is `1`. CPU and memory scale automatically with the GPU count (see **GPU Sizing** below). Each GPU costs 1 credit/hour, so a 4-GPU instance consumes credits 4x as fast. Check `GET /api/huggingface/gpus` for free capacity before requesting `2` or `4`.
-- `unlimited_credits` is optional, defaults to `false`. When `true`, this `user_name` is marked unlimited and its credit balance is frozen going forward (see **Credits** above). Sticky — cannot be unset by a later launch that omits it.
+- `gpu_count` must be `1`, `2`, or `4`. Default is `1`. CPU and memory scale automatically with the GPU count (see **GPU Sizing** below). For **metered** users, each GPU costs 1 credit/hour, so a 4-GPU instance consumes credits 4x as fast. **Unlimited** users are not charged regardless of `gpu_count`. Check `GET /api/huggingface/gpus` for free capacity before requesting `2` or `4`.
+- `unlimited_credits` is optional, defaults to `false`. When `true` on a **successful** launch, this `user_name` is marked unlimited and its credit balance is frozen going forward (see **Credits** above). Sticky — cannot be unset by a later launch that omits it. A launch rejected with `400` (e.g. `Each user can only have one active instance`) does **not** apply the flag.
 - Each `user_name` can have only one active notebook.
 
 Example success response:
@@ -211,12 +238,14 @@ Example response:
 ## Recommended Frontend Flow
 
 1. User clicks **Launch Notebook**.
-2. Frontend sends `user_name` and `notebook_path` to your backend.
+2. Frontend sends `user_name`, `notebook_path`, and (if needed) `unlimited_credits` to your backend.
 3. Backend calls `POST /api/huggingface/notebooks` with the bearer token.
 4. Frontend shows a loading state.
 5. Frontend polls `GET /api/huggingface/notebooks/current?user_name=...`.
 6. When `status === "ready"`, frontend shows or opens `url`.
 7. When the user ends the session, backend calls `DELETE /api/huggingface/notebooks/current?user_name=...`.
+
+For **unlimited** users your backend should pass `"unlimited_credits": true` on the **first** successful launch for that `user_name` (or on every launch — re-sending `true` is a no-op once already flagged). Do not expose the API bearer token to the browser; keep the unlimited decision on your backend.
 
 ## Minimal TypeScript Types
 
@@ -227,7 +256,7 @@ export type LaunchRequest = {
   gpu_count?: 1 | 2 | 4;
   image?: string; // a value from GET /api/huggingface/images
   pod_type?: "hackathon" | "workshop" | "one-click";
-  unlimited_credits?: boolean; // sticky: freezes this user_name's credit balance (billing-only; idle reaper still applies)
+  unlimited_credits?: boolean; // default false; when true on a successful launch, sticky-freezes this user_name's balance (billing skipped; 8h idle reaper still applies)
 };
 
 export type NotebookStatus = {
@@ -265,7 +294,9 @@ export type GpuAvailability = {
 ## UX Notes
 
 - If launch returns `400` with `Each user can only have one active instance`, call the status endpoint and show the existing notebook.
-- If launch returns `400` with `Insufficient credits`, the user is out of credits — show their balance and stop offering launch.
+- If launch returns `400` with `Insufficient credits`, the user is out of credits — show their balance and stop offering launch. **Unlimited** users never hit this gate once flagged; pass `unlimited_credits: true` on launch for users who should not be credit-limited.
+- Unlimited users still need GPUs: check `GET /api/huggingface/gpus` before launch. Unlimited does not bypass cluster capacity.
+- Unlimited instances are still destroyed after **8 hours idle** — warn long-running demo users or call `DELETE` when the session ends.
 - To build a launch form, call `GET /api/huggingface/images` for the image dropdown and `GET /api/huggingface/gpus` to show available capacity before submitting.
 - If status stays `initializing` or `jupyter_starting`, keep polling.
 - If status is `failed`, show an error and offer retry or cleanup.
