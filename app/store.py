@@ -66,6 +66,9 @@ _custom_image_cap_lock = threading.Lock()
 # Arbitrary fixed namespace for the two-int pg_advisory_xact_lock keyspace; pairs with
 # user_id so different users never contend.
 _CUSTOM_IMAGE_CAP_LOCK_NS = 0x0A3D_C0DE
+# Single-bigint advisory-lock key that serializes startup schema migration across workers/replicas.
+# Kept well below the two-int (NS<<32 | user_id) range above so the two lock spaces never collide.
+_SCHEMA_MIGRATION_LOCK_KEY = 0x5CEA_0001
 
 users = Table(
     "users",
@@ -440,6 +443,14 @@ def init_db():
 
 
 def ensure_schema_columns(conn):
+    # Serialize concurrent migrators. With uvicorn --workers N (and/or multiple replicas) every
+    # worker runs this at startup; a brand-new additive ALTER would otherwise race — all workers
+    # inspect, all see the column missing, all issue the ALTER, one wins and the rest crash with
+    # DuplicateColumn (observed under --workers 2). A transaction-scoped Postgres advisory lock makes
+    # the first migrator apply the DDL and commit while the others block, then re-inspect (READ
+    # COMMITTED sees the committed columns) and no-op. SQLite is single-writer, so it needs no lock.
+    if conn.dialect.name == "postgresql":
+        conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _SCHEMA_MIGRATION_LOCK_KEY})
     inspector = inspect(conn)
     user_columns = {col["name"] for col in inspector.get_columns("users")}
     if "is_editor" not in user_columns:
