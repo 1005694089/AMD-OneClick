@@ -1374,6 +1374,90 @@ findmnt "$mnt"
             'exit "$JUPYTER_RC"\n'
         )
 
+    def _git_clone_init_container(self, image: str, github_info: dict,
+                                  workspace_propagation: Optional[str],
+                                  git_token: str) -> dict:
+        """Init container that clones a PRIVATE repo using a token, isolated from the user.
+
+        Why an init container: the notebook container gives the user a root shell, so any secret in
+        its env is readable (os.environ, /proc/1/environ). Init containers are not user-exec
+        reachable and their /proc is gone once they exit, so the token — placed only in THIS
+        container's env — never reaches a user-readable surface. We clone into {workspace}/repo
+        before the notebook container starts; its startup script then skips its own clone.
+
+        Auth: the token is sent as the HTTP Basic *password* via a GIT_ASKPASS helper that reads it
+        from the env at runtime (never on argv, never in .git/config). The username is the fixed,
+        non-secret literal `x-access-token` (GitHub's documented token-auth convention), baked into
+        the clone URL so git only prompts for the password. GIT_TERMINAL_PROMPT=0 fails fast instead
+        of hanging if auth is rejected. main.py has already guaranteed repo_url is https:// before a
+        token is allowed; this method independently re-asserts that (raises ValueError otherwise), so
+        the credential is only ever sent over TLS regardless of the caller.
+        """
+        workspace = shlex.quote(settings.WORKSPACE_MOUNT_PATH)
+        repo_url = github_info.get("repo_url") or github_info.get("clone_url") or ""
+        # Fail CLOSED on transport, independently of the endpoint gate: a token is HTTP Basic auth,
+        # so we must never arm GIT_ASKPASS for a non-https clone (that would put the PAT on the wire
+        # in cleartext). main.py already 400s a token+http launch; this is the belt-and-suspenders
+        # invariant so any future caller of this helper cannot silently downgrade the secret.
+        if not repo_url.lower().startswith("https://"):
+            raise ValueError("refusing to use a git token over a non-HTTPS clone URL")
+        # Insert the x-access-token username into the https:// URL (GitHub token-auth convention);
+        # the token itself is supplied only via GIT_ASKPASS, never in this URL.
+        auth_repo_url = "https://x-access-token@" + repo_url[len("https://"):]
+        repo_url_q = shlex.quote(auth_repo_url)
+        branch = (github_info.get("branch") or "").strip()
+        branch_opt = f"--branch {shlex.quote(branch)} " if branch else ""
+        askpass_path = "/tmp/oneclick-git-askpass.sh"
+        script = f"""
+set -e
+umask 077
+mkdir -p {workspace}
+if [ -e {workspace}/repo ]; then
+    echo "workspace already populated; skipping authenticated clone"
+    exit 0
+fi
+cat > {askpass_path} <<'ONECLICK_ASKPASS_EOF'
+#!/bin/sh
+printf '%s' "$GIT_CLONE_TOKEN"
+ONECLICK_ASKPASS_EOF
+chmod 700 {askpass_path}
+export GIT_ASKPASS={askpass_path}
+export GIT_TERMINAL_PROMPT=0
+cloned=0
+for i in 1 2 3; do
+    rm -rf {workspace}/.repo-tmp
+    if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 {branch_opt}{repo_url_q} {workspace}/.repo-tmp; then
+        mv {workspace}/.repo-tmp {workspace}/repo
+        cloned=1
+        echo "Private repository cloned"
+        break
+    fi
+    echo "Authenticated clone attempt $i failed, retrying..."
+    sleep $((i * 3))
+done
+rm -f {askpass_path}
+if [ "$cloned" != "1" ]; then
+    echo "Authenticated clone failed after retries" >&2
+    exit 1
+fi
+"""
+        workspace_mount = {"name": "workspace", "mountPath": settings.WORKSPACE_MOUNT_PATH}
+        if workspace_propagation:
+            workspace_mount["mountPropagation"] = workspace_propagation
+        return {
+            "name": "git-clone",
+            "image": image,
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["/bin/sh", "-c"],
+            "args": [script],
+            # Token lives ONLY on this init container (not the user's notebook container). It is still
+            # a literal in the pod spec, so an operator with pod-read RBAC / etcd access can see it;
+            # eliminating that too would require a per-pod Secret, which the manager's RBAC does not
+            # currently permit creating. This closes the user-facing exposure, which is the exploit.
+            "env": [{"name": "GIT_CLONE_TOKEN", "value": git_token}],
+            "volumeMounts": [workspace_mount],
+        }
+
     def _build_startup_script(self, instance_id: str,
                               instance_type: str = "jupyter",
                               github_info: Optional[dict] = None,
@@ -1453,6 +1537,13 @@ fi
     find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
 fi
 """
+                # NOTE: a PRIVATE-repo clone that needs a token does NOT happen here. The token must
+                # never enter the notebook container (the user has a root shell in it: PID 1's
+                # /proc/1/environ, `os.environ`, and any child would expose it). Instead the manager
+                # runs the authenticated clone in a dedicated init container (see
+                # _git_clone_init_container) that populates {workspace}/repo before this container
+                # starts; the block below then finds the repo already present and skips cloning. This
+                # public path is unchanged and only clones when no token flow pre-populated the repo.
                 return f"""
 set -e
 export PATH="/root/.opencode/bin:$PATH"
@@ -1631,7 +1722,8 @@ exec {cmd}
                           ssh_public_key: Optional[str] = None,
                           pod_type: Optional[str] = None,
                           api_launched: bool = False,
-                          workspace_last_node: Optional[str] = None) -> dict:
+                          workspace_last_node: Optional[str] = None,
+                          git_token: Optional[str] = None) -> dict:
         """Generate Pod manifest"""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
@@ -1810,6 +1902,10 @@ exec {cmd}
             })
         elif settings.HF_TOKEN.strip():
             env.append({"name": "HF_TOKEN", "value": settings.HF_TOKEN.strip()})
+        # NOTE: a private-repo git_token is deliberately NOT injected into this (notebook) container's
+        # env. The user holds a root shell here, so any env var is readable via os.environ /
+        # /proc/1/environ. The authenticated clone runs in a separate init container instead (see
+        # _git_clone_init_container), keeping the token out of every user-reachable surface.
         if settings.PIP_INDEX_URL.strip():
             env.append({"name": "PIP_INDEX_URL", "value": settings.PIP_INDEX_URL.strip()})
         # Auto-configure common app frameworks so they serve under the Spaces
@@ -1988,6 +2084,24 @@ fi
                 "name": "workspace-durable",
                 "persistentVolumeClaim": {"claimName": shard_pvc},
             })
+
+        # Private-repo clone runs in a dedicated init container (NOT the user's notebook container).
+        # The token lives only in this init container's env; init containers are not user-exec
+        # reachable and their process table / /proc is gone once they complete, so the PAT never
+        # touches a surface the (root-in-pod) notebook user can read. It clones into {workspace}/repo
+        # before the notebook container starts; the notebook startup script then finds the repo
+        # present and skips its own (public, unauthenticated) clone. Gated on github_info + repo_url +
+        # git_token so public/.ipynb/bare launches are completely unaffected.
+        git_clone_repo_url = (github_info or {}).get("repo_url") if github_info else None
+        if git_token and git_clone_repo_url:
+            # Match the notebook container's workspace propagation: when the quota loop is mounted on
+            # the host by the privileged quota init container, HostToContainer lets this init see it.
+            clone_workspace_propagation = "HostToContainer" if (
+                settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir and not is_app_type
+            ) else None
+            init_containers.append(self._git_clone_init_container(
+                image, github_info, clone_workspace_propagation, git_token.strip(),
+            ))
 
         container_limits = {
             "cpu": resources["cpu_limit"],
@@ -3638,7 +3752,8 @@ exit 0
                         ssh_enabled: bool = False,
                         ssh_public_key: Optional[str] = None,
                         pod_type: Optional[str] = None,
-                        api_launched: bool = False) -> dict:
+                        api_launched: bool = False,
+                        git_token: Optional[str] = None) -> dict:
         """Create a new notebook instance"""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
@@ -3730,6 +3845,7 @@ exit 0
             pod_type=pod_type,
             api_launched=api_launched,
             workspace_last_node=workspace_last_node,
+            git_token=git_token,
         )
         pod_uid = None
         for attempt in range(1, 7):

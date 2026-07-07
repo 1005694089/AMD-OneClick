@@ -2784,6 +2784,7 @@ async def launch_huggingface_demo_notebook(
 
     # notebook_path can be: blank (bare Jupyter), a `.git` repo (workshop-only: clone + open
     # JupyterLab at repo root), or an .ipynb / HF URL (download or clone + open the notebook).
+    is_git_launch = False
     if (req.notebook_path or "").strip():
         try:
             git_info = _parse_huggingface_demo_git_path(req.notebook_path)
@@ -2796,6 +2797,7 @@ async def launch_huggingface_demo_notebook(
                     detail="A .git repo can only be launched with pod_type='workshop'",
                 )
             github_info = git_info
+            is_git_launch = True
         else:
             try:
                 github_info = _parse_huggingface_demo_notebook_path(req.notebook_path)
@@ -2803,6 +2805,31 @@ async def launch_huggingface_demo_notebook(
                 raise HTTPException(status_code=400, detail=str(e))
     else:
         github_info = None
+
+    # A git_token is a credential for a PRIVATE-repo clone; it is meaningless (and would be
+    # injected into a pod for no reason) outside a `.git` workshop launch, so reject it there
+    # rather than silently dropping it. Only forwarded to the pod when this is a git launch.
+    git_token = (req.git_token or "").strip()
+    if git_token and not is_git_launch:
+        raise HTTPException(
+            status_code=400,
+            detail="git_token is only supported for a .git workshop launch (pod_type='workshop')",
+        )
+    # Fail CLOSED on transport: a token authenticates over HTTP Basic auth, so sending it to a
+    # plain-http clone URL (the github.com hostAlias path serves git only over http://) would put
+    # the PAT on the wire in base64-decodable cleartext. Only allow a token when the resolved clone
+    # URL is https:// (e.g. a GITHUB_WEB_BASE proxy with a valid cert). Never downgrade a secret.
+    if git_token:
+        resolved_clone_url = (github_info or {}).get("repo_url") or ""
+        if not resolved_clone_url.lower().startswith("https://"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "git_token requires an HTTPS clone endpoint; this deployment resolves the repo "
+                    "over plain HTTP, which would expose the token on the wire. Configure an HTTPS "
+                    "GITHUB_WEB_BASE proxy to use a private-repo token."
+                ),
+            )
 
     provider_id, display_name, email = _huggingface_demo_user_identity(req.user_name)
     gpu_count = req.gpu_count or 1
@@ -2861,6 +2888,7 @@ async def launch_huggingface_demo_notebook(
             resource_profile="auto",
             pod_type=pod_type,
             api_launched=True,
+            git_token=git_token or None,
         ))
         _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,

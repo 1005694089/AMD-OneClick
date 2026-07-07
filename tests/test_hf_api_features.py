@@ -800,6 +800,147 @@ class GitWorkshopLaunch(HFLaunchTestBase):
         gi = self.fake.created[0]["github_info"]
         self.assertEqual(gi["path"], "x.ipynb")
 
+    def test_git_token_threaded_to_create_instance_over_https(self):
+        # A workshop .git launch whose clone URL resolves to https:// forwards the token.
+        main_module.settings.GITHUB_WEB_BASE = "https://gh-proxy.example.com"
+        try:
+            resp = self.client.post(
+                "/api/huggingface/notebooks",
+                json={"user_name": "wtok", "image": "registry/image:tag",
+                      "pod_type": "workshop", "notebook_path": "org/repo.git",
+                      "git_token": "ghp_secrettoken"},
+                headers=BEARER,
+            )
+            self.assertEqual(resp.status_code, 200, resp.text)
+            self.assertEqual(self.fake.created[0]["git_token"], "ghp_secrettoken")
+        finally:
+            main_module.settings.GITHUB_WEB_BASE = "https://github.com"
+
+    def test_git_token_rejected_over_plain_http(self):
+        # Default config resolves github.com to a plain-http clone URL; a token must be refused
+        # (fail closed) so the credential is never sent in cleartext on the wire.
+        main_module.settings.GITHUB_WEB_BASE = "https://github.com"  # not a proxy -> http clone
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "wtokhttp", "image": "registry/image:tag",
+                  "pod_type": "workshop", "notebook_path": "org/repo.git",
+                  "git_token": "ghp_secrettoken"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("HTTPS", resp.json()["detail"])
+        self.assertEqual(self.fake.created, [])
+
+    def test_blank_git_token_forwarded_as_none(self):
+        # A whitespace/blank git_token is normalized to None, not an empty string (and the
+        # HTTPS gate does not trip because there is effectively no token).
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "wtok2", "image": "registry/image:tag",
+                  "pod_type": "workshop", "notebook_path": "org/repo.git",
+                  "git_token": "   "},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(self.fake.created[0]["git_token"])
+
+    def test_git_token_rejected_for_non_git_launch(self):
+        # A git_token on an .ipynb (non-git) launch is a 400, never silently dropped.
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "wtok3", "image": "registry/image:tag",
+                  "notebook_path": "https://huggingface.co/org/repo/blob/main/x.ipynb",
+                  "git_token": "ghp_secrettoken"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("git_token", resp.json()["detail"])
+        self.assertEqual(self.fake.created, [])
+
+    def test_git_token_rejected_for_bare_launch(self):
+        # A git_token with no repo at all (bare Jupyter) is also rejected.
+        resp = self.client.post(
+            "/api/huggingface/notebooks",
+            json={"user_name": "wtok4", "image": "registry/image:tag",
+                  "pod_type": "workshop", "git_token": "ghp_secrettoken"},
+            headers=BEARER,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("git_token", resp.json()["detail"])
+
+
+class GitTokenInitContainer(unittest.TestCase):
+    """_get_pod_manifest runs the authenticated clone in an isolated init container, and keeps
+    the token off the user's notebook container entirely."""
+
+    def setUp(self):
+        _pin_settings()
+        from app import k8s_client as k8s_mod
+        self.builder = k8s_mod.K8sClient.__new__(k8s_mod.K8sClient)
+        self.builder.namespace = "test-ns"
+        # Neutralize node/quota/localcache/image-service helpers so _get_pod_manifest is pure.
+        self.builder._get_labels = lambda email, iid: {"app": iid}
+        self.builder._resolve_resource_profile = lambda gpu, prof: (
+            "standard", {"cpu_limit": "16", "cpu_request": "8", "memory_limit": "110Gi",
+                         "memory_request": "55Gi"})
+        self.builder._workspace_localcache_enabled = lambda: False
+        self.builder._notebook_tolerations = lambda: []
+
+    def _gi(self):
+        return {"org": "org", "repo": "repo", "branch": "main", "path": "", "raw_url": "",
+                "repo_url": "https://gh-proxy.example.com/org/repo.git"}
+
+    def _manifest(self, git_token):
+        return self.builder._get_pod_manifest(
+            "u@example.com", "hf-1-abc", "registry/image:tag",
+            instance_type="jupyter", gpu_count=1, github_info=self._gi(),
+            pod_type="workshop", api_launched=True, git_token=git_token)
+
+    def _notebook_container(self, manifest):
+        return manifest["spec"]["containers"][0]
+
+    def _init_by_name(self, manifest, name):
+        return next((c for c in manifest["spec"].get("initContainers", []) if c["name"] == name), None)
+
+    def test_token_launch_adds_isolated_clone_init_container(self):
+        m = self._manifest("ghp_secrettoken")
+        clone = self._init_by_name(m, "git-clone")
+        self.assertIsNotNone(clone, "git-clone init container missing")
+        # Token is on the init container env (the ONLY place it lives).
+        env_names = {e["name"]: e for e in clone["env"]}
+        self.assertIn("GIT_CLONE_TOKEN", env_names)
+        self.assertEqual(env_names["GIT_CLONE_TOKEN"]["value"], "ghp_secrettoken")
+        # Auth uses GIT_ASKPASS reading the env var; token not on argv / not literal in script.
+        script = clone["args"][0]
+        self.assertIn("GIT_ASKPASS", script)
+        self.assertIn("x-access-token", script)  # username baked in; token is the password
+        self.assertNotIn("ghp_secrettoken", script)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", script)
+
+    def test_token_never_reaches_notebook_container(self):
+        m = self._manifest("ghp_secrettoken")
+        nb = self._notebook_container(m)
+        env_names = {e["name"] for e in nb["env"]}
+        self.assertNotIn("GIT_CLONE_TOKEN", env_names)
+        # The token value appears nowhere in the notebook container (env or startup script).
+        import json as _json
+        self.assertNotIn("ghp_secrettoken", _json.dumps(nb))
+
+    def test_non_token_launch_has_no_clone_init_container(self):
+        m = self._manifest(None)
+        self.assertIsNone(self._init_by_name(m, "git-clone"))
+        # Public clone still happens in the notebook container's startup script.
+        nb = self._notebook_container(m)
+        self.assertIn("clone --depth 1", nb["args"][0])
+
+    def test_clone_init_container_fails_closed_on_non_https(self):
+        # Belt-and-suspenders: the helper itself refuses a token over a non-https clone URL,
+        # independently of the main.py gate, so no caller can downgrade the secret.
+        gi = {"org": "org", "repo": "repo", "branch": "main", "path": "", "raw_url": "",
+              "repo_url": "http://github.com/org/repo.git"}
+        with self.assertRaises(ValueError):
+            self.builder._git_clone_init_container("registry/image:tag", gi, None, "ghp_secrettoken")
+
 
 class TemplateRepoOnly(unittest.TestCase):
     """Notebook templates may clone a repo with no notebook path."""

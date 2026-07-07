@@ -91,6 +91,11 @@ class HuggingFaceNotebookLaunchRequest(BaseModel):
     # decremented by the billing loop) at whatever it is when this flag is applied. Does not
     # exempt the instance from the API idle reaper (still destroyed after 8h idle).
     unlimited_credits: bool = False
+    # Optional GitHub token for cloning a PRIVATE repo. Only honored for a `.git` workshop launch
+    # (pod_type='workshop') whose resolved clone URL is https://; rejected otherwise. The
+    # authenticated clone runs in a dedicated init container (never the user's notebook container),
+    # with the token consumed by git via GIT_ASKPASS — never on the git argv nor in .git/config.
+    git_token: Optional[str] = None
 
 
 class CustomImageBuildRequest(BaseModel):
