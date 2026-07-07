@@ -24,7 +24,84 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-06 19:41 (latest) - radeon-global: HF demo API `streamlit_url` (live Spaces surfacing for hackathon pods)
+## 2026-07-07 18:04 (latest) - radeon-global: HF demo API private-repo `git_token` for workshop `.git` launches
+
+**Code:** `prod/radeon-global` at `41d9e13` ("HF demo API: private-repo git_token for workshop .git
+launches"), on top of `d24e4de` (streamlit_url ledger) / `04df831` (streamlit_url feature). Committed
+LOCALLY on the build host; **NOT pushed to origin** (operator holding the push). Edits: `app/models.py`
+(+`git_token` field on `HuggingFaceNotebookLaunchRequest`), `app/main.py` (validation: token only on a
+`.git` workshop launch, fail-closed unless resolved clone URL is https://), `app/k8s_client.py`
+(+`_git_clone_init_container`; token-bearing clone isolated in a dedicated init container; token removed
+from the notebook container), `tests/test_hf_api_features.py` (+git_token endpoint/init-container/HTTPS
+tests). The test file does not ship in the image.
+
+**What changed:** an optional per-request `git_token` lets a workshop `.git` launch
+(`pod_type='workshop'`) clone a PRIVATE GitHub repo. Two security properties, from a 2-round
+adversarial multi-agent review (round 2 = 0 findings, READY TO COMMIT):
+- **Transport fail-closed (H1):** a present `git_token` is rejected with 400 unless the resolved clone
+  URL (`github_info['repo_url']`) is https://. Live `GITHUB_WEB_BASE=https://gh-test.anruicloud.com`, so
+  real launches resolve https:// and are allowed; the default plain-http github.com hostAlias path is
+  refused so the PAT is never sent in cleartext. `_git_clone_init_container` independently re-asserts
+  https:// (raises otherwise) as a belt-and-suspenders invariant.
+- **User-isolation (H2):** the authenticated clone runs in a dedicated `git-clone` init container, NOT
+  the user's notebook container. `GIT_CLONE_TOKEN` is set only on that init container; the token is
+  consumed via a GIT_ASKPASS helper (never on argv, never in `.git/config`) with username
+  `x-access-token` baked into the URL. Init containers are not user-exec reachable and their /proc is
+  gone post-exit, so the root-in-pod workshop user cannot read the token. Public/.ipynb/bare launches
+  are unaffected (no init container added; notebook startup script still does its own public clone).
+
+**Image build:** manager-only INCREMENTAL kaniko build (base unchanged, only 3 files layered) — Job
+`manager-build-gittoken-20260707-1804` in ns `amd-oneclick-lablab` (ran on s-063), kaniko executor
+`gcr.m.daocloud.io/kaniko-project/executor@sha256:2562c4fe551399514277ffff7dcca9a3b1628c4ea38cb017d7286dc6ea52f4cd`,
+`FROM 10.5.10.89:1808/xinwei/amd-oneclick-manager:streamlit-url-20260706-1941` + COPY of
+`app/models.py`/`app/main.py`/`app/k8s_client.py` at `/app/app/*.py`. Build context via ConfigMap
+`gittoken-build-ctx` (Dockerfile + 3 files, ~478KB, under the 1MiB cap) dereferenced by a busybox
+`cp -rL` initContainer into a plain emptyDir (the ledger's documented ConfigMap-symlink fix). Registry
+auth reused the existing `kaniko-harbor-auth` Secret (key `config.json`). Pushed
+`10.5.10.89:1808/xinwei/amd-oneclick-manager:gittoken-20260707-1804`
+(`@sha256:87463c6e274f744607b2b024457a640a82fef0923884ff668ad9437315adb9a9`). Import verified in a
+throwaway pod BEFORE rolling (`import app.main` clean, `_git_clone_init_container` present, `git_token`
+field present). Build Job + ConfigMap deleted after.
+
+**Deploy:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=...:gittoken-20260707-1804`. RollingUpdate (maxSurge=0/maxUnavailable=1, 2 replicas) — one
+replica serving throughout. Rollout 2/2, 0 restarts (final replicas on s-001 + s-003). No
+ConfigMap/Secret/RBAC/Service changes. PRE/APPLIED snapshots:
+`local-deploy-history/radeon-global/20260707-1804-gittoken-PRE-deploy.yaml` and
+`...-gittoken-APPLIED-deploy.yaml`.
+
+**Verification (e2e on LIVE cluster, workshop active, WORKSPACE_VOLUME_TYPE=localcache + quota on):**
+- `/` (public) stayed 200 throughout; both manager replicas 0 restarts.
+- **T1 (neg):** `git_token` on a non-git (.ipynb) launch -> 400 "git_token is only supported for a .git
+  workshop launch".
+- **T2 (pos):** workshop `.git` launch (`octocat/Hello-World.git`) + `git_token` over https -> 200,
+  instance `hf-161-3cfe960e`.
+- **T3 (isolation):** pod init containers = workspace-quota -> workspace-hydrate -> **git-clone** (last);
+  git-clone env carries `GIT_CLONE_TOKEN`, mounts /workspace with `HostToContainer` propagation (correct
+  for the quota loop-mount); notebook container env has **NO** GIT_CLONE_TOKEN; token appears **0 times**
+  in the init container script/args (env-only).
+- **T3b (clone works):** all 3 init containers exit 0; git-clone log "Private repository cloned"; the
+  authenticated init-container clone path works through the live HTTPS proxy.
+- **T4 (no leak in user pod):** `/workspace/repo` present; `.git/config` remote url =
+  `https://x-access-token@gh-test.anruicloud.com/octocat/Hello-World.git` (username only, **no token**);
+  `GIT_CLONE_TOKEN` absent from the user shell env AND from `/proc/1/environ`.
+- **T5 (neg):** `git_token` on a bare workshop launch (no repo) -> 400.
+- **T6 (no regression):** public workshop `.git` launch WITHOUT token -> 200 (`hf-162-...`), pod has
+  **no** git-clone init container, notebook startup script still does its own public clone.
+- Both test instances destroyed (destroyed_count:1 each, pods fully terminated); T1/T5 created no pods.
+  19 real user pods undisturbed throughout.
+- Pre-deploy: `pytest tests/test_hf_api_features.py` -> 84 passed, 2 pre-existing failures (fail on clean
+  HEAD too: resource-profile mem-limit + pod-type-threading, both env/config, unrelated); k8s/manifest
+  test files 40 passed.
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:streamlit-url-20260706-1941` (base image still
+present on nodes), or re-apply the PRE-deploy snapshot.
+
+**Process note:** operator has NOT authorized `git push`; commit `41d9e13` and this ledger update remain
+local only until the operator says to push.
+
+## 2026-07-06 19:41 - radeon-global: HF demo API `streamlit_url` (live Spaces surfacing for hackathon pods)
 
 **Code:** `prod/radeon-global` at `04df831` ("HF demo API: surface live streamlit_url for hackathon
 pods"), on top of `ec577be` (dir-quota backstop). Edits: `app/models.py` (+`streamlit_url` field on

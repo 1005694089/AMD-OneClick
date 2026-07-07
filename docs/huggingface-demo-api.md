@@ -137,7 +137,9 @@ Optional fields (may be combined with either body above):
 ```json
 {
   "image": "<allowed-notebook-image>",
-  "pod_type": "hackathon",
+  "pod_type": "workshop",
+  "notebook_path": "org/private-repo.git",
+  "git_token": "<github-token>",
   "unlimited_credits": false
 }
 ```
@@ -149,6 +151,7 @@ Rules:
   - **An `.ipynb` file** (a `github/org/repo/blob/branch/path.ipynb` path or a `huggingface.co` notebook URL) — the notebook is fetched server-side and opened in the launched notebook.
   - **A `.git` repo** (workshop only — see below) — the repo is cloned and JupyterLab opens at the repo root.
 - **Workshop `.git` repos:** when `pod_type` is `workshop`, `notebook_path` may be a GitHub repository instead of a notebook file: `org/repo.git`, a full `https://github.com/org/repo.git` URL, or the scp form `git@github.com:org/repo.git`. Append `@branch` to pick a branch (e.g. `org/repo.git@dev`); with no `@branch` the repo's default branch is cloned. The repo is cloned into the workspace and JupyterLab opens at its root — **no `.ipynb` is required**. A `.git` value with any non-workshop `pod_type` (or none) is rejected with `400 A .git repo can only be launched with pod_type='workshop'`. Only GitHub repositories are accepted.
+- **Private repos (`git_token`):** to clone a **private** GitHub repo, pass `git_token` (a GitHub personal-access / fine-grained token with read access to the repo) alongside a `.git` workshop launch. The token is used only for the clone and is handled so it never reaches the user's notebook environment: the authenticated clone runs in a dedicated init container, so the token is **not** present in the notebook container's env, **not** written into the cloned repo's `.git/config`, and **not** placed on any command line. `git_token` is honored **only** for a `.git` workshop launch — passing it on any other launch (`.ipynb`, blank, or a non-`workshop` `pod_type`) is rejected with `400 git_token is only supported for a .git workshop launch (pod_type='workshop')`. For safety the token is **only accepted when the repo resolves to an HTTPS clone endpoint**; if this deployment resolves GitHub over plain HTTP the request is rejected with `400 git_token requires an HTTPS clone endpoint` (configure an HTTPS GitHub proxy to use private-repo tokens). Public repos need no `git_token`.
 - Hugging Face notebook URLs are downloaded server-side through the configured internal Hugging Face proxy and server-side `HF_TOKEN`.
 - `image` is optional. Pass either the friendly `name` or the full `image` ref from `GET /api/huggingface/images` (name match is case-insensitive); anything not in the enabled catalog is rejected with `400 Invalid image selected`. Defaults to `default_image`.
 - `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
@@ -305,6 +308,7 @@ export type LaunchRequest = {
   gpu_count?: 1 | 2 | 4;
   image?: string; // a value from GET /api/huggingface/images
   pod_type?: "hackathon" | "workshop" | "one-click";
+  git_token?: string; // private-repo clone token; ONLY valid with a .git workshop launch over an HTTPS endpoint (rejected otherwise). Never reaches the notebook container.
   unlimited_credits?: boolean; // default false; when true on a successful launch, sticky-freezes this user_name's balance (billing skipped; 8h idle reaper still applies)
 };
 
