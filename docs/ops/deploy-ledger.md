@@ -24,6 +24,53 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-08 22:47 - radeon-global: HOTFIX flush-vs-relaunch race (marker/gen desync) + re-enable (DEPLOYED + race e2e verified)
+
+**Status:** DEPLOYED `wsfix2-20260708-2247` (`@sha256:5186f5cd815ecfe6d6f59a7ae76c18d16001f3206f987da93a0b3b87518f10ad`)
+to `amd-oneclick-lablab`; propagation RE-ENABLED after the fix + race e2e. Committed LOCALLY on
+`prod/radeon-global` at `9a17540` (fix) / this ledger commit; **NOT pushed**.
+
+**Incident:** shortly after enabling fenced propagation (prev entry), a user reported deletions not
+persisting and durable "re-populating" /workspace. Root cause = a **flush-vs-relaunch race**: the
+out-of-pod flush is async (~10-40s); a quick stop->relaunch let the new pod's hydrate read a stale Gd
+(before the prior session's flush committed its `durable_generation` bump) and stamp the on-node
+marker BELOW `durable_generation`. That desync then (a) made the next stop see `marker<gen` ->
+SUPERSEDED -> **discard the live session**, (b) made the next relaunch see `Gd>marker` -> MIRROR-wipe
+the warm copy, and (c) the racy hydrate ran on pre-`--delete` durable -> **resurrected deletions**.
+Fingerprint on `u-1-cf9e6454`: flush of session 14:18:17 committed gen=1 at 14:18:59, but the relaunch
+pod was created 14:18:49 (10s earlier) with annotation `workspace-durable-generation=0` -> marker=0 vs
+gen=1. Blast radius = 2 instances bumped in the ~20-min window (`u-1`, `hf-181-cbbde7a6`).
+
+**Mitigation (immediate):** flipped `WORKSPACE_DELETION_PROPAGATION_ENABLED=false` + restart ->
+instant revert to safe accumulate-only (no discard / no --delete / no MIRROR-wipe).
+
+**Fix (`9a17540`):**
+- **Launch-settle** (`_settle_workspace_flushes_before_launch`, called in `create_instance` for
+  durable+prop-on): drives any pending flush of the instance to completion BEFORE building the manifest,
+  so the hydrate's Gd is fresh and it runs on settled durable. Eliminates the race at its source.
+- **Defensive discard guard**: a `SUPERSEDED` flush outcome is only honored as a discard when a
+  STRICTLY-NEWER copy exists (`store.has_newer_local_copy`); otherwise it is the latest session with a
+  race-clobbered marker -> mark flushed, never discard. Protects the live session AND heals an
+  already-desynced running instance on its next stop.
+- 74 workspace unit tests (settle drives/awaits/only-this-instance; SUPERSEDED discarded only when a
+  newer copy exists else marked-flushed; has_newer_local_copy stranded-vs-latest).
+
+**Deploy + recovery:**
+1. Rebuilt incremental image `wsfix2-20260708-2247`, import-verified (`_settle_workspace_flushes_before_launch`
+   + `has_newer_local_copy` present), rolled with propagation STILL OFF (2/2, 0 restarts).
+2. Reconciled the 2 desynced instances' on-node markers to their DB `durable_generation`: `u-1` (running)
+   0->1 (now IN-SYNC); `hf-181` (stopped) heals on next launch via settle+hydrate.
+3. Flipped propagation ON + restart (2/2, `/` 200).
+
+**Race e2e (LIVE, prop on):** `hf-297-a904b1fb` — wrote KEEP_C + DELME_C, `rm DELME_C`, then a FAST
+stop->relaunch (relaunch overlapping the async flush, the exact incident trigger). Result: DELME_C
+**STAYS-DELETED**, KEEP_C present, and **on-node marker == DB durable_generation (3==3) IN-SYNC** — the
+desync is gone and the deletion persists through the race. `u-1` post-reconcile confirmed marker==gen
+(1==1). Test instance destroyed + durable trashed; build artifacts removed; no leftover test pods.
+
+**Rollback / kill-switch:** unchanged (set image to `gittoken-20260707-1804`, or
+`WORKSPACE_DELETION_PROPAGATION_ENABLED=false` + restart).
+
 ## 2026-07-08 21:49 - radeon-global: workspace persistence: fenced deletion propagation + per-template image seeding + PVC-optional seam (DEPLOYED + e2e verified)
 
 **Status:** DEPLOYED to `amd-oneclick-lablab` (radeon-global) and e2e-verified live. Committed LOCALLY
