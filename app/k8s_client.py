@@ -811,6 +811,45 @@ class K8sClient:
             logger.info("SUPERSEDED copy %s@%s not freed this pass (node busy/down); retry later",
                         instance_id, node_name)
 
+    def _settle_workspace_flushes_before_launch(self, instance_id: str, timeout_seconds: int = 120):
+        """Ensure every pending (unflushed) copy of this instance is flushed BEFORE a relaunch builds
+        its manifest / hydrates — closing the flush-vs-relaunch race that otherwise desyncs the
+        on-node generation marker below durable_generation.
+
+        Only meaningful in durable mode with propagation ON (legacy/ephemeral carry no generation).
+        Drives the flush for each pending copy (the flush itself serializes via the per-instance
+        in-process + advisory locks, so an in-flight delete-path flush is awaited rather than raced),
+        then re-checks. Bounded by timeout_seconds; if copies remain pending (e.g. a NotReady node),
+        it logs and proceeds — the retry sweep and the SUPERSEDED-is-not-discarded-unless-newer guard
+        keep that safe. The pod for this instance does not exist yet at call time (create_instance
+        already deleted/awaited any prior pod), so the flush won't abort on _pod_exists."""
+        if not (self._workspace_localcache_enabled()
+                and self._resolve_workspace_mode() == "durable"
+                and self._deletion_propagation_enabled()):
+            return
+        deadline = time.monotonic() + max(1, timeout_seconds)
+        while time.monotonic() < deadline:
+            try:
+                pending = [r for r in store.list_workspace_unflushed_copies()
+                           if r.get("instance_id") == instance_id and r.get("node_name")
+                           and r.get("session_token")]
+            except Exception as e:
+                logger.debug("settle: unflushed lookup for %s failed: %s", instance_id, e)
+                return
+            if not pending:
+                return  # durable + generation are settled; safe to build the manifest
+            for r in pending:
+                try:
+                    self._flush_workspace_to_durable(r["instance_id"], r["node_name"], r["session_token"])
+                except Exception as e:
+                    logger.debug("settle flush for %s@%s failed: %s",
+                                 instance_id, r.get("node_name"), e)
+            # A flush may have skipped because a delete-path/sweep flush holds the lock; re-check after
+            # a short pause so we wait for it to finish rather than busy-loop.
+            time.sleep(2)
+        logger.warning("settle: pending flush(es) for %s not fully settled within %ss; proceeding "
+                       "(retry sweep + superseded-guard keep this safe)", instance_id, timeout_seconds)
+
     def _flush_workspace_to_durable(self, instance_id: str, node_name: str, session_token: str,
                                     timeout_seconds: int = 600) -> bool:
         """Flush an instance's node-local SSD /workspace copy up to its durable NFS shard.
@@ -1109,8 +1148,28 @@ class K8sClient:
                                 instance_id, node_name)
                 return ok
             if outcome == "SUPERSEDED":
-                self._discard_superseded_local_copy(instance_id, node_name, session_token)
-                return True
+                # DATA-SAFETY: the in-container decision (Gl < Gd) says this copy is behind durable.
+                # That is a genuine stranded copy ONLY if a strictly-newer session ran elsewhere
+                # (B1). If NO newer copy exists, this IS the latest session and its marker was merely
+                # clobbered below durable_generation by a flush-vs-relaunch race — discarding it would
+                # destroy the live session's work. In that case do NOT discard: mark it flushed
+                # (keep the SSD; the reaper frees it normally, so a same-node relaunch can still reuse
+                # the warm copy). Only discard a copy a newer session provably superseded.
+                try:
+                    genuinely_superseded = store.has_newer_local_copy(
+                        instance_id, node_name, session_token)
+                except Exception as e:
+                    logger.debug("has_newer_local_copy check for %s/%s failed (treating as NOT "
+                                 "superseded, conservative): %s", instance_id, node_name, e)
+                    genuinely_superseded = False
+                if genuinely_superseded:
+                    self._discard_superseded_local_copy(instance_id, node_name, session_token)
+                    return True
+                logger.warning("flush for %s on %s reported SUPERSEDED but it is the LATEST copy "
+                               "(marker<gen desync, not a stranded copy); NOT discarding — marking "
+                               "flushed to preserve the session (durable unchanged)",
+                               instance_id, node_name)
+                return store.mark_workspace_flushed(instance_id, node_name, session_token)
             # MERGE / NOOP / unreadable-log -> plain mark, no generation bump (always safe).
             marked = store.mark_workspace_flushed(instance_id, node_name, session_token)
             if marked:
@@ -4319,6 +4378,18 @@ exit 0
                 workspace_last_node = store.get_workspace_last_node(instance_id)
             except Exception as e:
                 logger.debug("workspace last-node lookup failed for %s: %s", instance_id, e)
+            # DATA-SAFETY (flush-vs-relaunch race): drive any pending flush of THIS instance to
+            # completion BEFORE building the manifest, so the hydrate's Gd is fresh and it runs on a
+            # settled durable. Without this, a quick stop->relaunch lets the new pod's hydrate read a
+            # stale Gd (before the prior session's async out-of-pod flush commits its generation bump)
+            # and stamp the on-node marker below durable_generation — a desync that makes the next
+            # stop SUPERSEDED-discard the session and the next relaunch MIRROR-wipe the warm copy.
+            # Gated to durable + propagation-on (legacy/ephemeral have no generation to settle).
+            try:
+                self._settle_workspace_flushes_before_launch(instance_id)
+            except Exception as e:
+                logger.error("settle pending flushes before launch of %s failed (continuing): %s",
+                             instance_id, e)
         pod_manifest = self._get_pod_manifest(
             email, instance_id, image,
             instance_type=instance_type,

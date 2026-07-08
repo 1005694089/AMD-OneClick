@@ -249,6 +249,21 @@ class GenerationLedgerTests(unittest.TestCase):
         self.assertNotIn(("nb-f", "node-1"), ids,
                          "an unflushed superseded copy must never be reapable (never-reap-unflushed)")
 
+    def test_has_newer_local_copy_distinguishes_stranded_from_latest(self):
+        # Distinguishes a genuinely-superseded stranded copy (a newer session ran on another node)
+        # from a race-desynced LATEST copy (no newer copy) — the guard that prevents discarding a
+        # live session whose marker was clobbered below durable_generation.
+        s = self.store
+        tA = s.stamp_workspace_stopped("nb-h", "node-A")
+        # Only A exists → A is the latest → not superseded.
+        self.assertFalse(s.has_newer_local_copy("nb-h", "node-A", tA))
+        s.stamp_workspace_running("nb-h", None)
+        tB = s.stamp_workspace_stopped("nb-h", "node-B")   # newer session on a different node
+        self.assertTrue(s.has_newer_local_copy("nb-h", "node-A", tA),
+                        "A now has a strictly-newer copy on B → genuinely superseded")
+        self.assertFalse(s.has_newer_local_copy("nb-h", "node-B", tB),
+                         "B is the latest → not superseded")
+
     def test_clear_cache_state_resets_generation(self):
         # Admin durable delete calls clear_workspace_cache_state → generation resets so a re-created
         # workspace under the same id starts at 0 (won't MIRROR-wipe against empty durable).

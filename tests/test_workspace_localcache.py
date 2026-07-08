@@ -796,12 +796,15 @@ class FlushGenerationTests(unittest.TestCase):
         self.calls = {"auth": [], "mark": [], "discard": [], "adv": 0}
         self._orig_store = {k: getattr(k8s_module.store, k) for k in (
             "get_durable_generation", "mark_workspace_flushed", "mark_workspace_flushed_authoritative",
-            "discard_superseded_copy", "workspace_instance_advisory_lock")}
+            "discard_superseded_copy", "workspace_instance_advisory_lock", "has_newer_local_copy")}
         k8s_module.store.get_durable_generation = lambda iid: 0
         k8s_module.store.mark_workspace_flushed = lambda i, n, t: (self.calls["mark"].append((i, n, t)) or True)
         k8s_module.store.mark_workspace_flushed_authoritative = \
             lambda i, n, t, g: (self.calls["auth"].append((i, n, t, g)) or True)
         k8s_module.store.discard_superseded_copy = lambda i, n, t: (self.calls["discard"].append((i, n, t)) or True)
+        # Default: a SUPERSEDED copy IS genuinely superseded (a newer copy exists) unless a test says otherwise.
+        self._has_newer = True
+        k8s_module.store.has_newer_local_copy = lambda i, n, t: self._has_newer
         import contextlib as _cl
 
         def _adv(iid, timeout_seconds=180):
@@ -883,14 +886,31 @@ class FlushGenerationTests(unittest.TestCase):
                          "AUTHORITATIVE must confirm via the generation-bumping path with Gd+1")
         self.assertEqual(self.calls["mark"], [])
 
-    def test_superseded_outcome_discards(self):
+    def test_superseded_outcome_discards_when_newer_copy_exists(self):
+        # A genuinely stranded copy (a strictly-newer session ran elsewhere) IS discarded (B1).
+        self._has_newer = True
         self.c.core_v1 = self._core("WS_FLUSH_SUPERSEDED Gl=0 Gd=2")
         ok = self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "T1")
         self.assertTrue(ok)
         self.assertEqual(self.calls["discard"], [("nb-a1b2c3d4", "node-7", "T1")],
-                         "SUPERSEDED must discard the stranded copy, never merge it up")
+                         "a genuinely-superseded stranded copy must be discarded, never merged up")
         self.assertEqual(self.calls["auth"], [])
         self.assertEqual(self.calls["mark"], [])
+
+    def test_superseded_not_discarded_when_latest_copy_desync(self):
+        # DATA-LOSS REGRESSION (flush-vs-relaunch race): a SUPERSEDED outcome with NO newer copy means
+        # this is the LATEST session whose marker was clobbered below gen by the race — it must NOT be
+        # discarded (that would destroy the live session). It is marked flushed (SSD kept), durable
+        # untouched.
+        self._has_newer = False
+        self.c.core_v1 = self._core("WS_FLUSH_SUPERSEDED Gl=0 Gd=2")
+        ok = self.c._flush_workspace_to_durable("nb-a1b2c3d4", "node-7", "T1")
+        self.assertTrue(ok)
+        self.assertEqual(self.calls["discard"], [],
+                         "the LATEST copy must NOT be discarded on a marker<gen desync")
+        self.assertEqual(self.calls["mark"], [("nb-a1b2c3d4", "node-7", "T1")],
+                         "the desynced latest copy is marked flushed to preserve the session")
+        self.assertEqual(self.calls["auth"], [])
 
     def test_merge_outcome_marks_without_bump(self):
         self.c.core_v1 = self._core("WS_FLUSH_MERGE Gl=5 Gd=3")
@@ -973,6 +993,71 @@ class FlushGenerationTests(unittest.TestCase):
             held.release()
         # different instance uses a different lock object.
         self.assertIsNot(self.c._flush_lock_for("nb-a1b2c3d4"), self.c._flush_lock_for("nb-other"))
+
+
+class SettleBeforeLaunchTests(unittest.TestCase):
+    """_settle_workspace_flushes_before_launch closes the flush-vs-relaunch race: it drives any
+    pending flush of the instance to completion BEFORE the manifest/hydrate, and no-ops when
+    propagation is off or the mode isn't durable."""
+
+    def setUp(self):
+        s = k8s_module.settings
+        self._orig = {k: getattr(s, k) for k in ("WORKSPACE_VOLUME_TYPE", "WORKSPACE_DELETION_PROPAGATION_ENABLED")}
+        s.WORKSPACE_VOLUME_TYPE = "localcache"
+        s.WORKSPACE_DELETION_PROPAGATION_ENABLED = True
+        self._sleep = k8s_module.time.sleep
+        k8s_module.time.sleep = lambda *a, **k: None
+        self.c = k8s_module.K8sClient.__new__(k8s_module.K8sClient)
+        self._orig_list = k8s_module.store.list_workspace_unflushed_copies
+
+    def tearDown(self):
+        for k, v in self._orig.items():
+            setattr(k8s_module.settings, k, v)
+        k8s_module.store.list_workspace_unflushed_copies = self._orig_list
+        k8s_module.time.sleep = self._sleep
+
+    def test_settle_flushes_pending_then_returns(self):
+        # Two pending copies on the first poll, none after they're flushed → settle flushes both, returns.
+        state = {"pending": [
+            {"instance_id": "nb-x", "node_name": "node-A", "session_token": "T1"},
+            {"instance_id": "nb-x", "node_name": "node-B", "session_token": "T2"},
+        ], "flushed": []}
+        k8s_module.store.list_workspace_unflushed_copies = lambda: list(state["pending"])
+
+        def fake_flush(iid, node, tok, timeout_seconds=600):
+            state["flushed"].append((iid, node, tok))
+            state["pending"] = [r for r in state["pending"] if r["node_name"] != node]
+            return True
+        self.c._flush_workspace_to_durable = fake_flush
+        self.c._settle_workspace_flushes_before_launch("nb-x", timeout_seconds=10)
+        self.assertEqual(sorted(n for _, n, _ in state["flushed"]), ["node-A", "node-B"],
+                         "settle must flush every pending copy of the instance before returning")
+
+    def test_settle_noop_when_propagation_off(self):
+        k8s_module.settings.WORKSPACE_DELETION_PROPAGATION_ENABLED = False
+        called = {"list": 0}
+
+        def _list():
+            called["list"] += 1
+            return []
+        k8s_module.store.list_workspace_unflushed_copies = _list
+        self.c._settle_workspace_flushes_before_launch("nb-x", timeout_seconds=10)
+        self.assertEqual(called["list"], 0, "settle must be a no-op when propagation is off (legacy path)")
+
+    def test_settle_only_targets_this_instance(self):
+        state = {"pending": [
+            {"instance_id": "nb-x", "node_name": "node-A", "session_token": "T1"},
+            {"instance_id": "nb-OTHER", "node_name": "node-Z", "session_token": "T9"},
+        ], "flushed": []}
+        k8s_module.store.list_workspace_unflushed_copies = lambda: list(state["pending"])
+
+        def fake_flush(iid, node, tok, timeout_seconds=600):
+            state["flushed"].append(iid)
+            state["pending"] = [r for r in state["pending"] if r["instance_id"] != iid]
+            return True
+        self.c._flush_workspace_to_durable = fake_flush
+        self.c._settle_workspace_flushes_before_launch("nb-x", timeout_seconds=10)
+        self.assertEqual(state["flushed"], ["nb-x"], "settle must only flush THIS instance's copies")
 
 
 class EphemeralModeTests(_ManifestBase):

@@ -3241,6 +3241,25 @@ def mark_workspace_flushed_authoritative(instance_id: str, node_name: str, sessi
     return True
 
 
+def has_newer_local_copy(instance_id: str, node_name: str, session_token: str) -> bool:
+    """True if a STRICTLY-NEWER copy (larger session_token) exists for this instance on a DIFFERENT
+    node — i.e. a later session genuinely superseded this one. Distinguishes a truly-stranded copy
+    (a newer session ran elsewhere → safe to discard, B1) from a race-desynced LIVE copy (this is the
+    latest session but its on-node generation marker was clobbered below durable_generation by a
+    flush-vs-relaunch race → must NOT be discarded). session_token is the stop timestamp (ISO), so a
+    lexicographic '>' is a chronological '>'."""
+    lc = workspace_local_copy.c
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(lc.instance_id).where(
+                lc.instance_id == instance_id,
+                lc.node_name != node_name,
+                lc.session_token > session_token,
+            ).limit(1)
+        ).first()
+    return row is not None
+
+
 def discard_superseded_copy(instance_id: str, node_name: str, session_token: str) -> bool:
     """Drop a SUPERSEDED stranded local-copy row (synced_generation < durable_generation) so neither
     the retry sweep nor the reaper acts on it again. Token-fenced so a re-stopped session's fresh copy
