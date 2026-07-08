@@ -24,11 +24,56 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
-## 2026-07-08 (CODE-COMPLETE, NOT YET DEPLOYED) - workspace persistence: fenced deletion propagation + per-template image seeding + PVC-optional seam
+## 2026-07-08 21:49 - radeon-global: workspace persistence: fenced deletion propagation + per-template image seeding + PVC-optional seam (DEPLOYED + e2e verified)
 
-**Status:** code + tests landed locally on top of the `git_token` entry below; **NOT built, NOT
-deployed**. This row is a pre-deploy design record — a real deploy row (image tag/digest, snapshot,
-rollout) MUST be appended when it ships. Do not treat this as deployed.
+**Status:** DEPLOYED to `amd-oneclick-lablab` (radeon-global) and e2e-verified live. Committed LOCALLY
+on `prod/radeon-global` at `a22a388`; **NOT pushed** (operator holds the push, per the standing rule).
+
+**Image build:** manager-only INCREMENTAL kaniko build (base unchanged, 4 files layered) — Job
+`manager-build-wsfix-20260708-2149`, kaniko executor
+`gcr.m.daocloud.io/kaniko-project/executor@sha256:2562c4fe551399514277ffff7dcca9a3b1628c4ea38cb017d7286dc6ea52f4cd`,
+`FROM 10.5.10.89:1808/xinwei/amd-oneclick-manager:gittoken-20260707-1804` + COPY of
+`app/config.py`/`app/k8s_client.py`/`app/scheduler.py`/`app/store.py` at `/app/app/*.py`. Build context
+via ConfigMap `wsfix-build-ctx` (~556KB, under the 1MiB cap) dereferenced by a busybox `cp -rL`
+initContainer into an emptyDir. Pushed
+`10.5.10.89:1808/xinwei/amd-oneclick-manager:wsfix-20260708-2149`
+(`@sha256:7791bba3425b3236d843f4ffbaa8d0ee78c6e2934bdf709e47f68fb7fc9f2c21`). Import verified in a
+throwaway pod BEFORE rolling (`import app.main` clean; `_resolve_workspace_mode`/`_flush_script`/
+`_SYNCED_GEN_MARKER_REL` + store `get_durable_generation`/`mark_workspace_flushed_authoritative`/
+`discard_superseded_copy`/`workspace_instance_advisory_lock` all present). Build Job + ConfigMap deleted
+after. PRE/APPLIED snapshots: `local-deploy-history/radeon-global/20260708-2143-wsfix-{PRE,APPLIED}-deploy.yaml`.
+
+**Deploy (PHASED, per the mandatory ordering below):**
+1. `kubectl patch configmap` → `WORKSPACE_DELETION_PROPAGATION_ENABLED=false`, `WORKSPACE_SEED_ENABLED=true`,
+   `WORKSPACE_SEED_PER_TEMPLATE=true` BEFORE rolling the image (so new pods start with Part C dormant).
+2. `kubectl set image ...:wsfix-20260708-2149` — RollingUpdate maxSurge=0/maxUnavailable=1, one replica
+   serving throughout. Rollout 2/2, 0 restarts (s-001/s-002). Additive `ALTER TABLE` migration applied
+   live (Postgres): `workspace_cache_state.durable_generation` + `workspace_local_copy.synced_generation`
+   both present; `get_durable_generation` reads 0 for unmigrated rows.
+3. Phase-A e2e passed → flipped `WORKSPACE_DELETION_PROPAGATION_ENABLED=true` + `rollout restart`
+   (2/2, 0 restarts). `/` stayed 200 throughout; live env confirmed `prop=false` then `prop=true`.
+
+**Verification (e2e on LIVE cluster, localcache + quota on, 0 other user pods at deploy time):**
+- **Phase A (propagation OFF):** launch `hf-285-7dd7ed56` (durable mode, `/workspace`=/dev/loop2 98G),
+  wrote KEEP_A+DELME_A, destroyed → flush log = LEGACY `Flushed workspace ... -> durable shard-3` (NOT
+  authoritative), `durable_generation` stayed **0**; relaunch hydrated BOTH files back (workspace
+  durability intact, no regression).
+- **Phase B (propagation ON) — deletion-persistence proof (`hf-287-352b17bd`, node s-098):**
+  write KEEP_B+PERSIST_DELETE_B → destroy #1 → AUTHORITATIVE flush, `durable_generation` 0→**1**;
+  relaunch → both hydrated → `rm PERSIST_DELETE_B.txt` → destroy #2 → log `AUTHORITATIVE flush ...
+  durable_generation -> 2`, gen=**2**; relaunch #3 → **PERSIST_DELETE_B.txt STAYS DELETED**, KEEP_B.txt
+  present, on-node marker=2. Problem 1 fixed live: a user deletion now persists across destroy/relaunch
+  while unrelated files survive.
+- **Cleanup:** both test instances destroyed; `delete_workspace_durable` trashed their durable subdirs +
+  reset generations to 0; build artifacts + throwaway pods removed; no leftover test pods.
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:gittoken-20260707-1804` (base still on nodes), or
+re-apply the PRE-deploy snapshot. INSTANT feature kill without a rollback:
+`kubectl patch configmap ... WORKSPACE_DELETION_PROPAGATION_ENABLED=false` + `rollout restart` → reverts
+to accumulate-only (the additive columns/markers are harmless when the flag is off).
+
+**Original code/design record (unchanged):**
 
 **Code (edits):** `app/config.py` (+3 flags), `app/store.py` (generation schema + functions),
 `app/k8s_client.py` (mode seam, seed init, hydrate MIRROR/MERGE, fenced flush), `app/scheduler.py`
