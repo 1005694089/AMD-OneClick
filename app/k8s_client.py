@@ -1,6 +1,7 @@
 """
 Kubernetes client for managing notebook instances
 """
+import contextlib
 import hashlib
 import hmac
 import logging
@@ -71,7 +72,14 @@ AUTO_RESOURCE_PROFILE_BY_GPU = {
 
 class K8sClient:
     """Kubernetes client for notebook management"""
-    
+
+    # Node-local on-SSD marker recording the durable generation THIS node's /workspace copy is a
+    # confirmed descendant of (Part C fence). Lives under /workspace so it persists across the same
+    # node's pod teardown/relaunch, but is --exclude'd from BOTH the hydrate and flush rsyncs so it
+    # never travels between nodes (each node tracks its own generation). Distinct from the per-template
+    # `.oneclick/seeded-<key>` seed markers, which DO flush/hydrate.
+    _SYNCED_GEN_MARKER_REL = ".oneclick/synced-generation"
+
     def __init__(self):
         """Initialize K8s client"""
         try:
@@ -253,6 +261,58 @@ class K8sClient:
 
     def _workspace_localcache_enabled(self) -> bool:
         return (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() == "localcache"
+
+    def _resolve_workspace_mode(self, use_pvc: Optional[bool] = None) -> str:
+        """Resolve a launch's workspace storage mode: ``"durable"`` or ``"ephemeral"``.
+
+        THE PVC-OPTIONAL SEAM. All new workspace logic (image seeding, hydrate MIRROR/MERGE,
+        fenced flush, deletion propagation, SSD cleanup) routes through this single resolver
+        instead of scattered ``WORKSPACE_VOLUME_TYPE`` string checks, so the upcoming
+        "PVC optional per launch" feature is a one-line wiring change, not a rewrite.
+
+        Today the mode derives PURELY from ``WORKSPACE_VOLUME_TYPE`` — ``localcache`` => durable
+        (node-SSD working copy backed by the canonical NFS shard; hydrate/flush/generation fence),
+        anything else (``emptydir``/``hostpath``) => ephemeral (no durable tier) — so there is NO
+        behavior change. ``use_pvc`` is the future hook: passing ``use_pvc=False`` on a localcache
+        deployment selects ephemeral (node SSD working copy, but NO durable shard/hydrate/flush and
+        the SSD is reaped immediately on destroy). No caller passes ``use_pvc`` yet.
+        """
+        vol = (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower()
+        if vol == "localcache":
+            if use_pvc is False:
+                return "ephemeral"
+            return "durable"
+        return "ephemeral"
+
+    def _deletion_propagation_enabled(self) -> bool:
+        """Part C master switch: fenced, generation-tracked ``--delete`` propagation. When false the
+        flush stays accumulate-only (``rsync --update``, no ``--delete``, no generation bumps) — an
+        instant, data-safe revert to legacy behavior. Only ever consulted in ``durable`` mode."""
+        return bool(settings.WORKSPACE_DELETION_PROPAGATION_ENABLED)
+
+    def _seed_key(self, template_id: Optional[str], template_title: Optional[str],
+                  github_info: Optional[dict] = None) -> Optional[str]:
+        """Sanitized per-template slug used for image seeding (Part B), or ``None`` to skip seeding.
+
+        Returns ``None`` when seeding is disabled OR the launch carries no template identity (a
+        blank/API notebook launch) — DECIDED: blank launches are never seeded, so no empty
+        ``default/`` subdir is ever created. When ``WORKSPACE_SEED_PER_TEMPLATE`` is off, all
+        template launches collapse onto a single ``default`` key (a later template then finds the
+        one shared subdir already seeded and skips — the documented trade-off of that mode)."""
+        if not settings.WORKSPACE_SEED_ENABLED:
+            return None
+        ident = (template_title or template_id
+                 or (github_info or {}).get("template_title")
+                 or (github_info or {}).get("template_id") or "")
+        ident = str(ident).strip()
+        if not ident:
+            return None  # blank / non-template launch → never seed
+        if not settings.WORKSPACE_SEED_PER_TEMPLATE:
+            return "default"
+        slug = self._safe_storage_segment(ident)
+        # _safe_storage_segment maps empty/dot-only to "default"; a real template must not silently
+        # collapse onto that shared bucket, so treat a degenerate slug as "no seed" instead.
+        return slug if slug != "default" else None
 
     def _durable_shard_classes(self) -> list:
         """The append-only list of durable StorageClasses (one shared PVC per class)."""
@@ -676,14 +736,80 @@ class K8sClient:
         raise RuntimeError(f"workspace durable-op {pod_name} exhausted candidates for shard {shard_pvc}: {last_err}")
 
     def _flush_lock_for(self, key: str):
-        """Return a per-(instance,node) lock, created on first use. Serializes the delete-path flush
-        and the reconciler retry sweep so they never run concurrent rsyncs for the same copy."""
+        """Return a per-INSTANCE lock, created on first use. Serializes the delete-path flush and the
+        reconciler retry sweep WITHIN this process. Keyed per-instance (not per-(instance,node)) so
+        two DIFFERENT-node unflushed copies of the SAME instance can't run concurrent flushes into the
+        one durable subpath — destructive once `--delete` is in play. Cross-replica serialization is
+        provided by the Postgres per-instance advisory lock (store.workspace_instance_advisory_lock)."""
         with self._flush_locks_guard:
             lk = self._flush_locks.get(key)
             if lk is None:
                 lk = threading.Lock()
                 self._flush_locks[key] = lk
             return lk
+
+    @staticmethod
+    def _match_flush_outcome(text: str) -> Optional[str]:
+        """Map flush output text to an outcome token (last match wins), or None."""
+        body = text or ""
+        best_idx, best_name = -1, None
+        for name, tok in (("AUTHORITATIVE", "WS_FLUSH_AUTHORITATIVE"),
+                          ("SUPERSEDED", "WS_FLUSH_SUPERSEDED"),
+                          ("MERGE", "WS_FLUSH_MERGE"),
+                          ("NOOP", "WS_FLUSH_NOOP")):
+            idx = body.rfind(tok)
+            if idx > best_idx:
+                best_idx, best_name = idx, name
+        return best_name
+
+    def _read_flush_outcome(self, pod_name: str, pod=None) -> Optional[str]:
+        """Return the flush pod's outcome token (``AUTHORITATIVE``/``SUPERSEDED``/``MERGE``/``NOOP``)
+        or ``None`` if unreadable. Prefers the LOSSLESS k8s ``terminated.message`` (the pod wrote the
+        token to /dev/termination-log), which does not depend on the pod-log API or tail size; falls
+        back to a pod-log tail parse. On total failure returns None; the caller then falls back to a
+        plain, non-generation-advancing mark — always safe (durable already reflects the pod's rsync),
+        though it stalls the generation bump on an AUTHORITATIVE flush (a bounded, self-scoped, safe-
+        direction liveness cost, not durable loss)."""
+        # 1) Lossless termination message (default terminationMessagePath=/dev/termination-log).
+        try:
+            for cs in ((pod.status.container_statuses if pod and pod.status else None) or []):
+                term = getattr(cs.state, "terminated", None) if cs.state else None
+                msg = getattr(term, "message", None) if term else None
+                tok = self._match_flush_outcome(msg or "")
+                if tok:
+                    return tok
+        except Exception as e:
+            logger.debug("reading terminated.message for %s: %s", pod_name, e)
+        # 2) Fallback: pod-log tail (best-effort).
+        try:
+            log = self.core_v1.read_namespaced_pod_log(
+                name=pod_name, namespace=self.namespace, tail_lines=25)
+        except Exception as e:
+            logger.debug("could not read flush pod log for %s: %s", pod_name, e)
+            return None
+        return self._match_flush_outcome(log or "")
+
+    def _discard_superseded_local_copy(self, instance_id: str, node_name: str, session_token: str):
+        """Drop a SUPERSEDED stranded SSD copy (its node's generation < durable): free the SSD, then
+        (only if the SSD was actually freed) drop the ledger row so neither the reaper nor the retry
+        sweep touches it again. Its un-flushed edits are INTENTIONALLY discarded — merging them up
+        would re-inject files a newer session deleted, poisoning durable. If the SSD can't be freed
+        this pass (node busy/down) the row is kept so a later sweep retries. Best-effort, never raises."""
+        reaped = False
+        try:
+            reaped = self._cleanup_local_workspace_cache(instance_id, node_name)
+        except Exception as e:
+            logger.debug("SSD cleanup during superseded discard of %s/%s: %s", instance_id, node_name, e)
+        if reaped:
+            try:
+                store.discard_superseded_copy(instance_id, node_name, session_token)
+                logger.info("Discarded SUPERSEDED stranded copy %s@%s (generation-wins data-drop)",
+                            instance_id, node_name)
+            except Exception as e:
+                logger.debug("discard_superseded_copy for %s/%s failed: %s", instance_id, node_name, e)
+        else:
+            logger.info("SUPERSEDED copy %s@%s not freed this pass (node busy/down); retry later",
+                        instance_id, node_name)
 
     def _flush_workspace_to_durable(self, instance_id: str, node_name: str, session_token: str,
                                     timeout_seconds: int = 600) -> bool:
@@ -703,12 +829,24 @@ class K8sClient:
         reaper won't reap the unflushed SSD copy and the reconciler sweep retries once the node
         returns.
 
-        session_token FENCES the confirmation (store.mark_workspace_flushed only marks the local-copy
-        row whose token still matches), so a straggler flush that confirms after a relaunch/re-stop
-        can never falsely certify a session it didn't flush.
+        session_token FENCES the confirmation (only the local-copy row whose token still matches is
+        marked), so a straggler flush that confirms after a relaunch/re-stop can never falsely certify
+        a session it didn't flush.
 
-        Uses `rsync -a --update` (newer-wins, NO --delete) — identical semantics to the retired
-        preStop and symmetric with the hydrate init, so flush and hydrate can never fight."""
+        FENCED DELETION PROPAGATION (Part C, gated on WORKSPACE_DELETION_PROPAGATION_ENABLED): when
+        enabled, the flush pod reads its own on-node synced-generation marker (Gl) and compares it to
+        the manager-passed durable generation (Gd) to choose, IN-CONTAINER:
+          * Gl == Gd AND non-empty(+mounted) -> AUTHORITATIVE: `rsync -a --delete` (deletions
+            propagate), stamp the marker Gl=Gd+1; the manager then bumps durable_generation to Gd+1
+            in one token-fenced UPDATE (only AFTER the --delete confirmed).
+          * Gl <  Gd -> SUPERSEDED: touch nothing on durable (merging up would re-inject files a newer
+            session deleted); the manager discards the stranded copy.
+          * else -> MERGE/NOOP: `rsync -a --update` (today's accumulate-only, no gen bump), or a
+            confirmed empty no-op. An empty-and-unmounted loop under quota still exits 3 (not marked).
+        When DISABLED, the flush is IDENTICAL to the legacy behavior (`rsync -a --update`, no
+        --delete, no generation) — an instant, data-safe revert. The per-INSTANCE advisory lock (in
+        addition to the in-process lock) serializes destructive flushes across replicas/nodes so two
+        different-node copies of one instance can never interleave a --delete with an --update."""
         if not node_name or not session_token:
             logger.info("flush skip for %s: missing node/session token (nothing to flush)", instance_id)
             return True
@@ -723,194 +861,354 @@ class K8sClient:
             logger.error("Refusing to flush suspicious local cache path %s", local_path)
             return False
 
-        lock = self._flush_lock_for(f"{instance_id}\x00{node_name}")
+        propagate = self._deletion_propagation_enabled()
+
+        # Per-INSTANCE in-process lock (not per-(instance,node)) so two different-node copies of the
+        # same instance serialize within this process.
+        lock = self._flush_lock_for(instance_id)
         if not lock.acquire(blocking=False):
-            # Another flush for this exact copy is already running (delete path vs retry sweep). Skip;
-            # the in-flight one will mark flushed, or the sweep retries later. Not a failure.
-            logger.info("flush for %s on %s already in progress; skipping duplicate", instance_id, node_name)
+            logger.info("flush for %s already in progress in-process; skipping duplicate", instance_id)
             return False
         try:
-            # A live pod means the instance was (re)launched on this node; its hydrate-init may be
-            # rsyncing durable->local right now. Running our local->durable rsync concurrently against
-            # the same host dir would race. Abort — the copy is the active working set, not a stopped
-            # copy to flush; a later stop will re-record it.
-            if self._pod_exists(instance_id):
-                logger.info("flush for %s aborted: pod is live (relaunched); not flushing over active session",
-                            instance_id)
-                return False
+            # Cross-replica per-instance advisory lock — only needed when --delete is in play (legacy
+            # --update is order-independent, so we skip the lock/connection cost there).
+            adv_cm = (store.workspace_instance_advisory_lock(instance_id)
+                      if propagate else contextlib.nullcontext(True))
+            with adv_cm as adv_held:
+                if propagate and not adv_held:
+                    logger.warning("flush for %s: could not acquire per-instance advisory lock; "
+                                   "will retry via sweep", instance_id)
+                    return False
+                # Gd to pass to the flush pod. MUST be read AFTER the advisory lock is held: a
+                # concurrent authoritative flush of this instance on another replica bumps
+                # durable_generation, and reading Gd before the lock could hand this flush a STALE-low
+                # Gd — its pod would then see Gl==stale-Gd, take the AUTHORITATIVE --delete branch, and
+                # clobber the newer durable with an older copy (resurrecting deletions). Reading under
+                # the lock guarantees Gd reflects every already-committed authoritative flush. 0 when
+                # propagation is off (legacy path never uses it).
+                durable_gen = 0
+                if propagate:
+                    try:
+                        durable_gen = int(store.get_durable_generation(instance_id) or 0)
+                    except Exception as e:
+                        # DATA-SAFETY: do NOT guess Gd=0 on a read failure. A copy whose on-node marker
+                        # is Gl=0 (a superseded gen-0 descendant) would then match Gl==Gd(0) and take
+                        # the AUTHORITATIVE --delete branch, clobbering a higher-generation durable
+                        # (dropping newer files + resurrecting deletions). Abort and leave the copy
+                        # unflushed so the retry sweep re-runs once the DB is reachable. (Note: the
+                        # hydrate's Gd=0-on-error IS safe — it only ever downgrades MIRROR->MERGE.)
+                        logger.error("get_durable_generation failed for %s; aborting flush to avoid a "
+                                     "stale-Gd authoritative --delete (will retry via sweep): %s",
+                                     instance_id, e)
+                        return False
+                return self._run_flush_pod(
+                    instance_id, node_name, session_token, shard_pvc, durable_subpath, local_path,
+                    timeout_seconds, propagate, durable_gen)
+        finally:
+            lock.release()
 
-            # Unique per-invocation pod name so the delete-path flush and the retry sweep can never
-            # delete each other's in-flight pod (their _cleanup only targets their own name).
-            run_id = secrets.token_hex(4)
-            safe = self._safe_storage_segment(f"{instance_id}-{run_id}").lower()
-            pod_name = f"ws-flush-{safe}"[:63].rstrip("-")
+    def _flush_script(self, propagate: bool, quota_on: bool, durable_gen: int) -> str:
+        """Build the in-container flush script. Legacy (propagate=False) == today's `rsync --update`
+        accumulate-only. Generation (propagate=True) reads the on-node synced marker Gl and branches
+        AUTHORITATIVE(--delete)/SUPERSEDED(no-op)/MERGE(--update), printing a WS_FLUSH_* outcome the
+        manager reads back. The synced-generation marker is --exclude'd so it never travels to durable.
 
-            # DATA-SAFETY (finding 4): under quota, /local is an ext4 loop image mounted out-of-band in
-            # the host mount namespace. If that mount is ABSENT when we run (node rebooted, host agent
-            # hasn't re-provisioned), hostPath sees an EMPTY plain dir — which must NOT be mistaken for
-            # "nothing to flush" (that would mark flushed and let the reaper destroy the real, still
-            # loop-resident data). The prep DaemonSet drops a sentinel file (.oneclick-ssd-root) at the
-            # cache-root; inside a per-instance loop mount that sentinel is NOT visible. So: if the
-            # instance dir is empty AND the root sentinel IS visible from inside /local's parent, the
-            # loop is not mounted (or there's genuinely no data) — treat an empty dir cautiously:
-            #   * quota ON  -> require the loop to be an actual mountpoint before declaring no-op; if
-            #                  /local exists, is empty, and is NOT a mountpoint => FAIL (exit 3) so we
-            #                  do not mark flushed.
-            #   * quota OFF -> /local is a plain dir; empty legitimately means no data => no-op OK.
-            quota_on = self._workspace_quota_enabled()
+        The local/durable paths are the pod's mounts /local and /durable, but are read from
+        WS_FLUSH_LOCAL_DIR/WS_FLUSH_DURABLE_DIR (defaulting to those) so the data-loss-critical
+        decision can be exercised end-to-end by tests against temp dirs. The flush pod sets neither
+        env var, so production is unchanged.
+
+        The outcome token is written to /dev/termination-log (the default terminationMessagePath) in
+        addition to stdout, so the manager reads it LOSSLESSLY from the container's terminated.message
+        rather than depending on a best-effort pod-log tail parse — otherwise a post---delete log-read
+        hiccup could downgrade an AUTHORITATIVE flush to a plain mark, stall the generation bump, and
+        resurrect the just-propagated deletion on a warm relaunch."""
+        # Common preamble: resolve the local (node SSD) and durable (NFS subPath) dirs; publish the
+        # final outcome to BOTH stdout and the termination log.
+        preamble = (
+            'local_dir="${WS_FLUSH_LOCAL_DIR:-/local}"\n'
+            'durable_dir="${WS_FLUSH_DURABLE_DIR:-/durable}"\n'
+            "emit() { echo \"$1\"; printf '%s' \"$1\" > /dev/termination-log 2>/dev/null || true; }\n"
+        )
+        if not propagate:
             if quota_on:
                 guard = (
-                    "if [ -n \"$(ls -A /local 2>/dev/null)\" ]; then\n"
-                    "  rsync -a --update /local/ /durable/\n"
-                    "  echo WS_FLUSH_OK\n"
-                    "elif mountpoint -q /local; then\n"
-                    "  echo \"loop mounted but empty; nothing to flush\"; echo WS_FLUSH_OK\n"
+                    'if [ -n "$(ls -A "$local_dir" 2>/dev/null)" ]; then\n'
+                    '  rsync -a --update "$local_dir"/ "$durable_dir"/\n'
+                    "  emit WS_FLUSH_OK\n"
+                    'elif mountpoint -q "$local_dir"; then\n'
+                    "  echo \"loop mounted but empty; nothing to flush\"; emit WS_FLUSH_OK\n"
                     "else\n"
-                    "  echo \"ERROR: /local empty and NOT a mountpoint under quota — loop image not \"\n"
+                    "  echo \"ERROR: local empty and NOT a mountpoint under quota — loop image not \"\n"
                     "  echo \"mounted; refusing to mark flushed\" >&2\n"
                     "  exit 3\n"
                     "fi\n"
                 )
             else:
                 guard = (
-                    "if [ -n \"$(ls -A /local 2>/dev/null)\" ]; then\n"
-                    "  rsync -a --update /local/ /durable/\n"
+                    'if [ -n "$(ls -A "$local_dir" 2>/dev/null)" ]; then\n'
+                    '  rsync -a --update "$local_dir"/ "$durable_dir"/\n'
                     "fi\n"
-                    "echo WS_FLUSH_OK\n"
+                    "emit WS_FLUSH_OK\n"
                 )
-            script = "set -eux\n" + guard
+            return "set -eux\n" + preamble + guard
+        excl = "/" + self._SYNCED_GEN_MARKER_REL
+        # stamp_marker writes the completeness marker ROBUSTLY: it self-heals a wrong-TYPE path (a user
+        # — root in their pod — could have created /workspace/.oneclick as a file, or synced-generation
+        # as a directory), which would otherwise make `mkdir -p`/redirect fail and, under `set -eux`,
+        # abort the init/flush. Guards use `if` (a bare `A && B && C` with a false A trips `set -e`).
+        stamp_fn = (
+            "stamp_marker() {\n"
+            "  d=$(dirname \"$marker\")\n"
+            "  if [ -e \"$d\" ] && [ ! -d \"$d\" ]; then rm -f \"$d\"; fi\n"
+            "  mkdir -p \"$d\"\n"
+            "  if [ -e \"$marker\" ] && [ ! -f \"$marker\" ]; then rm -rf \"$marker\"; fi\n"
+            "  printf '%s' \"$1\" > \"$marker\"\n"
+            "}\n"
+        )
+        # have_marker is the POSITIVE COMPLETENESS PROOF: an authoritative --delete (or a superseded
+        # discard) is allowed ONLY when the marker file exists AND holds a valid generation integer,
+        # i.e. a hydrate/flush actually confirmed this local copy is a complete descendant of some
+        # generation. A missing marker (fresh/partial/interrupted hydrate) OR a present-but-empty/
+        # garbage marker (a truncated write, or a user — root in their pod — scribbling junk) must
+        # NEVER be treated as "Gl==Gd==0 → authoritative", or a killed first hydrate could let
+        # --delete wipe durable files that never made it to local. Either case => have_marker=0 =>
+        # fall through to the safe accumulate-only --update. (A wrong-TYPE marker dir also fails the
+        # `-f` test → have_marker=0 → MERGE, safe.)
+        branch = (
+            f"marker=\"$local_dir/{self._SYNCED_GEN_MARKER_REL}\"\n"
+            f"excl={shlex.quote(excl)}\n"
+            f"Gd={int(durable_gen)}\n"
+            + stamp_fn +
+            "Gl=0\n"
+            "have_marker=0\n"
+            "if [ -f \"$marker\" ]; then\n"
+            "  mv=$(cat \"$marker\" 2>/dev/null || echo \"\")\n"
+            "  case \"$mv\" in ''|*[!0-9]*) have_marker=0;; *) have_marker=1; Gl=$mv;; esac\n"
+            "fi\n"
+        )
+        # AUTHORITATIVE/SUPERSEDED/MERGE decision when local has content.
+        decide = (
+            "  if [ \"$have_marker\" = \"1\" ] && [ \"$Gl\" -eq \"$Gd\" ]; then\n"
+            "    rsync -a --delete --exclude=\"$excl\" \"$local_dir\"/ \"$durable_dir\"/\n"
+            "    newg=$((Gd + 1))\n"
+            "    stamp_marker \"$newg\"\n"
+            "    emit \"WS_FLUSH_AUTHORITATIVE newgen=$newg (Gl=$Gl Gd=$Gd)\"\n"
+            "  elif [ \"$have_marker\" = \"1\" ] && [ \"$Gl\" -lt \"$Gd\" ]; then\n"
+            "    emit \"WS_FLUSH_SUPERSEDED Gl=$Gl Gd=$Gd (dropping stranded edits; NOT merging up)\"\n"
+            "  else\n"
+            "    rsync -a --update --exclude=\"$excl\" \"$local_dir\"/ \"$durable_dir\"/\n"
+            "    emit \"WS_FLUSH_MERGE have_marker=$have_marker Gl=$Gl Gd=$Gd\"\n"
+            "  fi\n"
+        )
+        if quota_on:
+            tail = (
+                'if [ -n "$(ls -A "$local_dir" 2>/dev/null)" ]; then\n'
+                + decide +
+                'elif mountpoint -q "$local_dir"; then\n'
+                "  emit WS_FLUSH_NOOP\n"
+                "else\n"
+                "  echo \"ERROR: local empty and NOT a mountpoint under quota — loop image not \"\n"
+                "  echo \"mounted; refusing to mark flushed\" >&2\n"
+                "  exit 3\n"
+                "fi\n"
+            )
+        else:
+            tail = (
+                'if [ -n "$(ls -A "$local_dir" 2>/dev/null)" ]; then\n'
+                + decide +
+                "else\n"
+                "  emit WS_FLUSH_NOOP\n"
+                "fi\n"
+            )
+        return "set -eux\n" + preamble + branch + tail
 
-            overall_deadline = time.monotonic() + max(1, timeout_seconds)
-            start_deadline = max(30, min(90, timeout_seconds // 4))
+    def _run_flush_pod(self, instance_id: str, node_name: str, session_token: str, shard_pvc: str,
+                       durable_subpath: str, local_path: str, timeout_seconds: int,
+                       propagate: bool, durable_gen: int) -> bool:
+        """Create + poll the one-shot flush pod (pinned to node_name), then confirm the outcome.
+        Assumes the per-instance in-process + advisory locks are already held by the caller."""
+        # A live pod means the instance was (re)launched on this node; its hydrate-init may be
+        # rsyncing durable->local right now. Running our local->durable rsync concurrently against
+        # the same host dir would race. Abort — the copy is the active working set, not a stopped
+        # copy to flush; a later stop will re-record it.
+        if self._pod_exists(instance_id):
+            logger.info("flush for %s aborted: pod is live (relaunched); not flushing over active session",
+                        instance_id)
+            return False
 
-            def _read_pod():
-                last = None
-                for _ in range(3):
-                    try:
-                        return self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
-                    except ApiException as e:
-                        if e.status == 404:
-                            return None
-                        last = e
-                        time.sleep(1)
-                raise last if last else RuntimeError("read failed")
+        # Unique per-invocation pod name so the delete-path flush and the retry sweep can never
+        # delete each other's in-flight pod (their _cleanup only targets their own name).
+        run_id = secrets.token_hex(4)
+        safe = self._safe_storage_segment(f"{instance_id}-{run_id}").lower()
+        pod_name = f"ws-flush-{safe}"[:63].rstrip("-")
 
-            def _cleanup_pod():
+        # DATA-SAFETY (finding 4): under quota, /local is an ext4 loop image mounted out-of-band in
+        # the host mount namespace. If that mount is ABSENT when we run (node rebooted, host agent
+        # hasn't re-provisioned), hostPath sees an EMPTY plain dir — which must NOT be mistaken for
+        # "nothing to flush" (that would mark flushed and let the reaper destroy the real, still
+        # loop-resident data). So under quota an empty /local that is NOT a mountpoint => exit 3
+        # (not marked); quota-off treats empty as a legitimate no-op.
+        quota_on = self._workspace_quota_enabled()
+        script = self._flush_script(propagate, quota_on, durable_gen)
+
+        overall_deadline = time.monotonic() + max(1, timeout_seconds)
+        start_deadline = max(30, min(90, timeout_seconds // 4))
+
+        def _read_pod():
+            last = None
+            for _ in range(3):
                 try:
-                    self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
+                    return self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
                 except ApiException as e:
-                    if e.status != 404:
-                        logger.debug("flush cleanup delete of %s: %s", pod_name, e)
-                        return
-                for _ in range(30):
-                    try:
-                        self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
-                        time.sleep(1)
-                    except ApiException as e:
-                        if e.status == 404:
-                            return
-                        logger.debug("flush cleanup poll of %s: %s", pod_name, e)
-                        return
-
-            body = {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": pod_name,
-                    "namespace": self.namespace,
-                    "labels": {"app": "oneclick-workspace-flush", "instance-id": instance_id},
-                },
-                "spec": {
-                    "restartPolicy": "Never",
-                    "automountServiceAccountToken": False,
-                    "nodeName": node_name,
-                    "tolerations": self._notebook_tolerations(),
-                    "securityContext": {
-                        "runAsNonRoot": False,
-                        "seccompProfile": {"type": "RuntimeDefault"},
-                    },
-                    "containers": [
-                        {
-                            "name": "flush",
-                            "image": self._workspace_sync_image(),
-                            "imagePullPolicy": "IfNotPresent",
-                            "command": ["/bin/bash", "-lc"],
-                            "args": [script],
-                            "resources": {
-                                "requests": {"cpu": "50m", "memory": "64Mi"},
-                                "limits": {"cpu": "1", "memory": "512Mi"},
-                            },
-                            "securityContext": {
-                                "allowPrivilegeEscalation": False,
-                                "capabilities": {"drop": ["ALL"]},
-                            },
-                            "volumeMounts": [
-                                {"name": "durable", "mountPath": "/durable", "subPath": durable_subpath},
-                                # HostToContainer so the loop-image contents (mounted in the host mount
-                                # namespace) are visible, mirroring the hydrate init's /workspace mount.
-                                {"name": "local", "mountPath": "/local",
-                                 "mountPropagation": "HostToContainer"},
-                            ],
-                        }
-                    ],
-                    "volumes": [
-                        {"name": "durable", "persistentVolumeClaim": {"claimName": shard_pvc}},
-                        # DirectoryOrCreate so a genuinely-reaped dir mounts empty (quota-off no-op).
-                        # Under quota the in-container mountpoint check guards the empty-but-unmounted
-                        # case before we ever mark flushed.
-                        {"name": "local", "hostPath": {"path": local_path, "type": "DirectoryOrCreate"}},
-                    ],
-                },
-            }
-            _cleanup_pod()
-            try:
-                self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
-            except ApiException as e:
-                logger.error("flush pod create failed for %s on %s: %s", instance_id, node_name, e)
-                return False
-            started = False
-            attempt_start = time.monotonic()
-            try:
-                while True:
-                    if time.monotonic() >= overall_deadline:
-                        logger.error("flush for %s on %s timed out (started=%s)", instance_id, node_name, started)
-                        return False
-                    try:
-                        pod = _read_pod()
-                    except ApiException as e:
-                        logger.error("flush read failed for %s: %s", instance_id, e)
-                        return False
-                    if pod is None:
-                        logger.error("flush pod for %s vanished on %s before completion", instance_id, node_name)
-                        return False
-                    phase = pod.status.phase
-                    cst = (pod.status.container_statuses or [])
-                    if phase == "Running" or (cst and (cst[0].state.running or cst[0].state.terminated)):
-                        started = True
-                    if phase == "Succeeded":
-                        marked = store.mark_workspace_flushed(instance_id, node_name, session_token)
-                        if marked:
-                            logger.info("Flushed workspace %s -> durable shard %s (node %s, session %s)",
-                                        instance_id, shard_pvc, node_name, session_token)
-                        else:
-                            # Session advanced (relaunch/re-stop) while we flushed — our copy was the
-                            # OLD session's; the current row keeps its own (correct) unflushed state.
-                            logger.info("flush for %s on %s succeeded but session token stale (%s); "
-                                        "not marking current row", instance_id, node_name, session_token)
-                        return marked
-                    if phase == "Failed":
-                        logger.error("flush pod for %s FAILED on %s (shard %s) — not marked",
-                                     instance_id, node_name, shard_pvc)
-                        return False
-                    if not started and (time.monotonic() - attempt_start) >= start_deadline:
-                        logger.error("flush for %s did not start on %s within %ss (node may be NotReady/"
-                                     "cannot mount shard) — not marked", instance_id, node_name, start_deadline)
-                        return False
+                    if e.status == 404:
+                        return None
+                    last = e
                     time.sleep(1)
-            finally:
-                _cleanup_pod()
+            raise last if last else RuntimeError("read failed")
+
+        def _cleanup_pod():
+            try:
+                self.core_v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=0)
+            except ApiException as e:
+                if e.status != 404:
+                    logger.debug("flush cleanup delete of %s: %s", pod_name, e)
+                    return
+            for _ in range(30):
+                try:
+                    self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+                    time.sleep(1)
+                except ApiException as e:
+                    if e.status == 404:
+                        return
+                    logger.debug("flush cleanup poll of %s: %s", pod_name, e)
+                    return
+
+        def _confirm(pod_name_: str, pod_=None) -> bool:
+            """Turn the pod's Succeeded outcome into the right ledger update."""
+            if not propagate:
+                marked = store.mark_workspace_flushed(instance_id, node_name, session_token)
+                if marked:
+                    logger.info("Flushed workspace %s -> durable shard %s (node %s, session %s)",
+                                instance_id, shard_pvc, node_name, session_token)
+                else:
+                    logger.info("flush for %s on %s succeeded but session token stale (%s); "
+                                "not marking current row", instance_id, node_name, session_token)
+                return marked
+            outcome = self._read_flush_outcome(pod_name_, pod_)
+            if outcome == "AUTHORITATIVE":
+                new_gen = int(durable_gen) + 1
+                ok = store.mark_workspace_flushed_authoritative(
+                    instance_id, node_name, session_token, new_gen)
+                if ok:
+                    logger.info("AUTHORITATIVE flush %s -> shard %s (node %s): durable_generation -> %s",
+                                instance_id, shard_pvc, node_name, new_gen)
+                else:
+                    logger.info("authoritative flush for %s on %s succeeded but token stale; "
+                                "durable content advanced, generation NOT bumped (conservative)",
+                                instance_id, node_name)
+                return ok
+            if outcome == "SUPERSEDED":
+                self._discard_superseded_local_copy(instance_id, node_name, session_token)
+                return True
+            # MERGE / NOOP / unreadable-log -> plain mark, no generation bump (always safe).
+            marked = store.mark_workspace_flushed(instance_id, node_name, session_token)
+            if marked:
+                logger.info("Flushed workspace %s -> durable shard %s (node %s, session %s, outcome=%s)",
+                            instance_id, shard_pvc, node_name, session_token, outcome or "unknown")
+            else:
+                logger.info("flush for %s on %s succeeded but session token stale (%s); not marking",
+                            instance_id, node_name, session_token)
+            return marked
+
+        body = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "namespace": self.namespace,
+                "labels": {"app": "oneclick-workspace-flush", "instance-id": instance_id},
+            },
+            "spec": {
+                "restartPolicy": "Never",
+                "automountServiceAccountToken": False,
+                "nodeName": node_name,
+                "tolerations": self._notebook_tolerations(),
+                "securityContext": {
+                    "runAsNonRoot": False,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "containers": [
+                    {
+                        "name": "flush",
+                        "image": self._workspace_sync_image(),
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["/bin/bash", "-lc"],
+                        "args": [script],
+                        "resources": {
+                            "requests": {"cpu": "50m", "memory": "64Mi"},
+                            "limits": {"cpu": "1", "memory": "512Mi"},
+                        },
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                        "volumeMounts": [
+                            {"name": "durable", "mountPath": "/durable", "subPath": durable_subpath},
+                            # HostToContainer so the loop-image contents (mounted in the host mount
+                            # namespace) are visible, mirroring the hydrate init's /workspace mount.
+                            {"name": "local", "mountPath": "/local",
+                             "mountPropagation": "HostToContainer"},
+                        ],
+                    }
+                ],
+                "volumes": [
+                    {"name": "durable", "persistentVolumeClaim": {"claimName": shard_pvc}},
+                    # DirectoryOrCreate so a genuinely-reaped dir mounts empty (quota-off no-op).
+                    # Under quota the in-container mountpoint check guards the empty-but-unmounted
+                    # case before we ever mark flushed.
+                    {"name": "local", "hostPath": {"path": local_path, "type": "DirectoryOrCreate"}},
+                ],
+            },
+        }
+        _cleanup_pod()
+        try:
+            self.core_v1.create_namespaced_pod(namespace=self.namespace, body=body)
+        except ApiException as e:
+            logger.error("flush pod create failed for %s on %s: %s", instance_id, node_name, e)
+            return False
+        started = False
+        attempt_start = time.monotonic()
+        try:
+            while True:
+                if time.monotonic() >= overall_deadline:
+                    logger.error("flush for %s on %s timed out (started=%s)", instance_id, node_name, started)
+                    return False
+                try:
+                    pod = _read_pod()
+                except ApiException as e:
+                    logger.error("flush read failed for %s: %s", instance_id, e)
+                    return False
+                if pod is None:
+                    logger.error("flush pod for %s vanished on %s before completion", instance_id, node_name)
+                    return False
+                phase = pod.status.phase
+                cst = (pod.status.container_statuses or [])
+                if phase == "Running" or (cst and (cst[0].state.running or cst[0].state.terminated)):
+                    started = True
+                if phase == "Succeeded":
+                    return _confirm(pod_name, pod)
+                if phase == "Failed":
+                    logger.error("flush pod for %s FAILED on %s (shard %s) — not marked",
+                                 instance_id, node_name, shard_pvc)
+                    return False
+                if not started and (time.monotonic() - attempt_start) >= start_deadline:
+                    logger.error("flush for %s did not start on %s within %ss (node may be NotReady/"
+                                 "cannot mount shard) — not marked", instance_id, node_name, start_deadline)
+                    return False
+                time.sleep(1)
         finally:
-            lock.release()
+            _cleanup_pod()
 
     def delete_workspace_durable(self, instance_id: str) -> bool:
         """ADMIN ONLY: soft-delete an instance's durable workspace by moving its subdir into
@@ -968,15 +1266,30 @@ class K8sClient:
             workspace_dirquota.mark_unapplied(instance_id)
         except Exception as e:
             logger.debug("dirquota delete hook for %s failed (non-fatal): %s", instance_id, e)
+        # Capture the last node BEFORE clearing cache_state (clearing drops node_name), then reset the
+        # fenced-deletion generation BEFORE the trash-move. Ordering matters: if Gd were reset AFTER
+        # the move, a relaunch racing the admin delete could read empty-durable + a stale-high Gd in
+        # the window and stamp its on-node marker to that Gd, which could later resurrect the trashed
+        # content. Resetting first means the window always shows Gd=0 (the safe new-instance path:
+        # hydrate MERGEs, no MIRROR-wipe). Safe even if the trash-move then fails — Gd=0 is the
+        # conservative value, and the admin can retry.
+        last_node = None
+        try:
+            last_node = store.get_workspace_last_node(instance_id)
+        except Exception as e:
+            logger.debug("last-node lookup before durable delete of %s: %s", instance_id, e)
+        try:
+            store.clear_workspace_cache_state(instance_id)
+        except Exception as e:
+            logger.debug("clear_workspace_cache_state before durable delete of %s: %s", instance_id, e)
         try:
             self._run_durable_shard_command(f"del-{instance_id}", shard_pvc, script, timeout_seconds=180)
             logger.info("Soft-deleted durable workspace for %s on shard %s", instance_id, shard_pvc)
             # The SSD copy (if any) is now stale AND would be resurrected by the retry sweep (which
             # would flush it back up, undoing the trash). The pod is already gone (guarded above), so:
-            # (1) free the SSD copy on the last node, then (2) drop all copy rows so neither the retry
-            # sweep nor the reaper acts on it again.
+            # (1) free the SSD copy on the last node (also clears its on-node synced marker), then
+            # (2) drop all copy rows so neither the retry sweep nor the reaper acts on it again.
             try:
-                last_node = store.get_workspace_last_node(instance_id)
                 if last_node:
                     self._cleanup_local_workspace_cache(instance_id, last_node)
             except Exception as e:
@@ -1458,11 +1771,36 @@ fi
             "volumeMounts": [workspace_mount],
         }
 
+    def _seed_root_expr(self, workspace_q: str, seed_key: Optional[str]) -> tuple:
+        """Return ``(prelude, dir_expr)`` for the effective workspace root when seeding is active.
+
+        ``workspace_q`` is the shlex-quoted /workspace mount path. When ``seed_key`` is set, the
+        prelude resolves a ``WS_ROOT`` shell var to ``/workspace/<seed_key>`` IF that seeded subdir
+        exists (created by the seed init only when the image had content), else ``/workspace``; the
+        returned ``dir_expr`` is ``"$WS_ROOT"``. When ``seed_key`` is None, no prelude and the plain
+        quoted workspace path. ``seed_key`` is already sanitized (``_safe_storage_segment``), so it is
+        shell-safe to interpolate directly."""
+        if not seed_key:
+            return "", workspace_q
+        prelude = (
+            f"WS_ROOT={workspace_q}\n"
+            f"if [ -d {workspace_q}/{seed_key} ]; then WS_ROOT={workspace_q}/{seed_key}; fi\n"
+        )
+        return prelude, '"$WS_ROOT"'
+
     def _build_startup_script(self, instance_id: str,
                               instance_type: str = "jupyter",
                               github_info: Optional[dict] = None,
-                              pod_type: Optional[str] = None) -> str:
-        """Build startup script based on instance type"""
+                              pod_type: Optional[str] = None,
+                              seed_key: Optional[str] = None) -> str:
+        """Build startup script based on instance type.
+
+        ``seed_key`` (Part B): when set, the workspace-seed init container has copied the image's
+        baked ``/workspace`` into ``/workspace/<seed_key>/``. For the plain jupyter/opencode launch
+        (no repo/notebook to open) we relocate the working dir + Jupyter root INTO that subdir so the
+        user opens straight into their template's content. The relocation is computed at RUNTIME
+        (``[ -d /workspace/<seed_key> ]``) so a content-less image (no subdir seeded) transparently
+        falls back to ``/workspace`` root."""
         workspace = shlex.quote(settings.WORKSPACE_MOUNT_PATH)
         model_link_script = f"""
 mkdir -p /app
@@ -1607,21 +1945,22 @@ fi
 {jupyter_ensure}
 {self._service_launch_snippet(instance_id, f"{workspace}/notebooks", pod_type=pod_type)}"""
 
+        seed_prelude, root_expr = self._seed_root_expr(workspace, seed_key)
         if instance_type == "opencode":
             return f"""
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
-cd {workspace}
+{seed_prelude}cd {root_expr}
 {jupyter_ensure}
-{self._service_launch_snippet(instance_id, workspace, pod_type=pod_type)}"""
+{self._service_launch_snippet(instance_id, root_expr, pod_type=pod_type)}"""
 
         # Default: jupyter
         return f"""
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
-cd {workspace}
+{seed_prelude}cd {root_expr}
 {jupyter_ensure}
-{self._service_launch_snippet(instance_id, workspace, pod_type=pod_type)}"""
+{self._service_launch_snippet(instance_id, root_expr, pod_type=pod_type)}"""
 
     def _notebook_download_url(self, raw_url: str) -> str:
         endpoint = settings.HF_ENDPOINT.strip().rstrip("/")
@@ -1723,8 +2062,13 @@ exec {cmd}
                           pod_type: Optional[str] = None,
                           api_launched: bool = False,
                           workspace_last_node: Optional[str] = None,
-                          git_token: Optional[str] = None) -> dict:
-        """Generate Pod manifest"""
+                          git_token: Optional[str] = None,
+                          use_pvc: Optional[bool] = None) -> dict:
+        """Generate Pod manifest.
+
+        ``use_pvc`` is the FUTURE per-launch PVC-optional toggle (unsurfaced): it feeds
+        ``_resolve_workspace_mode`` and is ``None`` for every current caller, so localcache
+        launches always resolve to ``durable`` (no behavior change)."""
         labels = self._get_labels(email, instance_id)
         profile_name, resources = self._resolve_resource_profile(gpu_count, resource_profile)
 
@@ -1777,6 +2121,23 @@ exec {cmd}
         image_defined_command = bool(INSTANCE_TYPES.get(instance_type, {}).get("image_defined_command"))
         app_preset = APP_FRAMEWORK_PRESETS.get(instance_type)
         is_app_type = app_preset is not None
+
+        # --- Workspace mode seam (Part A) + per-template seed key (Part B) -------------------------
+        # Resolve the storage mode ONCE, up front, so seed/hydrate/flush/delete all agree. use_pvc is
+        # the future per-launch toggle (unsurfaced today) → localcache is always "durable" for now.
+        workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
+        workspace_uses_empty_dir = workspace_volume_type == "emptydir"
+        workspace_mode = self._resolve_workspace_mode(use_pvc=use_pvc)
+        annotations["amd-oneclick/workspace-mode"] = workspace_mode
+        # SSD-backed working copy (node-local hostPath + optional quota loop) applies to localcache in
+        # BOTH durable and (future) ephemeral modes. App types keep their image's own /workspace.
+        workspace_ssd_backed = workspace_volume_type == "localcache" and not is_app_type
+        # Only durable mode wires the canonical NFS shard + hydrate init + out-of-pod flush.
+        workspace_is_durable = workspace_ssd_backed and workspace_mode == "durable"
+        # Seed the image's baked /workspace once, per template (approach A). Runs for ANY non-app
+        # /workspace overmount (localcache/emptydir/hostpath) in either mode; blank launches → None.
+        seed_key = None if is_app_type else self._seed_key(template_id, template_title, github_info)
+
         api_key_value = None
         if is_app_type:
             _eff_cmd, _eff_port = self._resolve_app_command(instance_type, start_command, app_port)
@@ -1792,17 +2153,13 @@ exec {cmd}
                 start_command=start_command, app_port=app_port,
             )
         else:
-            startup_script = self._build_startup_script(instance_id, instance_type, github_info, pod_type=pod_type)
+            startup_script = self._build_startup_script(instance_id, instance_type, github_info,
+                                                        pod_type=pod_type, seed_key=seed_key)
 
         ssh_enabled = bool(ssh_enabled)
         if ssh_enabled:
             annotations["amd-oneclick/ssh-enabled"] = "true"
 
-        workspace_volume_type = (settings.WORKSPACE_VOLUME_TYPE or "hostPath").strip().lower()
-        workspace_uses_empty_dir = workspace_volume_type == "emptydir"
-        # Two-tier persistent workspace: node-local SSD /workspace backed by durable NFS shard.
-        # Only for non-app instances (app types keep their image's own /workspace).
-        workspace_is_localcache = workspace_volume_type == "localcache" and not is_app_type
         hf_cache_volume_type = (settings.HF_CACHE_VOLUME_TYPE or "emptyDir").strip().lower()
         hf_cache_uses_empty_dir = hf_cache_volume_type == "emptydir"
 
@@ -1846,9 +2203,11 @@ exec {cmd}
             elif settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip():
                 workspace_empty_dir["sizeLimit"] = settings.WORKSPACE_EMPTYDIR_SIZE_LIMIT.strip()
             volumes.append({"name": "workspace", "emptyDir": workspace_empty_dir})
-        elif workspace_is_localcache:
-            # /workspace lives on the node-local SSD (fast working copy). Durable NFS shard is
-            # mounted separately below and synced in/out by init + preStop.
+        elif workspace_ssd_backed:
+            # /workspace lives on the node-local SSD (fast working copy). In durable mode the NFS
+            # shard is mounted separately below and synced in via the hydrate init + out-of-pod
+            # flush; in (future) ephemeral mode there is no durable tier and the SSD is reaped on
+            # destroy. The SSD hostPath volume itself is identical in both modes.
             volumes.append({
                 "name": "workspace",
                 "hostPath": {
@@ -1958,7 +2317,7 @@ exec {cmd}
             # Use the warm base image (ships e2fsprogs/mount/rsync) instead of a public-registry
             # ubuntu, which is blocked from the nodes. Legacy behavior preserved when localcache is
             # off only if the warm image is still reachable; the base image is always node-local.
-            quota_image = self._workspace_sync_image() if workspace_is_localcache else "docker.m.daocloud.io/library/ubuntu:24.04"
+            quota_image = self._workspace_sync_image() if workspace_ssd_backed else "docker.m.daocloud.io/library/ubuntu:24.04"
             init_containers.append({
                 "name": "workspace-quota",
                 "image": quota_image,
@@ -2034,25 +2393,40 @@ findmnt "$mnt"
         # Independent of the quota loop-mount: with quota on, /workspace is the loop image (so the
         # hydrate mount uses HostToContainer propagation to see it); with quota off, /workspace is
         # the plain SSD dir.
-        if workspace_is_localcache:
+        if workspace_is_durable:
             shard_pvc = self._durable_shard_pvc(instance_id)
             durable_subpath = self._durable_subpath(instance_id)
             durable_mount_path = settings.WORKSPACE_DURABLE_MOUNT_PATH.rstrip("/")
             annotations["amd-oneclick/workspace-durable-pvc"] = shard_pvc
             annotations["amd-oneclick/workspace-durable-subpath"] = durable_subpath
             annotations["amd-oneclick/workspace-local-cache"] = self._workspace_local_cache_path(instance_id)
-            # Hydrate init container: merge durable INTO local using `rsync -a --update` (newer-mtime
-            # wins), NEVER `--delete`. This is the load-bearing data-safety choice:
-            #   * An ungraceful kill (OOM/eviction/force-delete) skips the preStop flush, so durable
-            #     is stale. If soft-affinity lands the relaunch on the same node, the warm local copy
-            #     is NEWER than durable. `--update` keeps those newer local files instead of clobbering
-            #     them (a plain `--delete` mirror would destroy every change since the last flush).
-            #   * `--update` also means an empty/partial durable can never wipe a good local copy.
-            # Trade-off: a file deleted on one side is not propagated as a deletion to the other (it
-            # reappears from whichever side still has it). For a "keep user data forever" system this
-            # is the correct, conservative direction — accumulate, never silently destroy. rsync writes
-            # via a temp file + atomic rename, so a mid-copy SIGKILL leaves a stray temp file, not a
-            # corrupted destination file. Runs after the quota loop-mount when quota is enabled.
+            # Generation to pass to the hydrate init (Gd = the current durable generation). The
+            # manager passes ONLY this node-independent number — NOT a MIRROR/MERGE verdict — because
+            # soft affinity may land the pod on a DIFFERENT node than the one whose warm copy we last
+            # saw, and a verdict computed for the wrong node could --delete-wipe another node's
+            # un-flushed copy. The container itself compares Gd against its own on-node synced marker.
+            # KILL-SWITCH: when deletion propagation is disabled we pass Gd=0 so hydrate can never take
+            # the MIRROR (--delete) branch — an instant, complete revert to accumulate-only.
+            durable_gen = 0
+            if self._deletion_propagation_enabled():
+                try:
+                    durable_gen = int(store.get_durable_generation(instance_id) or 0)
+                except Exception as e:
+                    logger.debug("get_durable_generation failed for %s (defaulting Gd=0): %s", instance_id, e)
+                    durable_gen = 0
+            annotations["amd-oneclick/workspace-durable-generation"] = str(durable_gen)
+            synced_marker = settings.WORKSPACE_MOUNT_PATH.rstrip("/") + "/" + self._SYNCED_GEN_MARKER_REL
+            # Hydrate init container: decide MIRROR vs MERGE IN-CONTAINER on the actual node, reading
+            # its own on-node synced-generation marker (Gl) vs the manager-passed durable generation
+            # (Gd). NEVER manager-decided (see above). Two branches:
+            #   * durable non-empty AND Gd > Gl -> MIRROR: `rsync -a --delete` so a deletion recorded
+            #     in a newer durable generation actually propagates down (Problem 1 fix). Then stamp
+            #     the marker Gl=Gd so this node is now a confirmed descendant of that generation.
+            #   * else -> MERGE: `rsync -a --update` (newer-mtime wins, NO --delete). Protects a newer
+            #     un-flushed warm local copy (ungraceful-kill safety) and an empty/absent durable can
+            #     never wipe local. A stale-low Gd only ever downgrades MIRROR->MERGE, always safe.
+            # The synced marker is node-local truth and is --exclude'd from BOTH rsyncs so it never
+            # travels between nodes (each node tracks the generation its own SSD copy descends from).
             init_containers.append({
                 "name": "workspace-hydrate",
                 "image": self._workspace_sync_image(),
@@ -2062,12 +2436,47 @@ findmnt "$mnt"
 set -eux
 src={shlex.quote(durable_mount_path + '/')}
 dst={shlex.quote(settings.WORKSPACE_MOUNT_PATH.rstrip('/') + '/')}
+marker={shlex.quote(synced_marker)}
+excl={shlex.quote('/' + self._SYNCED_GEN_MARKER_REL)}
+Gd={int(durable_gen)}
 mkdir -p "$src" "$dst"
+# stamp_marker writes the completeness marker ROBUSTLY, self-healing a wrong-TYPE path a user (root in
+# their pod) could have planted (/workspace/.oneclick as a file, or synced-generation as a directory),
+# which would otherwise make mkdir/redirect fail and — under `set -eux` — abort this init and BLOCK the
+# launch. `if` guards avoid a bare `A && B` tripping `set -e`.
+stamp_marker() {{
+  d=$(dirname "$marker")
+  if [ -e "$d" ] && [ ! -d "$d" ]; then rm -f "$d"; fi
+  mkdir -p "$d"
+  if [ -e "$marker" ] && [ ! -f "$marker" ]; then rm -rf "$marker"; fi
+  printf '%s' "$1" > "$marker"
+}}
+Gl=0
+if [ -f "$marker" ]; then
+  mv=$(cat "$marker" 2>/dev/null || echo "")
+  case "$mv" in ''|*[!0-9]*) Gl=0;; *) Gl=$mv;; esac
+fi
 if [ -n "$(ls -A "$src" 2>/dev/null)" ]; then
-  rsync -a --update "$src" "$dst"
-  echo "hydrated $dst from durable (newer-wins merge)"
+  if [ "$Gd" -gt "$Gl" ]; then
+    rsync -a --delete --exclude="$excl" "$src" "$dst"
+    stamp_marker "$Gd"
+    echo "hydrated (MIRROR: Gd=$Gd > Gl=$Gl) $dst from durable"
+  else
+    rsync -a --update --exclude="$excl" "$src" "$dst"
+    # COMPLETENESS PROOF: stamp the marker ONLY after the merge finishes. A finished MERGE proves
+    # local is a complete descendant of gen $Gl (MERGE only runs when Gd<=Gl, so max(Gl,Gd)=Gl). An
+    # INTERRUPTED merge never reaches this line, so the marker stays absent and the flush safely falls
+    # back to --update instead of an authoritative --delete. This closes the gen-0 bootstrap hole
+    # where an absent marker (Gl defaulting to 0 == Gd) was indistinguishable from a partial hydrate.
+    stamp_marker "$Gl"
+    echo "hydrated (MERGE: Gd=$Gd <= Gl=$Gl) $dst from durable"
+  fi
 else
-  echo "durable empty; keeping local cache as-is (will seed durable on flush)"
+  # Empty durable: local is trivially a complete descendant of an empty durable at generation Gd, so
+  # stamp the marker (completeness proof) — lets a brand-new instance's first flush authoritatively
+  # establish generation 1. An empty durable can never wipe local (we copy nothing here).
+  stamp_marker "$Gd"
+  echo "durable empty; keeping local cache as-is (empty durable can never wipe local)"
 fi
 """],
                 "volumeMounts": [
@@ -2083,6 +2492,87 @@ fi
             volumes.append({
                 "name": "workspace-durable",
                 "persistentVolumeClaim": {"claimName": shard_pvc},
+            })
+
+        # --- Part B: workspace-seed init container (per-template, once, marker-gated) --------------
+        # Seed the launch IMAGE's baked /workspace content into a per-template subdir so a /workspace
+        # overmount (localcache/emptydir/hostpath) no longer SHADOWS it. Ordered AFTER hydrate and
+        # BEFORE git-clone. Runs in BOTH durable and ephemeral modes; skipped for app types (no
+        # overmount) and for blank launches (seed_key is None). Pure-additive: without Part C a
+        # deleted seed file resurrects exactly like any other file does today (no regression), so this
+        # is safe to ship independently and de-risks the rollout.
+        if seed_key and not is_app_type:
+            seed_mount_path = "/mnt/ws-seed"
+            # Match the notebook container's workspace propagation so the quota loop-image contents
+            # (mounted in the host mount namespace) are visible: HostToContainer when the privileged
+            # quota init mounted the loop, else default.
+            seed_propagation = "HostToContainer" if (
+                settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir and not is_app_type
+            ) else None
+            seed_vm = {"name": "workspace", "mountPath": seed_mount_path}
+            if seed_propagation:
+                seed_vm["mountPropagation"] = seed_propagation
+            # CRITICAL: the workspace volume is mounted at the ALTERNATE path /mnt/ws-seed, NOT at
+            # /workspace, so the image's baked /workspace stays unshadowed and readable inside this
+            # container. We copy image:/workspace -> /mnt/ws-seed/<slug> exactly once (the marker,
+            # which lives under /workspace, flushes to durable + hydrates back, so relaunches skip).
+            # Only seed when the image ACTUALLY has content under /workspace, so a content-less image
+            # never creates an empty <slug>/ dir.
+            init_containers.append({
+                "name": "workspace-seed",
+                # The USER's own image, so its baked /workspace is present in the container rootfs.
+                "image": image,
+                "imagePullPolicy": "IfNotPresent",
+                # Runs a (possibly untrusted) user image: bound its resources and drop privileges. Runs
+                # as root (not runAsNonRoot) so `cp -a` can read root-owned baked files and preserve
+                # ownership, but with no privilege escalation and all capabilities dropped.
+                "resources": {
+                    "requests": {"cpu": "50m", "memory": "64Mi"},
+                    "limits": {"cpu": "1", "memory": "1Gi"},
+                },
+                "securityContext": {
+                    "allowPrivilegeEscalation": False,
+                    "capabilities": {"drop": ["ALL"]},
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "command": ["/bin/bash", "-lc"],
+                "args": [f"""
+set -eux
+key={shlex.quote(seed_key)}
+seed_root={shlex.quote(seed_mount_path)}
+dst="$seed_root/$key"
+marker="$seed_root/.oneclick/seeded-$key"
+if [ -e "$marker" ]; then
+  echo "already seeded ($key); skipping"
+  exit 0
+fi
+if [ -n "$(ls -A /workspace 2>/dev/null)" ]; then
+  # A user (root in their pod) could have planted /workspace/<slug> as a FILE, or /workspace/.oneclick
+  # as a file. Under `set -eux` a failing mkdir would abort this init and BLOCK the launch (self-DoS).
+  # Skip gracefully if the seed target is a non-directory (never clobber user data); self-heal a
+  # wrong-type .oneclick so the marker can be written.
+  if [ -e "$dst" ] && [ ! -d "$dst" ]; then
+    echo "seed target $dst exists as a non-directory (user data?); skipping seed" >&2
+  else
+    mkdir -p "$dst"
+    # Mark seeded ONLY if the copy actually succeeded — a failed/partial copy must NOT be recorded as
+    # seeded (that would skip a re-seed on the next launch and leave the user in an incomplete subdir).
+    if cp -a /workspace/. "$dst"/; then
+      if [ -e "$seed_root/.oneclick" ] && [ ! -d "$seed_root/.oneclick" ]; then rm -f "$seed_root/.oneclick"; fi
+      mkdir -p "$seed_root/.oneclick"
+      touch "$marker"
+      echo "seeded image /workspace -> $dst"
+    else
+      # Non-fatal: a failed/partial copy must NOT block the launch, but also must NOT be marked seeded
+      # (leave it unmarked so the next launch retries; cp -a is a safe merge/overwrite on retry).
+      echo "seed copy for $key FAILED/partial; NOT marking seeded (will retry next launch)" >&2
+    fi
+  fi
+else
+  echo "image has no /workspace content; nothing to seed for $key"
+fi
+"""],
+                "volumeMounts": [seed_vm],
             })
 
         # Private-repo clone runs in a dedicated init container (NOT the user's notebook container).
@@ -3753,8 +4243,12 @@ exit 0
                         ssh_public_key: Optional[str] = None,
                         pod_type: Optional[str] = None,
                         api_launched: bool = False,
-                        git_token: Optional[str] = None) -> dict:
-        """Create a new notebook instance"""
+                        git_token: Optional[str] = None,
+                        use_pvc: Optional[bool] = None) -> dict:
+        """Create a new notebook instance.
+
+        ``use_pvc`` is the FUTURE per-launch PVC-optional toggle (unsurfaced): forwarded to
+        ``_get_pod_manifest`` -> ``_resolve_workspace_mode``. ``None`` for every caller today."""
         instance_id = custom_instance_id or self._generate_instance_id(email)
         image = image or settings.DEFAULT_IMAGE
 
@@ -3846,6 +4340,7 @@ exit 0
             api_launched=api_launched,
             workspace_last_node=workspace_last_node,
             git_token=git_token,
+            use_pvc=use_pvc,
         )
         pod_uid = None
         for attempt in range(1, 7):
@@ -4076,28 +4571,39 @@ exit 0
         is_localcache = self._workspace_localcache_enabled()
         node_name = None
         session_token = None
+        # Resolve the launch-time workspace mode from the pod annotation (Part A seam). Today every
+        # localcache pod is annotated "durable", so the ephemeral branch below is wired but dormant
+        # until the future per-launch PVC toggle emits "ephemeral" pods.
+        workspace_mode = "durable"
         if is_localcache:
             try:
                 pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
                 node_name = getattr(pod.spec, "node_name", None)
+                workspace_mode = (pod.metadata.annotations or {}).get(
+                    "amd-oneclick/workspace-mode") or "durable"
             except ApiException as e:
                 if e.status != 404:
                     logger.debug("could not read node for %s before delete: %s", instance_id, e)
-            try:
-                # Records the (instance, node) local-copy row + returns its session fence token.
-                session_token = store.stamp_workspace_stopped(instance_id, node_name)
-            except Exception as e:
-                logger.debug("stamp_workspace_stopped failed for %s: %s", instance_id, e)
+            # Only the durable mode has an out-of-pod flush to fence; record the stop token for it.
+            # Ephemeral has no durable tier — its SSD is cleaned immediately on destroy (below), so a
+            # soft-affinity stamp / flush ledger would only leave rows nothing ever consumes.
+            if workspace_mode == "durable":
+                try:
+                    # Records the (instance, node) local-copy row + returns its session fence token.
+                    session_token = store.stamp_workspace_stopped(instance_id, node_name)
+                except Exception as e:
+                    logger.debug("stamp_workspace_stopped failed for %s: %s", instance_id, e)
 
         self._delete_service(instance_id)
         self._delete_pod(instance_id)
 
         if not wait:
             gone = not self._pod_exists(instance_id)
-            # Even on the fire-and-forget path, kick the flush if the pod is already gone; otherwise the
-            # reconciler retry sweep will pick up the unflushed copy row later.
+            # Even on the fire-and-forget path, finalize if the pod is already gone; otherwise the
+            # reconciler retry sweep will pick up the unflushed copy row later (durable mode).
             if gone:
-                self._flush_after_delete(instance_id, node_name, session_token, is_localcache)
+                self._finalize_workspace_after_delete(instance_id, node_name, session_token,
+                                                      is_localcache, workspace_mode)
             return gone
 
         # No in-pod flush to wait out anymore — the out-of-pod flush reads the host SSD copy after the
@@ -4108,7 +4614,8 @@ exit 0
         while time.monotonic() < deadline:
             if not self._pod_exists(instance_id):
                 logger.info("Confirmed pod %s is gone", instance_id)
-                self._flush_after_delete(instance_id, node_name, session_token, is_localcache)
+                self._finalize_workspace_after_delete(instance_id, node_name, session_token,
+                                                      is_localcache, workspace_mode)
                 return True
             time.sleep(interval)
 
@@ -4119,20 +4626,40 @@ exit 0
         while time.monotonic() < force_deadline:
             if not self._pod_exists(instance_id):
                 logger.info("Confirmed pod %s is gone after force delete", instance_id)
-                self._flush_after_delete(instance_id, node_name, session_token, is_localcache)
+                self._finalize_workspace_after_delete(instance_id, node_name, session_token,
+                                                      is_localcache, workspace_mode)
                 return True
             time.sleep(interval)
 
         logger.error("Pod %s still present after force delete; leaving for reconciler", instance_id)
         return False
 
-    def _flush_after_delete(self, instance_id: str, node_name: Optional[str],
-                            session_token: Optional[str], is_localcache: bool):
-        """Run the out-of-pod local->durable flush once a delete has confirmed the pod is gone.
-        Best-effort: a failed flush leaves the local-copy row's flushed_at NULL, so (a) the reaper
-        won't reap the unflushed SSD copy and (b) the reconciler sweep retries it later. Never raises
-        — a flush hiccup must not turn a successful delete into a failure."""
-        if not is_localcache or not node_name or not session_token:
+    def _finalize_workspace_after_delete(self, instance_id: str, node_name: Optional[str],
+                                         session_token: Optional[str], is_localcache: bool,
+                                         workspace_mode: str = "durable"):
+        """Finalize the workspace once a delete has confirmed the pod is gone.
+
+        DURABLE mode: run the out-of-pod local->durable flush. Best-effort — a failed flush leaves the
+        local-copy row's flushed_at NULL, so (a) the reaper won't reap the unflushed SSD copy and
+        (b) the reconciler sweep retries it later.
+
+        EPHEMERAL mode (Part A seam, dormant until the PVC toggle is surfaced): there is no durable
+        tier, so the node-local SSD copy is freed IMMEDIATELY (no flush, no TTL gate) and its ledger
+        rows are dropped — the workspace auto-deletes on destroy. Never raises: a hiccup must not turn
+        a successful delete into a failure."""
+        if not is_localcache or not node_name:
+            return
+        if workspace_mode == "ephemeral":
+            try:
+                self._cleanup_local_workspace_cache(instance_id, node_name)
+                store.clear_all_local_copies(instance_id)
+                store.clear_workspace_cache_state(instance_id)
+                logger.info("Ephemeral workspace %s on %s freed immediately (no durable tier)",
+                            instance_id, node_name)
+            except Exception as e:
+                logger.error("ephemeral SSD cleanup for %s on %s failed: %s", instance_id, node_name, e)
+            return
+        if not session_token:
             return
         try:
             self._flush_workspace_to_durable(instance_id, node_name, session_token)
@@ -4189,6 +4716,12 @@ exit 0
         node was NotReady when delete_instance_by_id fired the flush (or the pod was lost out-of-band
         before any delete), the flush couldn't run and the copy is unflushed. Once the node is Ready
         again this retries it, fenced by the copy's session_token so it marks exactly that session.
+
+        SUPERSEDED routing (Part C, CORRECTNESS not just latency): this sweep is the path that hits a
+        stranded copy whose generation is behind live durable (synced_generation < durable_generation).
+        The flush it invokes re-derives the authoritative decision from the copy's on-node marker and
+        DISCARDS a superseded copy to trash instead of merging it up (which would resurrect deletions).
+        list_workspace_unflushed_copies carries the generation context for that observability.
         Returns the "instance@node" keys successfully flushed this sweep."""
         if not self._workspace_localcache_enabled():
             return []
@@ -4214,6 +4747,10 @@ exit 0
             session_token = row.get("session_token")
             if not node_name or node_name not in ready_nodes or not session_token:
                 continue
+            if row.get("synced_generation", 0) < row.get("durable_generation", 0):
+                logger.info("retry sweep: %s@%s is superseded (synced=%s < durable=%s); flush will "
+                            "discard the stranded copy, not merge it up", instance_id, node_name,
+                            row.get("synced_generation"), row.get("durable_generation"))
             # A live pod ON THIS NODE means the instance was relaunched here; its /workspace is the
             # active working set and its hydrate-init may be rsyncing — don't flush over it (the flush
             # method also guards this, but skip early). A live pod on ANOTHER node doesn't affect this

@@ -385,6 +385,31 @@ class Settings:
     # it real headroom. delete_instance_by_id also uses this (not DELETE_CONFIRM_TIMEOUT_SECONDS) as its
     # confirm window for localcache pods so the manager never force-deletes before the flush finishes.
     WORKSPACE_TERMINATION_GRACE_SECONDS: int = int(os.getenv("WORKSPACE_TERMINATION_GRACE_SECONDS", "600"))
+
+    # --- Fenced deletion propagation + per-template image seeding (workspace_persistence_fix) -------
+    # Master switch for Part C (fenced deletion propagation). When true, a clean stop's authoritative
+    # flush uses `rsync --delete` (gated by the per-instance generation fence) so a file the user
+    # deleted under /workspace stays deleted across relaunch. false = instant revert to the legacy
+    # accumulate-only behavior (`rsync --update`, no --delete) with no generation bumps — a safe
+    # kill-switch that never risks durable data. Only consulted in "durable" workspace mode.
+    WORKSPACE_DELETION_PROPAGATION_ENABLED: bool = os.getenv(
+        "WORKSPACE_DELETION_PROPAGATION_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # Part B: seed the launch image's baked /workspace content into the workspace once. When true a
+    # `workspace-seed` init container copies the image's /workspace into a per-template subdir
+    # (/workspace/<slug>/), marker-gated so it runs exactly once per template and never re-injects a
+    # file the user later deletes. Runs in BOTH durable and ephemeral modes; pure-additive.
+    WORKSPACE_SEED_ENABLED: bool = os.getenv(
+        "WORKSPACE_SEED_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    # When true, seed into a per-template subdir keyed by the template slug (approach A), so launching
+    # a different template seeds its own subdir without touching another template's files. When false
+    # a single shared "default" key is used. Blank launches (no template slug) are never seeded.
+    WORKSPACE_SEED_PER_TEMPLATE: bool = os.getenv(
+        "WORKSPACE_SEED_PER_TEMPLATE", "true").lower() in {"1", "true", "yes", "on"}
+    # FUTURE per-launch PVC hook (Part A seam): the workspace mode ("durable" vs "ephemeral") is
+    # resolved centrally by k8s_client._resolve_workspace_mode(). Today it derives purely from
+    # WORKSPACE_VOLUME_TYPE (localcache => durable; emptydir/hostpath => ephemeral). When the optional
+    # "PVC off per launch" feature is built, a per-launch use_pvc flag (from create_instance params)
+    # will feed that resolver — a one-line wiring change — WITHOUT a new user-facing setting here.
     EPHEMERAL_STORAGE_REQUEST: str = os.getenv("EPHEMERAL_STORAGE_REQUEST", "")
     EPHEMERAL_STORAGE_LIMIT: str = os.getenv("EPHEMERAL_STORAGE_LIMIT", "")
     NETWORK_DISK_ENABLED: bool = os.getenv("NETWORK_DISK_ENABLED", "false").lower() in {"1", "true", "yes", "on"}

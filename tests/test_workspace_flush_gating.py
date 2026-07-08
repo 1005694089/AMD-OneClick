@@ -133,5 +133,178 @@ class LocalCopyFlushTests(unittest.TestCase):
         self.assertNotIn("nb-done", pending)
 
 
+class GenerationLedgerTests(unittest.TestCase):
+    """Fenced-deletion generation model (Part C): the durable_generation / synced_generation columns,
+    the authoritative-flush bump, superseded discard, and that the reaper stays flushed-only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        cls._tmp.close()
+        from app import store
+        from sqlalchemy import create_engine
+        store.engine = create_engine(f"sqlite:///{cls._tmp.name}", future=True)
+        cls.store = store
+        store.metadata.create_all(store.engine)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            os.unlink(cls._tmp.name)
+        except OSError:
+            pass
+
+    def setUp(self):
+        with self.store.engine.begin() as conn:
+            conn.execute(self.store.workspace_cache_state.delete())
+            conn.execute(self.store.workspace_local_copy.delete())
+
+    def _backdate_copy(self, instance_id, node_name, minutes_ago):
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+        with self.store.engine.begin() as conn:
+            conn.execute(
+                self.store.update(self.store.workspace_local_copy)
+                .where(
+                    self.store.workspace_local_copy.c.instance_id == instance_id,
+                    self.store.workspace_local_copy.c.node_name == node_name,
+                )
+                .values(session_token=ts)
+            )
+        return ts
+
+    def test_fresh_instance_generation_zero(self):
+        # An unmigrated / never-flushed instance reads generation 0 (accumulate-only, today's behavior).
+        self.assertEqual(self.store.get_durable_generation("nb-new"), 0)
+
+    def test_authoritative_flush_bumps_and_marks(self):
+        s = self.store
+        t = s.stamp_workspace_stopped("nb-a", "node-1")
+        self.assertEqual(s.get_durable_generation("nb-a"), 0)
+        self.assertTrue(s.mark_workspace_flushed_authoritative("nb-a", "node-1", t, 1))
+        self.assertEqual(s.get_durable_generation("nb-a"), 1)
+        # Marked flushed + synced=1 → out of the unflushed list.
+        self.assertNotIn("nb-a", {r["instance_id"] for r in s.list_workspace_unflushed_copies()})
+
+    def test_authoritative_stale_token_is_noop(self):
+        # A straggler authoritative confirm with the WRONG token must NOT bump the generation.
+        s = self.store
+        s.stamp_workspace_stopped("nb-b", "node-1")
+        self.assertFalse(s.mark_workspace_flushed_authoritative("nb-b", "node-1", "OLD-TOKEN", 1))
+        self.assertEqual(s.get_durable_generation("nb-b"), 0, "stale token must not bump durable_generation")
+
+    def test_authoritative_never_regresses_generation(self):
+        # If durable is already ahead (5), a confirm computing a lower new_gen must not lower it.
+        s = self.store
+        t = s.stamp_workspace_stopped("nb-c", "node-1")
+        with s.engine.begin() as conn:
+            conn.execute(
+                s.update(s.workspace_cache_state)
+                .where(s.workspace_cache_state.c.instance_id == "nb-c")
+                .values(durable_generation=5)
+            )
+        self.assertTrue(s.mark_workspace_flushed_authoritative("nb-c", "node-1", t, 3))
+        self.assertEqual(s.get_durable_generation("nb-c"), 5, "durable_generation must never regress")
+
+    def test_superseded_discard_drops_row_token_fenced(self):
+        s = self.store
+        t = s.stamp_workspace_stopped("nb-d", "node-1")
+        # Wrong token → no-op (row stays).
+        self.assertFalse(s.discard_superseded_copy("nb-d", "node-1", "OLD"))
+        self.assertIn(("nb-d", "node-1"),
+                      {(r["instance_id"], r["node_name"]) for r in s.list_workspace_unflushed_copies()})
+        # Correct token → dropped.
+        self.assertTrue(s.discard_superseded_copy("nb-d", "node-1", t))
+        self.assertNotIn(("nb-d", "node-1"),
+                         {(r["instance_id"], r["node_name"]) for r in s.list_workspace_unflushed_copies()})
+
+    def test_unflushed_list_carries_generation_context(self):
+        # The retry sweep needs synced/durable generations to observe a superseded copy.
+        s = self.store
+        t = s.stamp_workspace_stopped("nb-e", "node-1")
+        with s.engine.begin() as conn:
+            conn.execute(
+                s.update(s.workspace_cache_state)
+                .where(s.workspace_cache_state.c.instance_id == "nb-e")
+                .values(durable_generation=4)
+            )
+        rows = [r for r in s.list_workspace_unflushed_copies() if r["instance_id"] == "nb-e"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["synced_generation"], 0)   # NULL → 0
+        self.assertEqual(rows[0]["durable_generation"], 4)  # from the joined cache_state
+
+    def test_superseded_unflushed_copy_never_reaped(self):
+        # A superseded stranded copy is UNFLUSHED (flushed_at NULL), so the reaper must never select it
+        # even past TTL — reaping it would destroy data before it is discarded/routed.
+        s = self.store
+        s.stamp_workspace_stopped("nb-f", "node-1")
+        with s.engine.begin() as conn:
+            conn.execute(
+                s.update(s.workspace_cache_state)
+                .where(s.workspace_cache_state.c.instance_id == "nb-f")
+                .values(durable_generation=9)
+            )
+        self._backdate_copy("nb-f", "node-1", 999)
+        ids = {(r["instance_id"], r["node_name"]) for r in s.list_workspace_cache_to_reap(1)}
+        self.assertNotIn(("nb-f", "node-1"), ids,
+                         "an unflushed superseded copy must never be reapable (never-reap-unflushed)")
+
+    def test_clear_cache_state_resets_generation(self):
+        # Admin durable delete calls clear_workspace_cache_state → generation resets so a re-created
+        # workspace under the same id starts at 0 (won't MIRROR-wipe against empty durable).
+        s = self.store
+        t = s.stamp_workspace_stopped("nb-g", "node-1")
+        s.mark_workspace_flushed_authoritative("nb-g", "node-1", t, 7)
+        self.assertEqual(s.get_durable_generation("nb-g"), 7)
+        s.clear_workspace_cache_state("nb-g")
+        self.assertEqual(s.get_durable_generation("nb-g"), 0)
+
+
+class GenerationMigrationTests(unittest.TestCase):
+    """The generation columns MUST be added by an explicit ALTER on a pre-existing table — create_all
+    does not add columns to an existing table. Simulate an old DB (tables without the columns) and
+    assert ensure_workspace_generation_columns adds them, idempotently."""
+
+    def setUp(self):
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        from app import store
+        from sqlalchemy import create_engine, text
+        self._text = text
+        self.eng = create_engine(f"sqlite:///{self._tmp.name}", future=True)
+        self.store = store
+        # OLD schema: the two workspace tables WITHOUT the generation columns.
+        with self.eng.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE workspace_cache_state (instance_id VARCHAR(255) PRIMARY KEY, "
+                "node_name VARCHAR(255), stopped_at VARCHAR(64), updated_at VARCHAR(64) NOT NULL)"))
+            conn.execute(text(
+                "CREATE TABLE workspace_local_copy (instance_id VARCHAR(255) NOT NULL, "
+                "node_name VARCHAR(255) NOT NULL, session_token VARCHAR(64) NOT NULL, "
+                "flushed_at VARCHAR(64), created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL, "
+                "PRIMARY KEY (instance_id, node_name))"))
+
+    def tearDown(self):
+        try:
+            os.unlink(self._tmp.name)
+        except OSError:
+            pass
+
+    def _columns(self, conn, table):
+        from sqlalchemy import inspect
+        return {c["name"] for c in inspect(conn).get_columns(table)}
+
+    def test_alter_adds_generation_columns_idempotently(self):
+        with self.eng.begin() as conn:
+            self.assertNotIn("durable_generation", self._columns(conn, "workspace_cache_state"))
+            self.assertNotIn("synced_generation", self._columns(conn, "workspace_local_copy"))
+            self.store.ensure_workspace_generation_columns(conn)
+            self.assertIn("durable_generation", self._columns(conn, "workspace_cache_state"))
+            self.assertIn("synced_generation", self._columns(conn, "workspace_local_copy"))
+            # Idempotent: a second run must not raise (column already present).
+            self.store.ensure_workspace_generation_columns(conn)
+            self.assertIn("durable_generation", self._columns(conn, "workspace_cache_state"))
+
+
 if __name__ == "__main__":
     unittest.main()

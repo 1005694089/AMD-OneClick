@@ -545,17 +545,14 @@ def reconcile_job():
         cluster_ids = {p["instance_id"] for p in pod_states}
 
         # --- classify (no side effects yet) ---
-        # A localcache pod runs a preStop flush (local->durable, up to 100GB over NFS) and is given a
-        # long terminationGracePeriodSeconds (WORKSPACE_TERMINATION_GRACE_SECONDS) for it. Force-deleting
-        # it at the global 180s TERMINATING_GRACE_SECONDS would truncate that flush and lose the delta —
-        # the exact data-loss the grace-period fix prevents on the direct delete path. So a Terminating
-        # localcache pod is only "stuck" once it has exceeded its own grace (plus slack). Non-localcache
-        # keeps the standard 180s threshold.
+        # NOTE (workspace flush is OUT-OF-POD): the local->durable flush is no longer an in-pod preStop
+        # hook — it runs from the manager AFTER the pod is confirmed gone (delete path + retry sweep),
+        # reading the host-resident SSD copy. So a Terminating localcache pod has NO in-pod flush to
+        # protect and does not actually need the long grace window for data safety. We nonetheless keep
+        # a slightly higher stuck-threshold for localcache pods below purely as conservative slack (a
+        # cheap, harmless delay before force-reclaiming a wedged pod); force-deleting one can never
+        # truncate a flush anymore because the flush hasn't started until the pod is gone.
         is_localcache = (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() == "localcache"
-        # When localcache is on, raise the stuck threshold to cover the pod's real termination grace so
-        # a legitimately-flushing pod isn't force-killed early. app/api pods have no flush, so the
-        # longer wait is merely a harmless delay before they're reclaimed (pod_states carries no
-        # per-pod type, so we apply one threshold to all our pods rather than mis-key on a missing field).
         stuck_threshold = settings.TERMINATING_GRACE_SECONDS
         if is_localcache:
             stuck_threshold = max(stuck_threshold, int(settings.WORKSPACE_TERMINATION_GRACE_SECONDS) + 60)

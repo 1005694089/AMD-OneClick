@@ -3,11 +3,14 @@ Persistent store for users, image catalog, and credit accounting.
 
 Uses PostgreSQL when DATABASE_URL is set; falls back to local SQLite for dev.
 """
+import hashlib
 import json
 import os
 import re
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -69,6 +72,10 @@ _CUSTOM_IMAGE_CAP_LOCK_NS = 0x0A3D_C0DE
 # Single-bigint advisory-lock key that serializes startup schema migration across workers/replicas.
 # Kept well below the two-int (NS<<32 | user_id) range above so the two lock spaces never collide.
 _SCHEMA_MIGRATION_LOCK_KEY = 0x5CEA_0001
+# Namespace for the per-instance workspace-flush advisory lock (two-int form: (NS, instance_hash)).
+# Postgres keeps single-int and two-int advisory locks in SEPARATE spaces, and this NS differs from
+# the custom-image-cap NS above, so the three lock spaces never collide.
+_WORKSPACE_FLUSH_LOCK_NS = 0x5CEA_0002
 
 users = Table(
     "users",
@@ -393,6 +400,11 @@ workspace_cache_state = Table(
     Column("node_name", String(255)),
     Column("stopped_at", String(64)),   # ISO ts when the pod was last deleted; NULL while running
     Column("updated_at", String(64), nullable=False),
+    # Fenced-deletion generation (Part C): the per-instance canonical durable version. NULL reads as
+    # 0. Bumped to Gd+1 ONLY by a confirmed authoritative flush (`rsync --delete`); the single fence
+    # is "only --delete when a copy's synced_generation == this durable_generation". Reset when the
+    # durable workspace is admin-deleted so a re-created workspace never inherits a stale-high value.
+    Column("durable_generation", Integer),
     # The reaper query filters on (stopped_at IS NOT NULL, stopped_at < cutoff, node_name IS NOT NULL);
     # index those so it stays cheap as the table grows instead of full-scanning every 10 min.
     Index("ix_workspace_cache_reap", "stopped_at", "node_name"),
@@ -419,6 +431,12 @@ workspace_local_copy = Table(
     Column("session_token", String(64), nullable=False),
     # ISO ts when the local->durable flush for THIS session/copy confirmed; NULL = unflushed.
     Column("flushed_at", String(64)),
+    # Fenced-deletion generation (Part C): the durable generation this SSD copy is a confirmed
+    # DESCENDANT of. NULL reads as 0. Advances ONLY on a confirmed authoritative flush from this copy
+    # (set to the new durable_generation, token-fenced) — never speculatively. The on-node marker
+    # (.oneclick/synced-generation) is this value's node-local mirror consulted by the in-container
+    # hydrate/flush; this column is the manager-side record for retry-sweep routing/observability.
+    Column("synced_generation", Integer),
     Column("created_at", String(64), nullable=False),
     Column("updated_at", String(64), nullable=False),
     PrimaryKeyConstraint("instance_id", "node_name", name="pk_workspace_local_copy"),
@@ -581,7 +599,29 @@ def ensure_schema_columns(conn):
     # new code reads only workspace_local_copy, so we leave any stray column in place rather than risk
     # a destructive DROP on a live table.
 
+    # Fenced-deletion generation columns (workspace_persistence_fix). create_all does NOT add columns
+    # to a pre-existing table, so add them explicitly (mirrors every other additive column above).
+    ensure_workspace_generation_columns(conn)
+
     _backfill_hf_credit_cap(conn)
+
+
+def ensure_workspace_generation_columns(conn):
+    """Additive migration for the fenced-deletion generation columns (workspace_persistence_fix).
+
+    create_all does NOT add columns to a pre-existing table, so add them explicitly (idempotent,
+    guarded by inspect — mirrors the other additive column migrations). NULL on old rows reads as
+    generation 0 (today's accumulate-only behavior), so every existing instance starts at 0 and only
+    reaches generation 1 on its first authoritative flush — no risk to existing durable data."""
+    inspector = inspect(conn)
+    if inspector.has_table("workspace_cache_state"):
+        wcs_columns = {col["name"] for col in inspector.get_columns("workspace_cache_state")}
+        if "durable_generation" not in wcs_columns:
+            conn.execute(text("ALTER TABLE workspace_cache_state ADD COLUMN durable_generation INTEGER"))
+    if inspector.has_table("workspace_local_copy"):
+        wlc_columns = {col["name"] for col in inspector.get_columns("workspace_local_copy")}
+        if "synced_generation" not in wlc_columns:
+            conn.execute(text("ALTER TABLE workspace_local_copy ADD COLUMN synced_generation INTEGER"))
 
 
 def _backfill_hf_credit_cap(conn):
@@ -3136,6 +3176,134 @@ def mark_workspace_flushed(instance_id: str, node_name: str, session_token: str)
     return (res.rowcount or 0) > 0
 
 
+def get_durable_generation(instance_id: str) -> int:
+    """Current per-instance durable generation Gd (NULL/absent reads as 0). Node-independent; the
+    manager passes this to the hydrate/flush init so the container can compare it against its own
+    on-node synced marker. Cheap PK lookup on workspace_cache_state."""
+    with engine.begin() as conn:
+        val = conn.execute(
+            select(workspace_cache_state.c.durable_generation).where(
+                workspace_cache_state.c.instance_id == instance_id
+            )
+        ).scalar()
+    return int(val or 0)
+
+
+def mark_workspace_flushed_authoritative(instance_id: str, node_name: str, session_token: str,
+                                         new_generation: int) -> bool:
+    """Confirm an AUTHORITATIVE flush (`rsync --delete` ran and succeeded): in ONE token-fenced
+    transaction, set the copy's flushed_at + synced_generation=new_generation AND bump the instance's
+    durable_generation to new_generation. DATA-LOSS-CRITICAL: this is called ONLY AFTER the in-pod
+    --delete confirmed, so durable is never certified at a higher generation than it actually holds.
+
+    Token fence (identical to mark_workspace_flushed): the copy row is updated only if its
+    session_token still matches, so a straggler flush from a superseded session can't certify a newer
+    one. If the fence fails (rowcount 0) the durable_generation is NOT bumped and False is returned.
+    Serialized across replicas by the per-instance advisory lock the caller holds, so the
+    read-modify-write of durable_generation cannot race a concurrent flush of the same instance."""
+    if not node_name or not session_token:
+        return False
+    now = utc_now()
+    with engine.begin() as conn:
+        res = conn.execute(
+            update(workspace_local_copy)
+            .where(
+                workspace_local_copy.c.instance_id == instance_id,
+                workspace_local_copy.c.node_name == node_name,
+                workspace_local_copy.c.session_token == session_token,
+            )
+            .values(flushed_at=now, synced_generation=int(new_generation), updated_at=now)
+        )
+        if (res.rowcount or 0) <= 0:
+            return False  # stale token → do NOT bump durable_generation
+        # Bump the canonical durable generation. Never regress it (a stale caller must not lower it).
+        cur = conn.execute(
+            select(workspace_cache_state.c.durable_generation).where(
+                workspace_cache_state.c.instance_id == instance_id
+            )
+        ).scalar()
+        target = max(int(cur or 0), int(new_generation))
+        upd = conn.execute(
+            update(workspace_cache_state)
+            .where(workspace_cache_state.c.instance_id == instance_id)
+            .values(durable_generation=target, updated_at=now)
+        )
+        if (upd.rowcount or 0) <= 0:
+            # No cache_state row yet (e.g. the affinity-hint row was reaped) — create one so the
+            # generation sticks. stopped_at = the session_token (the stop timestamp) rather than NULL:
+            # this row is created during a post-stop flush, so it is NOT running.
+            conn.execute(
+                workspace_cache_state.insert().values(
+                    instance_id=instance_id, node_name=node_name, stopped_at=session_token,
+                    durable_generation=target, updated_at=now,
+                )
+            )
+    return True
+
+
+def discard_superseded_copy(instance_id: str, node_name: str, session_token: str) -> bool:
+    """Drop a SUPERSEDED stranded local-copy row (synced_generation < durable_generation) so neither
+    the retry sweep nor the reaper acts on it again. Token-fenced so a re-stopped session's fresh copy
+    is never dropped by a straggler. Caller frees the SSD separately. Returns True if a row was
+    dropped. This is the intentional generation-wins-over-mtime data-drop of that node's un-flushed
+    edits (merging them up would re-inject files a newer session deleted, poisoning durable)."""
+    if not node_name or not session_token:
+        return False
+    with engine.begin() as conn:
+        res = conn.execute(
+            workspace_local_copy.delete().where(
+                workspace_local_copy.c.instance_id == instance_id,
+                workspace_local_copy.c.node_name == node_name,
+                workspace_local_copy.c.session_token == session_token,
+            )
+        )
+    return (res.rowcount or 0) > 0
+
+
+@contextmanager
+def workspace_instance_advisory_lock(instance_id: str, timeout_seconds: int = 180):
+    """Cross-process/-replica per-INSTANCE lock serializing durable flushes. Two DIFFERENT-node
+    unflushed copies of one instance can otherwise flush concurrently into the SAME durable subpath,
+    and with `--delete` in play that interleaving is destructive. The existing per-instance in-process
+    lock only covers one manager process; this Postgres session-scoped advisory lock covers all
+    replicas. No-op on SQLite (single-writer; tests are single-process). Yields True if held (or
+    lock-free backend), False if it could not be acquired within the timeout."""
+    if engine.dialect.name != "postgresql":
+        yield True
+        return
+    key32 = int(hashlib.md5(instance_id.encode()).hexdigest(), 16) % (2 ** 31)
+    conn = engine.connect()
+    acquired = False
+    try:
+        deadline = time.monotonic() + max(1, timeout_seconds)
+        while True:
+            acquired = bool(conn.execute(
+                text("SELECT pg_try_advisory_lock(:ns, :k)"),
+                {"ns": _WORKSPACE_FLUSH_LOCK_NS, "k": key32},
+            ).scalar())
+            if acquired or time.monotonic() >= deadline:
+                break
+            time.sleep(1)
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                conn.execute(
+                    text("SELECT pg_advisory_unlock(:ns, :k)"),
+                    {"ns": _WORKSPACE_FLUSH_LOCK_NS, "k": key32},
+                )
+            except Exception:
+                # A session-scoped advisory lock is NOT released by returning a POOLED connection to
+                # the pool — only by an explicit unlock or a real disconnect. If unlock failed, force
+                # a disconnect (invalidate) so the lock can't linger on a reused pooled connection and
+                # deadlock this instance's future flushes.
+                try:
+                    conn.invalidate()
+                except Exception:
+                    pass
+        conn.close()
+
+
 def clear_local_copy_node(instance_id: str, node_name: str):
     """Drop the local-copy row for one (instance, node) — used after the reaper frees that node's SSD
     copy (and the durable copy is current)."""
@@ -3161,16 +3329,35 @@ def clear_all_local_copies(instance_id: str):
 def list_workspace_unflushed_copies() -> list[dict]:
     """All (instance, node) copies awaiting a confirmed flush (flushed_at IS NULL). The reconciler
     retry sweep re-runs the flush for these once the node is Ready. Returns
-    [{instance_id, node_name, session_token}]."""
+    [{instance_id, node_name, session_token, synced_generation, durable_generation}].
+
+    The generation context (LEFT JOINed from workspace_cache_state) lets the retry sweep observe
+    whether a copy is a current descendant (synced == durable) or SUPERSEDED (synced < durable) —
+    routing/observability context; the in-container flush re-derives the authoritative decision from
+    the on-node marker. NULL generations read as 0 (an unmigrated/first-gen instance)."""
+    lc = workspace_local_copy.c
+    cs = workspace_cache_state.c
     with engine.begin() as conn:
         rows = conn.execute(
             select(
-                workspace_local_copy.c.instance_id,
-                workspace_local_copy.c.node_name,
-                workspace_local_copy.c.session_token,
-            ).where(workspace_local_copy.c.flushed_at.is_(None))
+                lc.instance_id,
+                lc.node_name,
+                lc.session_token,
+                lc.synced_generation,
+                cs.durable_generation,
+            ).select_from(
+                workspace_local_copy.outerjoin(
+                    workspace_cache_state, lc.instance_id == cs.instance_id
+                )
+            ).where(lc.flushed_at.is_(None))
         ).mappings().all()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["synced_generation"] = int(d.get("synced_generation") or 0)
+        d["durable_generation"] = int(d.get("durable_generation") or 0)
+        out.append(d)
+    return out
 
 
 def get_workspace_last_node(instance_id: str) -> Optional[str]:

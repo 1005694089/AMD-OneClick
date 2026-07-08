@@ -24,6 +24,139 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-08 (CODE-COMPLETE, NOT YET DEPLOYED) - workspace persistence: fenced deletion propagation + per-template image seeding + PVC-optional seam
+
+**Status:** code + tests landed locally on top of the `git_token` entry below; **NOT built, NOT
+deployed**. This row is a pre-deploy design record — a real deploy row (image tag/digest, snapshot,
+rollout) MUST be appended when it ships. Do not treat this as deployed.
+
+**Code (edits):** `app/config.py` (+3 flags), `app/store.py` (generation schema + functions),
+`app/k8s_client.py` (mode seam, seed init, hydrate MIRROR/MERGE, fenced flush), `app/scheduler.py`
+(vestigial preStop-grace comment corrected); tests in `tests/test_workspace_flush_gating.py` (+9) and
+`tests/test_workspace_localcache.py` (+34, incl. a real bash+rsync hydrate e2e). Plan:
+`.cursor/plans/workspace_persistence_fix_9b2428ec.plan.md`.
+
+**What changed (three parts, sequenced A→B→C, C is the only risky one and is flag+generation-gated):**
+
+- **Part A — workspace-mode seam (no behavior change).** `k8s_client._resolve_workspace_mode(use_pvc)`
+  resolves `durable` (localcache) vs `ephemeral` (emptydir/hostpath) in ONE place; seed/hydrate/flush/
+  delete route through it. Pods are annotated `amd-oneclick/workspace-mode`. The future per-launch
+  "PVC optional" toggle is a one-line wiring change (`use_pvc=False` on a localcache launch →
+  ephemeral: node-SSD working copy, NO durable shard/hydrate/flush, SSD reaped immediately on destroy,
+  seed still runs). `use_pvc` is NOT surfaced by any caller yet, so every localcache launch is
+  `durable` == today.
+
+- **Part B — per-template image seeding (Problem 2, `WORKSPACE_SEED_ENABLED`, default on).** A new
+  `workspace-seed` init container (ordered AFTER hydrate, BEFORE git-clone) runs the USER's image with
+  the workspace volume mounted at the ALT path `/mnt/ws-seed` (HostToContainer) — NOT `/workspace`, so
+  the image's baked `/workspace` stays unshadowed — and copies it into `/workspace/<template-slug>/`
+  ONCE, marker-gated (`.oneclick/seeded-<slug>`, which flushes/hydrates so it holds across relaunches).
+  Blank/no-template launches are never seeded (no empty `default/` dir); a content-less image seeds
+  nothing. The plain jupyter/opencode startup relocates cwd + Jupyter root into the seeded subdir when
+  it exists. Pure-additive: without Part C a deleted seed file resurrects like any file does today (no
+  regression), so B is safe to ship independently.
+
+- **Part C — fenced deletion propagation (Problem 1, `WORKSPACE_DELETION_PROPAGATION_ENABLED`, default
+  on; durable mode only).** New per-instance `durable_generation` (Gd) and per-copy `synced_generation`
+  (added via explicit `ALTER TABLE ADD COLUMN`; NULL reads as 0). The single load-bearing invariant:
+  an authoritative `rsync --delete` happens ONLY when a copy's on-node generation marker `Gl == Gd`
+  (proving it is a complete descendant of live durable). Otherwise the flush accumulates (`--update`,
+  today's safe behavior) or DISCARDS a superseded stranded copy (`Gl < Gd`) instead of merging it up
+  (which would re-inject deletions). The hydrate decides MIRROR (`--delete`, propagate deletions) vs
+  MERGE (`--update`) IN-CONTAINER from its on-node marker vs the manager-passed Gd — the manager passes
+  ONLY Gd, never a verdict, so soft-affinity node drift can't `--delete`-wipe another node's copy. The
+  flush runs under a per-INSTANCE advisory lock (Postgres, cross-replica) so two different-node copies
+  of one instance can't interleave a `--delete` with an `--update`. Generation only ever advances on a
+  confirmed authoritative flush (token-fenced, bumped AFTER the `--delete` confirms). `delete_workspace_
+  durable` resets the generation so a re-created workspace can't inherit a stale-high Gd.
+
+**Rollout / generation-gating (why C is safe on live durable data):** every existing instance starts
+at generation 0 (NULL). While running and up through its FIRST clean stop, hydrate MERGEs and flush
+stays `--update` — behavior IDENTICAL to today. The first clean stop is the first authoritative
+`--delete` (that is how generation reaches 1); it runs after a MERGE where local is a superset of
+durable (proven complete by the on-node marker), so it only removes THIS session's deletions.
+Deletions persist from that point on. Kill-switch: `WORKSPACE_DELETION_PROPAGATION_ENABLED=false`
+passes Gd=0 everywhere → hydrate never MIRRORs and flush never `--delete`s → instant revert to
+accumulate-only, no data-loss risk.
+
+**DEPLOY ORDERING (MANDATORY — mixed-replica safety):** the per-instance advisory lock only serializes
+flushes among replicas that HAVE it. During the rolling update, an old replica (legacy `--update`, no
+lock) and a new replica (authoritative `--delete`, lock) could otherwise flush the same instance
+concurrently. So ship this change with `WORKSPACE_DELETION_PROPAGATION_ENABLED=false` in the configmap,
+complete the rollout to 2/2 new replicas, and ONLY THEN flip the flag to `true` (configmap edit +
+restart). With the flag off during the mixed window, all replicas do legacy `--update` (no `--delete`,
+no lock needed), so there is no destructive interleave; and right after enabling, existing instances
+have no on-node marker yet, so their first flush is `--update` anyway until a new-code hydrate stamps a
+marker. This ordering makes enabling the feature race-free even though the default is `true`.
+
+**Verification (local, no cluster):** 62 fast unit tests + a real `bash`+`rsync` hydrate e2e green —
+MIRROR removes a file a newer durable generation deleted (resurrection fixed), MERGE keeps a newer
+un-flushed local file (ungraceful-kill safety) and never deletes local-only files, empty durable never
+wipes local, a stale-low Gd only downgrades MIRROR→MERGE. Flush outcome routing (AUTHORITATIVE bumps /
+SUPERSEDED discards / MERGE marks), the never-reap-unflushed invariant, and the additive migration are
+covered. Pending: build, in-cluster e2e, and a real deploy row.
+
+**Adversarial review (2 subagents) — findings addressed:**
+- CRITICAL (cross-replica stale-Gd false-authoritative clobber): `durable_generation` is now read
+  INSIDE the per-instance advisory lock, so a concurrent authoritative flush can't hand a stale-low Gd
+  that turns a superseded copy into an authoritative `--delete`.
+- HIGH (gen-0 bootstrap `--delete` on an incomplete hydrate): a completed hydrate now writes a POSITIVE
+  completeness marker (MIRROR, MERGE, and empty-durable branches all stamp `.oneclick/synced-generation`),
+  and the flush requires the marker to be PRESENT before any authoritative `--delete`/superseded
+  discard. An interrupted first hydrate leaves no marker → the flush safely falls back to `--update`
+  (no `--delete` against a partial `/local`). Previously an absent marker (`Gl` defaulting to 0 == Gd)
+  was indistinguishable from a complete hydrate — the rollout-window data-loss hole.
+- MEDIUM (seed marked "seeded" on a failed `cp`): the `seeded-<slug>` marker is touched ONLY on copy
+  success (non-fatal to launch; retries next launch).
+- LOW hardening: advisory-lock connection is `invalidate()`d if `pg_advisory_unlock` fails (no leaked
+  session lock on a pooled conn); the seed init container gained resource limits + a drop-ALL-caps
+  securityContext; the authoritative-flush fallback cache_state insert stamps `stopped_at` (not NULL).
+- Accepted/known (reviewer-confirmed data-safe): a marker-ahead-of-`durable_generation` after an
+  unreadable-log/stale-token authoritative flush is safe-direction (a deletion may not persist that
+  round, never durable loss); advisory-lock connection-hold is bounded by the 2-worker delete executor
+  + sequential retry sweep (no pool exhaustion under current wiring); DB `synced_generation` is
+  observability-only (the in-container marker drives the decision).
+
+**Round-2 adversarial review (3 more agents) — findings addressed:**
+- HIGH (regression introduced by the round-1 stale-Gd fix): the flush fell back to `Gd=0` if
+  `get_durable_generation` threw (DB error), so a superseded gen-0-marked copy would match `Gl==Gd(0)`
+  and false-authoritatively `--delete` over a higher durable. Now the flush ABORTS on a Gd read
+  failure (retried by the sweep); the hydrate keeps its `Gd=0`-on-error (only downgrades to MERGE).
+- MEDIUM (verification gap): the flush `--delete` path — the sole durable-write surface — had only
+  string assertions. Added a real bash+rsync `FlushShellE2ETests` proving authoritative removes ONLY
+  this session's deletion (keeps unrelated durable files, bumps the marker, marker never travels),
+  SUPERSEDED leaves durable byte-identical, and a MISSING or GARBAGE marker falls back to `--update`
+  (never `--delete`) — the gen-0 interrupted-hydrate protection, now proven end to end.
+- LOW hardening: the completeness marker must now be a VALID integer to count as proof (empty/truncated/
+  user-scribbled junk → `have_marker=0` → safe MERGE); `delete_workspace_durable` resets the generation
+  BEFORE the trash-move (closing an admin-delete-vs-relaunch resurrection window); deploy-ordering note
+  added (enable propagation only after full rollout — see below).
+- Reviewer-confirmed data-safe (no change): user-writable on-node marker is strictly self-scoped (durable
+  is a per-instance subPath; garbage → MERGE, a valid value only propagates the user's OWN deletions);
+  a hostile image's baked `/workspace/.oneclick` lands under `/workspace/<slug>/`, never poisoning the
+  root markers; generation-desync-after-unreadable-log is safe-direction (liveness only).
+
+**Round-2b (concurrency/adversarial reviewer) — findings addressed:** the reviewer found NO committed-
+data-loss and NO cross-tenant path; the marker-abuse, hostile-image, subPath, migration, ephemeral, and
+reaper angles are all confirmed defended. Two MEDIUMs fixed:
+- Authoritative outcome was detected by parsing pod stdout; a post-`--delete` log-read failure would
+  downgrade to a plain mark (no gen bump) → warm-relaunch resurrection. The pod now also writes the
+  outcome to `/dev/termination-log`, and the manager reads it LOSSLESSLY from `terminated.message`
+  (pod-log tail is only a fallback) — removing the log-read dependency for the AUTHORITATIVE path.
+- `set -eux` `mkdir`/redirect over a user- or image-planted wrong-type path (`/workspace/.oneclick` as
+  a file, `<slug>` as a file) would abort the init and BLOCK that instance's own launches (self-DoS).
+  The hydrate/flush marker write now self-heals a wrong-type path (`stamp_marker`), and the seed skips
+  gracefully if its target is a non-directory. All three generated scripts pass `bash -n`.
+- Operational (documented, see DEPLOY ORDERING above): the advisory-lock connection-hold is bounded by
+  the 2-worker delete executor + sequential sweep (self-healing, no permanent deadlock); the flush-vs-
+  relaunch-hydrate TOCTOU is `bump-after-delete`-safe (worst case a one-cycle resurrection, no committed
+  loss); a user deleting their OWN marker only self-resurrects in their OWN durable.
+
+New tests: lossless `terminated.message` routing (log API down), the flush `--delete` bash+rsync e2e
+(authoritative removes only this session's deletion / SUPERSEDED + missing/garbage marker never
+`--delete`), hydrate self-heals a wrong-type `.oneclick` (no launch block), Gd-read-failure aborts the
+flush. Total workspace tests: 76 green.
+
 ## 2026-07-07 18:04 (latest) - radeon-global: HF demo API private-repo `git_token` for workshop `.git` launches
 
 **Code:** `prod/radeon-global` at `41d9e13` ("HF demo API: private-repo git_token for workshop .git
