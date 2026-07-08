@@ -1,6 +1,7 @@
 k8s-deployment-v2.local.yaml
 k8s-manager-v2-manager-only.local.yaml
 k8s-manager-v2-test.local.yaml
+*.local.yaml
 local-deploy-history/
 cluster.yaml
 external-url-dump.txt

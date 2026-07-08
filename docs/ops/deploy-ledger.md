@@ -26,6 +26,44 @@ secrets.
 
 ---
 
+## 2026-07-08 — PR1 Zijun manager sync to online branch
+
+**Code commit:** `15e4a4a40419add8d93ab5a4dd11897e8e8476d1`
+("----更新 amdai 用户不在显示提示以及 amdai 用户不允许进行绑定操作"),
+branch `sync/v2-base-with-pr1-account-20260626` (pushed to `origin`).
+
+| Service / Port | Image (`:tag`) | Digest / ID | Local yaml + sha256 | Snapshot |
+|----------------|----------------|-------------|---------------------|----------|
+| pr1-zijun / 30392 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:pr1-zijun-sync-20260708-1343` | digest `sha256:ba480dbf3aea6546adb18d69862b90b76147eff65b60a8c739a09ecdadabf078` / id `sha256:4ebc6e814aeb3a06763b003798668e09b31d274971dc99bc68f996f01ee68777` | `k8s-manager-pr1-zijun.local.yaml` sha256 `9aa9b7be401fb224a05a3b706f554ae6520ae5cdb0ced3777be6755f9472a03f` | `local-deploy-history/pr1-zijun/2026-07-08-1355-manager-sync-15e4a4a.local.yaml` |
+
+**Changes:** Pull the online `/radeon/` branch `sync/v2-base-with-pr1-account-20260626`
+(HEAD `15e4a4a`, latest commits update the login prompt wording and stop showing
+the account-binding notice / disallow binding for `amdai` users) and roll the
+PR1 manager onto an image built from it. Manager-only image + `STATIC_ASSET_VERSION`
+bump; all environment (SSO config, `SSO_ENABLED=false` inline override,
+`PUBLIC_BASE_URL`, `RUN_SCHEDULER=false`) is unchanged from the live Deployment.
+
+**Process:** Built from a clean detached worktree at the pushed commit (no
+uncommitted tree changes; the separate `AMD-OneClick-pr1-zijun` worktree's local
+edits were NOT used). Image pushed to ACR, pre-imported into `wx-ms-w7900d-0005`
+containerd `k8s.io` via a temporary privileged helper pod, then a manager-only
+manifest snapshot was `kubectl diff`'d (only image + `STATIC_ASSET_VERSION`
+change confirmed) and `kubectl apply`'d with bounded rollout. Did NOT touch
+ConfigMap `amd-oneclick-config-pr1-zijun`, Secret, Postgres, or the PR1 edge.
+
+**Verification:** rollout `1/1 ready`, new pod `amd-oneclick-manager-pr1-zijun-76f967b5d5-6nx5t`
+on the new image; `http://36.150.116.200:30392/health` 200; `/radeon/` 200 with
+title `Radeon Cloud` and no `/radeon/radeon`; `/radeon/static/app-path.js` 200;
+`/` → 307 redirect; running pod env `SSO_ENABLED=false`,
+`PUBLIC_BASE_URL=https://developer.amd.com.cn/radeon`,
+`STATIC_ASSET_VERSION=pr1-zijun-sync-20260708-1343`, `RUN_SCHEDULER=false`; no
+errors/tracebacks in recent manager logs.
+
+**Rollback:** `kubectl -n default rollout undo deployment/amd-oneclick-manager-pr1-zijun`
+(previous image `pr1-zijun-sync-20260630-0928`).
+
+---
+
 ## 2026-07-04 — v2 proxy recovery, websocket token fix, NFS workspace rollout
 
 **Code commit:** `4f80868881283b9f293cbed3b04cd56d34384e2f`
