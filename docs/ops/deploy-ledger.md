@@ -24,6 +24,90 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-09 18:52 - radeon-global: PVC-optional storage + workshop repo_sub_path (DEPLOYED + e2e verified)
+
+**Status:** DEPLOYED `pvc-tpl-20260709-1852`
+(`@sha256:541d1e54173d6b910f0c593d8111ccdd95999797cc6cd9fa16d6332eabe61032`) to
+`amd-oneclick-lablab`. Code pushed to `origin/prod/radeon-global` across 5 commits
+(`d616e81`..`08a2d35`, on top of `6c48286`).
+
+**Features added (two, from plan `.cursor/plans/pvc_and_repo_sub_path_4d658dd8.plan.md`):**
+
+1. **PVC-optional storage toggle (`use_pvc`):** wires the existing `_resolve_workspace_mode`
+   seam end-to-end. `use_pvc=false` → ephemeral (local SSD only, no durable NFS
+   hydrate/flush); omit/`true` → durable (default, unchanged behavior). Surfaced in three
+   places:
+   - **HF Demo API** (`POST /api/huggingface/notebooks`): new optional `use_pvc` boolean field.
+   - **Browser template creation** (profile/admin/index template forms): new "Storage" dropdown
+     (default Local SSD). Saved per template in `notebook_templates.use_pvc` (new column,
+     auto-migrated). Forwarded to `create_instance` on template launch.
+   - **Browser notebook launch** (`POST /api/notebook/request`): `use_pvc` field in
+     `NotebookRequest` model + included in `upsert_launch_intent` for distribute-resume path.
+   - Settle call (`_settle_workspace_flushes_before_launch`) stays unconditional — NOT gated on
+     the new launch's `use_pvc`. Bugbot round 1 caught the original plan's settle-skip as a
+     same-`instance_id` race (a stale durable flush can still be rsyncing the shared hostPath
+     when a new ephemeral pod mounts it); fixed before any deploy.
+
+2. **Workshop `repo_sub_path`** (HF Demo API only, `pod_type=workshop`, `.git` launches): opens
+   JupyterLab at a subdirectory of the cloned repo instead of its root. Validated at the API
+   (workshop+git gate, no `..` traversal). Shell-safe via `shlex.quote` on the full joined path.
+   `--notebook-dir="$PWD"` keeps `cd` and Jupyter root in sync. Falls back to repo root with a
+   diagnostic listing on missing subpath.
+
+**Commits (all pushed before image build):**
+- `d616e81` — `feat: PVC-optional storage toggle + workshop repo_sub_path` (models, main, k8s_client, index.html, API docs)
+- `ea45325` — `fix: enable Space tab` (reverted immediately in next commit)
+- `323c0db` — `revert: re-disable Space tab (must stay disabled)`
+- `56e40e4` — `feat: add Storage selector to template creation (default SSD)` (models, main, store, template_form.js)
+- `08a2d35` — `fix: cache-bust template_form.js so Storage selector shows` (index, profile, admin HTML)
+
+**Image builds (incremental kaniko, 4 sequential builds layering changed files):**
+- `pvc-subpath-20260709-1801` (`@sha256:e58e5538...`): FROM `tmplrepo-20260709-1440` + models/main/k8s_client/index.html
+- `pvc-subpath-20260709-1828` (`@sha256:10d8a420...`): FROM above + reverted index.html (Space tab re-disabled)
+- `pvc-subpath-20260709-1831` (`@sha256:...`): FROM above + re-reverted index.html
+- `pvc-tpl-20260709-1835` (`@sha256:7ada4760...`): FROM above + models/main/store/template_form.js
+- `pvc-tpl-20260709-1852` (`@sha256:541d1e54...`): FROM above + index/profile/admin HTML (cache-buster)
+
+All build pods on `wx-k8s-prod-s-001`, kaniko `gcr.m.daocloud.io/kaniko-project/executor:debug`,
+`kaniko-harbor-auth` Secret for registry auth, "fast" emptyDir+kubectl-cp context delivery pattern,
+md5sum-verified before signaling ready. Build pods deleted after each step.
+
+**Deploy:** `kubectl set image` to each successive tag (5 rollouts). Final: `pvc-tpl-20260709-1852`.
+RollingUpdate (maxSurge=0/maxUnavailable=1, 2 replicas), 0 restarts across all rollouts. PRE
+snapshot: `local-deploy-history/radeon-global/20260709-1801-pvc-subpath-PRE-deploy.yaml`
+(`sha256:72f81077...`). ~975 running user/workspace pods undisturbed.
+
+**Review (pre-deploy, 3 rounds):**
+- Round 1: Bugbot (high: settle-skip race) + Security Review (clean). Fixed settle-guard, re-ran full test suite (379 passed, 2 pre-existing unrelated).
+- Rounds 2 & 3: Bugbot (clean) + Security Review (clean), two consecutive passes.
+
+**Verification (e2e on LIVE cluster):**
+
+*HF Demo API path:*
+- `use_pvc=false` launch → pod annotation `workspace-mode=ephemeral`, 0 durable volumes, 0 hydrate inits. ✓
+- `repo_sub_path` fallback (public clone succeeded, requested `styles` not a directory) → diagnostic listing + repo-root fallback, `--notebook-dir="$PWD"` confirmed working. ✓
+- `repo_sub_path` rejection (non-workshop): `400 A .git repo can only be launched with pod_type='workshop'`. ✓
+- `repo_sub_path` rejection (`..` traversal): `400 repo_sub_path must not contain '..'`. ✓
+- `repo_sub_path` rejection (non-`.git`): `400 repo_sub_path is only supported for a .git workshop launch`. ✓
+- `use_pvc=false` + `use_pvc=true` HF API launches → `ephemeral` / `durable` pods confirmed. ✓
+
+*Browser template path (deterministic manifest test on deployed code for `u-1-cf9e645`):*
+- Template created via `_save_notebook_template` with `use_pvc=False` → DB round-trip → `_get_pod_manifest(use_pvc=False)` → `workspace-mode=ephemeral`, no durable vol, no hydrate init. ✓
+- Same with `use_pvc=True` → `durable`, durable vol present, hydrate init present. ✓
+- Test templates cleaned up; no side effects on the live user.
+
+*Admin API template CRUD:*
+- `POST /api/admin/templates` with `use_pvc=false` → `id=32, use_pvc=False` persisted. ✓
+- `POST /api/admin/templates` with `use_pvc=true` → `id=33, use_pvc=True` persisted. ✓
+- Both test templates deleted. ✓
+
+All test instances destroyed; `/health` 200 confirmed; no leftover pods/artifacts.
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:tmplrepo-20260709-1440` (base image still on
+nodes). No ConfigMap/Secret/RBAC changes. DB migration (`ALTER TABLE notebook_templates ADD COLUMN
+use_pvc BOOLEAN`) is additive — rollback image ignores the column.
+
 ## 2026-07-09 14:40 - radeon-global: template repo isolation fix (DEPLOYED + e2e verified)
 
 **Status:** DEPLOYED `tmplrepo-20260709-1440` (`@sha256:7d4f27b86f29e6b82a821443e0ea8251af31a52b4310e08b1b61adefa463fdb4`)
