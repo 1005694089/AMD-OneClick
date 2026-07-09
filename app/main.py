@@ -3455,8 +3455,11 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
     try:
         target_base = (await _instance_service_base_async(instance_id)).replace("http://", "ws://")
         target_url = f"{target_base}/instances/{instance_id}/{path}"
-        if websocket.url.query:
-            target_url += f"?{websocket.url.query}"
+        qs = websocket.url.query or ""
+        if "token=" not in qs:
+            sep = "&" if qs else ""
+            qs = f"{qs}{sep}token={settings.NOTEBOOK_TOKEN}"
+        target_url += f"?{qs}"
 
         headers = []
         if websocket.headers.get("cookie"):
