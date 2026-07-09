@@ -26,9 +26,7 @@ class ImageRequest(BaseModel):
     image: Optional[str] = None
     description: Optional[str] = ""
     enabled: bool = True
-    source_type: Optional[str] = None
     source_ref: Optional[str] = None
-    github_url: Optional[str] = None
 
 
 class CreditGrantRequest(BaseModel):

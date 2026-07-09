@@ -629,42 +629,28 @@ class Settings:
     # Default TRUE: this only affects the previously-broken 0/N manual rows. Mirror rows (preheat DS)
     # and image-service rows are unaffected — they keep their own status paths.
     NODE_IMAGE_SCAN_ENABLED: bool = os.getenv("NODE_IMAGE_SCAN_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-    # ACR Enterprise registry used as the admin-image backup source of truth.
-    ACR_ENTERPRISE_REGISTRY: str = os.getenv("ACR_ENTERPRISE_REGISTRY", "")
     # Self-hosted LAN registry (zot) on node 0042 — the durable source of truth for the P2P
     # transport (host:port, e.g. "10.5.10.43:5000"). EMPTY => P1 push behavior is dormant: the
     # `push` chain step is not inserted and readiness still gates on node-loaded rows only, so
     # deploying P1 code before the registry env is wired is a no-op (safe/revertible). When set,
     # admin/custom builds push here and "ready" gates on the pushed digest being recorded.
     LAN_REGISTRY: str = os.getenv("LAN_REGISTRY", "").strip().rstrip("/")
-    # --- Harbor auto-mirror + node preheat (in-cluster image distribution) ---
-    # Admin Add Image mirrors the external source ref into this Harbor registry via skopeo, rewrites
-    # the catalog launch ref to the Harbor ref, and preheats it onto eligible GPU nodes with an
-    # unprivileged prepull DaemonSet. This removes the launch-time dependency on public registries/DNS.
-    HARBOR_REGISTRY: str = os.getenv("HARBOR_REGISTRY", "10.5.10.89:1808").strip().rstrip("/")
-    HARBOR_PROJECT: str = os.getenv("HARBOR_PROJECT", "xinwei").strip().strip("/")
-    # Default FALSE so deploying this code is INERT (admin Add Image keeps the legacy path) until an
-    # operator explicitly opts in per environment — a controlled/dark rollout, matching the dormant
-    # defaults used by LAN_REGISTRY / PURGE_FANOUT_ENABLED elsewhere in this file.
-    HARBOR_MIRROR_ENABLED: bool = os.getenv("HARBOR_MIRROR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-    # Docker config.json (from secret kaniko-harbor-auth) mounted into the manager for skopeo dest auth.
-    HARBOR_AUTH_CONFIG_PATH: str = os.getenv("HARBOR_AUTH_CONFIG_PATH", "/harbor/config.json").strip()
-    # skopeo copy retry count — mandatory: large multi-GB layers flake with transient Harbor 502s.
-    HARBOR_MIRROR_RETRY_TIMES: int = int(os.getenv("HARBOR_MIRROR_RETRY_TIMES", "8"))
-    # Verify the SOURCE registry's TLS cert (default true — only disable for a known plaintext src).
-    HARBOR_MIRROR_SRC_TLS_VERIFY: bool = os.getenv("HARBOR_MIRROR_SRC_TLS_VERIFY", "true").lower() in {"1", "true", "yes", "on"}
-    HARBOR_MIRROR_TIMEOUT_SECONDS: int = int(os.getenv("HARBOR_MIRROR_TIMEOUT_SECONDS", "3600"))
-    # SSRF guard for the mirror source. Admin is an app-level shared password, not network-level
-    # trust, so an admin must not be able to point skopeo at arbitrary internal hosts. By default,
-    # reject source hosts that resolve to private/loopback/link-local addresses. An optional
-    # allowlist (comma-separated host[:port] or host suffixes) whitelists specific internal
-    # registries (e.g. the LAN Harbor itself for re-mirror). Empty allowlist = only public hosts.
-    HARBOR_MIRROR_BLOCK_PRIVATE_SRC: bool = os.getenv("HARBOR_MIRROR_BLOCK_PRIVATE_SRC", "true").lower() in {"1", "true", "yes", "on"}
-    HARBOR_MIRROR_SRC_HOST_ALLOWLIST: list = [
-        h.strip().lower() for h in os.getenv("HARBOR_MIRROR_SRC_HOST_ALLOWLIST", "").split(",") if h.strip()
+    # --- Harbor image sources + node preheat (in-cluster image distribution) ---
+    # Ordered list of Harbor registry/project pairs to search when the admin adds an image.
+    # The image is assumed to already exist in one of these locations; the system verifies via
+    # skopeo inspect (first hit wins) then preheats onto GPU nodes via an unprivileged DaemonSet.
+    HARBOR_IMAGE_SOURCES: list = [
+        s.strip().rstrip("/") for s in os.getenv(
+            "HARBOR_IMAGE_SOURCES",
+            "10.5.10.12:1808/radeon-cloud-global,10.5.10.12:1808/radeon-cloud-user,10.5.10.89:1808/xinwei"
+        ).split(",") if s.strip()
     ]
+    # Docker config.json (from secret kaniko-harbor-auth) mounted into the manager for skopeo auth.
+    HARBOR_AUTH_CONFIG_PATH: str = os.getenv("HARBOR_AUTH_CONFIG_PATH", "/harbor/config.json").strip()
+    # Per-candidate timeout for skopeo inspect during Harbor image resolution.
+    HARBOR_RESOLVE_TIMEOUT_SECONDS: int = int(os.getenv("HARBOR_RESOLVE_TIMEOUT_SECONDS", "30"))
     # Node preheat via unprivileged prepull DaemonSet (pulls the Harbor image onto every eligible
-    # node). Default FALSE — inert until opted in alongside HARBOR_MIRROR_ENABLED.
+    # node). Default FALSE — inert until opted in per environment.
     PREHEAT_DS_ENABLED: bool = os.getenv("PREHEAT_DS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     # ephemeral-storage request for the preheat pod. Image LAYERS live in containerd's image store,
     # NOT the pod's ephemeral-storage (which only counts the writable container layer + logs). A
@@ -674,9 +660,9 @@ class Settings:
     # Low, non-preempting priority class for preheat pods (created once; yields to real workloads).
     PREHEAT_PRIORITY_CLASS: str = os.getenv("PREHEAT_PRIORITY_CLASS", "oneclick-preheat-low").strip()
     # Master switch to disable user-submitted custom image builds (admin-curated catalog only).
-    # INTENTIONALLY defaults FALSE (disabled) — unlike the dark-rollout HARBOR_MIRROR_ENABLED /
-    # PREHEAT_DS_ENABLED flags, disabling custom builds is a REQUESTED behavior change to ship, not
-    # an inert code drop. Deploying this flips POST /api/custom-images/build to 403 immediately and
+    # INTENTIONALLY defaults FALSE (disabled) — unlike the dark-rollout PREHEAT_DS_ENABLED flag,
+    # disabling custom builds is a REQUESTED behavior change to ship, not an inert code drop.
+    # Deploying this flips POST /api/custom-images/build to 403 immediately and
     # hides the build UI; existing built images stay launchable/deletable. Set to true to re-enable.
     USER_CUSTOM_BUILDS_ENABLED: bool = os.getenv("USER_CUSTOM_BUILDS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     # P4 complete-delete fan-out gate. FALSE (default) => delete/idle paths keep the pre-P4 single
@@ -705,8 +691,7 @@ class Settings:
     # How often the manager drains purge_p2p/purge_seed/purge_meta. Deletes are interactive, so keep
     # this brisk. Inert unless PURGE_FANOUT_ENABLED.
     PURGE_DRAIN_INTERVAL_SECONDS: int = int(os.getenv("PURGE_DRAIN_INTERVAL_SECONDS", "15"))
-    # Optional Docker Hub pull secret for dockerhub_pull source images.
-    DOCKERHUB_PULL_SECRET_NAME: str = os.getenv("DOCKERHUB_PULL_SECRET_NAME", "")
+    
     # Optional proxy prefix for raw GitHub fetches. raw.githubusercontent.com is intermittently
     # throttled from the cn-shanghai region (~1/3 of fetches time out), so route through a GitHub
     # mirror: the fetch URL becomes f"{GITHUB_RAW_PROXY}{raw_url}". Default gh-proxy.org (Cloudflare,

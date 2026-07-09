@@ -98,27 +98,6 @@ class ResumeDistributingLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
 
 
-class AdminImageRefDerivationTests(unittest.TestCase):
-    def test_pull_source_keeps_registry_ref(self):
-        ref = main_module._derive_admin_image_ref("acr_pull", "registry.example.com/foo/bar:1.0", None)
-        self.assertEqual(ref, "registry.example.com/foo/bar:1.0")
-
-    def test_github_build_derives_real_tag_not_url(self):
-        url = "https://github.com/acme/widgets/blob/main/Dockerfile"
-        ref = main_module._derive_admin_image_ref("github_build", url, None)
-        self.assertNotIn("github.com", ref)
-        self.assertNotIn("blob", ref)
-        self.assertIn("acme-widgets", ref)
-        # tag form registry/.../name:tag
-        self.assertIn(":", ref.rsplit("/", 1)[-1])
-
-    def test_explicit_image_wins(self):
-        ref = main_module._derive_admin_image_ref("github_build",
-                                                  "https://github.com/a/b/blob/main/Dockerfile",
-                                                  "my/explicit:tag")
-        self.assertEqual(ref, "my/explicit:tag")
-
-
 class HuggingFaceProxyTests(unittest.TestCase):
     def setUp(self):
         self._orig_base = main_module.settings.GITHUB_WEB_BASE

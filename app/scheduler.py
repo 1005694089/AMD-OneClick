@@ -22,16 +22,16 @@ logger = logging.getLogger(__name__)
 # pool isolates them (max_instances=1 per job still prevents overlap of the same job).
 scheduler = AsyncIOScheduler(executors={"default": APThreadPoolExecutor(max_workers=8)})
 
-# Real image-service source_type keys (mirror rows use 'harbor_mirror', deliberately excluded).
-# Kept in sync with main._ADMIN_SOURCE_HEAD_KIND; duplicated here to avoid an import cycle.
+# Source types for Harbor-preheat rows (current + legacy stamp). Duplicated from main.py
+# to avoid an import cycle.
+_HARBOR_SOURCE_TYPES = frozenset({"harbor", "harbor_mirror"})
+# Legacy image-service source_type keys — these rows are owned by the build/distribute pipeline.
 _IMAGE_SERVICE_SOURCE_TYPES = frozenset({"acr_pull", "dockerhub_pull", "github_build"})
-# Dedicated source_type stamped on Harbor-mirror rows (kept in sync with main.HARBOR_MIRROR_SOURCE_TYPE).
-_HARBOR_MIRROR_SOURCE_TYPE = "harbor_mirror"
 
 
-def _mirror_row_is_stale(image: dict) -> bool:
-    """True if a 'distributing' mirror row hasn't been touched in longer than a full mirror timeout
-    plus buffer — i.e. its in-process background task almost certainly died (manager restart)."""
+def _resolve_row_is_stale(image: dict) -> bool:
+    """True if a 'distributing' row hasn't been touched in longer than the resolve+preheat
+    timeout plus buffer — i.e. its background task almost certainly died (manager restart)."""
     ts = (image.get("updated_at") or image.get("sync_started_at") or "").strip()
     if not ts:
         return False
@@ -41,7 +41,7 @@ def _mirror_row_is_stale(image: dict) -> bool:
         return False
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
-    budget = int(getattr(settings, "HARBOR_MIRROR_TIMEOUT_SECONDS", 3600)) + 300
+    budget = int(getattr(settings, "HARBOR_RESOLVE_TIMEOUT_SECONDS", 30)) * 3 + 600
     return (datetime.now(timezone.utc) - started).total_seconds() > budget
 
 # The asyncio loop the app runs on, captured at scheduler start. The heavy jobs
@@ -722,65 +722,35 @@ def image_sync_refresh_job():
     from .k8s_client import k8s_client
     from .store import list_images, update_image_sync_status
 
+    from .harbor_mirror import image_matches_harbor_source
     logger.info("Running image sync refresh job...")
-    harbor_prefix = f"{settings.HARBOR_REGISTRY.strip().rstrip('/')}/{settings.HARBOR_PROJECT.strip().strip('/')}/"
     try:
         catalog = list_images(enabled_only=False)
         for image in catalog:
             try:
-                # Branch per-ROW on how the row was actually distributed, NOT on the current global
-                # HARBOR_MIRROR_ENABLED flag: a row mirrored+preheated earlier must keep being
-                # reconciled via its DaemonSet even if the flag is later disabled (else it would fall
-                # into the legacy image_nodes path — which mirror rows never populate — and be
-                # misreported as 'pulling' forever).
-                # Classify by the ROW's own source_type, not the live IMAGE_SERVICE_ENABLED flag:
-                # an image-service-owned row must be left to that pipeline even if the flag is now
-                # off, else it would fall into the legacy status read and get misreported.
                 source_type = (image.get("source_type") or "").strip()
-                is_mirror_row = source_type == _HARBOR_MIRROR_SOURCE_TYPE
+                is_harbor_row = source_type in _HARBOR_SOURCE_TYPES
                 is_image_service_row = source_type in _IMAGE_SERVICE_SOURCE_TYPES
-                if is_mirror_row:
+                if is_harbor_row:
                     status = image.get("sync_status")
-                    # A row is "already mirrored" iff its `image` is a real Harbor ref. Such a row
-                    # (even one now marked 'failed' by a transient re-sync error) has a live DS that
-                    # must keep tracking node-set drift — reconcile it. A row whose image is NOT yet a
-                    # Harbor ref ('pending' placeholder pre-copy, or a brand-new failed mirror storing
-                    # the raw src) must NOT be preheated (would pin a DS to a nonexistent image).
-                    image_in_harbor = (image.get("image") or "").startswith(harbor_prefix)
+                    image_in_harbor = image_matches_harbor_source(image.get("image") or "")
                     if status == "distributing":
-                        # Mirror still copying (bg task owns it). But the bg task is in-process — a
-                        # manager restart mid-mirror loses it, leaving the row stuck 'distributing'.
-                        # Reap a row whose status hasn't advanced in > timeout+buffer to 'failed'.
-                        if _mirror_row_is_stale(image):
+                        if _resolve_row_is_stale(image):
                             update_image_sync_status(
                                 image["id"], "failed", 0, 0,
-                                "Mirror interrupted (manager restarted?); re-sync to retry", False)
+                                "Resolve interrupted (manager restarted?); re-sync to retry", False)
                         continue
                     if not image_in_harbor:
-                        # Not yet mirrored (pending placeholder, or a never-succeeded failed row).
-                        # No valid Harbor image to preheat; leave it to the admin bg task / re-sync.
                         continue
                     if not settings.PREHEAT_DS_ENABLED:
-                        # Preheat globally disabled: the image is durably in Harbor and launchable,
-                        # so a mirror row is effectively ready. Actively flip any row still stuck in a
-                        # non-terminal state (its DS was/will be torn down by the orphan sweep) to
-                        # 'ready' instead of leaving it frozen at a stale 'pulling N/M' forever.
                         if image.get("sync_status") != "ready":
                             update_image_sync_status(
-                                image["id"], "ready", 0, 0, "Mirrored to Harbor (preheat disabled)", True)
+                                image["id"], "ready", 0, 0, "In Harbor (preheat disabled)", True)
                         continue
-                    # reconcile (not just read) so a newly-joined eligible node gets preheated and a
-                    # stuck/stale DS self-heals, without waiting for a manual admin re-sync.
                     sync = k8s_client.reconcile_preheat_ds(image["id"], image.get("image"))
                 elif is_image_service_row:
-                    # Owned by the build/distribute pipeline — leave its status to that pipeline.
                     continue
                 else:
-                    # Everything else (legacy 'manual' rows, or non-mirror rows). These never get an
-                    # image_nodes row (no distribute job), so the legacy get_image_sync_status counts
-                    # 0/N forever. When NODE_IMAGE_SCAN_ENABLED, compute readiness from each node's
-                    # kubelet image inventory (node.status.images) instead — reflecting that the image
-                    # is genuinely resident. Pass image["image"] so the scan has a ref to match.
                     if settings.NODE_IMAGE_SCAN_ENABLED:
                         sync = k8s_client.get_image_node_scan_status(image["id"], image.get("image"))
                     else:
@@ -791,23 +761,13 @@ def image_sync_refresh_job():
                 )
             except Exception as e:
                 logger.warning("Image sync refresh failed for image %s: %s", image.get("id"), e)
-        # Sweep preheat DaemonSets that should no longer exist. Run UNCONDITIONALLY (not gated on
-        # PREHEAT_DS_ENABLED) so leftover DaemonSets are cleaned up even after preheat is disabled.
-        # "Should exist" = live catalog rows whose source_type is still harbor_mirror; anything else
-        # with a preheat DS is orphaned (row deleted, source_type switched away, or preheat disabled
-        # → empty expected set → all preheat DSs removed). Re-fetch HERE (not the pre-loop snapshot):
-        # the loop can take seconds during which an admin create may have added a mirror row + DS.
+        # Sweep orphan preheat DaemonSets. Accept both 'harbor' and 'harbor_mirror' source_types
+        # during the transition period.
         try:
-            # A mirror row SHOULD keep its preheat DS iff its `image` is a real Harbor ref (mirror
-            # succeeded at some point). Discriminate on the image ref, NOT sync_status: a row that
-            # mirrored successfully then hit a TRANSIENT re-sync failure keeps its good Harbor `image`
-            # (sync_status='failed' but DS still valid — must NOT be swept); a brand-new failed row
-            # stores the raw un-mirrored src as `image` (never Harbor-prefixed → correctly swept).
-            harbor_prefix = f"{settings.HARBOR_REGISTRY.strip().rstrip('/')}/{settings.HARBOR_PROJECT.strip().strip('/')}/"
             expected_ids = {
                 img["id"] for img in list_images(enabled_only=False)
-                if (img.get("source_type") or "").strip() == _HARBOR_MIRROR_SOURCE_TYPE
-                and (img.get("image") or "").startswith(harbor_prefix)
+                if (img.get("source_type") or "").strip() in _HARBOR_SOURCE_TYPES
+                and image_matches_harbor_source(img.get("image") or "")
                 and settings.PREHEAT_DS_ENABLED
             }
             orphans = k8s_client.sweep_orphan_preheat_ds(expected_ids)

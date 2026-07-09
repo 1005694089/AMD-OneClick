@@ -126,7 +126,7 @@ function App(){
   const [bulkDestroyLoading,setBulkDestroyLoading]=React.useState(false);
   const [editingTemplate,setEditingTemplate]=React.useState(null);
   const [creditModalUser,setCreditModalUser]=React.useState(null);
-  const imageSourceType = Form.useWatch('source_type', form) || 'registry';
+  
 
   // Each admin section loads its own (potentially expensive) endpoint on demand,
   // so the page opens fast instead of fetching everything up front.
@@ -229,7 +229,7 @@ function App(){
   }
   async function addImage(values){
     if(!(await confirmLargeImage())) return;
-    const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:values.name, description:values.description, source_type:values.source_type||'registry', source_ref:values.source_ref, enabled:true})});
+    const res=await fetch('/api/admin/images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:values.name, description:values.description, source_ref:values.source_ref, enabled:true})});
     if(res.ok){ message.success('Image added; pull started'); form.resetFields(); setImageModalOpen(false); loadSection('images',true); } else {
       const data = await res.json().catch(()=>({detail:'Failed to add image'}));
       message.error(data.detail || 'Failed to add image');
@@ -419,12 +419,11 @@ function App(){
         ...(gpuDashboardEnabled?[{key:'gpunodes',label:'GPU Nodes',children:React.createElement(GpuNodesPanel,{data:gpunodes,loading:!!sectionLoading.gpunodes})}]:[])
       ]}),
       React.createElement(Modal,{title:'Add Image',open:imageModalOpen,onCancel:()=>setImageModalOpen(false),footer:null,destroyOnClose:true},
-        React.createElement(Form,{form,layout:'vertical',onFinish:addImage,initialValues:{source_type:'registry'}},
+        React.createElement(Form,{form,layout:'vertical',onFinish:addImage},
           React.createElement(Form.Item,{name:'name',label:'Display name',rules:[{required:true}]},React.createElement(Input,{placeholder:'amd-geis'})),
-          React.createElement(Form.Item,{name:'source_type',label:'Source',rules:[{required:true}]},React.createElement(Select,{options:[{value:'registry',label:'Registry link (pull from ACR / Docker Hub)'},{value:'github',label:'GitHub Dockerfile URL (build)'}]})),
-          React.createElement(Form.Item,{name:'source_ref',label:imageSourceType==='github'?'GitHub Dockerfile URL':'Image reference',rules:[{required:true}]},React.createElement(Input.TextArea,{autoSize:true,placeholder:imageSourceType==='github'?'https://github.com/org/repo/blob/main/Dockerfile':'registry/repo/image:tag'})),
+          React.createElement(Form.Item,{name:'source_ref',label:'Harbor image (repo/image:tag)',rules:[{required:true}]},React.createElement(Input.TextArea,{autoSize:true,placeholder:'crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416'})),
           React.createElement(Form.Item,{name:'description',label:'Description'},React.createElement(Input,{placeholder:'optional'})),
-          React.createElement(Button,{type:'primary',htmlType:'submit',block:true},'Add and Sync')
+          React.createElement(Button,{type:'primary',htmlType:'submit',block:true},'Add and Preheat')
         )
       ),
       React.createElement(Modal,{title:editingTemplate?'Edit Template':'Add Template',open:templateModalOpen,onCancel:()=>{setTemplateModalOpen(false);setEditingTemplate(null);},footer:null,destroyOnClose:true,width:'min(760px, calc(100vw - 32px))'},

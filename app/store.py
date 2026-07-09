@@ -2214,8 +2214,8 @@ def claim_next_image_job(agent_id: str, kinds: Optional[list[str]] = None) -> Op
             # wipe the freshly-loaded image. Drop the evict (mark superseded) instead of running it.
             # Tags are mutable and reused, so a delete's evict can otherwise race a later rebuild.
             # "warm" must be included alongside "distribute": since P3, warm is the primary transport
-            # once a LAN registry is wired up (see _enqueue_admin_image_chain / _ensure_image_on_node
-            # in app/main.py), so a rebuild after this merge enqueues "warm", not "distribute" — an
+            # once a LAN registry is wired up (see _ensure_image_on_node in app/main.py), so a
+            # rebuild after this merge enqueues "warm", not "distribute" — an
             # evict racing that rebuild would otherwise go undetected and wipe the freshly-warmed image.
             if pending["kind"] == "evict" and pending.get("ref"):
                 newer = conn.execute(
