@@ -756,7 +756,7 @@
         React.createElement(Header, { className: 'app-header' },
           React.createElement('div', { className: 'left-header' },
             React.createElement('div', { className: 'brand' }, React.createElement('img', { src: 'https://amd-ai-academy.com/static/image.png' }), React.createElement('span', null, 'Radeon Cloud')),
-            React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'space', label: 'Space', disabled: true }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 300 } })
+            React.createElement(Menu, { mode: 'horizontal', selectedKeys: [activeTab], onClick: e => setActiveTab(e.key), items: [{ key: 'gallery', label: 'Gallery' }, { key: 'space', label: 'Space' }, { key: 'contest', label: 'Contest', disabled: true }], style: { borderBottom: 0, minWidth: 300 } })
           ), React.createElement(UserMenu)
         ),
         React.createElement('section', { className: activeTab === 'gallery' ? 'hero gallery-hero' : 'hero' },
