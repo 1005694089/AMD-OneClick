@@ -71,6 +71,7 @@ class NotebookTemplateRequest(BaseModel):
     app_port: Optional[int] = None
     model_source: Optional[str] = ""
     ssh_enabled: bool = False
+    use_pvc: Optional[bool] = False
 
 
 class SshPublicKeyRequest(BaseModel):

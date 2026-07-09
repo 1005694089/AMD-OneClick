@@ -86,6 +86,8 @@
       e(Form.Item, { name: 'cover_url', label: 'Cover URL' }, e(Input, { placeholder: 'optional' })),
       e(Form.Item, { name: 'ssh_enabled', label: 'SSH Access (advanced)', valuePropName: 'checked', tooltip: 'Off by default. When on, instances launched from this template expose an SSH port (uses an extra NodePort). Login is key-only using each user\u2019s Profile SSH public key \u2014 no password.' },
         e(Switch, null)),
+      e(Form.Item, { name: 'use_pvc', label: 'Storage', initialValue: false, tooltip: 'Persistent (PVC) keeps files across restarts but is slower to start. Local SSD is fast but ephemeral \u2014 data is lost when the instance is destroyed.' },
+        e(Select, { options: [{ value: false, label: 'Local SSD (ephemeral)' }, { value: true, label: 'Persistent (PVC)' }] })),
       canPublish && e(Form.Item, { name: 'enabled', label: 'Visibility', tooltip: 'Private = only you can see and launch it. Public = listed in the Gallery for everyone.' },
         e(Select, { options: [{ value: false, label: 'Private (only you)' }, { value: true, label: 'Public (Gallery)' }] }))
     );

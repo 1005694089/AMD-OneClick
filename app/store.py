@@ -151,6 +151,7 @@ notebook_templates = Table(
     Column("app_port", Integer),
     Column("model_source", String(32)),
     Column("ssh_enabled", Boolean, nullable=False, default=False),
+    Column("use_pvc", Boolean),
     Column("enabled", Boolean, nullable=False, default=True),
     Column("sort_order", Integer, nullable=False, default=0),
     Column("owner_user_id", Integer, ForeignKey("users.id")),
@@ -507,6 +508,8 @@ def ensure_schema_columns(conn):
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN model_source VARCHAR(32)"))
     if "ssh_enabled" not in template_columns:
         conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN ssh_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+    if "use_pvc" not in template_columns:
+        conn.execute(text("ALTER TABLE notebook_templates ADD COLUMN use_pvc BOOLEAN"))
 
     # New launches reuse the same Kubernetes instance_id, so billing idempotency must be scoped
     # to a launch session instead of the stable instance id.
@@ -1137,6 +1140,7 @@ def upsert_notebook_template(
     app_port: Optional[int] = None,
     model_source: Optional[str] = None,
     ssh_enabled: Optional[bool] = None,
+    use_pvc: Optional[bool] = None,
 ) -> dict:
     now = utc_now()
     title = title.strip()
@@ -1170,6 +1174,8 @@ def upsert_notebook_template(
         values["model_source"] = (model_source or "").strip() or None
     if ssh_enabled is not None:
         values["ssh_enabled"] = bool(ssh_enabled)
+    if use_pvc is not None:
+        values["use_pvc"] = bool(use_pvc)
     if owner_user_id is not None:
         values["owner_user_id"] = owner_user_id
     if not title:

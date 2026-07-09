@@ -547,6 +547,7 @@ def _save_notebook_template(
         app_port=template_app_port,
         model_source=(req.model_source or "").strip().lower() or None,
         ssh_enabled=bool(getattr(req, "ssh_enabled", False)),
+        use_pvc=req.use_pvc,
     )
     if template.get("repo_url") and template.get("notebook_path"):
         ensure_template_preview_cache(template, force=True)
@@ -1664,6 +1665,7 @@ async def _provision_template_instance(user: dict, email: str, template: dict, p
         model_source=template.get("model_source"),
         ssh_enabled=bool(template.get("ssh_enabled")),
         ssh_public_key=user.get("ssh_public_key"),
+        use_pvc=template.get("use_pvc"),
     ))
     _invalidate_service_ip(instance["id"])
     _stamp_launch(user, template["image"], target_node or None)
