@@ -168,7 +168,7 @@ Rules:
 - `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
 - `gpu_count` must be `1`, `2`, or `4`. Default is `1`. CPU and memory scale automatically with the GPU count (see **GPU Sizing** below). For **metered** users, each GPU costs 1 credit/hour, so a 4-GPU instance consumes credits 4x as fast. **Unlimited** users are not charged regardless of `gpu_count`. Check `GET /api/huggingface/gpus` for free capacity before requesting `2` or `4`.
 - `unlimited_credits` is optional, defaults to `false`. When `true` on a **successful** launch, this `user_name` is marked unlimited and its credit balance is frozen going forward (see **Credits** above). Sticky — cannot be unset by a later launch that omits it. A launch rejected with `400` (e.g. `Each user can only have one active instance`) does **not** apply the flag.
-- `use_pvc` is optional and controls whether this instance's workspace is backed by durable storage. Omit it (or pass no value) for the server default — **durable**, same as passing `true`: files survive a pod restart/relaunch. Pass `false` for **ephemeral**, local-SSD-only storage — the same fast disk, but nothing is synced to durable storage, so the workspace is wiped when the instance is destroyed. Has no effect (the deployment is always ephemeral regardless of this flag) on clusters not configured for durable/PVC-backed storage. Note: **browser-launched** (Gallery template) instances default to **ephemeral** (Local SSD) via a per-template `use_pvc` setting chosen by the template creator; the API default remains durable for backward compatibility.
+- `use_pvc` is optional and controls whether this instance's workspace is backed by durable storage. Pass `true` for **durable** (files survive pod restart/relaunch). Pass `false` for **ephemeral** (local-SSD-only — fast, but data is wiped on destroy). When omitted, the default depends on `pod_type`: **`hackathon` defaults to durable** (PVC on — hackathon projects need persistent state across restarts); **all other pod types default to ephemeral** (Local SSD). An explicit `true` or `false` always overrides the default. Has no effect on clusters not configured for durable/PVC-backed storage (always ephemeral). Browser-launched (Gallery template) instances use a per-template `use_pvc` setting chosen by the template creator (default Local SSD).
 - Each `user_name` can have only one active notebook.
 
 Example success response:
@@ -323,7 +323,7 @@ export type LaunchRequest = {
   git_token?: string; // private-repo clone token; ONLY valid with a .git workshop launch over an HTTPS endpoint (rejected otherwise). Never reaches the notebook container.
   repo_sub_path?: string; // open JupyterLab at this subdirectory of the cloned repo instead of its root; ONLY valid with a .git workshop launch (rejected otherwise); no ".." path-traversal components
   unlimited_credits?: boolean; // default false; when true on a successful launch, sticky-freezes this user_name's balance (billing skipped; 8h idle reaper still applies)
-  use_pvc?: boolean; // default unset = durable (survives restart), same as true; false = ephemeral local-SSD-only (wiped on destroy)
+  use_pvc?: boolean; // omit = hackathon→durable, others→ephemeral; true = durable (survives restart); false = ephemeral local-SSD-only (wiped on destroy)
 };
 
 export type NotebookStatus = {

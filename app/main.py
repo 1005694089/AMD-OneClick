@@ -2896,6 +2896,13 @@ async def launch_huggingface_demo_notebook(
     if req.unlimited_credits and not user["unlimited_credits"]:
         user = set_user_unlimited(user["id"], True) or user
 
+    # Default use_pvc by pod_type when the caller omits it: hackathon → durable (PVC on,
+    # workshops need persistent state across restarts), everything else → ephemeral (SSD).
+    # An explicit True/False from the caller always wins.
+    effective_use_pvc = req.use_pvc
+    if effective_use_pvc is None:
+        effective_use_pvc = True if pod_type == "hackathon" else False
+
     try:
         instance_id = f"hf-{user['id']}-{hashlib.md5(email.encode()).hexdigest()[:8]}"
         instance = await _run_launch_op(functools.partial(
@@ -2910,7 +2917,7 @@ async def launch_huggingface_demo_notebook(
             pod_type=pod_type,
             api_launched=True,
             git_token=git_token or None,
-            use_pvc=req.use_pvc,
+            use_pvc=effective_use_pvc,
         ))
         _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,
