@@ -1008,7 +1008,10 @@ class StartupScriptClone(unittest.TestCase):
         self.assertIn("clone", s)
         self.assertNotIn("Notebook not found", s)
         self.assertNotIn("--branch", s)
-        self.assertIn("/repo", s)
+        # Tightened: assert the per-template isolation structure (a dedicated
+        # template-repos/<key>/ subdirectory), not just the old shared /workspace/repo — the
+        # bare "/repo" substring alone would still pass and no longer proves isolation.
+        self.assertRegex(s, r"/workspace/template-repos/[^/\s]+/repo\b")
 
     def test_repo_with_path_keeps_notebook_check(self):
         gi = {"org": "o", "repo": "r", "branch": "main", "path": "nb/x.ipynb",

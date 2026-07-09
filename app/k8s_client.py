@@ -236,6 +236,37 @@ class K8sClient:
             return "default"
         return seg
 
+    def _template_repo_dir_name(self, github_info: dict) -> str:
+        """Stable per-template repo directory name for workspace isolation.
+
+        Keyed on template_id when available (gallery launches); falls back to
+        md5(repo_url|branch) for non-template clones (HF workshop, GitHub browser).
+        """
+        template_id = str(github_info.get("template_id") or "").strip()
+        if template_id:
+            return f"template-{self._safe_storage_segment(template_id)}"
+        repo_url = github_info.get("repo_url") or github_info.get("clone_url") or "repo"
+        branch = (github_info.get("branch") or "").strip()
+        digest = hashlib.md5(f"{repo_url}|{branch}".encode()).hexdigest()[:12]
+        return f"repo-{digest}"
+
+    def _template_repo_paths(self, github_info: dict) -> tuple:
+        """Return (repo_dir, repo_tmp, repo_meta, expected_source) for template repo isolation.
+
+        All three clone paths (init container, startup script, app startup script) MUST use this
+        to guarantee identical directory and marker computation, so whichever one clones first is
+        found by the others. Returns RAW (unquoted) strings — callers MUST shlex.quote() each value
+        before embedding it in a shell script; NEVER interpolate these raw into shell.
+        """
+        key = self._template_repo_dir_name(github_info)
+        repo_dir = f"{settings.WORKSPACE_MOUNT_PATH}/template-repos/{key}/repo"
+        repo_tmp = f"{repo_dir}.tmp"
+        repo_meta = f"{repo_dir}/.amd-oneclick-source"
+        repo_url = github_info.get("repo_url") or github_info.get("clone_url") or ""
+        branch = (github_info.get("branch") or "").strip()
+        expected_source = f"{repo_url}|{branch}"
+        return repo_dir, repo_tmp, repo_meta, expected_source
+
     def _network_disk_sub_path(self, instance_id: str) -> str:
         prefix = settings.NETWORK_DISK_SUBPATH_PREFIX.strip("/")
         safe_id = self._safe_storage_segment(instance_id)
@@ -1754,8 +1785,9 @@ findmnt "$mnt"
         Why an init container: the notebook container gives the user a root shell, so any secret in
         its env is readable (os.environ, /proc/1/environ). Init containers are not user-exec
         reachable and their /proc is gone once they exit, so the token — placed only in THIS
-        container's env — never reaches a user-readable surface. We clone into {workspace}/repo
-        before the notebook container starts; its startup script then skips its own clone.
+        container's env — never reaches a user-readable surface. We clone into a per-template path
+        under {workspace}/template-repos/ before the notebook container starts; its startup script
+        then skips its own clone.
 
         Auth: the token is sent as the HTTP Basic *password* via a GIT_ASKPASS helper that reads it
         from the env at runtime (never on argv, never in .git/config). The username is the fixed,
@@ -1779,12 +1811,26 @@ findmnt "$mnt"
         repo_url_q = shlex.quote(auth_repo_url)
         branch = (github_info.get("branch") or "").strip()
         branch_opt = f"--branch {shlex.quote(branch)} " if branch else ""
+        # Marker uses the plain (non-auth) repo_url so the startup script's comparison — which never
+        # sees this token-bearing URL — matches. _template_repo_paths is the single source of truth
+        # for this path/marker computation; the startup script calls the same helper to find it.
+        repo_dir, repo_tmp, repo_meta, expected_source = self._template_repo_paths(github_info)
+        repo_dir_q = shlex.quote(repo_dir)
+        repo_tmp_q = shlex.quote(repo_tmp)
+        repo_meta_q = shlex.quote(repo_meta)
+        expected_source_q = shlex.quote(expected_source)
         askpass_path = "/tmp/oneclick-git-askpass.sh"
         script = f"""
 set -e
 umask 077
 mkdir -p {workspace}
-if [ -e {workspace}/repo ]; then
+mkdir -p "$(dirname {repo_dir_q})"
+expected_source={expected_source_q}
+if [ -d {repo_dir_q} ] && [ "$(cat {repo_meta_q} 2>/dev/null || true)" != "$expected_source" ]; then
+    echo "Template repo source changed; refreshing {repo_dir}"
+    rm -rf {repo_dir_q}
+fi
+if [ -e {repo_dir_q} ]; then
     echo "workspace already populated; skipping authenticated clone"
     exit 0
 fi
@@ -1797,9 +1843,10 @@ export GIT_ASKPASS={askpass_path}
 export GIT_TERMINAL_PROMPT=0
 cloned=0
 for i in 1 2 3; do
-    rm -rf {workspace}/.repo-tmp
-    if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 {branch_opt}{repo_url_q} {workspace}/.repo-tmp; then
-        mv {workspace}/.repo-tmp {workspace}/repo
+    rm -rf {repo_tmp_q}
+    if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 {branch_opt}{repo_url_q} {repo_tmp_q}; then
+        printf "%s" "$expected_source" > {repo_tmp_q}/.amd-oneclick-source
+        mv {repo_tmp_q} {repo_dir_q}
         cloned=1
         echo "Private repository cloned"
         break
@@ -1851,7 +1898,8 @@ fi
                               instance_type: str = "jupyter",
                               github_info: Optional[dict] = None,
                               pod_type: Optional[str] = None,
-                              seed_key: Optional[str] = None) -> str:
+                              seed_key: Optional[str] = None,
+                              git_token: Optional[str] = None) -> str:
         """Build startup script based on instance type.
 
         ``seed_key`` (Part B): when set, the workspace-seed init container has copied the image's
@@ -1915,6 +1963,11 @@ fi
             notebook_filename = notebook_path.split("/")[-1]
             repo_url = github_info.get("repo_url") or github_info.get("clone_url")
             if repo_url:
+                repo_dir, repo_tmp, repo_meta, expected_source = self._template_repo_paths(github_info)
+                repo_dir_q = shlex.quote(repo_dir)
+                repo_tmp_q = shlex.quote(repo_tmp)
+                repo_meta_q = shlex.quote(repo_meta)
+                expected_source_q = shlex.quote(expected_source)
                 repo_url_q = shlex.quote(repo_url)
                 notebook_path_q = shlex.quote(notebook_path)
                 # Pin a branch only when one is given; otherwise follow the remote's default
@@ -1934,25 +1987,51 @@ fi
     find . -maxdepth 4 -name '*.ipynb' | sed 's#^./##' | head -50
 fi
 """
+                # Self-heal a repo cache that is missing the requested notebook (e.g. the template
+                # was edited to point at a different path within the same repo/branch, so the marker
+                # below still matches). Gated on `not git_token`: when a token launch is in play, the
+                # init container already cloned the PRIVATE repo here and this container has no
+                # token, so it could only attempt an unauthenticated reclone — which would just fail
+                # for a private repo. The shell script itself cannot know whether a token was used;
+                # that decision is made here, in Python, at script-build time.
+                notebook_missing_check = ""
+                if notebook_path and not git_token:
+                    # Echo the shlex-quoted path, never the raw value — same rule as
+                    # notebook_check above (a notebook_path can carry shell metacharacters that,
+                    # unquoted inside this double-quoted echo, would break out and execute).
+                    notebook_missing_check = f"""if [ -d {repo_dir_q} ] && [ ! -f {repo_dir_q}/{notebook_path_q} ]; then
+    echo "Template repo cache missing notebook:" {notebook_path_q} "; refreshing {repo_dir}"
+    rm -rf {repo_dir_q}
+fi
+"""
                 # NOTE: a PRIVATE-repo clone that needs a token does NOT happen here. The token must
                 # never enter the notebook container (the user has a root shell in it: PID 1's
                 # /proc/1/environ, `os.environ`, and any child would expose it). Instead the manager
                 # runs the authenticated clone in a dedicated init container (see
-                # _git_clone_init_container) that populates {workspace}/repo before this container
-                # starts; the block below then finds the repo already present and skips cloning. This
-                # public path is unchanged and only clones when no token flow pre-populated the repo.
+                # _git_clone_init_container) that populates the per-template repo dir before this
+                # container starts; the block below then finds the repo already present and skips
+                # cloning. This public path is unchanged and only clones when no token flow
+                # pre-populated the repo.
                 return f"""
 set -e
 export PATH="/root/.opencode/bin:$PATH"
 {model_link_script}
 mkdir -p {workspace}
+mkdir -p "$(dirname {repo_dir_q})"
 
-if [ ! -e {workspace}/repo ]; then
-    echo "Cloning {repo_url}..."
+expected_source={expected_source_q}
+if [ -d {repo_dir_q} ] && [ "$(cat {repo_meta_q} 2>/dev/null || true)" != "$expected_source" ]; then
+    echo "Template repo source changed; refreshing {repo_dir}"
+    rm -rf {repo_dir_q}
+fi
+{notebook_missing_check}
+if [ ! -e {repo_dir_q} ]; then
+    echo "Cloning:" {repo_url_q} "..."
     for i in 1 2 3; do
-        rm -rf {workspace}/.repo-tmp
-        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 {branch_opt}{repo_url_q} {workspace}/.repo-tmp; then
-            mv {workspace}/.repo-tmp {workspace}/repo
+        rm -rf {repo_tmp_q}
+        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 {branch_opt}{repo_url_q} {repo_tmp_q}; then
+            printf "%s" "$expected_source" > {repo_tmp_q}/.amd-oneclick-source
+            mv {repo_tmp_q} {repo_dir_q}
             echo "Repository cloned"
             break
         fi
@@ -1960,13 +2039,13 @@ if [ ! -e {workspace}/repo ]; then
         sleep $((i * 3))
     done
 else
-    echo "Using existing persistent workspace at {settings.WORKSPACE_MOUNT_PATH}/repo"
+    echo "Using existing template workspace at {repo_dir}"
 fi
 
-cd {workspace}/repo
+cd {repo_dir_q}
 {notebook_check}
 {jupyter_ensure}
-{self._service_launch_snippet(instance_id, f"{workspace}/repo", pod_type=pod_type)}"""
+{self._service_launch_snippet(instance_id, repo_dir_q, pod_type=pod_type)}"""
             return f"""
 {model_link_script}
 mkdir -p {workspace}/notebooks
@@ -1983,10 +2062,10 @@ download_notebook() {{
 }}
 
 if [ ! -f {shlex.quote(notebook_filename)} ]; then
-    echo "Downloading {notebook_filename}..."
+    echo "Downloading:" {shlex.quote(notebook_filename)} "..."
     for i in 1 2 3; do
         if download_notebook {shlex.quote(notebook_filename)} {shlex.quote(self._notebook_download_url(github_info["raw_url"]))}; then
-            echo "Downloaded: {notebook_filename}"
+            echo "Downloaded:" {shlex.quote(notebook_filename)}
             break
         else
             echo "Attempt $i failed, retrying..."
@@ -1994,7 +2073,7 @@ if [ ! -f {shlex.quote(notebook_filename)} ]; then
         fi
     done
 else
-    echo "Using existing persistent notebook {notebook_filename}"
+    echo "Using existing persistent notebook:" {shlex.quote(notebook_filename)}
 fi
 
 if [ ! -f {shlex.quote(notebook_filename)} ]; then
@@ -2064,24 +2143,43 @@ export PATH="/root/.opencode/bin:$PATH"
         run_dir = settings.WORKSPACE_MOUNT_PATH
         if github_info and (github_info.get("repo_url") or github_info.get("clone_url")):
             repo_url = github_info.get("repo_url") or github_info.get("clone_url")
-            branch_q = shlex.quote(github_info.get("branch") or "main")
+            # Pin a branch only when one is given; otherwise follow the remote's default HEAD —
+            # matches the notebook-startup-script and init-container clone paths (previously this
+            # hardcoded `or "main"`, which silently forced --branch main even for repos whose
+            # default branch isn't main).
+            branch = (github_info.get("branch") or "").strip()
+            branch_opt = f"--branch {shlex.quote(branch)} " if branch else ""
             repo_url_q = shlex.quote(repo_url)
+            repo_dir, repo_tmp, repo_meta, expected_source = self._template_repo_paths(github_info)
+            repo_dir_q = shlex.quote(repo_dir)
+            repo_tmp_q = shlex.quote(repo_tmp)
+            repo_meta_q = shlex.quote(repo_meta)
+            expected_source_q = shlex.quote(expected_source)
             clone_block = f"""
-if [ ! -e {workspace}/repo ]; then
-    echo "Cloning {repo_url}..."
+mkdir -p "$(dirname {repo_dir_q})"
+expected_source={expected_source_q}
+if [ -d {repo_dir_q} ] && [ "$(cat {repo_meta_q} 2>/dev/null || true)" != "$expected_source" ]; then
+    echo "Template repo source changed; refreshing {repo_dir}"
+    rm -rf {repo_dir_q}
+fi
+if [ ! -e {repo_dir_q} ]; then
+    echo "Cloning:" {repo_url_q} "..."
     for i in 1 2 3; do
-        rm -rf {workspace}/.repo-tmp
-        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 --branch {branch_q} {repo_url_q} {workspace}/.repo-tmp; then
-            mv {workspace}/.repo-tmp {workspace}/repo
+        rm -rf {repo_tmp_q}
+        if timeout 240 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 clone --depth 1 {branch_opt}{repo_url_q} {repo_tmp_q}; then
+            printf "%s" "$expected_source" > {repo_tmp_q}/.amd-oneclick-source
+            mv {repo_tmp_q} {repo_dir_q}
             echo "Repository cloned"
             break
         fi
         echo "Git clone attempt $i failed, retrying..."
         sleep $((i * 3))
     done
+else
+    echo "Using existing template workspace at {repo_dir}"
 fi
 """
-            run_dir = f"{settings.WORKSPACE_MOUNT_PATH}/repo"
+            run_dir = repo_dir
         pip_index = settings.PIP_INDEX_URL.strip()
         pip_flag = f"-i {shlex.quote(pip_index)} " if pip_index else ""
         return f"""
@@ -2213,7 +2311,8 @@ exec {cmd}
             )
         else:
             startup_script = self._build_startup_script(instance_id, instance_type, github_info,
-                                                        pod_type=pod_type, seed_key=seed_key)
+                                                        pod_type=pod_type, seed_key=seed_key,
+                                                        git_token=git_token)
 
         ssh_enabled = bool(ssh_enabled)
         if ssh_enabled:
@@ -2637,10 +2736,11 @@ fi
         # Private-repo clone runs in a dedicated init container (NOT the user's notebook container).
         # The token lives only in this init container's env; init containers are not user-exec
         # reachable and their process table / /proc is gone once they complete, so the PAT never
-        # touches a surface the (root-in-pod) notebook user can read. It clones into {workspace}/repo
-        # before the notebook container starts; the notebook startup script then finds the repo
-        # present and skips its own (public, unauthenticated) clone. Gated on github_info + repo_url +
-        # git_token so public/.ipynb/bare launches are completely unaffected.
+        # touches a surface the (root-in-pod) notebook user can read. It clones into a per-template
+        # path under {workspace}/template-repos/ before the notebook container starts; the notebook
+        # startup script then finds the repo present and skips its own (public, unauthenticated)
+        # clone. Gated on github_info + repo_url + git_token so public/.ipynb/bare launches are
+        # completely unaffected.
         git_clone_repo_url = (github_info or {}).get("repo_url") if github_info else None
         if git_token and git_clone_repo_url:
             # Match the notebook container's workspace propagation: when the quota loop is mounted on
