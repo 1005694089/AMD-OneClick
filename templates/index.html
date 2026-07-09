@@ -330,7 +330,7 @@
         const values = await form.validateFields();
         setNotebookLoading(true); setReadyUrl(''); setReadyOpencodeUrl(''); setReadyOpencodeUsername(''); setReadyOpencodePassword(''); setReadyTemplateId(null); setLaunchModalOpen(true); setLaunchStatus({ status: 'allocating', message: 'Allocating resources for your workspace...', target: { type: 'notebook' } });
         try {
-          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode', disk_size_gb: values.disk_size_gb }) });
+          const res = await fetch('/api/notebook/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: values.image, gpu_count: values.gpu_count, resource_profile: values.resource_profile, instance_type: 'opencode', disk_size_gb: values.disk_size_gb, use_pvc: values.use_pvc }) });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Launch failed');
           pollStatus(data.url, { type: 'notebook' });
@@ -625,6 +625,7 @@
             React.createElement(Form.Item, { label: 'GPU Count', name: 'gpu_count', rules: [{ required: true }] }, React.createElement(Select, { options: [{ value: 1, label: '1 GPU / 1 credit per hour' }, { value: 2, label: '2 GPUs / 2 credits per hour' }, { value: 4, label: '4 GPUs / 4 credits per hour' }] })),
             React.createElement(Form.Item, { label: 'CPU / Memory', name: 'resource_profile', extra: selectedProfile === 'auto' ? `Auto currently uses ${recommendedResource}` : 'Use a larger profile if your workload was OOMKilled.' }, React.createElement(Select, { options: resourceProfileOptions })),
             React.createElement(Form.Item, { label: 'Disk Size', name: 'disk_size_gb', extra: `Up to ${diskMax} GB for this instance scale.` }, React.createElement(Select, { options: diskOptions, placeholder: `${diskMax} GB` })),
+            React.createElement(Form.Item, { label: 'Storage', name: 'use_pvc', extra: 'Persistent keeps files across restarts; Local SSD is faster but ephemeral.' }, React.createElement(Select, { allowClear: true, placeholder: 'Default (Persistent)', options: [{ value: true, label: 'Persistent (PVC)' }, { value: false, label: 'Local SSD (ephemeral)' }] })),
             React.createElement(Button, { type: 'primary', size: 'large', block: true, loading: notebookLoading, onClick: launch }, 'Launch Notebook')
           ), (!launchModalOpen && readyUrl && launchStatus && launchStatus.status === 'ready') && React.createElement(React.Fragment, null, React.createElement(Divider), React.createElement(Space, { style: { width: '100%' }, direction: 'vertical' },
             React.createElement(Button, { href: readyUrl, target: '_blank', block: true, title: 'Open Notebook (Jupyter)' }, brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')),

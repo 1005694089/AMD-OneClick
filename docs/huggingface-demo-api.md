@@ -140,7 +140,9 @@ Optional fields (may be combined with either body above):
   "pod_type": "workshop",
   "notebook_path": "org/private-repo.git",
   "git_token": "<github-token>",
-  "unlimited_credits": false
+  "repo_sub_path": "Workshop 10 - Hyperloom",
+  "unlimited_credits": false,
+  "use_pvc": false
 }
 ```
 Rules:
@@ -151,12 +153,22 @@ Rules:
   - **An `.ipynb` file** (a `github/org/repo/blob/branch/path.ipynb` path or a `huggingface.co` notebook URL) — the notebook is fetched server-side and opened in the launched notebook.
   - **A `.git` repo** (workshop only — see below) — the repo is cloned and JupyterLab opens at the repo root.
 - **Workshop `.git` repos:** when `pod_type` is `workshop`, `notebook_path` may be a GitHub repository instead of a notebook file: `org/repo.git`, a full `https://github.com/org/repo.git` URL, or the scp form `git@github.com:org/repo.git`. Append `@branch` to pick a branch (e.g. `org/repo.git@dev`); with no `@branch` the repo's default branch is cloned. The repo is cloned into the workspace and JupyterLab opens at its root — **no `.ipynb` is required**. A `.git` value with any non-workshop `pod_type` (or none) is rejected with `400 A .git repo can only be launched with pod_type='workshop'`. Only GitHub repositories are accepted.
+- **`repo_sub_path` (workshop `.git` launches only):** opens JupyterLab at a subdirectory of the cloned repo instead of its root — use this when one repo hosts multiple workshops, e.g.:
+  ```json
+  {
+    "notebook_path": "ROCm/AAI-2026-Workshops-Dev.git",
+    "pod_type": "workshop",
+    "repo_sub_path": "Workshop 10 - Hyperloom"
+  }
+  ```
+  Only that subfolder is shown as `/workspace`; the rest of the repo is still cloned server-side but not surfaced. Only honored on a `.git` workshop launch — passing it on any other launch is rejected with `400 repo_sub_path is only supported for a .git workshop launch`. A leading `/` is stripped automatically; `..` path-traversal components are rejected with `400 repo_sub_path must not contain '..'`. If the subpath does not exist in the clone (e.g. a typo), the launch still succeeds but falls back to the repo root.
 - **Private repos (`git_token`):** to clone a **private** GitHub repo, pass `git_token` (a GitHub personal-access / fine-grained token with read access to the repo) alongside a `.git` workshop launch. The token is used only for the clone and is handled so it never reaches the user's notebook environment: the authenticated clone runs in a dedicated init container, so the token is **not** present in the notebook container's env, **not** written into the cloned repo's `.git/config`, and **not** placed on any command line. `git_token` is honored **only** for a `.git` workshop launch — passing it on any other launch (`.ipynb`, blank, or a non-`workshop` `pod_type`) is rejected with `400 git_token is only supported for a .git workshop launch (pod_type='workshop')`. For safety the token is **only accepted when the repo resolves to an HTTPS clone endpoint**; if this deployment resolves GitHub over plain HTTP the request is rejected with `400 git_token requires an HTTPS clone endpoint` (configure an HTTPS GitHub proxy to use private-repo tokens). Public repos need no `git_token`.
 - Hugging Face notebook URLs are downloaded server-side through the configured internal Hugging Face proxy and server-side `HF_TOKEN`.
 - `image` is optional. Pass either the friendly `name` or the full `image` ref from `GET /api/huggingface/images` (name match is case-insensitive); anything not in the enabled catalog is rejected with `400 Invalid image selected`. Defaults to `default_image`.
 - `pod_type` is optional. When provided it must be one of `hackathon`, `workshop`, or `one-click` (case-insensitive; stored lowercase); any other value is rejected with `400 Invalid pod_type`. Use it to tag instances by program. Omit it for an untagged instance.
 - `gpu_count` must be `1`, `2`, or `4`. Default is `1`. CPU and memory scale automatically with the GPU count (see **GPU Sizing** below). For **metered** users, each GPU costs 1 credit/hour, so a 4-GPU instance consumes credits 4x as fast. **Unlimited** users are not charged regardless of `gpu_count`. Check `GET /api/huggingface/gpus` for free capacity before requesting `2` or `4`.
 - `unlimited_credits` is optional, defaults to `false`. When `true` on a **successful** launch, this `user_name` is marked unlimited and its credit balance is frozen going forward (see **Credits** above). Sticky — cannot be unset by a later launch that omits it. A launch rejected with `400` (e.g. `Each user can only have one active instance`) does **not** apply the flag.
+- `use_pvc` is optional and controls whether this instance's workspace is backed by durable storage. Omit it (or pass no value) for the server default — **durable**, same as passing `true`: files survive a pod restart/relaunch. Pass `false` for **ephemeral**, local-SSD-only storage — the same fast disk, but nothing is synced to durable storage, so the workspace is wiped when the instance is destroyed. Has no effect (the deployment is always ephemeral regardless of this flag) on clusters not configured for durable/PVC-backed storage.
 - Each `user_name` can have only one active notebook.
 
 Example success response:
@@ -309,7 +321,9 @@ export type LaunchRequest = {
   image?: string; // a value from GET /api/huggingface/images
   pod_type?: "hackathon" | "workshop" | "one-click";
   git_token?: string; // private-repo clone token; ONLY valid with a .git workshop launch over an HTTPS endpoint (rejected otherwise). Never reaches the notebook container.
+  repo_sub_path?: string; // open JupyterLab at this subdirectory of the cloned repo instead of its root; ONLY valid with a .git workshop launch (rejected otherwise); no ".." path-traversal components
   unlimited_credits?: boolean; // default false; when true on a successful launch, sticky-freezes this user_name's balance (billing skipped; 8h idle reaper still applies)
+  use_pvc?: boolean; // default unset = durable (survives restart), same as true; false = ephemeral local-SSD-only (wiped on destroy)
 };
 
 export type NotebookStatus = {

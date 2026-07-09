@@ -15,6 +15,9 @@ class NotebookRequest(BaseModel):
     resource_profile: Optional[str] = "auto"
     disk_size_gb: Optional[int] = None
     pod_type: Optional[str] = None
+    # None = server default (durable). true = force durable PVC-backed storage. false = ephemeral
+    # local-SSD-only (no durable NFS hydrate/flush; data does not survive a pod restart).
+    use_pvc: Optional[bool] = None
 
 
 class ImageRequest(BaseModel):
@@ -96,6 +99,13 @@ class HuggingFaceNotebookLaunchRequest(BaseModel):
     # authenticated clone runs in a dedicated init container (never the user's notebook container),
     # with the token consumed by git via GIT_ASKPASS — never on the git argv nor in .git/config.
     git_token: Optional[str] = None
+    # None = server default (durable). true = force durable PVC-backed storage. false = ephemeral
+    # local-SSD-only (no durable NFS hydrate/flush; data does not survive a pod restart).
+    use_pvc: Optional[bool] = None
+    # Optional subdirectory of a cloned `.git` repo to open as /workspace instead of the repo root.
+    # Only honored for a `.git` workshop launch (pod_type='workshop'); rejected otherwise. Must not
+    # contain '..' path-traversal components.
+    repo_sub_path: Optional[str] = None
 
 
 class CustomImageBuildRequest(BaseModel):

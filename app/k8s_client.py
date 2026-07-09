@@ -1975,6 +1975,27 @@ fi
                 # branch to "main", so their behaviour is unchanged.
                 branch = (github_info.get("branch") or "").strip()
                 branch_opt = f"--branch {shlex.quote(branch)} " if branch else ""
+                # Workshop-only: open Jupyter at a subdirectory of the clone instead of the repo
+                # root (e.g. a single workshop folder inside a multi-workshop monorepo). Quote the
+                # full joined path ONCE (not two separately-quoted strings concatenated) so a path
+                # containing spaces (e.g. "Workshop 10 - Hyperloom") round-trips through the shell
+                # correctly. Falls back to the repo root — with a clear message — if the requested
+                # subpath does not exist (e.g. a typo, or the repo was restructured).
+                repo_sub_path = github_info.get("repo_sub_path", "")
+                if repo_sub_path:
+                    full_sub_dir_q = shlex.quote(f"{repo_dir}/{repo_sub_path}")
+                    sub_path_q = shlex.quote(repo_sub_path)
+                    sub_path_check = f"""if [ ! -d {full_sub_dir_q} ]; then
+    echo "repo_sub_path not found:" {sub_path_q}
+    echo "Available directories:"
+    ls -1 {repo_dir_q}/ | head -30
+    echo "Falling back to repo root"
+    cd {repo_dir_q}
+else
+    cd {full_sub_dir_q}
+fi"""
+                else:
+                    sub_path_check = f"cd {repo_dir_q}"
                 # Only look for / warn about a missing notebook when a path was requested. A
                 # repo-only clone (no notebook_path) just opens JupyterLab at the repo root.
                 notebook_check = ""
@@ -2042,10 +2063,10 @@ else
     echo "Using existing template workspace at {repo_dir}"
 fi
 
-cd {repo_dir_q}
+{sub_path_check}
 {notebook_check}
 {jupyter_ensure}
-{self._service_launch_snippet(instance_id, repo_dir_q, pod_type=pod_type)}"""
+{self._service_launch_snippet(instance_id, '"$PWD"', pod_type=pod_type)}"""
             return f"""
 {model_link_script}
 mkdir -p {workspace}/notebooks
@@ -4485,6 +4506,14 @@ exit 0
             # and stamp the on-node marker below durable_generation — a desync that makes the next
             # stop SUPERSEDED-discard the session and the next relaunch MIRROR-wipe the warm copy.
             # Gated to durable + propagation-on (legacy/ephemeral have no generation to settle).
+            # NOT gated on this call's use_pvc: instance_id is deterministic per user, so a STALE
+            # out-of-pod flush from that same instance_id's PREVIOUS durable session can still be
+            # rsyncing the shared node-local SSD dir when this call is for a new use_pvc=False
+            # (ephemeral) relaunch. That relaunch skips hydrate but still lands its container on
+            # the same hostPath, so racing it against the old flush would let the notebook and the
+            # rsync mutate the same files concurrently. Settling first (a fast no-op when nothing
+            # is pending, per _settle_workspace_flushes_before_launch) closes that window regardless
+            # of what mode the NEW launch requests.
             try:
                 self._settle_workspace_flushes_before_launch(instance_id)
             except Exception as e:

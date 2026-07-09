@@ -1620,6 +1620,7 @@ async def _provision_notebook_instance(user: dict, email: str, image: str, param
         resource_profile=params.get("resource_profile", "auto"),
         disk_size_gb=params.get("disk_size_gb"),
         pod_type=pod_type,
+        use_pvc=params.get("use_pvc"),
     ))
     _invalidate_service_ip(instance["id"])
     _stamp_launch(user, image, target_node or None)
@@ -1777,6 +1778,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             "resource_profile": resource_profile,
             "disk_size_gb": disk_size_gb,
             "pod_type": pod_type,
+            "use_pvc": req.use_pvc,
         })
         return NotebookStatus(
             status="distributing",
@@ -1792,6 +1794,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             "resource_profile": resource_profile,
             "disk_size_gb": disk_size_gb,
             "pod_type": pod_type,
+            "use_pvc": req.use_pvc,
         }, target_node)
         return NotebookStatus(
             status="allocating",
@@ -2831,6 +2834,22 @@ async def launch_huggingface_demo_notebook(
                 ),
             )
 
+    # repo_sub_path narrows which subdirectory of a cloned workshop repo Jupyter opens at (e.g. a
+    # single workshop folder inside a multi-workshop monorepo). Like git_token, it is meaningless
+    # outside a `.git` workshop launch, so reject it there rather than silently ignoring it. Strip
+    # a leading slash (callers may pass either form) and reject '..' components — this value is
+    # joined onto the server-side repo directory to build a `cd` target in the startup script.
+    repo_sub_path = (req.repo_sub_path or "").strip().strip("/")
+    if repo_sub_path:
+        if not is_git_launch or pod_type != "workshop":
+            raise HTTPException(
+                status_code=400,
+                detail="repo_sub_path is only supported for a .git workshop launch",
+            )
+        if ".." in repo_sub_path.split("/"):
+            raise HTTPException(status_code=400, detail="repo_sub_path must not contain '..'")
+        github_info["repo_sub_path"] = repo_sub_path
+
     provider_id, display_name, email = _huggingface_demo_user_identity(req.user_name)
     gpu_count = req.gpu_count or 1
     requested_image = req.image or settings.HUGGINGFACE_DEMO_DEFAULT_IMAGE
@@ -2889,6 +2908,7 @@ async def launch_huggingface_demo_notebook(
             pod_type=pod_type,
             api_launched=True,
             git_token=git_token or None,
+            use_pvc=req.use_pvc,
         ))
         _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,
