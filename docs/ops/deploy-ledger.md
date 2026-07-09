@@ -24,6 +24,122 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-09 14:40 - radeon-global: template repo isolation fix (DEPLOYED + e2e verified)
+
+**Status:** DEPLOYED `tmplrepo-20260709-1440` (`@sha256:7d4f27b86f29e6b82a821443e0ea8251af31a52b4310e08b1b61adefa463fdb4`)
+to `amd-oneclick-lablab`. Code pushed to `origin/prod/radeon-global` at `69e78c4` (on top of `76a6393`,
+the currently-running base image's commit).
+
+**Bug fixed:** all three clone paths (private-repo init container, notebook startup script, app
+startup script) cloned into a single fixed `/workspace/repo`. Per-user workspaces are durable
+(NFS-backed, keyed only by user-id, survive pod deletion), so switching templates on the same user
+reused the previous template's stale clone instead of the new template's repo. Confirmed live
+pre-fix on two mismatched pods (`u-1-cf9e6454`, `u-29-0058c975`) per the bug report.
+
+**Fix:** `_template_repo_dir_name`/`_template_repo_paths` key each clone by `template_id` (gallery
+launches) or `md5(repo_url|branch)` (HF workshop/GitHub browser launches) under
+`/workspace/template-repos/<key>/repo`, with a `.amd-oneclick-source` marker (`repo_url|branch`)
+written atomically alongside the clone. On marker mismatch or a missing notebook file (public
+launches only), the stale dir is wiped and recloned. Also fixes `_build_app_startup_script`'s
+branch handling, which previously hardcoded `--branch main` even when the template specified a
+different (or no) branch. Ported the per-template-directory + marker approach from `d3b0c7c`
+(`feature/oauth-credit-manager`, fixed 2 of 3 paths on an older revision of this file) to all three
+paths on this diverged branch. Plan: `.cursor/plans/template_repo_isolation_fd2aa94d.plan.md`.
+
+Hardened across 3 multi-agent review rounds (correctness/security/plan-conformance) before deploy:
+found and fixed a shell command-injection introduced by the new notebook-missing echo (raw
+`notebook_path` in a double-quoted echo), plus 2 pre-existing instances of the same class
+(`repo_url` in both "Cloning..." messages, `notebook_filename` in the HF-direct-download branch)
+discovered in the same methods and fixed for consistency, each confirmed closed by executing
+adversarial payloads through the real generated scripts.
+
+**Image build:** manager-only INCREMENTAL kaniko build (base unchanged, 1 file layered) — Pod
+`manager-build-tmplrepo-20260709-1440` in ns `amd-oneclick-lablab` (`nodeName: wx-k8s-prod-s-001`),
+kaniko executor `gcr.m.daocloud.io/kaniko-project/executor:debug`, `FROM
+10.5.10.89:1808/xinwei/amd-oneclick-manager:wsfix-wsproxy-20260709-1303` + `COPY
+app/k8s_client.py /app/app/k8s_client.py`. Build context delivered via the "fast" pattern (`ctx`
+emptyDir + `wait-for-context` initContainer polling for `/workspace/.ready`, populated by `kubectl
+cp` — not a ConfigMap, so the documented symlink gotcha does not apply) instead of a ConfigMap.
+`kubectl cp`'d file confirmed byte-identical to the local working tree via `md5sum` before
+signaling ready. Registry auth reused the existing `kaniko-harbor-auth` Secret. Pushed
+`10.5.10.89:1808/xinwei/amd-oneclick-manager:tmplrepo-20260709-1440`
+(`@sha256:7d4f27b86f29e6b82a821443e0ea8251af31a52b4310e08b1b61adefa463fdb4`). Import- and
+symbol-verified in a throwaway pod BEFORE rolling, reusing the real Deployment's env/envFrom/Secret
+mounts (`import app.main` clean; `_template_repo_dir_name`/`_template_repo_paths` present;
+`git_token` param present on `_build_startup_script`; rendered `_template_repo_paths` and
+`_build_startup_script` output inspected directly). Build Pod + verify Pod deleted after each step
+— no leftover resources in the namespace.
+
+**Deploy:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=...:tmplrepo-20260709-1440`. RollingUpdate (maxSurge=0/maxUnavailable=1, 2 replicas).
+Rollout reported 2/2 successfully rolled out in ~60s, 0 container restarts on either final replica
+(`s-001`, `s-003`). PRE/APPLIED snapshots:
+`local-deploy-history/radeon-global/20260709-1440-tmplrepo-{PRE,APPLIED}-deploy.yaml`.
+
+**Gotcha / incident — transient readiness-probe blips during rollout, self-resolved, NOT a code
+regression:** an external health monitor (2s-interval curl to the public edge) logged 6 timeouts
+(`000`/no-response) spread across the ~2.5 min rollout+settle window, and `kubectl get events`
+showed matching `Unhealthy` (readiness/liveness probe `context deadline exceeded`) warnings on both
+new-replica pods in that same window. Zero container restarts occurred (`RESTARTS=0` throughout);
+pod logs show the app was actively serving substantial concurrent traffic (websocket proxying for
+JupyterLab collaboration/kernels/terminals across the live session count, apscheduler jobs) the
+entire time, consistent with cold-start + a websocket-reconnect burst transiently exceeding the
+readiness probe's tight `timeoutSeconds: 1` under significantly higher concurrent load than prior
+deploys (~87 active user session pods now vs. 19 at the last `gittoken` deploy) — NOT any specific
+code path failing (this diff touches only pod-launch shell-script-building logic, never the
+`/health` endpoint, websocket proxy, or scheduler). Fully self-resolved: last blip at 06:46:23 UTC,
+then 20/20 consecutive clean checks (60s, both replicas `1/1 Ready` throughout) confirmed before
+proceeding to e2e. Flagging transparently per this ledger's own precedent (cf. the 2026-07-06
+ConfigMap-symlink incident) even though no rollback was needed. Worth a separate look at whether
+the readiness `timeoutSeconds` should be loosened given current session counts — not addressed
+here (out of scope for this fix).
+
+**Verification (e2e on LIVE cluster, ~87 real user session pods undisturbed throughout, via the HF
+Demo API — bearer token from secret `amd-oneclick-lablab-secrets`/`HUGGINGFACE_DEMO_API_TOKENS`,
+since the plan's `template_id`-keyed gallery path needs a browser session this environment doesn't
+have; the HF path exercises the identical `_template_repo_paths`/marker/self-heal machinery keyed
+by `md5(repo_url|branch)` instead of `template_id` — the `template_id`-specific keying and the
+app-startup-script path were additionally verified deterministically against the real deployed code
+in a throwaway pod, see below):**
+- **Isolation (T1):** launched `octocat/Hello-World.git` for user `e2e-tmplrepo-test` ->
+  `hf-477-749a495f` -> `/workspace/template-repos/repo-b0fea2e683cd/repo`, marker exactly
+  `https://gh-test.anruicloud.com/octocat/Hello-World.git|`, git remote correct; old shared
+  `/workspace/repo` confirmed absent. Deleted.
+- **Isolation (T2, core bug proof):** relaunched the SAME user with a DIFFERENT repo
+  (`octocat/Spoon-Knife.git`) -> same instance id (same durable per-user workspace) ->
+  `/workspace/template-repos/repo-cca1447c9438/repo` created fresh, correct marker/remote, AND
+  repo A's directory (`repo-b0fea2e683cd`) still present untouched alongside it. This is the exact
+  scenario that was broken pre-fix (switching templates reused/overwrote the one shared path).
+- **Marker-mismatch self-heal (T3):** on the live repo-B directory, planted a sentinel file inside
+  the repo dir + overwrote `.amd-oneclick-source` with garbage, then deleted + relaunched the same
+  repo for the same user. Result: sentinel file GONE (proves `rm -rf` + reclone fired), marker
+  RESTORED to the correct value, repo A's directory untouched. Directly proves the self-heal path
+  the plan's "change a template's branch, relaunch" scenario exercises (same underlying
+  marker-mismatch mechanism; template_id-branch-independence separately confirmed below).
+- **git_token wiring (T4):** launched with `git_token` set (dummy PAT, public repo) matching an
+  already-cloned key -> `git-clone` init container present, logged "workspace already populated;
+  skipping authenticated clone" (correctly found the existing marker-matched clone via the SAME
+  `_template_repo_paths` computation the public path used, skipped re-cloning). Relaunched with a
+  fresh, never-cloned key (`octocat/Hello-World.git@test-e2e-branch`) to force a real attempt:
+  init container correctly targeted a NEW per-key temp dir (`repo-2d072aadd1b6/repo.tmp`), retried 3x,
+  failed closed (`Init:Error`, exit 1) on the (deliberately) nonexistent branch — retry/fail-closed
+  logic intact. `GIT_CLONE_TOKEN` confirmed absent from the notebook container's env AND
+  `/proc/1/environ` in all cases; token never appears in any log line.
+- **template_id keying + app-startup-script (T5, throwaway pod, real deployed code):**
+  `_template_repo_paths({"template_id":"77", branch:"main"})` vs. `{"template_id":"77",
+  branch:"dev"}` -> IDENTICAL `repo_dir` (`template-77/repo`, branch-independent, as designed) but
+  DIFFERENT `expected_source` -> proves a template's branch edit + relaunch would trigger the same
+  marker-mismatch reclone as T3, deterministically. `_build_app_startup_script` confirmed emitting
+  the per-template path + marker and the FIXED branch semantics (no `--branch` when empty, correct
+  `--branch dev` when set; old hardcoded `or "main"` bug confirmed absent).
+- Cleanup: test instance destroyed (confirmed `status: not_found` after); no leftover test pods;
+  `/health` at the public edge returned 200 throughout final confirmation (20/20 over 60s).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:wsfix-wsproxy-20260709-1303` (base image still
+present on nodes), or re-apply the PRE-deploy snapshot. No ConfigMap/Secret/RBAC/Service changes,
+so rollback is a single `set image` with no other steps.
+
 ## 2026-07-08 22:47 - radeon-global: HOTFIX flush-vs-relaunch race (marker/gen desync) + re-enable (DEPLOYED + race e2e verified)
 
 **Status:** DEPLOYED `wsfix2-20260708-2247` (`@sha256:5186f5cd815ecfe6d6f59a7ae76c18d16001f3206f987da93a0b3b87518f10ad`)
