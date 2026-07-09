@@ -322,26 +322,32 @@ class K8sClient:
         return bool(settings.WORKSPACE_DELETION_PROPAGATION_ENABLED)
 
     def _seed_key(self, template_id: Optional[str], template_title: Optional[str],
-                  github_info: Optional[dict] = None) -> Optional[str]:
-        """Sanitized per-template slug used for image seeding (Part B), or ``None`` to skip seeding.
+                  github_info: Optional[dict] = None,
+                  image: Optional[str] = None) -> Optional[str]:
+        """Sanitized per-template (or per-image) slug used for image seeding (Part B), or ``None``
+        to skip seeding.
 
-        Returns ``None`` when seeding is disabled OR the launch carries no template identity (a
-        blank/API notebook launch) — DECIDED: blank launches are never seeded, so no empty
-        ``default/`` subdir is ever created. When ``WORKSPACE_SEED_PER_TEMPLATE`` is off, all
-        template launches collapse onto a single ``default`` key (a later template then finds the
-        one shared subdir already seeded and skips — the documented trade-off of that mode)."""
+        Prefers template_title/template_id when available (gallery launches). Falls back to the
+        image tag for API launches that carry no template identity — so images with baked
+        ``/workspace`` content (e.g. ``rocm-certification``) get seeded even via the HF API.
+        When ``WORKSPACE_SEED_PER_TEMPLATE`` is off, all seeded launches collapse onto a single
+        ``default`` key."""
         if not settings.WORKSPACE_SEED_ENABLED:
             return None
         ident = (template_title or template_id
                  or (github_info or {}).get("template_title")
                  or (github_info or {}).get("template_id") or "")
         ident = str(ident).strip()
+        if not ident and image:
+            # Derive a stable key from the image name (strip registry prefix, keep repo:tag).
+            tag_part = image.rsplit("/", 1)[-1] if "/" in image else image
+            ident = tag_part.split("@")[0]  # drop @sha256 digest if present
         if not ident:
-            return None  # blank / non-template launch → never seed
+            return None  # truly blank launch with no image info → skip
         if not settings.WORKSPACE_SEED_PER_TEMPLATE:
             return "default"
         slug = self._safe_storage_segment(ident)
-        # _safe_storage_segment maps empty/dot-only to "default"; a real template must not silently
+        # _safe_storage_segment maps empty/dot-only to "default"; a real identity must not silently
         # collapse onto that shared bucket, so treat a degenerate slug as "no seed" instead.
         return slug if slug != "default" else None
 
@@ -2314,7 +2320,7 @@ exec {cmd}
         workspace_is_durable = workspace_ssd_backed and workspace_mode == "durable"
         # Seed the image's baked /workspace once, per template (approach A). Runs for ANY non-app
         # /workspace overmount (localcache/emptydir/hostpath) in either mode; blank launches → None.
-        seed_key = None if is_app_type else self._seed_key(template_id, template_title, github_info)
+        seed_key = None if is_app_type else self._seed_key(template_id, template_title, github_info, image=image)
 
         api_key_value = None
         if is_app_type:
