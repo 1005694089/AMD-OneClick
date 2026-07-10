@@ -247,6 +247,16 @@ class Settings:
     SMTP_PASSWORD: Optional[str] = os.getenv("SMTP_PASSWORD")
     SMTP_FROM: str = os.getenv("SMTP_FROM", "noreply@amd-oneclick.local")
 
+    # Passwordless email login (OTP): user enters email -> receives a 6-digit code
+    # -> code verified -> session established (auto-registers via get_or_create_user).
+    # Env-gated so production is unaffected until explicitly enabled. Requires SMTP
+    # and Redis (codes are stored in Redis with a TTL; fails closed without Redis).
+    EMAIL_LOGIN_ENABLED: bool = os.getenv("EMAIL_LOGIN_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    EMAIL_OTP_TTL_SECONDS: int = int(os.getenv("EMAIL_OTP_TTL_SECONDS", "600"))
+    EMAIL_OTP_COOLDOWN_SECONDS: int = int(os.getenv("EMAIL_OTP_COOLDOWN_SECONDS", "60"))
+    EMAIL_OTP_MAX_ATTEMPTS: int = int(os.getenv("EMAIL_OTP_MAX_ATTEMPTS", "5"))
+    EMAIL_OTP_REQUESTS_PER_HOUR: int = int(os.getenv("EMAIL_OTP_REQUESTS_PER_HOUR", "5"))
+
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     NODE_PORT_BASE: int = int(os.getenv("NODE_PORT_BASE", "30000"))

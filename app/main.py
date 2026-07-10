@@ -2,9 +2,11 @@
 FastAPI main application for AMD OneClick Notebook Manager
 """
 import hashlib
+import hmac
 import json
 import logging
 import os
+import re
 import base64
 import asyncio
 import time
@@ -25,7 +27,7 @@ import requests
 import websockets
 
 from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
-from .redis_client import rate_limit_ok
+from .redis_client import rate_limit_ok, get_redis
 from .models import (
     NotebookRequest, 
     NotebookStatus, 
@@ -886,6 +888,7 @@ async def index(request: Request):
             "active_instance_json": json.dumps(active_instance or {}),
             "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
             "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
+            "email_login_enabled": settings.EMAIL_LOGIN_ENABLED,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
             "disk_size_min_gb": settings.DISK_SIZE_MIN_GB,
@@ -1103,6 +1106,128 @@ async def admin_login(request: Request):
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
     user = get_or_create_user("admin", "admin", "admin@radeon.local", "Radeon Cloud Admin", "")
     user = ensure_user_min_credits(user["id"], settings.ADMIN_LOGIN_CREDITS) or user
+    _establish_session(request, user)
+    return {"user": user}
+
+
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _normalize_email(raw: str) -> Optional[str]:
+    email = (raw or "").strip().lower()
+    if not email or len(email) > 254 or not _EMAIL_RE.match(email):
+        return None
+    return email
+
+
+def _email_otp_hash(email: str, code: str) -> str:
+    """HMAC the code with the server secret so the stored value is not the raw code."""
+    return hmac.new(settings.SESSION_SECRET.encode("utf-8"), f"{email}:{code}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+@app.post("/auth/email/request-code")
+async def email_request_code(request: Request):
+    if not settings.EMAIL_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Email login is not enabled")
+    _enforce_login_rate_limit(request)
+    payload = await request.json()
+    email = _normalize_email(str(payload.get("email", "")))
+    if not email:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address")
+    redis = get_redis()
+    if redis is None:
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+    # Per-email resend cooldown.
+    cd_key = f"emailotp_cd:{email}"
+    try:
+        if redis.get(cd_key):
+            raise HTTPException(status_code=429, detail="A code was just sent. Please wait before requesting another.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    # Per-email hourly request cap (independent of the per-IP login limit above).
+    if not rate_limit_ok(f"emailotp_req:{email}", settings.EMAIL_OTP_REQUESTS_PER_HOUR, 3600):
+        raise HTTPException(status_code=429, detail="Too many code requests for this email. Please try again later.")
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    ttl = int(settings.EMAIL_OTP_TTL_SECONDS)
+    try:
+        redis.setex(f"emailotp:{email}", ttl, _email_otp_hash(email, code))
+        redis.delete(f"emailotp_att:{email}")
+        redis.setex(cd_key, int(settings.EMAIL_OTP_COOLDOWN_SECONDS), "1")
+    except Exception as e:
+        logger.error("Failed to store email OTP for %s: %s", email, e)
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+
+    from .email_service import send_verification_code_email
+
+    if not send_verification_code_email(email, code):
+        # Do not keep a code that could not be delivered.
+        try:
+            redis.delete(f"emailotp:{email}")
+            redis.delete(cd_key)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail="Failed to send verification email. Please try again later.")
+    return {"ok": True, "cooldown": int(settings.EMAIL_OTP_COOLDOWN_SECONDS)}
+
+
+@app.post("/auth/email/verify")
+async def email_verify_code(request: Request):
+    if not settings.EMAIL_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Email login is not enabled")
+    _enforce_login_rate_limit(request)
+    payload = await request.json()
+    email = _normalize_email(str(payload.get("email", "")))
+    code = str(payload.get("code", "")).strip()
+    if not email or not code.isdigit() or len(code) != 6:
+        raise HTTPException(status_code=400, detail="Invalid email or code")
+    redis = get_redis()
+    if redis is None:
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+
+    otp_key = f"emailotp:{email}"
+    att_key = f"emailotp_att:{email}"
+    try:
+        stored = redis.get(otp_key)
+    except Exception as e:
+        logger.error("Failed to read email OTP for %s: %s", email, e)
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+    if not stored:
+        raise HTTPException(status_code=400, detail="Code expired or not found. Please request a new one.")
+    # Cap verification attempts per issued code.
+    try:
+        attempts = redis.incr(att_key)
+        if attempts == 1:
+            redis.expire(att_key, int(settings.EMAIL_OTP_TTL_SECONDS))
+    except Exception:
+        attempts = 1
+    if attempts > int(settings.EMAIL_OTP_MAX_ATTEMPTS):
+        try:
+            redis.delete(otp_key)
+        except Exception:
+            pass
+        raise HTTPException(status_code=429, detail="Too many incorrect attempts. Please request a new code.")
+
+    if not hmac.compare_digest(stored, _email_otp_hash(email, code)):
+        raise HTTPException(status_code=401, detail="Incorrect verification code")
+
+    # Success: consume the code, establish session (auto-registers via email provider).
+    try:
+        redis.delete(otp_key)
+        redis.delete(att_key)
+    except Exception:
+        pass
+    user = get_or_create_user("email", email, email, email.split("@", 1)[0], "")
+    _enforce_signup_quota(request, user)
+    if user.get("_created"):
+        try:
+            from .telemetry import report_user_registered_event
+
+            await report_user_registered_event(user)
+        except Exception:
+            pass
     _establish_session(request, user)
     return {"user": user}
 

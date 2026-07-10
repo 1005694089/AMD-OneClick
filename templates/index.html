@@ -102,6 +102,7 @@
     const initialActiveInstance = {{ active_instance_json | safe }};
     const showWorkshopLogin = {{ workshop_login_enabled | tojson }};
     const showAdminLogin = {{ admin_login_enabled | tojson }};
+    const showEmailLogin = {{ email_login_enabled | tojson }};
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
     const diskSizeMinGb = {{ disk_size_min_gb | tojson }};
@@ -119,6 +120,7 @@
           { key: 'github', label: React.createElement('a', { href: '/auth/github/login' }, 'Login with GitHub') },
           { key: 'modelscope', label: React.createElement('a', { href: '/auth/modelscope/login' }, 'Login with ModelScope') },
         ];
+        if (showEmailLogin) items.push({ key: 'email', label: React.createElement('span', { onClick: () => window.dispatchEvent(new Event('open-email-login')) }, 'Login with Email') });
         if (showWorkshopLogin) items.unshift({ key: 'workshop', label: React.createElement('span', { onClick: () => window.dispatchEvent(new Event('open-workshop-login')) }, 'Workshop Login') });
         if (showAdminLogin) items.unshift({ key: 'admin', label: React.createElement('span', { onClick: () => window.dispatchEvent(new Event('open-admin-login')) }, 'Admin Login') });
         return React.createElement(Dropdown, { menu: { items }, placement: 'bottomRight', trigger: ['click'] }, React.createElement(Button, { shape: 'round' }, 'Login'));
@@ -176,6 +178,13 @@
       const [adminLoginOpen, setAdminLoginOpen] = React.useState(false);
       const [adminLoginLoading, setAdminLoginLoading] = React.useState(false);
       const [adminForm] = Form.useForm();
+      const [emailLoginOpen, setEmailLoginOpen] = React.useState(false);
+      const [emailForm] = Form.useForm();
+      const [emailStep, setEmailStep] = React.useState('email');
+      const [emailValue, setEmailValue] = React.useState('');
+      const [emailSending, setEmailSending] = React.useState(false);
+      const [emailVerifying, setEmailVerifying] = React.useState(false);
+      const [emailCooldown, setEmailCooldown] = React.useState(0);
       const initialTab = new URLSearchParams(window.location.search).get('tab') === 'notebook' ? 'notebook' : 'gallery';
       const [activeTab, setActiveTab] = React.useState(initialTab);
       const [gallerySearch, setGallerySearch] = React.useState('');
@@ -220,6 +229,16 @@
         window.addEventListener('open-admin-login', open);
         return () => window.removeEventListener('open-admin-login', open);
       }, []);
+      React.useEffect(() => {
+        const open = () => { setEmailStep('email'); setEmailValue(''); setEmailCooldown(0); emailForm.resetFields(); setEmailLoginOpen(true); };
+        window.addEventListener('open-email-login', open);
+        return () => window.removeEventListener('open-email-login', open);
+      }, []);
+      React.useEffect(() => {
+        if (emailCooldown <= 0) return;
+        const t = setTimeout(() => setEmailCooldown(emailCooldown - 1), 1000);
+        return () => clearTimeout(t);
+      }, [emailCooldown]);
 
       async function loginWorkshop(values) {
         setWorkshopLoginLoading(true);
@@ -246,6 +265,57 @@
           message.error(err.message || 'Admin login failed');
         } finally {
           setAdminLoginLoading(false);
+        }
+      }
+
+      async function sendEmailCode(values) {
+        const email = (values.email || '').trim();
+        if (!email) return;
+        setEmailSending(true);
+        try {
+          const res = await fetch('/auth/email/request-code', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ email }) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Failed to send code');
+          setEmailValue(email);
+          setEmailStep('code');
+          setEmailCooldown(data.cooldown || 60);
+          message.success('Verification code sent. Please check your inbox.');
+        } catch (err) {
+          message.error(err.message || 'Failed to send code');
+        } finally {
+          setEmailSending(false);
+        }
+      }
+
+      async function resendEmailCode() {
+        if (emailCooldown > 0 || !emailValue) return;
+        setEmailSending(true);
+        try {
+          const res = await fetch('/auth/email/request-code', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ email: emailValue }) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Failed to resend code');
+          setEmailCooldown(data.cooldown || 60);
+          message.success('A new code has been sent.');
+        } catch (err) {
+          message.error(err.message || 'Failed to resend code');
+        } finally {
+          setEmailSending(false);
+        }
+      }
+
+      async function verifyEmailCode(values) {
+        const code = (values.code || '').trim();
+        if (!code) return;
+        setEmailVerifying(true);
+        try {
+          const res = await fetch('/auth/email/verify', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ email: emailValue, code }) });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(data.detail || 'Verification failed');
+          window.location.href = '/';
+        } catch (err) {
+          message.error(err.message || 'Verification failed');
+        } finally {
+          setEmailVerifying(false);
         }
       }
 
@@ -392,6 +462,23 @@
             React.createElement(Form.Item, { name:'password', label:'Password', rules:[{required:true,message:'Password is required'}] }, React.createElement(Input.Password)),
             React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:adminLoginLoading }, 'Login')
           )
+        ),
+        React.createElement(Modal, { title:'Login with Email', open:emailLoginOpen, onCancel:()=>setEmailLoginOpen(false), footer:null, destroyOnClose:true },
+          emailStep === 'email'
+            ? React.createElement(Form, { form:emailForm, layout:'vertical', onFinish:sendEmailCode },
+                React.createElement('p', { style:{color:'#566175', marginTop:0} }, 'Enter your email and we will send you a 6-digit verification code.'),
+                React.createElement(Form.Item, { name:'email', label:'Email', rules:[{required:true,message:'Email is required'},{type:'email',message:'Enter a valid email'}] }, React.createElement(Input, { placeholder:'you@example.com', autoComplete:'email' })),
+                React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:emailSending }, 'Send code')
+              )
+            : React.createElement(Form, { form:emailForm, layout:'vertical', onFinish:verifyEmailCode },
+                React.createElement('p', { style:{color:'#566175', marginTop:0} }, ['Code sent to ', React.createElement('strong', { key:'e' }, emailValue), '. It expires in a few minutes.']),
+                React.createElement(Form.Item, { name:'code', label:'Verification code', rules:[{required:true,message:'Enter the 6-digit code'},{pattern:/^\d{6}$/, message:'The code is 6 digits'}] }, React.createElement(Input, { placeholder:'123456', maxLength:6, inputMode:'numeric' })),
+                React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:emailVerifying }, 'Verify & sign in'),
+                React.createElement('div', { style:{marginTop:12, textAlign:'center'} },
+                  React.createElement(Button, { type:'link', disabled:emailCooldown>0 || emailSending, onClick:resendEmailCode }, emailCooldown>0 ? ('Resend code in ' + emailCooldown + 's') : 'Resend code'),
+                  React.createElement(Button, { type:'link', onClick:()=>{ setEmailStep('email'); emailForm.resetFields(['code']); } }, 'Change email')
+                )
+              )
         )
       );
     }
