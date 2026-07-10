@@ -26,6 +26,64 @@ secrets.
 
 ---
 
+## 2026-07-10 — Passwordless email OTP login (radeon-test then radeon prod)
+
+**Code commit:** `0dec34734327bd319e391225a0d4bb384d6a8af8`
+("Add passwordless email OTP login"), branch `feature/oauth-credit-manager`
+(pushed). Feature is env-gated by `EMAIL_LOGIN_ENABLED` (default off), so the
+shared branch/image is inert anywhere the flag is not set.
+
+| Service / Port | Image (`:tag`) | Digest / ID | Local yaml + sha256 | Snapshot |
+|----------------|----------------|-------------|---------------------|----------|
+| v2 test / 30288 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-test-email-otp-20260710-1300` | digest `sha256:a9f4525d29ea622b3430f71d540b518c2fdbe85d15be6d4f5f5d05326db4ec29` / id `sha256:6031b7959fd9ba58d89a4fe4f1d719ecf363c47cff6c66e58f11c12e52891b66` | `kubectl set env` + `set image` (no manifest snapshot for the test iteration) | N/A |
+| v2 prod / 30088 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-email-otp-20260710-1300` | digest `sha256:a9f4525d29ea622b3430f71d540b518c2fdbe85d15be6d4f5f5d05326db4ec29` / id `sha256:6031b7959fd9ba58d89a4fe4f1d719ecf363c47cff6c66e58f11c12e52891b66` | `k8s-manager-v2-manager-only.local.yaml` sha256 `c4a37bb679409c72f31e749bddfa0d679d1a1d45e2da3ca354ca43058b4a56cd` | `local-deploy-history/v2-manager-only/2026-07-10-1345-v2-prod-email-otp.local.yaml` |
+
+The prod tag is a retag of the exact validated test image (identical digest
+`sha256:a9f4525d…`).
+
+**Feature:** New passwordless email login (OTP). `POST /auth/email/request-code`
+sends a 6-digit code over SMTP (Office365, STARTTLS:587); `POST /auth/email/verify`
+checks it and establishes a session, auto-registering via the `email` provider
+(inherits `SIGNUP_BONUS_CREDITS`, currently 2). Codes are stored in Redis as an
+HMAC(SESSION_SECRET) with TTL `EMAIL_OTP_TTL_SECONDS` (600s), per-email resend
+cooldown (60s), per-email hourly cap (5), and max 5 verify attempts; fails closed
+without Redis. Header login dropdown gains a two-step "Login with Email" modal.
+Open registration (any email), relying on the existing per-IP/day signup quota.
+
+**Env / secrets applied (both services):**
+- `EMAIL_LOGIN_ENABLED=true`, `SMTP_HOST=smtp.office365.com`, `SMTP_PORT=587`,
+  `SMTP_USER=noreply_radeoncloud@mail.developer.amd.com.cn`,
+  `SMTP_FROM=AMD Radeon Cloud <noreply_radeoncloud@mail.developer.amd.com.cn>`.
+- `SMTP_PASSWORD` added to Secret `amd-oneclick-secrets-v2` (prod, injected via
+  envFrom) and `amd-oneclick-secrets-v2-test` (test); raw value not recorded here.
+- Redis: prod uses existing `redis://10.233.140.78:6379/0`; test was given
+  `redis://10.233.140.78:6379/1` (dedicated DB index) since it had none.
+
+**Process:** code committed/pushed first; image built from that commit and
+validated on radeon-test (`kubectl set env`+`set image`); after the user confirmed
+functionality, the SAME image was retagged for prod, prod Secret updated, a
+manager-only manifest snapshot was `kubectl diff`'d (only image + the 5 new env),
+pre-imported on `wx-ms-w7900d-0005`, then `kubectl apply` + bounded rollout. Did
+NOT touch ConfigMap/Postgres or the PR1/edge.
+
+**Verification:**
+- radeon-test: env present, `redis_ok=True`; `request-code` (self-send to the
+  noreply mailbox) → 200 (`Sent login verification code`), proving Office365 creds
+  work; `verify` wrong→401 / right→200 auto-creating a `provider=email`,
+  `credits=2` user; served page exposes the flow; browser: Login dropdown shows
+  "Login with Email".
+- radeon prod: rollout `1/1 ready`; `https://radeon.anruicloud.com/health` 200 and
+  page exposes email login; env present, `redis_ok=True`; `request-code` self-send
+  → 200; `verify` wrong→401 / right→200 (user created, credits=2); test users and
+  Redis keys cleaned up after each check.
+
+**Rollback (prod):** `kubectl -n default rollout undo deployment/amd-oneclick-manager-v2`
+(previous image `v2-proxy-recover-ws-nfs-20260704-1224`), or simply disable the
+feature with `kubectl -n default set env deployment/amd-oneclick-manager-v2 EMAIL_LOGIN_ENABLED-`
+(and the SMTP_* env) — the code default is off.
+
+---
+
 ## 2026-07-10 — PR1 Zijun manager sync to online branch (shared model API)
 
 **Code commit:** `832930fbd3f56b0d36959f558c4e5ba36318a515`
