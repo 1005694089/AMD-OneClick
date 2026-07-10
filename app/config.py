@@ -309,8 +309,8 @@ class Settings:
     WORKSHOP_MODEL_STORAGE_CLASS: str = os.getenv("WORKSHOP_MODEL_STORAGE_CLASS", "managed-nfs-storage-1")
     WORKSHOP_MODEL_PVC_SIZE_GI: int = int(os.getenv("WORKSHOP_MODEL_PVC_SIZE_GI", "10240"))
     WORKSHOP_MODEL_DIRS: dict = {
-        "comfyui": "ComfyUI",
-        "openclaw": "Openclaw",
+        "comfyui": {"subPath": "ComfyUI", "mountPath": "/comfyui_workspace/ComfyUI/models"},
+        "openclaw": {"subPath": "Openclaw", "mountPath": "/models"},
     }
     # Durable tier = one shared RWX PVC per StorageClass below (created once at bootstrap). Each
     # instance gets an isolated subdirectory on its shard, chosen by md5(instance_id) % len(list).

@@ -2307,9 +2307,9 @@ exec {cmd}
             annotations["amd-oneclick/network-disk-pvc"] = network_disk_pvc_name
             if network_disk_sub_path:
                 annotations["amd-oneclick/network-disk-sub-path"] = network_disk_sub_path
-        model_mount_dir = settings.WORKSHOP_MODEL_DIRS.get((model_mount or "").strip().lower()) if model_mount else None
-        if model_mount_dir:
-            annotations["amd-oneclick/model-mount"] = model_mount_dir
+        model_mount_cfg = settings.WORKSHOP_MODEL_DIRS.get((model_mount or "").strip().lower()) if model_mount else None
+        if model_mount_cfg:
+            annotations["amd-oneclick/model-mount"] = model_mount_cfg["subPath"]
         if workspace_quota_node_name:
             annotations["amd-oneclick/workspace-quota"] = f"{settings.WORKSPACE_QUOTA_SIZE_GI}Gi"
             annotations["amd-oneclick/workspace-quota-node"] = workspace_quota_node_name
@@ -2531,11 +2531,13 @@ exec {cmd}
             })
             env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
 
-        if model_mount_dir and settings.WORKSHOP_MODEL_PVC_NAME:
+        if model_mount_cfg and settings.WORKSHOP_MODEL_PVC_NAME:
+            model_sub_path = model_mount_cfg["subPath"]
+            model_mount_path = model_mount_cfg.get("mountPath", settings.WORKSHOP_MODEL_MOUNT_PATH)
             volume_mounts.append({
                 "name": "workshop-model",
-                "mountPath": settings.WORKSHOP_MODEL_MOUNT_PATH,
-                "subPath": model_mount_dir,
+                "mountPath": model_mount_path,
+                "subPath": model_sub_path,
                 "readOnly": not user_is_editor,
             })
             volumes.append({
@@ -2544,7 +2546,7 @@ exec {cmd}
                     "claimName": settings.WORKSHOP_MODEL_PVC_NAME,
                 },
             })
-            env.append({"name": "MODELS_DIR", "value": settings.WORKSHOP_MODEL_MOUNT_PATH})
+            env.append({"name": "MODELS_DIR", "value": model_mount_path})
 
         init_containers = []
         if settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir and not is_app_type:
@@ -4515,7 +4517,8 @@ exit 0
                 existing_image = None
             existing_type = (existing_pod.metadata.annotations or {}).get("amd-oneclick/instance-type", "jupyter")
             existing_model_mount = (existing_pod.metadata.annotations or {}).get("amd-oneclick/model-mount")
-            requested_model_dir = settings.WORKSHOP_MODEL_DIRS.get((model_mount or "").strip().lower()) if model_mount else None
+            _req_cfg = settings.WORKSHOP_MODEL_DIRS.get((model_mount or "").strip().lower()) if model_mount else None
+            requested_model_dir = _req_cfg["subPath"] if _req_cfg else None
             if existing_image == image and existing_type == instance_type and existing_model_mount == requested_model_dir:
                 logger.info("Reusing matching existing pod %s (image/type identical)", instance_id)
                 return self.get_instance_by_id(instance_id)
