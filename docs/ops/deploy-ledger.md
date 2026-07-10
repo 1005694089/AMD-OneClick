@@ -26,6 +26,42 @@ secrets.
 
 ---
 
+## 2026-07-10 — PR1 Zijun manager sync to online branch (shared model API)
+
+**Code commit:** `832930fbd3f56b0d36959f558c4e5ba36318a515`
+("Merge pull request #9 from AMD-AIM/feature/shared-model-api"), branch
+`sync/v2-base-with-pr1-account-20260626` (pushed to `origin`). Advances the prior
+deploy `15e4a4a` by PR #9: `0724cf4` "Shared Model API: OpenAI-compatible /v1
+proxy + Model APIs catalog UI".
+
+| Service / Port | Image (`:tag`) | Digest / ID | Local yaml + sha256 | Snapshot |
+|----------------|----------------|-------------|---------------------|----------|
+| pr1-zijun / 30392 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:pr1-zijun-sync-20260710-1009` | digest `sha256:0b3e86b56e66401033080e5e58cdc8e8c9cc2f44c1a713663f4b0b646ab92b8c` / id `sha256:f7c21884ac6560c8a743319f70bd7acf692f6454d3482219979fc0edf2468ae1` | `k8s-manager-pr1-zijun.local.yaml` sha256 `54f3fd28b5c8169e0c205596d2004e14f763e9d6cfc1ee6d3cb661cdc8818b0c` | `local-deploy-history/pr1-zijun/2026-07-10-1009-manager-sync-832930f.local.yaml` |
+
+**Changes:** Pull the online `/radeon/` branch to its new HEAD `832930f` and roll
+the PR1 manager onto an image built from it. Manager-only image + `STATIC_ASSET_VERSION`
+bump; all environment unchanged from live (SSO config, inline `SSO_ENABLED=false`,
+`PUBLIC_BASE_URL`, `RUN_SCHEDULER=false`).
+
+**Process:** Built from a clean detached worktree at the pushed commit (the dirty
+`AMD-OneClick-pr1-zijun` worktree was NOT used). Image pushed to ACR, pre-imported
+into `wx-ms-w7900d-0005` containerd `k8s.io` via a temporary privileged helper pod,
+manager-only manifest snapshot `kubectl diff`'d (only image + `STATIC_ASSET_VERSION`
+changed), then `kubectl apply` + bounded rollout. Did NOT touch ConfigMap
+`amd-oneclick-config-pr1-zijun`, Secret, Postgres, or the PR1 edge.
+
+**Verification:** rollout `1/1 ready`, new pod `amd-oneclick-manager-pr1-zijun-54bcb789b9-m85mv`;
+`http://36.150.116.200:30392/health` 200; `/radeon/` 200 title `Radeon Cloud`, no
+`/radeon/radeon`; `/radeon/static/app-path.js` 200; `/` → 307; pod env
+`SSO_ENABLED=false`, `PUBLIC_BASE_URL=https://developer.amd.com.cn/radeon`,
+`RUN_SCHEDULER=false`, `STATIC_ASSET_VERSION=pr1-zijun-sync-20260710-1009`; no
+errors/tracebacks in recent logs.
+
+**Rollback:** `kubectl -n default rollout undo deployment/amd-oneclick-manager-pr1-zijun`
+(previous image `pr1-zijun-sync-20260708-1343`).
+
+---
+
 ## 2026-07-08 — PR1 Zijun manager sync to online branch
 
 **Code commit:** `15e4a4a40419add8d93ab5a4dd11897e8e8476d1`
