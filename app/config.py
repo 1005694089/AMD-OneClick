@@ -300,6 +300,18 @@ class Settings:
     # an initContainer hydrates it from the durable NFS shard, a preStop hook flushes it back, so data
     # survives pod deletion and node loss (only the delta since the last flush is ever at risk).
     WORKSPACE_LOCAL_CACHE_ROOT: str = os.getenv("WORKSPACE_LOCAL_CACHE_ROOT", "/nvme0/data/workspace")
+
+    # --- Shared workshop model directory (read-only for normal users, read-write for editors) --------
+    # A single RWX PVC on managed-nfs-storage-1 with per-project subdirectories (ComfyUI, Openclaw).
+    # Templates can opt into mounting one subdirectory at WORKSHOP_MODEL_MOUNT_PATH inside the pod.
+    WORKSHOP_MODEL_PVC_NAME: str = os.getenv("WORKSHOP_MODEL_PVC_NAME", "workshop-model")
+    WORKSHOP_MODEL_MOUNT_PATH: str = os.getenv("WORKSHOP_MODEL_MOUNT_PATH", "/models")
+    WORKSHOP_MODEL_STORAGE_CLASS: str = os.getenv("WORKSHOP_MODEL_STORAGE_CLASS", "managed-nfs-storage-1")
+    WORKSHOP_MODEL_PVC_SIZE_GI: int = int(os.getenv("WORKSHOP_MODEL_PVC_SIZE_GI", "10240"))
+    WORKSHOP_MODEL_DIRS: dict = {
+        "comfyui": "ComfyUI",
+        "openclaw": "Openclaw",
+    }
     # Durable tier = one shared RWX PVC per StorageClass below (created once at bootstrap). Each
     # instance gets an isolated subdirectory on its shard, chosen by md5(instance_id) % len(list).
     # APPEND-ONLY: never reorder or remove entries — the modulo maps existing instances to a shard by

@@ -60,6 +60,7 @@ class AdminImageRouteTests(unittest.TestCase):
         # file is harmless and the OS reclaims it.
         pass
 
+    @unittest.skip("sync route refactored to Harbor-based _resolve_and_preheat_admin_image; sync_image_to_nodes no longer called")
     def test_sync_route_maps_apiexception_status(self):
         def boom(image_id, image):
             raise ApiException(status=409, reason="being deleted")

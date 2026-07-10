@@ -1680,6 +1680,37 @@ findmnt "$mnt"
             logger.warning("Durable shards ready %s/%s: %s", len(bound), len(classes), bound)
         return bound
 
+    def _ensure_workshop_model_pvc(self) -> Optional[str]:
+        """Idempotent: create the shared workshop-model PVC if it doesn't exist."""
+        pvc_name = (settings.WORKSHOP_MODEL_PVC_NAME or "").strip()
+        if not pvc_name:
+            return None
+        try:
+            self.core_v1.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=self.namespace)
+            return pvc_name
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        storage_class = settings.WORKSHOP_MODEL_STORAGE_CLASS
+        size = f"{int(settings.WORKSHOP_MODEL_PVC_SIZE_GI)}Gi"
+        pvc_body = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "namespace": self.namespace,
+                "labels": {"app": "oneclick-workshop-model"},
+            },
+            "spec": {
+                "accessModes": ["ReadWriteMany"],
+                "resources": {"requests": {"storage": size}},
+                "storageClassName": storage_class,
+            },
+        }
+        self.core_v1.create_namespaced_persistent_volume_claim(namespace=self.namespace, body=pvc_body)
+        logger.info("Created workshop-model PVC %s (class %s, size %s)", pvc_name, storage_class, size)
+        return pvc_name
+
     def _resolve_resource_profile(self, gpu_count: int, resource_profile: Optional[str] = None) -> tuple[str, dict]:
         profile = (resource_profile or "auto").strip().lower()
         if profile == "auto":
@@ -2247,7 +2278,9 @@ exec {cmd}
                           api_launched: bool = False,
                           workspace_last_node: Optional[str] = None,
                           git_token: Optional[str] = None,
-                          use_pvc: Optional[bool] = None) -> dict:
+                          use_pvc: Optional[bool] = None,
+                          model_mount: Optional[str] = None,
+                          user_is_editor: bool = False) -> dict:
         """Generate Pod manifest.
 
         ``use_pvc`` is the FUTURE per-launch PVC-optional toggle (unsurfaced): it feeds
@@ -2274,6 +2307,9 @@ exec {cmd}
             annotations["amd-oneclick/network-disk-pvc"] = network_disk_pvc_name
             if network_disk_sub_path:
                 annotations["amd-oneclick/network-disk-sub-path"] = network_disk_sub_path
+        model_mount_dir = settings.WORKSHOP_MODEL_DIRS.get((model_mount or "").strip().lower()) if model_mount else None
+        if model_mount_dir:
+            annotations["amd-oneclick/model-mount"] = model_mount_dir
         if workspace_quota_node_name:
             annotations["amd-oneclick/workspace-quota"] = f"{settings.WORKSPACE_QUOTA_SIZE_GI}Gi"
             annotations["amd-oneclick/workspace-quota-node"] = workspace_quota_node_name
@@ -2494,6 +2530,21 @@ exec {cmd}
                 }
             })
             env.append({"name": "NETWORK_DISK_DIR", "value": settings.NETWORK_DISK_MOUNT_PATH})
+
+        if model_mount_dir and settings.WORKSHOP_MODEL_PVC_NAME:
+            volume_mounts.append({
+                "name": "workshop-model",
+                "mountPath": settings.WORKSHOP_MODEL_MOUNT_PATH,
+                "subPath": model_mount_dir,
+                "readOnly": not user_is_editor,
+            })
+            volumes.append({
+                "name": "workshop-model",
+                "persistentVolumeClaim": {
+                    "claimName": settings.WORKSHOP_MODEL_PVC_NAME,
+                },
+            })
+            env.append({"name": "MODELS_DIR", "value": settings.WORKSHOP_MODEL_MOUNT_PATH})
 
         init_containers = []
         if settings.WORKSPACE_QUOTA_ENABLED and not workspace_uses_empty_dir and not is_app_type:
@@ -4430,7 +4481,9 @@ exit 0
                         pod_type: Optional[str] = None,
                         api_launched: bool = False,
                         git_token: Optional[str] = None,
-                        use_pvc: Optional[bool] = None) -> dict:
+                        use_pvc: Optional[bool] = None,
+                        model_mount: Optional[str] = None,
+                        user_is_editor: bool = False) -> dict:
         """Create a new notebook instance.
 
         ``use_pvc`` is the FUTURE per-launch PVC-optional toggle (unsurfaced): forwarded to
@@ -4461,7 +4514,9 @@ exit 0
             except Exception:
                 existing_image = None
             existing_type = (existing_pod.metadata.annotations or {}).get("amd-oneclick/instance-type", "jupyter")
-            if existing_image == image and existing_type == instance_type:
+            existing_model_mount = (existing_pod.metadata.annotations or {}).get("amd-oneclick/model-mount")
+            requested_model_dir = settings.WORKSHOP_MODEL_DIRS.get((model_mount or "").strip().lower()) if model_mount else None
+            if existing_image == image and existing_type == instance_type and existing_model_mount == requested_model_dir:
                 logger.info("Reusing matching existing pod %s (image/type identical)", instance_id)
                 return self.get_instance_by_id(instance_id)
             logger.info(
@@ -4547,6 +4602,8 @@ exit 0
             workspace_last_node=workspace_last_node,
             git_token=git_token,
             use_pvc=use_pvc,
+            model_mount=model_mount,
+            user_is_editor=user_is_editor,
         )
         pod_uid = None
         for attempt in range(1, 7):

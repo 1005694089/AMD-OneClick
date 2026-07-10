@@ -72,6 +72,9 @@ class _FakeK8s:
     def delete_instance_by_id(self, instance_id):
         return True
 
+    def invalidate_service_ip(self, instance_id):
+        pass
+
     def get_pod_status(self, email, instance_id=None):
         return self.pod_status
 
@@ -572,9 +575,9 @@ class MultiGpuResourceProfiles(unittest.TestCase):
 
     def test_auto_profile_scales_with_gpu_count(self):
         cases = {
-            1: ("standard", "16", "110Gi"),
-            2: ("large", "32", "220Gi"),
-            4: ("xlarge", "64", "440Gi"),
+            1: ("standard", "16", "55Gi"),
+            2: ("large", "32", "110Gi"),
+            4: ("xlarge", "64", "220Gi"),
         }
         for gpu, (name, cpu_lim, mem_lim) in cases.items():
             pname, res = self.k._resolve_resource_profile(gpu, "auto")

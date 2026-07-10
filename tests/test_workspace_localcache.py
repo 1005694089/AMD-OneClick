@@ -504,12 +504,15 @@ class FlushPodTests(unittest.TestCase):
         # abort-on-error behavior is covered by FlushGenerationTests.test_get_durable_generation_error_aborts_flush.
         self._orig_gdg = k8s_module.store.get_durable_generation
         k8s_module.store.get_durable_generation = lambda iid: 0
+        self._orig_sleep = k8s_module.time.sleep
+        k8s_module.time.sleep = lambda *a, **k: None
 
     def tearDown(self):
         for k, v in self._orig.items():
             setattr(k8s_module.settings, k, v)
         k8s_module.store.mark_workspace_flushed = self._orig_mark
         k8s_module.store.get_durable_generation = self._orig_gdg
+        k8s_module.time.sleep = self._orig_sleep
 
     def test_skip_when_no_session_token(self):
         # No session token → nothing to flush → True, no pod created, no mark.
@@ -702,9 +705,10 @@ class SeedManifestTests(_ManifestBase):
         self.assertLess(names.index("workspace-hydrate"), names.index("workspace-seed"),
                         "seed must be ordered AFTER hydrate")
 
-    def test_no_seed_for_blank_launch(self):
-        self.assertNotIn("workspace-seed", self._inits(self._manifest()),
-                         "a blank/no-template launch must NOT be seeded (no empty default/ subdir)")
+    def test_blank_launch_seeds_by_image_tag(self):
+        inits = self._inits(self._manifest())
+        self.assertIn("workspace-seed", inits,
+                      "a blank launch with a known image should still seed by image tag")
 
     def test_seed_key_per_template_slug(self):
         script = self._inits(self._manifest(template_id="42", template_title="Cool Template"))["workspace-seed"]["args"][0]

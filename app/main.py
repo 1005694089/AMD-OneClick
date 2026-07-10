@@ -170,6 +170,15 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error("Durable workspace shard bootstrap failed (continuing): %s", e)
         asyncio.create_task(_bootstrap_durable_shards())
+    if settings.WORKSHOP_MODEL_PVC_NAME:
+        async def _bootstrap_workshop_model_pvc():
+            try:
+                pvc = await asyncio.to_thread(k8s_client._ensure_workshop_model_pvc)
+                if pvc:
+                    logger.info("Workshop model PVC ready: %s", pvc)
+            except Exception as e:
+                logger.error("Workshop model PVC bootstrap failed (continuing): %s", e)
+        asyncio.create_task(_bootstrap_workshop_model_pvc())
     if settings.RUN_SCHEDULER:
         from .leader import elector
         elector.start()
@@ -526,6 +535,9 @@ def _save_notebook_template(
     template_app_port = req.app_port if req.app_port else None
     if template_app_port is not None and int(template_app_port) not in set(settings.APP_PORTS.values()):
         raise ValueError(f"app_port must be one of the curated app ports: {sorted(set(settings.APP_PORTS.values()))}")
+    _req_model_mount = (req.model_mount or "").strip().lower() or None
+    if _req_model_mount and _req_model_mount not in settings.WORKSHOP_MODEL_DIRS:
+        raise ValueError(f"model_mount must be one of {list(settings.WORKSHOP_MODEL_DIRS.keys())}")
     template = upsert_notebook_template(
         req.title,
         req.slug or "",
@@ -548,6 +560,7 @@ def _save_notebook_template(
         model_source=(req.model_source or "").strip().lower() or None,
         ssh_enabled=bool(getattr(req, "ssh_enabled", False)),
         use_pvc=req.use_pvc,
+        model_mount=_req_model_mount,
     )
     if template.get("repo_url") and template.get("notebook_path"):
         ensure_template_preview_cache(template, force=True)
@@ -1664,6 +1677,8 @@ async def _provision_template_instance(user: dict, email: str, template: dict, p
         ssh_enabled=bool(template.get("ssh_enabled")),
         ssh_public_key=user.get("ssh_public_key"),
         use_pvc=template.get("use_pvc"),
+        model_mount=template.get("model_mount"),
+        user_is_editor=bool(user.get("is_editor")),
     ))
     _invalidate_service_ip(instance["id"])
     _stamp_launch(user, template["image"], target_node or None)
@@ -2894,6 +2909,10 @@ async def launch_huggingface_demo_notebook(
     if req.unlimited_credits and not user["unlimited_credits"]:
         user = set_user_unlimited(user["id"], True) or user
 
+    hf_model_mount = (req.model_mount or "").strip().lower() or None
+    if hf_model_mount and hf_model_mount not in settings.WORKSHOP_MODEL_DIRS:
+        raise HTTPException(status_code=400, detail=f"model_mount must be one of {list(settings.WORKSHOP_MODEL_DIRS.keys())}")
+
     # Default use_pvc by pod_type when the caller omits it: hackathon → durable (PVC on,
     # workshops need persistent state across restarts), everything else → ephemeral (SSD).
     # An explicit True/False from the caller always wins.
@@ -2916,6 +2935,8 @@ async def launch_huggingface_demo_notebook(
             api_launched=True,
             git_token=git_token or None,
             use_pvc=effective_use_pvc,
+            model_mount=hf_model_mount,
+            user_is_editor=False,
         ))
         _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,

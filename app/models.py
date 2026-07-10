@@ -70,6 +70,7 @@ class NotebookTemplateRequest(BaseModel):
     model_source: Optional[str] = ""
     ssh_enabled: bool = False
     use_pvc: Optional[bool] = False
+    model_mount: Optional[str] = None
 
 
 class SshPublicKeyRequest(BaseModel):
@@ -105,6 +106,9 @@ class HuggingFaceNotebookLaunchRequest(BaseModel):
     # Only honored for a `.git` workshop launch (pod_type='workshop'); rejected otherwise. Must not
     # contain '..' path-traversal components.
     repo_sub_path: Optional[str] = None
+    # Mount a shared workshop model directory at /models. Values: "comfyui", "openclaw", or null.
+    # Always read-only for HF API users regardless of editor status.
+    model_mount: Optional[str] = None
 
 
 class CustomImageBuildRequest(BaseModel):

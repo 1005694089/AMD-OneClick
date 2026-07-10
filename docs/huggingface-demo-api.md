@@ -142,7 +142,8 @@ Optional fields (may be combined with either body above):
   "git_token": "<github-token>",
   "repo_sub_path": "Workshop 10 - Hyperloom",
   "unlimited_credits": false,
-  "use_pvc": false
+  "use_pvc": false,
+  "model_mount": "comfyui"
 }
 ```
 Rules:
@@ -169,6 +170,7 @@ Rules:
 - `gpu_count` must be `1`, `2`, or `4`. Default is `1`. CPU and memory scale automatically with the GPU count (see **GPU Sizing** below). For **metered** users, each GPU costs 1 credit/hour, so a 4-GPU instance consumes credits 4x as fast. **Unlimited** users are not charged regardless of `gpu_count`. Check `GET /api/huggingface/gpus` for free capacity before requesting `2` or `4`.
 - `unlimited_credits` is optional, defaults to `false`. When `true` on a **successful** launch, this `user_name` is marked unlimited and its credit balance is frozen going forward (see **Credits** above). Sticky — cannot be unset by a later launch that omits it. A launch rejected with `400` (e.g. `Each user can only have one active instance`) does **not** apply the flag.
 - `use_pvc` is optional and controls whether this instance's workspace is backed by durable storage. Pass `true` for **durable** (files survive pod restart/relaunch). Pass `false` for **ephemeral** (local-SSD-only — fast, but data is wiped on destroy). When omitted, the default depends on `pod_type`: **`hackathon` defaults to durable** (PVC on — hackathon projects need persistent state across restarts); **all other pod types default to ephemeral** (Local SSD). An explicit `true` or `false` always overrides the default. Has no effect on clusters not configured for durable/PVC-backed storage (always ephemeral). Browser-launched (Gallery template) instances use a per-template `use_pvc` setting chosen by the template creator (default Local SSD).
+- `model_mount` is optional. Pass `"comfyui"` or `"openclaw"` to mount the shared workshop model directory at `/models` inside the instance. The mount is always **read-only** for API-launched instances. Omit or pass `null` for no model mount.
 - Each `user_name` can have only one active notebook.
 
 Example success response:
@@ -324,6 +326,7 @@ export type LaunchRequest = {
   repo_sub_path?: string; // open JupyterLab at this subdirectory of the cloned repo instead of its root; ONLY valid with a .git workshop launch (rejected otherwise); no ".." path-traversal components
   unlimited_credits?: boolean; // default false; when true on a successful launch, sticky-freezes this user_name's balance (billing skipped; 8h idle reaper still applies)
   use_pvc?: boolean; // omit = hackathon→durable, others→ephemeral; true = durable (survives restart); false = ephemeral local-SSD-only (wiped on destroy)
+  model_mount?: "comfyui" | "openclaw"; // mount shared model dir at /models (always read-only for API launches)
 };
 
 export type NotebookStatus = {

@@ -88,6 +88,8 @@
         e(Switch, null)),
       e(Form.Item, { name: 'use_pvc', label: 'Storage', initialValue: false, tooltip: 'Persistent (PVC) keeps files across restarts but is slower to start. Local SSD is fast but ephemeral \u2014 data is lost when the instance is destroyed.' },
         e(Select, { options: [{ value: false, label: 'Local SSD (ephemeral)' }, { value: true, label: 'Persistent (PVC)' }] })),
+      e(Form.Item, { name: 'model_mount', label: 'Model Directory', tooltip: 'Mount a shared workshop model directory at /models inside the instance. Normal users get read-only access; editors get read-write.' },
+        e(Select, { allowClear: true, placeholder: 'None', options: [{ value: 'comfyui', label: 'ComfyUI' }, { value: 'openclaw', label: 'Openclaw' }] })),
       canPublish && e(Form.Item, { name: 'enabled', label: 'Visibility', tooltip: 'Private = only you can see and launch it. Public = listed in the Gallery for everyone.' },
         e(Select, { options: [{ value: false, label: 'Private (only you)' }, { value: true, label: 'Public (Gallery)' }] }))
     );
