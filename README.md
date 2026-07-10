@@ -35,7 +35,7 @@ Programmatic surface for external callers. Full guide: [`docs/huggingface-demo-a
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/huggingface/images` | List selectable images (name + ref) |
-| GET | `/api/huggingface/gpus` | Free vs total GPUs reachable by launches |
+| GET | `/api/huggingface/gpus` | Disabled — returns `204 No Content` (use `/api/admin/gpus`) |
 | POST | `/api/huggingface/notebooks` | Launch a notebook |
 | GET | `/api/huggingface/notebooks/current?user_name=xxx` | Poll status |
 | DELETE | `/api/huggingface/notebooks/current?user_name=xxx` | Destroy |

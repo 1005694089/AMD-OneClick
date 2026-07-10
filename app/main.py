@@ -3111,11 +3111,13 @@ async def admin_images_list(_username: str = Depends(verify_admin)):
 
 
 @app.get("/api/huggingface/gpus")
-async def huggingface_demo_gpus(_auth: None = Depends(verify_huggingface_demo_api)):
-    """Free vs total GPUs reachable by this service's launches (HF bearer auth).
+async def huggingface_demo_gpus():
+    """Disabled entry point: returns an empty response without querying the cluster.
 
-    Scoped to launch-eligible nodes, not the entire cluster — see gpu_capacity_summary."""
-    return k8s_client.gpu_capacity_summary()
+    Previously reported free vs total GPUs reachable by this service's launches. The
+    endpoint is intentionally short-circuited to return nothing; use /api/admin/gpus
+    for live capacity figures."""
+    return Response(status_code=204)
 
 
 @app.get("/api/admin/gpus")

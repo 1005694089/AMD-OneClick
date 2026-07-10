@@ -552,18 +552,26 @@ class Feature2And6Endpoints(unittest.TestCase):
 
     def test_gpu_endpoint_shape(self):
         class _GpuK8s:
+            def __init__(self):
+                self.called = False
+
             def gpu_capacity_summary(self):
+                self.called = True
                 return {"total_gpus": 8, "free_gpus": 3,
                         "nodes": [{"node": "n1", "total": 8, "free": 3,
                                    "committed": 5, "quarantined": False}]}
-        main_module.k8s_client = _GpuK8s()
+        fake = _GpuK8s()
+        main_module.k8s_client = fake
+        # HF demo /gpus entry point is disabled: returns nothing and never queries the cluster.
         r1 = self.client.get("/api/huggingface/gpus", headers=BEARER)
+        self.assertEqual(r1.status_code, 204, r1.text)
+        self.assertEqual(r1.content, b"")
+        self.assertFalse(fake.called)
+        # Admin /gpus still reports the live capacity figures.
         r2 = self.client.get("/api/admin/gpus", auth=ADMIN)
-        self.assertEqual(r1.status_code, 200, r1.text)
         self.assertEqual(r2.status_code, 200, r2.text)
-        self.assertEqual(r1.json()["total_gpus"], 8)
-        self.assertEqual(r1.json()["free_gpus"], 3)
-        self.assertEqual(r2.json(), r1.json())
+        self.assertEqual(r2.json()["total_gpus"], 8)
+        self.assertEqual(r2.json()["free_gpus"], 3)
 
 
 class MultiGpuResourceProfiles(unittest.TestCase):

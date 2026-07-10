@@ -82,26 +82,18 @@ When launching, the `image` field accepts **either** the friendly `name` (e.g. `
 
 ## Check GPU Availability
 
-Report free vs total GPUs reachable by this service's launches (not the whole cluster).
+> **Disabled.** This entry point has been turned off. `GET /api/huggingface/gpus`
+> now returns an empty `204 No Content` response and no longer reports GPU capacity.
 
 ```http
 GET /api/huggingface/gpus
-Authorization: Bearer <token>
 ```
 
-Example response:
+Response:
 
-```json
-{
-  "total_gpus": 982,
-  "free_gpus": 981,
-  "nodes": [
-    { "node": "<node-name>", "total": 8, "free": 7, "committed": 1, "quarantined": false }
-  ]
-}
+```http
+HTTP/1.1 204 No Content
 ```
-
-`free` is schedulable capacity (`total - committed`), not live utilization. Check this before launching multi-GPU instances.
 
 ## Launch A Notebook
 
