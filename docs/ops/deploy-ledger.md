@@ -24,6 +24,58 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-11 03:16 - radeon-global: disable HF `/api/huggingface/gpus` entry point (DEPLOYED + live verified)
+
+**Status:** DEPLOYED `hf-gpus-off-20260711-0316`
+(`@sha256:ba4595d544dc440a12519a95dfd8c86ce342ce719f17dfe2748ff5c2cdb1c2a7`) to
+`amd-oneclick-lablab`. Code committed **LOCAL-ONLY (not pushed, per operator request)**:
+`b74d5b4` (`chore: disable /api/huggingface/gpus entry point`) on top of `84e368f`.
+
+**Change (single endpoint, from operator request):** `GET /api/huggingface/gpus` is
+intentionally short-circuited to **return `204 No Content` (empty body)** and no longer
+calls `k8s_client.gpu_capacity_summary()`. The bearer-auth dependency
+(`verify_huggingface_demo_api`) was removed from this route so it returns nothing
+unconditionally (a tokenless request now gets `204` instead of the old `401`). The
+admin twin `GET /api/admin/gpus` is **unchanged** (still Basic-auth, still reports live
+capacity). One file baked: `app/main.py`. Non-image edits in the same commit:
+`tests/test_hf_api_features.py` (`test_gpu_endpoint_shape` now asserts 204 + empty +
+`gpu_capacity_summary` never called), `docs/huggingface-demo-api.md`, `README.md`. Full
+suite green pre-build: 375 passed, 1 skipped.
+
+**Image build:** manager-only INCREMENTAL kaniko build (base unchanged, 1 file layered) —
+Pod `manager-build-hf-gpus-off-20260711-0316` in ns `amd-oneclick-lablab` (`nodeName:
+wx-k8s-prod-s-001`), kaniko `gcr.m.daocloud.io/kaniko-project/executor:debug`, `FROM
+10.5.10.89:1808/xinwei/amd-oneclick-manager:models-20260710-1630` + `COPY app/main.py
+/app/app/main.py`. Context via emptyDir `ctx` staged by an init container (reusing the
+manager base image, already on-node) that copies `app/main.py` + `Dockerfile` out of a
+ConfigMap (`manager-build-src-...`, md5 `85abe112…` verified byte-identical). Flags
+`--single-snapshot --insecure --skip-tls-verify --insecure-pull`. Registry auth reused
+`kaniko-harbor-auth` Secret (key `config.json`). Pushed
+`10.5.10.89:1808/xinwei/amd-oneclick-manager:hf-gpus-off-20260711-0316`
+(`@sha256:ba4595d5…`). Import/behavior-verified in a throwaway pod (reusing the real
+Deployment's envFrom: config + lablab-secrets + postgres + sfs-turbo) BEFORE rolling:
+`import app.main` clean, `huggingface_demo_gpus()` returns `Response status=204 body=b''`,
+signature `()` (auth dep gone). Build + verify pods + build ConfigMap deleted.
+
+**Deploy:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=…:hf-gpus-off-20260711-0316`. RollingUpdate (maxSurge=0/maxUnavailable=1, 3
+replicas), 3/3 rolled out in ~73s, 0 restarts on all three final replicas
+(`s-001`/`s-002`/`s-003`). PRE/APPLIED snapshots:
+`local-deploy-history/radeon-global/20260711-0316-hf-gpus-off-{PRE,APPLIED}-deploy.yaml`
+(PRE `sha256:7bb7c769304815bb43d582a6064f826b97d9d758aeb48e93f4d78e827c18004c`,
+APPLIED `sha256:eae22aff8c1e1ebe73207621df19d916c249b499e7331d1161540d187fec5616`).
+
+**Verification (LIVE at public edge `https://radeon-global.anruicloud.com`):**
+- `/health`: 200 (x3 consecutive).
+- `GET /api/huggingface/gpus` (no token): `HTTP/2 204`, empty body (was `401` pre-deploy).
+- `GET /api/huggingface/gpus` (bearer `test123`): `204`, `size_download=0`.
+- `GET /api/admin/gpus` (no auth): `401` — admin twin intact, NOT short-circuited.
+- ~live user/workspace pods undisturbed (manager-only rollout).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:models-20260710-1630` (base image
+still on nodes), or re-apply the PRE snapshot. No ConfigMap/Secret/RBAC/Service changes.
+
 ## 2026-07-10 14:00 - radeon-global: shared workshop model NFS mount at /models (DEPLOYED + e2e verified)
 
 **Status:** DEPLOYED `models-20260710-1400`
