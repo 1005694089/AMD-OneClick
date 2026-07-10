@@ -24,6 +24,101 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-10 14:00 - radeon-global: shared workshop model NFS mount at /models (DEPLOYED + e2e verified)
+
+**Status:** DEPLOYED `models-20260710-1400`
+(`@sha256:071b3ab731703fd6c5cc0d71092c831dca6062144ef9a5df0c9b39115d5485c9`) to
+`amd-oneclick-lablab`. Code committed **LOCAL-ONLY (not pushed, per operator request)**:
+`7c7fcb1` (cache-bust) on top of `d82b300` (feature), base commit `dc5ae12` (the
+running `harbor-seed-20260709-2331` image's commit).
+
+**Feature added (from plan `.cursor/plans/workshop_model_nfs_mount_109d7894.plan.md`):**
+An optional per-template shared model directory mounted at `/models` from a single RWX
+PVC `workshop-model` on `managed-nfs-storage-1` (SFS-Turbo `712f4074-...`, ~101 TiB,
+verified mountable — the deploy-ledger's earlier "denies mounts" note on this backend
+was stale). Two subdirectories (`ComfyUI`, `Openclaw`) are exposed one-at-a-time via
+K8s `subPath`, so a pod only ever sees the chosen subdir. Write access is gated on the
+existing `is_editor` user flag: editors get RW, everyone else (and all HF API launches)
+get `readOnly: true` — enforced by kubelet, verified at runtime.
+
+Surfaced in:
+- **Template forms** (`static/template_form.js`, shared by admin/index/profile): new
+  optional "Model Directory" select (None default, `allowClear`). Stored per template in
+  `notebook_templates.model_mount` (new nullable `VARCHAR(64)` column, additive
+  auto-migration in `ensure_schema_columns`). Cache-bust `?v=20260709-storage` ->
+  `?v=20260710-models` in the 3 HTML files so returning browsers refetch.
+- **HF Demo API** (`POST /api/huggingface/notebooks`): new optional `model_mount` field
+  (`comfyui`|`openclaw`|null), always read-only for API users (`user_is_editor=False`).
+  Documented in `docs/huggingface-demo-api.md`.
+- Threaded template->pod via `_provision_template_instance` -> `create_instance` ->
+  `_get_pod_manifest` (new `model_mount` + `user_is_editor` params). Pod reuse compares
+  the resolved model-dir annotation so switching mounts replaces the pod. Idempotent PVC
+  bootstrap `_ensure_workshop_model_pvc` at manager startup (lifespan).
+
+**Pre-deploy prep (lablab-only):** created PVC `workshop-model` (RWX, 10Ti,
+`managed-nfs-storage-1`, Bound) + `ComfyUI`/`Openclaw` dirs (0777) via a one-shot
+busybox pod in `amd-oneclick-lablab`. Manager's startup bootstrap is idempotent and
+no-ops against it.
+
+**Review:** 3 review subagents pre-deploy (correctness + security + HF-API) — found+fixed
+one pod-reuse annotation key/value mismatch (`comfyui` vs `ComfyUI`) before build; subPath
+traversal, validation allowlist, and readOnly escalation all confirmed safe. Full test
+suite green (375 passed, 1 skipped) after fixing 4 pre-existing test regressions unrelated
+to this change (fake-k8s `invalidate_service_ip`, recalibrated mem profiles, flush-pod
+`time.sleep` patch, Harbor sync-route dead test skip, image-tag seed fallback).
+
+**Image build:** manager-only INCREMENTAL kaniko build (base unchanged, 9 files layered) —
+Pod `manager-build-models-20260710-1400` in ns `amd-oneclick-lablab` (`nodeName:
+wx-k8s-prod-s-001`), kaniko `gcr.m.daocloud.io/kaniko-project/executor:debug`, `FROM
+10.5.10.89:1808/xinwei/amd-oneclick-manager:harbor-seed-20260709-2331` + `COPY` of
+`app/{config,k8s_client,main,models,store}.py`, `static/template_form.js`,
+`templates/{admin,index,profile}.html`. Context via the "fast" `ctx` emptyDir +
+`wait-for-context` init polling `/workspace/.ready`, populated by `kubectl cp`;
+md5-verified byte-identical before signaling ready. `--single-snapshot --insecure
+--skip-tls-verify --insecure-pull`. Registry auth reused `kaniko-harbor-auth` Secret
+(key `config.json`). Pushed
+`10.5.10.89:1808/xinwei/amd-oneclick-manager:models-20260710-1400`
+(`@sha256:071b3ab7...`). Import/symbol-verified in a throwaway pod (reusing the real
+Deployment's envFrom: config + lablab-secrets + postgres + sfs-turbo) BEFORE rolling:
+`import app.main` clean, `_ensure_workshop_model_pvc` present, `model_mount` on both
+request models, `WORKSHOP_MODEL_*` settings correct, `template_form.js` baked with
+`model_mount`, `index.html` baked with the new cache-bust. Build + verify pods deleted.
+
+**Deploy:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=...:models-20260710-1400`. RollingUpdate (maxSurge=0/maxUnavailable=1, 2 replicas),
+2/2 rolled out in ~41s, 0 restarts on both final replicas (`s-002`, `s-003`). Startup logs
+clean: "Workshop model PVC ready: workshop-model", "Durable workspace shards ready [0-3]",
+"Application startup complete". PRE/APPLIED snapshots:
+`local-deploy-history/radeon-global/20260710-1400-models-{PRE,APPLIED}-deploy.yaml`
+(PRE `sha256:ae3845fbc2d95a4c84a2c876cc3edcc70052d0e1b85b8dbf6ae68505c7391009`,
+APPLIED `sha256:abfabbfd9a80a575f1b71f38823f3298d9e734e5ccdb0bb97867515fc7c2b56a`).
+
+**Transient (benign, NOT a regression):** post-rollout the manager logged WebSocket-proxy
+404s for 8 distinct instances — all confirmed `NO_POD`/`NO_SVC` (already-destroyed
+instances whose users' browser tabs keep retrying kernel/collaboration websockets). This
+diff never touches ws-proxy or service-IP resolution; `/health` stayed 200 throughout.
+Same class as prior deploys' documented reconnect churn.
+
+**Verification (e2e on LIVE cluster, ~live user pods undisturbed):**
+- `/health` at public edge: 200 (x5 consecutive).
+- DB migration: `model_mount` column present on `notebook_templates`; `is_editor` write-gate
+  present on `users`.
+- **Model mount (HF API, T1):** launched `gpu_count=1, model_mount=comfyui` for
+  `e2e-modelmount-*` -> `hf-695-bc7f4c49`. Pod annotation `amd-oneclick/model-mount:
+  ComfyUI`; `notebook` container has volume `workshop-model` (PVC `workshop-model`) mounted
+  at `/models`, `readOnly: true`, `subPath: ComfyUI`.
+- **Read-only enforcement (T2):** inside the running pod, `/models` shows the ComfyUI subdir
+  and `touch /models/probe` fails `Read-only file system` (WRITE_BLOCKED_AS_EXPECTED).
+- **Frontend:** served `template_form.js?v=20260710-models` contains "Model Directory";
+  `GET /` references the new cache-bust query.
+- Cleanup: test instance destroyed via API (`destroyed_count: 1`, pod Terminating).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deploy/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:harbor-seed-20260709-2331` (base image
+still on nodes), or re-apply the PRE snapshot. The `model_mount` column + `workshop-model`
+PVC are additive — the rollback image simply ignores them. No ConfigMap/Secret/RBAC/Service
+changes.
+
 ## 2026-07-09 18:52 - radeon-global: PVC-optional storage + workshop repo_sub_path (DEPLOYED + e2e verified)
 
 **Status:** DEPLOYED `pvc-tpl-20260709-1852`
