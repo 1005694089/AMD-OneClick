@@ -36,16 +36,20 @@ class NodePortAllocationTests(unittest.TestCase):
             k8s_module.settings.NODE_PORT_BASE,
             k8s_module.settings.NODE_PORT_MAX,
             k8s_module.settings.NODE_PORT_CLUSTER_SCAN_ENABLED,
+            k8s_module.settings.OPENCODE_ENABLED,
         )
         k8s_module.settings.NODE_PORT_BASE = 32500
         k8s_module.settings.NODE_PORT_MAX = 32699
         k8s_module.settings.NODE_PORT_CLUSTER_SCAN_ENABLED = False
+        # This class exercises the jupyter+opencode dual-port allocation/retry path.
+        k8s_module.settings.OPENCODE_ENABLED = True
 
     def tearDown(self):
         (
             k8s_module.settings.NODE_PORT_BASE,
             k8s_module.settings.NODE_PORT_MAX,
             k8s_module.settings.NODE_PORT_CLUSTER_SCAN_ENABLED,
+            k8s_module.settings.OPENCODE_ENABLED,
         ) = self.original
 
     def test_used_node_ports_does_not_scan_cluster_when_disabled(self):
@@ -81,6 +85,26 @@ class NodePortAllocationTests(unittest.TestCase):
         self.assertEqual(client._allocate_node_port({32500}, start_port=32500), 32501)
         with self.assertRaises(RuntimeError):
             client._allocate_node_port({32500, 32501}, start_port=32500)
+
+    def test_opencode_disabled_allocates_single_port(self):
+        # With OpenCode disabled (the default) an instance gets ONLY a jupyter NodePort:
+        # opencode_node_port is None and no second port is allocated. This is the change that
+        # frees ~half the NodePort range (instances drop from a pair to a single port).
+        k8s_module.settings.OPENCODE_ENABLED = False
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+        client.core_v1 = FakeCoreV1()
+
+        with patch.object(k8s_module.random, "randint", return_value=0):
+            node_port, opencode_node_port, created = client._create_service_with_nodeport_retry(
+                "hf-user@example.test", "hf-demo",
+            )
+
+        self.assertTrue(created)
+        self.assertIsNone(opencode_node_port)
+        # First candidate 32500 is rejected by the stub; retry lands on 32501 (jupyter only).
+        self.assertEqual(node_port, 32501)
+        self.assertEqual(client.core_v1.created_ports, [32500, 32501])
 
 
 class NotebookNodePinningTests(unittest.TestCase):
@@ -305,9 +329,14 @@ class HuggingFaceEndpointTests(unittest.TestCase):
     def test_service_launch_waits_on_jupyter_not_all_jobs(self):
         # Regression: a bare `wait` keeps the pod alive as long as ANY backgrounded job runs,
         # so a crashed Jupyter is masked by a still-running OpenCode. We must wait on Jupyter's
-        # PID specifically, then tear OpenCode down and exit with Jupyter's code.
+        # PID specifically, then tear OpenCode down and exit with Jupyter's code. (OpenCode path.)
         client = object.__new__(k8s_module.K8sClient)
-        snippet = client._service_launch_snippet("nb-1", "/work")
+        orig = k8s_module.settings.OPENCODE_ENABLED
+        try:
+            k8s_module.settings.OPENCODE_ENABLED = True
+            snippet = client._service_launch_snippet("nb-1", "/work")
+        finally:
+            k8s_module.settings.OPENCODE_ENABLED = orig
 
         self.assertIn("JUPYTER_PID=$!", snippet)
         self.assertIn("OPENCODE_REQUIRED_VERSION", snippet)
@@ -318,6 +347,24 @@ class HuggingFaceEndpointTests(unittest.TestCase):
         self.assertIn('exit "$JUPYTER_RC"', snippet)
         # The old unconditional `wait` (no PID) must be gone.
         self.assertNotIn("\nwait\n", snippet)
+
+    def test_service_launch_omits_opencode_when_disabled(self):
+        # With OpenCode disabled (default), the pod runs ONLY Jupyter: no opencode install/web
+        # and no OPENCODE_PID teardown, yet Jupyter is still waited on and its exit code honored.
+        client = object.__new__(k8s_module.K8sClient)
+        orig = k8s_module.settings.OPENCODE_ENABLED
+        try:
+            k8s_module.settings.OPENCODE_ENABLED = False
+            snippet = client._service_launch_snippet("nb-1", "/work")
+        finally:
+            k8s_module.settings.OPENCODE_ENABLED = orig
+
+        self.assertIn("JUPYTER_PID=$!", snippet)
+        self.assertIn('wait "$JUPYTER_PID"', snippet)
+        self.assertIn('exit "$JUPYTER_RC"', snippet)
+        self.assertNotIn("OPENCODE_REQUIRED_VERSION", snippet)
+        self.assertNotIn("opencode web", snippet)
+        self.assertNotIn("OPENCODE_PID", snippet)
 
 
 def _event(reason, message, ts):

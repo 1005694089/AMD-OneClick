@@ -1,0 +1,20 @@
+# Thin / incremental manager build for the "disable OpenCode" change.
+#
+# Reuses the currently-deployed manager image as the base (same Python + pip deps + skopeo layers)
+# and overlays the current working-tree source. requirements.txt is UNCHANGED, so there is no pip
+# step and the build is seconds, not minutes. A full COPY of app/templates/static (not a 2-file
+# overlay) makes the result independent of whatever code the base image happens to have baked in:
+# the shipped image is exactly (base deps) + (current working-tree source).
+#
+# Bump this FROM tag if a newer manager base is rolled out before this build runs.
+FROM 10.5.10.89:1808/xinwei/amd-oneclick-manager:hf-gpus-off-20260711-0316
+
+WORKDIR /app
+
+COPY app/ ./app/
+COPY templates/ ./templates/
+COPY static/ ./static/
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -35,12 +35,15 @@ class OpenCodeAuthTests(unittest.TestCase):
             k8s_module.settings.PUBLIC_BASE_URL,
             k8s_module.settings.SERVICE_HOST,
             k8s_module.settings.OPENCODE_PUBLIC_BASE_URL,
+            k8s_module.settings.OPENCODE_ENABLED,
         )
         # NOTEBOOK_TOKEN is deliberately DIFFERENT from the password secret: the OpenCode
         # password must derive from the server-only secret, never from the user-visible token.
         k8s_module.settings.NOTEBOOK_TOKEN = "user-visible-tok"
         k8s_module.settings.OPENCODE_PASSWORD_SECRET = "server-only-secret"
         k8s_module.settings.OPENCODE_WEB_USERNAME = "opencode"
+        # These tests validate the OpenCode credential wiring that only exists when enabled.
+        k8s_module.settings.OPENCODE_ENABLED = True
 
     def tearDown(self):
         (
@@ -50,6 +53,7 @@ class OpenCodeAuthTests(unittest.TestCase):
             k8s_module.settings.PUBLIC_BASE_URL,
             k8s_module.settings.SERVICE_HOST,
             k8s_module.settings.OPENCODE_PUBLIC_BASE_URL,
+            k8s_module.settings.OPENCODE_ENABLED,
         ) = self._orig
 
     @staticmethod
@@ -187,29 +191,21 @@ class DualPortAllocationTests(unittest.TestCase):
             k8s_module.settings.NODE_PORT_BASE,
             k8s_module.settings.NODE_PORT_MAX,
             k8s_module.settings.NODE_PORT_CLUSTER_SCAN_ENABLED,
+            k8s_module.settings.OPENCODE_ENABLED,
         )
         k8s_module.settings.NODE_PORT_BASE = 32500
         k8s_module.settings.NODE_PORT_MAX = 32699
         k8s_module.settings.NODE_PORT_CLUSTER_SCAN_ENABLED = False
+        # This class exercises the jupyter+opencode dual-port allocation/retry path.
+        k8s_module.settings.OPENCODE_ENABLED = True
 
     def tearDown(self):
         (
             k8s_module.settings.NODE_PORT_BASE,
             k8s_module.settings.NODE_PORT_MAX,
             k8s_module.settings.NODE_PORT_CLUSTER_SCAN_ENABLED,
+            k8s_module.settings.OPENCODE_ENABLED,
         ) = self._orig
-
-    def test_allocate_pair_returns_distinct_ports(self):
-        client = object.__new__(k8s_module.K8sClient)
-        jupyter, opencode = client._allocate_node_port_pair(set(), start_port=32500)
-        self.assertEqual((jupyter, opencode), (32500, 32501))
-
-    def test_allocate_pair_skips_used_ports(self):
-        client = object.__new__(k8s_module.K8sClient)
-        jupyter, opencode = client._allocate_node_port_pair({32500, 32502}, start_port=32500)
-        self.assertEqual(jupyter, 32501)
-        self.assertEqual(opencode, 32503)
-        self.assertNotEqual(jupyter, opencode)
 
     def test_create_service_retries_when_opencode_port_conflicts(self):
         # Stub rejects only the opencode port (ports[1]) of the first pair, forcing the
@@ -274,6 +270,52 @@ class DualPortAllocationTests(unittest.TestCase):
         self.assertEqual(instances[0]["node_port"], 30001)
         self.assertEqual(instances[0]["opencode_node_port"], 30002)
         self.assertIsNotNone(instances[0]["opencode_url"])
+
+
+class OpenCodeDisabledTests(unittest.TestCase):
+    """Master switch OFF (the default): OpenCode leaves no trace on the pod or service."""
+
+    def setUp(self):
+        self._orig = k8s_module.settings.OPENCODE_ENABLED
+        k8s_module.settings.OPENCODE_ENABLED = False
+
+    def tearDown(self):
+        k8s_module.settings.OPENCODE_ENABLED = self._orig
+
+    def test_pod_manifest_omits_opencode_env_and_container_port(self):
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+
+        manifest = client._get_pod_manifest(
+            "hf-user@example.test", "hf-demo", "notebook-image",
+        )
+        container = manifest["spec"]["containers"][0]
+
+        env_names = {e["name"] for e in container["env"]}
+        self.assertNotIn("OPENCODE_SERVER_USERNAME", env_names)
+        self.assertNotIn("OPENCODE_SERVER_PASSWORD", env_names)
+
+        port_names = {p.get("name") for p in container["ports"]}
+        self.assertIn("jupyter", port_names)
+        self.assertNotIn("opencode", port_names)
+
+    def test_service_manifest_has_only_jupyter_when_opencode_port_none(self):
+        client = object.__new__(k8s_module.K8sClient)
+        client.namespace = "amd-oneclick-radeon-beta"
+
+        manifest = client._get_service_manifest(
+            "u@example.test", "nb-1", 30001, opencode_node_port=None,
+        )
+        port_names = {p.get("name") for p in manifest["spec"]["ports"]}
+        self.assertEqual(port_names, {"jupyter"})
+
+    def test_opencode_instance_type_stays_launchable(self):
+        # The kill-switch must NOT disable the "opencode" instance type: it is the default notebook
+        # launcher (the UI hardcodes instance_type=opencode for the main + custom-image launches),
+        # so disabling the type would 400 the primary launch path. Disabling only strips the
+        # opencode web server + NodePort; an opencode-type launch degrades to Jupyter-only.
+        from app.config import INSTANCE_TYPES
+        self.assertTrue(INSTANCE_TYPES["opencode"]["enabled"])
 
 
 if __name__ == "__main__":

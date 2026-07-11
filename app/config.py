@@ -17,6 +17,11 @@ INSTANCE_TYPES = {
         "max_lifetime_hours": None,
         "idle_timeout_minutes": None,
     },
+    # NOTE: "opencode" is the DEFAULT notebook launcher in the UI (the "Notebook (Jupyter /
+    # OpenCode)" option; index.html/profile.html hardcode instance_type=opencode). It MUST stay
+    # enabled or the primary launch path 400s. The OpenCode *web server + NodePort* are gated
+    # separately by settings.OPENCODE_ENABLED (default off) in k8s_client — when off, an
+    # opencode-type launch degrades to Jupyter-only (no opencode web, no opencode NodePort).
     "opencode": {
         "name": "OpenCode",
         "description": "AI coding agent in terminal — launch opencode from Jupyter",
@@ -536,6 +541,13 @@ class Settings:
 
     # OpenCode web (second in-pod service alongside Jupyter). The HTTP basic-auth password is a
     # per-instance HMAC so the web UI is never exposed unauthenticated on a NodePort.
+    # Master kill-switch for the OpenCode WEB feature (default OFF): when false, no per-instance
+    # opencode NodePort is allocated, the pod does not start the opencode web server, and its env +
+    # container port are omitted — freeing ~half the NodePort range. The "opencode" instance type
+    # itself stays launchable (it is the default Jupyter notebook launcher); disabling only strips
+    # the OpenCode web/NodePort, so a launch degrades to Jupyter-only. Set OPENCODE_ENABLED=true to
+    # restore the feature.
+    OPENCODE_ENABLED: bool = os.getenv("OPENCODE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     OPENCODE_WEB_PORT: int = int(os.getenv("OPENCODE_WEB_PORT", "4096"))
     OPENCODE_VERSION: str = os.getenv("OPENCODE_VERSION", "1.4.6")
     OPENCODE_WEB_USERNAME: str = os.getenv("OPENCODE_WEB_USERNAME", "opencode")

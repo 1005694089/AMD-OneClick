@@ -1773,44 +1773,50 @@ findmnt "$mnt"
         else:
             collab_gate = ""
             collab_flag_ref = ""
+        # OpenCode is gated on the master switch. When disabled (default) the pod runs ONLY Jupyter
+        # and never starts the opencode web server (no opencode NodePort is exposed either, see
+        # _allocate_instance_node_ports). When enabled it runs in a backgrounded, fully-bounded
+        # subshell so it can never delay Jupyter.
+        if settings.OPENCODE_ENABLED:
+            opencode_block = (
+                "(\n"
+                f"  OPENCODE_REQUIRED_VERSION='{settings.OPENCODE_VERSION}'\n"
+                "  OPENCODE_CURRENT_VERSION=\"$(opencode --version 2>/dev/null | tr -d '[:space:]' || true)\"\n"
+                "  if [ \"$OPENCODE_CURRENT_VERSION\" != \"$OPENCODE_REQUIRED_VERSION\" ]; then\n"
+                "    echo \"Installing OpenCode ${OPENCODE_REQUIRED_VERSION} (current: ${OPENCODE_CURRENT_VERSION:-missing})\" >>/tmp/opencode-web.log\n"
+                "    ( timeout 300 sh -c 'curl -4 -fsSL --connect-timeout 10 --max-time 180 --retry 2 -o /tmp/oc-install.sh https://opencode.ai/install && bash /tmp/oc-install.sh --version \"'\"$OPENCODE_REQUIRED_VERSION\"'\"' ) >>/tmp/opencode-web.log 2>&1 || timeout 300 npm i -g \"opencode-ai@$OPENCODE_REQUIRED_VERSION\" >>/tmp/opencode-web.log 2>&1 || echo 'OpenCode install failed; continuing without it.' >>/tmp/opencode-web.log\n"
+                "    if [ \"$(/usr/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /usr/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
+                "    if [ \"$(/root/.opencode/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
+                "  fi\n"
+                "  opencode --version >>/tmp/opencode-web.log 2>&1 || true\n"
+                "  if command -v opencode >/dev/null 2>&1; then\n"
+                f"    opencode web --port {settings.OPENCODE_WEB_PORT} --hostname 0.0.0.0 >>/tmp/opencode-web.log 2>&1\n"
+                "  fi\n"
+                ") &\n"
+                "OPENCODE_PID=$!\n"
+            )
+            opencode_kill = 'kill "$OPENCODE_PID" 2>/dev/null\n'
+        else:
+            opencode_block = ""
+            opencode_kill = ""
+
         return (
             "set +e\n"
             "export PATH=\"/usr/local/bin:/usr/bin:/root/.opencode/bin:$PATH\"\n"
             ": > /tmp/opencode-web.log\n"
             f"{collab_gate}"
-            # CRITICAL: start Jupyter FIRST and never block it on OpenCode. OpenCode is opt-in and
-            # its installer fetches from opencode.ai/github (intermittently throttled from
-            # cn-shanghai); a blocking, un-timed install there used to hang the whole startup so
-            # Jupyter never launched and the instance was stuck "JupyterStarting". Jupyter is the
-            # required process — launch it immediately; reconcile + run OpenCode in the background.
+            # CRITICAL: start Jupyter FIRST and never block it on OpenCode. Jupyter is the required
+            # process — launch it immediately; reconcile + run OpenCode (if enabled) in the background.
             f"jupyter lab --ip=0.0.0.0 --port={settings.NOTEBOOK_PORT} --no-browser --allow-root "
             f"{collab_flag_ref}"
             f"--ServerApp.token='{settings.NOTEBOOK_TOKEN}' --ServerApp.base_url='{base_url}' "
             f"--notebook-dir={notebook_dir} &\n"
             "JUPYTER_PID=$!\n"
-            # OpenCode setup runs entirely in a backgrounded subshell, fully bounded so it can never
-            # delay Jupyter. The version normally matches the baked image (no reinstall); if it ever
-            # mismatches, the install is timeout-capped and best-effort. opencode web only starts if
-            # the binary is present.
-            "(\n"
-            f"  OPENCODE_REQUIRED_VERSION='{settings.OPENCODE_VERSION}'\n"
-            "  OPENCODE_CURRENT_VERSION=\"$(opencode --version 2>/dev/null | tr -d '[:space:]' || true)\"\n"
-            "  if [ \"$OPENCODE_CURRENT_VERSION\" != \"$OPENCODE_REQUIRED_VERSION\" ]; then\n"
-            "    echo \"Installing OpenCode ${OPENCODE_REQUIRED_VERSION} (current: ${OPENCODE_CURRENT_VERSION:-missing})\" >>/tmp/opencode-web.log\n"
-            "    ( timeout 300 sh -c 'curl -4 -fsSL --connect-timeout 10 --max-time 180 --retry 2 -o /tmp/oc-install.sh https://opencode.ai/install && bash /tmp/oc-install.sh --version \"'\"$OPENCODE_REQUIRED_VERSION\"'\"' ) >>/tmp/opencode-web.log 2>&1 || timeout 300 npm i -g \"opencode-ai@$OPENCODE_REQUIRED_VERSION\" >>/tmp/opencode-web.log 2>&1 || echo 'OpenCode install failed; continuing without it.' >>/tmp/opencode-web.log\n"
-            "    if [ \"$(/usr/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /usr/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
-            "    if [ \"$(/root/.opencode/bin/opencode --version 2>/dev/null | tr -d '[:space:]')\" = \"$OPENCODE_REQUIRED_VERSION\" ]; then ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode 2>/dev/null || true; fi\n"
-            "  fi\n"
-            "  opencode --version >>/tmp/opencode-web.log 2>&1 || true\n"
-            "  if command -v opencode >/dev/null 2>&1; then\n"
-            f"    opencode web --port {settings.OPENCODE_WEB_PORT} --hostname 0.0.0.0 >>/tmp/opencode-web.log 2>&1\n"
-            "  fi\n"
-            ") &\n"
-            "OPENCODE_PID=$!\n"
+            f"{opencode_block}"
             'wait "$JUPYTER_PID"\n'
             "JUPYTER_RC=$?\n"
             'echo "Jupyter exited with code $JUPYTER_RC; stopping container."\n'
-            'kill "$OPENCODE_PID" 2>/dev/null\n'
+            f"{opencode_kill}"
             'exit "$JUPYTER_RC"\n'
         )
 
@@ -2452,14 +2458,15 @@ exec {cmd}
             {"name": "HF_HOME", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HUGGINGFACE_HUB_CACHE", "value": settings.HF_CACHE_MOUNT_PATH},
             {"name": "HF_HUB_DISABLE_XET", "value": settings.HF_HUB_DISABLE_XET},
+        ]
+        if settings.OPENCODE_ENABLED:
             # Protect OpenCode web (bound to 0.0.0.0 on a NodePort) with HTTP Basic auth.
             # OpenCode reads these for both `serve` and `web`. The password is per-instance
             # (HMAC keyed on the server-only OPENCODE_PASSWORD_SECRET + instance_id) so it can't
             # be reused against another owner's NodePort; the same value is embedded in this
             # owner's opencode_url.
-            {"name": "OPENCODE_SERVER_USERNAME", "value": settings.OPENCODE_WEB_USERNAME},
-            {"name": "OPENCODE_SERVER_PASSWORD", "value": self._opencode_password(instance_id)},
-        ]
+            env.append({"name": "OPENCODE_SERVER_USERNAME", "value": settings.OPENCODE_WEB_USERNAME})
+            env.append({"name": "OPENCODE_SERVER_PASSWORD", "value": self._opencode_password(instance_id)})
         use_modelscope = (model_source or "").strip().lower() == "modelscope"
         if use_modelscope:
             # vLLM/SGLang download the model from ModelScope instead of HuggingFace.
@@ -2856,8 +2863,9 @@ fi
 
         container_ports = [
             {"containerPort": settings.NOTEBOOK_PORT, "name": "jupyter"},
-            {"containerPort": settings.OPENCODE_WEB_PORT, "name": "opencode"},
         ]
+        if settings.OPENCODE_ENABLED:
+            container_ports.append({"containerPort": settings.OPENCODE_WEB_PORT, "name": "opencode"})
         for _app_name, _app_port in settings.APP_PORTS.items():
             container_ports.append({"containerPort": int(_app_port), "name": _app_name[:15]})
         if ssh_enabled:
@@ -3142,15 +3150,6 @@ exit 0
                 return port
         raise RuntimeError("No available NodePort in configured range")
 
-    def _allocate_node_port_pair(self, used_ports: Optional[set[int]] = None,
-                                 start_port: Optional[int] = None) -> tuple[int, int]:
-        """Allocate two distinct available NodePorts (jupyter + opencode)."""
-        used_ports = set(used_ports) if used_ports is not None else self._used_node_ports()
-        jupyter_port = self._allocate_node_port(used_ports, start_port=start_port)
-        opencode_port = self._allocate_node_port(used_ports | {jupyter_port},
-                                                 start_port=jupyter_port + 1)
-        return jupyter_port, opencode_port
-
     def _is_node_port_conflict(self, exc: ApiException) -> bool:
         message = str(exc).lower()
         return exc.status in {409, 422} and (
@@ -3186,16 +3185,24 @@ exit 0
 
     def _allocate_instance_node_ports(self, used_ports: Optional[set[int]] = None,
                                       start_port: Optional[int] = None,
-                                      ssh_enabled: bool = False) -> tuple[int, int, Optional[int]]:
-        """Allocate distinct NodePorts for Jupyter, OpenCode, and optional SSH."""
+                                      ssh_enabled: bool = False) -> tuple[int, Optional[int], Optional[int]]:
+        """Allocate distinct NodePorts for Jupyter, (optionally) OpenCode, and optional SSH.
+
+        OpenCode is gated on settings.OPENCODE_ENABLED. When disabled (the default) no opencode
+        NodePort is allocated (opencode_node_port is None), so each instance consumes only the
+        Jupyter port (plus SSH when enabled), freeing ~half the NodePort range.
+        """
         used_ports = set(used_ports) if used_ports is not None else self._used_node_ports()
-        jupyter_port, opencode_port = self._allocate_node_port_pair(used_ports, start_port=start_port)
+        jupyter_port = self._allocate_node_port(used_ports, start_port=start_port)
+        used_ports = used_ports | {jupyter_port}
+        opencode_port = None
+        if settings.OPENCODE_ENABLED:
+            opencode_port = self._allocate_node_port(used_ports, start_port=jupyter_port + 1)
+            used_ports = used_ports | {opencode_port}
         ssh_node_port = None
         if ssh_enabled:
-            ssh_node_port = self._allocate_node_port(
-                used_ports | {jupyter_port, opencode_port},
-                start_port=opencode_port + 1,
-            )
+            ssh_start = (opencode_port if opencode_port is not None else jupyter_port) + 1
+            ssh_node_port = self._allocate_node_port(used_ports, start_port=ssh_start)
         return jupyter_port, opencode_port, ssh_node_port
 
     def _create_service_with_nodeport_retry(self, email: str, instance_id: str,
