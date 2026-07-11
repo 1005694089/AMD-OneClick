@@ -24,6 +24,68 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-11 12:00 - radeon-global: disable OpenCode web + free its per-instance NodePorts (DEPLOYED + live verified)
+
+**Status:** DEPLOYED `opencode-off-20260711-1101`
+(`@sha256:d36dbb660fceb9f83cf66b2743fab596b2efd288320413530e4f4ac46077c66b`) to
+`amd-oneclick-lablab` (3 replicas, RollingUpdate maxSurge=0/maxUnavailable=1),
+fronted by Azure Front Door `https://radeon-global.anruicloud.com` -> NodePort 30080.
+
+**Code commit:** `6a016ed` (on `prod/radeon-global`) — `feat: OPENCODE_ENABLED switch to disable
+OpenCode web + free per-instance NodePorts`. This ledger entry is committed on top.
+
+**Why:** each instance allocated a SECOND per-instance NodePort (opencode, 4096) alongside jupyter,
+plus a global TLS proxy on NodePort 30450 — pushing the 30000-32767 range toward exhaustion.
+
+**Change:** new master switch `settings.OPENCODE_ENABLED` (env `OPENCODE_ENABLED`, default **off**).
+When off, `_allocate_instance_node_ports` allocates only the jupyter NodePort (opencode_node_port=
+None), `_service_launch_snippet` omits the opencode-web subshell, and the opencode env vars +
+containerPort are not injected — so each instance uses a single NodePort. The `opencode`
+INSTANCE_TYPE stays `enabled:True` (it is the default notebook launcher the UI hardcodes as
+`instance_type=opencode`), so a launch degrades to Jupyter-only rather than 400. Files:
+`app/config.py`, `app/k8s_client.py`, `tests/test_k8s_nodeport.py`, `tests/test_opencode_merge_fixes.py`.
+Reviewed by a 4-agent panel (Bugbot, security, code-quality, rollout-safety) to unanimous approval
+over 2 rounds. Full suite: 378 passed, 1 skipped.
+
+**Operational NodePort release (before rollout):** removed the opencode (4096) port from all live
+per-instance services via strategic-merge `$patch:delete` (jupyter/ssh untouched), and deleted the
+global opencode TLS proxy stack (Service+Deployment+ConfigMap) freeing NodePort 30450. Backup:
+`/tmp/opencode-nodeport-backup-20260711-103955/` (full svc YAML + freed-port list + proxy stack).
+
+**Image build:** THIN kaniko build — `FROM 10.5.10.89:1808/xinwei/amd-oneclick-manager:hf-gpus-off-20260711-0316`
++ `COPY app/ templates/ static/` (`Dockerfile.thin`), build pod `manager-build-opencode-off`
+(ns amd-oneclick-lablab). kaniko args add `--insecure-pull/--skip-tls-verify-pull` (base image is
+pulled from the same LAN Harbor). Pushed
+`10.5.10.89:1808/xinwei/amd-oneclick-manager:opencode-off-20260711-1101`
+(digest `@sha256:d36dbb660fceb9f83cf66b2743fab596b2efd288320413530e4f4ac46077c66b`). Built via
+`scripts/deploy-opencode-off.sh build` from this working tree; `app/` unchanged since build == commit `6a016ed`.
+
+**Deploy:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=...:opencode-off-20260711-1101`. Rollout **3/3, 0 restarts**, `/health` 200. Pre-deploy
+`verify` (throwaway pod on the new tag): `settings.OPENCODE_ENABLED is False`, 5 gating refs in
+`k8s_client.py`.
+
+**Verification (live):**
+- Post-rollout `sweep` removed residual opencode NodePorts **46 -> 0**.
+- Durability: after 75s of live launches, opencode NodePort count held at **0**; new services
+  (`hf-952`, `hf-953`) came up jupyter-only; NodePort 30450 free; 0 opencode mentions in manager logs.
+- `WebSocket ... 404 Instance service not found` log lines are pre-existing RTC reconnects to
+  already-reaped instances (`hf-108`/`hf-135` have no service at all); live instances (`hf-870`)
+  resolve + proxy 200.
+
+**No yaml applied:** rolled via `kubectl set image` (no manifest file); env/ConfigMap unchanged.
+**PRE/APPLIED snapshots:** `local-deploy-history/radeon-global/20260711-1152-opencode-off-{PRE,APPLIED}-deploy.yaml`
+(PRE image `hf-gpus-off-20260711-0316`).
+
+**Rollback:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=10.5.10.89:1808/xinwei/amd-oneclick-manager:hf-gpus-off-20260711-0316` (already-freed
+ports/30450 stay freed). Or re-enable without a rollback: set `OPENCODE_ENABLED=true` in the manager
+ConfigMap + `rollout restart`.
+
+**Follow-up:** stale `OPENCODE_PUBLIC_BASE_URL=https://radeon-global.anruicloud.com:30450` remains in
+ConfigMap `amd-oneclick-lablab-config` (harmless while off; footgun on re-enable) — cleanup command
+in `docs/ops/opencode-off-deploy-prep.md`.
+
 ## 2026-07-11 03:16 - radeon-global: disable HF `/api/huggingface/gpus` entry point (DEPLOYED + live verified)
 
 **Status:** DEPLOYED `hf-gpus-off-20260711-0316`
