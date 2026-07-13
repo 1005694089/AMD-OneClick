@@ -270,6 +270,9 @@ class Settings:
     # GeeTest recommends failing open when their service is unreachable so a GeeTest
     # outage does not lock users out; per-IP/per-email rate limits remain the backstop.
     GEETEST_FAIL_OPEN: bool = os.getenv("GEETEST_FAIL_OPEN", "true").lower() in {"1", "true", "yes", "on"}
+    # After a passed CAPTCHA, a short-lived signed cookie lets the OAuth login
+    # start (GitHub/ModelScope) redirect without re-challenging on the same click.
+    CAPTCHA_GATE_TTL_SECONDS: int = int(os.getenv("CAPTCHA_GATE_TTL_SECONDS", "300"))
 
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")

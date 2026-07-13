@@ -18,7 +18,7 @@ from urllib.parse import quote, urlencode, urlparse, parse_qsl
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.middleware.sessions import SessionMiddleware
 import secrets
@@ -921,6 +921,8 @@ async def profile_page(request: Request):
 @app.get("/auth/github/login")
 async def github_login(request: Request):
     _enforce_login_rate_limit(request)
+    if settings.CAPTCHA_ENABLED and not _valid_captcha_gate(request.cookies.get(CAPTCHA_GATE_COOKIE, "")):
+        return _captcha_interstitial("github", request.url.path)
     if not settings.GITHUB_CLIENT_ID:
         raise HTTPException(status_code=500, detail="GitHub OAuth is not configured")
     params = {
@@ -982,6 +984,8 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
 @app.get("/auth/modelscope/login")
 async def modelscope_login(request: Request):
     _enforce_login_rate_limit(request)
+    if settings.CAPTCHA_ENABLED and not _valid_captcha_gate(request.cookies.get(CAPTCHA_GATE_COOKIE, "")):
+        return _captcha_interstitial("modelscope", request.url.path)
     if not settings.MODELSCOPE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="ModelScope OAuth is not configured")
     params = {
@@ -1173,6 +1177,104 @@ def _verify_captcha(captcha: dict) -> bool:
     except Exception as e:
         logger.warning("GeeTest unreachable (fail_open=%s): %s", settings.GEETEST_FAIL_OPEN, e)
         return bool(settings.GEETEST_FAIL_OPEN)
+
+
+CAPTCHA_GATE_COOKIE = "amd_oneclick_captcha_gate"
+
+
+def _issue_captcha_gate() -> str:
+    """Signed, short-lived proof that a CAPTCHA was just solved, carried as a
+    cookie so an OAuth login start can redirect on the same click without a
+    second challenge."""
+    exp = str(int(time.time()) + int(settings.CAPTCHA_GATE_TTL_SECONDS))
+    sig = hmac.new(settings.SESSION_SECRET.encode("utf-8"), exp.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _valid_captcha_gate(cookie: str) -> bool:
+    if not cookie or "." not in cookie:
+        return False
+    exp_s, _, sig = cookie.rpartition(".")
+    if not exp_s.isdigit():
+        return False
+    if int(exp_s) < int(time.time()):
+        return False
+    good = hmac.new(settings.SESSION_SECRET.encode("utf-8"), exp_s.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, good)
+
+
+def _captcha_interstitial(provider: str, return_url: str) -> HTMLResponse:
+    """Self-contained page that renders the GeeTest widget, then POSTs the result
+    to /auth/captcha/gate and returns the user to ``return_url`` (the OAuth login
+    start). Used so every entry point into GitHub/ModelScope login is gated without
+    editing each link."""
+    cid = json.dumps(settings.GEETEST_CAPTCHA_ID)
+    ret = json.dumps(return_url)
+    label = "GitHub" if provider == "github" else ("ModelScope" if provider == "modelscope" else provider)
+    html = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>安全验证 / Security check</title>
+<script src="https://static.geetest.com/v4/gt4.js"></script>
+<style>
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f6f8;color:#1f2430;display:flex;min-height:100vh;align-items:center;justify-content:center}
+  .card{background:#fff;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.08);padding:28px 32px;max-width:360px;width:calc(100% - 40px);text-align:center}
+  h3{margin:0 0 6px;font-size:18px}
+  p{margin:6px 0;color:#566175;font-size:14px}
+  #cap{margin:18px 0 6px;display:flex;justify-content:center}
+  #status{min-height:18px;font-size:13px}
+  a{color:#1677ff;text-decoration:none;font-size:13px}
+</style></head><body>
+<div class="card">
+  <h3>安全验证</h3>
+  <p>请完成验证后继续使用 __LABEL__ 登录<br>Complete the check to continue to __LABEL__ login.</p>
+  <div id="cap"></div>
+  <p id="status"></p>
+  <a href="/">返回首页 / Back to home</a>
+</div>
+<script>
+  var CAPTCHA_ID = __CID__, RETURN_URL = __RET__;
+  var st = document.getElementById('status');
+  function boot(){
+    if(!window.initGeetest4){ return setTimeout(boot, 300); }
+    window.initGeetest4({ captchaId: CAPTCHA_ID, product: 'popup', language: 'zho', riskType: 'slide' }, function(c){
+      c.appendTo('#cap');
+      c.onSuccess(function(){
+        st.textContent = '验证中… / Verifying…';
+        fetch('/auth/captcha/gate', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ captcha: c.getValidate() }) })
+          .then(function(r){ if(r.ok){ st.textContent='已验证,正在跳转… / Verified, redirecting…'; location.replace(RETURN_URL); } else { st.textContent='验证失败,请重试 / Verification failed, please retry'; try{c.reset();}catch(e){} } })
+          .catch(function(){ st.textContent='网络错误,请重试 / Network error, please retry'; try{c.reset();}catch(e){} });
+      });
+      c.onError(function(){ st.textContent='验证组件加载失败,请刷新 / Widget failed to load, please refresh'; });
+    });
+  }
+  boot();
+</script></body></html>"""
+    html = html.replace("__LABEL__", label).replace("__CID__", cid).replace("__RET__", ret)
+    return HTMLResponse(html)
+
+
+@app.post("/auth/captcha/gate")
+async def captcha_gate(request: Request):
+    """Verify a GeeTest result and, on success, set the short-lived gate cookie so
+    the follow-up OAuth login start can proceed."""
+    if not settings.CAPTCHA_ENABLED:
+        return JSONResponse({"ok": True})
+    _enforce_login_rate_limit(request)
+    payload = await request.json()
+    captcha = payload.get("captcha") if isinstance(payload.get("captcha"), dict) else payload
+    if not _verify_captcha(captcha):
+        raise HTTPException(status_code=400, detail="Captcha verification failed. Please try again.")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        CAPTCHA_GATE_COOKIE,
+        _issue_captcha_gate(),
+        max_age=int(settings.CAPTCHA_GATE_TTL_SECONDS),
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    return resp
 
 
 @app.post("/auth/email/request-code")
