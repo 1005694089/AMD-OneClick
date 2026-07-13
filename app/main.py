@@ -1164,11 +1164,14 @@ def _verify_captcha(captcha: dict) -> bool:
         body = resp.json()
         if resp.status_code == 200 and str(body.get("status")) == "success":
             return str(body.get("result")) == "success"
-        # status != success means GeeTest could not process the request itself.
-        logger.warning("GeeTest validate non-success: %s", body)
-        return bool(settings.GEETEST_FAIL_OPEN)
+        # A 200 with status="error" means GeeTest rejected the *submission* (e.g.
+        # forged/expired params like "illegal gen_time"), which is an attacker
+        # signal, not a GeeTest outage. Fail closed so garbage params cannot bypass;
+        # fail-open is reserved for genuine transport failures (the except below).
+        logger.warning("GeeTest validate rejected submission: %s", body)
+        return False
     except Exception as e:
-        logger.warning("GeeTest validation error (fail_open=%s): %s", settings.GEETEST_FAIL_OPEN, e)
+        logger.warning("GeeTest unreachable (fail_open=%s): %s", settings.GEETEST_FAIL_OPEN, e)
         return bool(settings.GEETEST_FAIL_OPEN)
 
 
