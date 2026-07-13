@@ -26,6 +26,73 @@ secrets.
 
 ---
 
+## 2026-07-10 (1748) — PR1 Zijun manager sync to online branch (token factory)
+
+**Code commit:** `3241b24aa863a362c53ce0a49bbeaaeb40209b10`
+("Merge pull request #10 from AMD-AIM/feature/token-factory"), branch
+`sync/v2-base-with-pr1-account-20260626` (pushed). Advances the prior deploy
+`832930f` by PR #10: `994aa91` "Add Token Factory model provider management" and
+`8f53b5d` "Remove default preview model seeding".
+
+| Service / Port | Image (`:tag`) | Digest / ID | Local yaml + sha256 | Snapshot |
+|----------------|----------------|-------------|---------------------|----------|
+| pr1-zijun / 30392 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:pr1-zijun-sync-20260710-1748` | digest `sha256:8aec20ad8e1b1cbd9d3e27ae08edd00ef36e43dfe28ed84defe33f82e5fbc00b` / id `sha256:48faf258f8199808a877ea8c020e36e7b3be9d89caca228b2015a70ab67e9bbe` | `k8s-manager-pr1-zijun.local.yaml` sha256 `d6473ff112b221862475f996990c3fff1a8459609f3beaa55bf6eb2433bc15e3` | `local-deploy-history/pr1-zijun/2026-07-10-1748-manager-sync-3241b24.local.yaml` |
+
+**Changes:** Pull the online `/radeon/` branch to new HEAD `3241b24` and roll the
+PR1 manager onto an image built from it. Manager-only image + `STATIC_ASSET_VERSION`
+bump; environment unchanged from live (SSO config, inline `SSO_ENABLED=false`,
+`PUBLIC_BASE_URL`, `RUN_SCHEDULER=false`).
+
+**Process:** built from a clean detached worktree at the pushed commit; image
+pushed to ACR, pre-imported on `wx-ms-w7900d-0005`, manager-only manifest snapshot
+`kubectl diff`'d (only image + `STATIC_ASSET_VERSION`), then `kubectl apply` +
+bounded rollout. Did NOT touch ConfigMap/Secret/Postgres or the PR1 edge.
+
+**Verification:** rollout `1/1 ready`, new pod `amd-oneclick-manager-pr1-zijun-68b487c8fc-w5f2c`;
+`http://36.150.116.200:30392/health` 200; `/radeon/` 200 title `Radeon Cloud`, no
+`/radeon/radeon`; `/radeon/static/app-path.js` 200; `/` → 307; pod env
+`SSO_ENABLED=false`, `PUBLIC_BASE_URL=https://developer.amd.com.cn/radeon`,
+`RUN_SCHEDULER=false`, `STATIC_ASSET_VERSION=pr1-zijun-sync-20260710-1748`; no
+errors in recent logs.
+
+**Rollback:** `kubectl -n default rollout undo deployment/amd-oneclick-manager-pr1-zijun`
+(previous image `pr1-zijun-sync-20260710-1009`).
+
+---
+
+## 2026-07-13 — Incident stopgap: disable email OTP login (abuse)
+
+**Scope:** env-only, manager-only. No image/code change (image stays
+`v2-email-otp-20260710-1300`). Prod `amd-oneclick-manager-v2` and test
+`amd-oneclick-manager-v2-test` (which share the same Postgres via
+`amd-oneclick-postgres`).
+
+**Incident:** the 2026-07-10 passwordless email OTP login was being mass-abused
+for automated registration — 958 `provider=email` users in 24h, ~200/hour,
+using catch-all/disposable domains (e.g. `rumahwebku.my.id`, `actionvspot.com`,
+`gardianwaves.org`, `airfryersbg.com`) where any local part receives the code,
+so the per-email cooldown/cap are ineffective (unlimited unique addresses). The
+operator had already set free signup credits to 0; remaining risk was DB growth
+and SMTP abuse.
+
+**Action:** `kubectl -n default set env deployment/amd-oneclick-manager-v2 EMAIL_LOGIN_ENABLED=false`
+and the same on `amd-oneclick-manager-v2-test`. The feature is env-gated, so this
+instantly makes `/auth/email/request-code` and `/auth/email/verify` return 404 —
+no more DB inserts or outbound OTP email from this vector.
+
+**Verification:** both deployments rolled out `1/1`; pod `EMAIL_LOGIN_ENABLED=false`;
+`request-code` → 404 on both `radeon.anruicloud.com` and `radeon-test.anruicloud.com`;
+`provider=email` signups in the last 1 min = 0 after rollout (total flat at ~969).
+Postgres healthy (74 MB, ~14 connections). Did NOT touch image/ConfigMap/Postgres.
+
+**Re-enable:** `kubectl -n default set env deployment/amd-oneclick-manager-v2 EMAIL_LOGIN_ENABLED=true`
+— but only AFTER anti-abuse hardening (CAPTCHA/Turnstile on request-code, global
+hourly registration cap, disposable-domain handling, keep signup credits gated).
+The ~969 abusive `provider=email` accounts currently have 0 credits (cannot
+launch); cleanup is optional (DB size is small).
+
+---
+
 ## 2026-07-10 — Passwordless email OTP login (radeon-test then radeon prod)
 
 **Code commit:** `0dec34734327bd319e391225a0d4bb384d6a8af8`
