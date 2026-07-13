@@ -26,6 +26,37 @@ secrets.
 
 ---
 
+## 2026-07-13 (1700) — v2 PROD: GeeTest v4 CAPTCHA + re-enable email login
+
+**Code commit:** `8fb073862247f6ef88c7ff22c95e9495c980af8b` (branch
+`feature/oauth-credit-manager`, pushed) — same validated commit as the 1545 test
+deploy. Promotes GeeTest v4 CAPTCHA on `/auth/email/request-code` to the main site
+and re-enables email OTP login (which had been disabled by the abuse stopgap).
+User confirmed the GeeTest widget loads and logs in fine on radeon-test from a
+mainland China network before this promotion.
+
+Manifest-first: `kubectl diff` showed only image + `EMAIL_LOGIN_ENABLED` false→true
++ new `CAPTCHA_ENABLED=true` + `GEETEST_CAPTCHA_ID`. No ConfigMap/Postgres/edge
+changes. `GEETEST_CAPTCHA_KEY` added to Secret `amd-oneclick-secrets-v2` (value not
+recorded), injected via existing `envFrom` secretRef. Image pre-imported on
+`wx-ms-w7900d-0005`.
+
+| Service / Port | Image (`:tag`) | Digest / ID | Local yaml + sha256 | Snapshot |
+|----------------|----------------|-------------|---------------------|----------|
+| v2 prod / 30088 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-email-geetest-20260713-1700` | digest `sha256:ec2d015deb99744ef85f1177c608bb03b08cf9ca46cee76b7d3f9f5c007913b5` / id `sha256:7cb3d46dec9fee10f104d7b39c98fc27881021b6f2c3dbc25bb9b3bfe74de03c` | `k8s-manager-v2-manager-only.local.yaml` sha256 `ad14301d9bd7481165a2710b7bad77f7e2edeb5a4ed65f741bb953a39916ca45` | `local-deploy-history/v2-manager-only/2026-07-13-1700-v2-prod-email-geetest.local.yaml` |
+
+**Rollback:** `kubectl -n default rollout undo deployment/amd-oneclick-manager-v2`
+(prev image `v2-email-otp-20260710-1300`); or fast-disable via
+`kubectl -n default set env deploy/amd-oneclick-manager-v2 CAPTCHA_ENABLED-`
+(drops CAPTCHA) or `EMAIL_LOGIN_ENABLED=false` (re-arms the abuse stopgap).
+
+**Verified:** rollout `1/1 ready`, new pod `amd-oneclick-manager-v2-55c9c78749-bmqcs`;
+pod env `CAPTCHA_ENABLED=true`, `GEETEST_CAPTCHA_ID` set, `GEETEST_CAPTCHA_KEY` len 32,
+`EMAIL_LOGIN_ENABLED=true`; `/health` 200; `request-code` no-captcha → 400 and
+forged-params → 400 (fail-closed); served `/` injects `gt4.js` + `captchaEnabled=true`
++ captcha id. Positive end-to-end (widget solve → 200 → login) already validated on
+radeon-test with the identical image bits.
+
 ## 2026-07-13 (1545) — v2 TEST: GeeTest v4 CAPTCHA on email request-code
 
 **Code commit:** `8fb073862247f6ef88c7ff22c95e9495c980af8b` (branch
