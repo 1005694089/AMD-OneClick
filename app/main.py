@@ -595,10 +595,18 @@ def _preview_cache_public(cache: Optional[dict]) -> dict:
     }
 
 
-def _validate_oauth_state(request: Request, provider: str, state: str):
-    expected = request.session.pop(f"{provider}_oauth_state", None)
-    if not expected or not secrets.compare_digest(expected, state or ""):
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+def _validate_oauth_state(request: Request, provider: str, state: str) -> bool:
+    """Return True when ``state`` matches the value stored for this session.
+
+    Reads with ``get()`` (not ``pop()``): OAuth providers (notably ModelScope)
+    sometimes deliver the callback twice for one login — each with a fresh code
+    but the same state — and consuming the state made the second delivery fail
+    with "Invalid OAuth state". The state is still bound to the session (CSRF
+    protection intact) and is discarded when the session is re-established on
+    success. Callers treat a failed match as a hard error only when the browser
+    is not already logged in, so a duplicate/late callback is idempotent."""
+    expected = request.session.get(f"{provider}_oauth_state")
+    return bool(expected and secrets.compare_digest(expected, state or ""))
 
 
 def _instance_service_base(instance_id: str) -> str:
@@ -937,7 +945,12 @@ async def github_login(request: Request):
 @app.get("/auth/github/callback", name="github_callback")
 async def github_callback(request: Request, code: str = Query(...), state: str = Query("")):
     _enforce_login_rate_limit(request)
-    _validate_oauth_state(request, "github", state)
+    if not _validate_oauth_state(request, "github", state):
+        # A duplicate/late callback for a login that already succeeded (state was
+        # cleared when the session was established) is idempotent, not an error.
+        if request.session.get("user_id"):
+            return RedirectResponse("/")
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
     try:
         async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
             token_resp = await client.post(
@@ -1001,9 +1014,13 @@ async def modelscope_login(request: Request):
 @app.get("/auth/modelscope/callback", name="modelscope_callback")
 async def modelscope_callback(request: Request, code: str = Query(...), state: str = Query("")):
     _enforce_login_rate_limit(request)
-    # Fail closed on OAuth state, matching the GitHub path. A missing/mismatched
-    # state is a CSRF/login-fixation signal and must not be allowed through.
-    _validate_oauth_state(request, "modelscope", state)
+    if not _validate_oauth_state(request, "modelscope", state):
+        # ModelScope can deliver the callback twice for one login; the second
+        # arrives after the session is established (state cleared). Treat an
+        # already-logged-in duplicate as idempotent instead of failing state.
+        if request.session.get("user_id"):
+            return RedirectResponse("/")
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
     try:
         async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
             token_resp = await client.post(
