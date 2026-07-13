@@ -11,6 +11,7 @@
   <script src="https://cdn.jsdelivr.net/npm/antd@5.27.6/dist/antd.min.js"></script>
   <script src="/static/template_form.js"></script>
   <script src="/static/launch_flow.js"></script>
+  {% if captcha_enabled %}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{% endif %}
   <style>
     html { scrollbar-gutter: stable; }
     body { margin: 0; background: #f5f6fb; }
@@ -103,6 +104,8 @@
     const showWorkshopLogin = {{ workshop_login_enabled | tojson }};
     const showAdminLogin = {{ admin_login_enabled | tojson }};
     const showEmailLogin = {{ email_login_enabled | tojson }};
+    const captchaEnabled = {{ captcha_enabled | tojson }};
+    const turnstileSiteKey = {{ turnstile_site_key | tojson }};
     const resourceProfiles = {{ resource_profiles_json | safe }};
     const autoResourceProfileByGpu = {{ auto_resource_profile_by_gpu_json | safe }};
     const diskSizeMinGb = {{ disk_size_min_gb | tojson }};
@@ -185,6 +188,9 @@
       const [emailSending, setEmailSending] = React.useState(false);
       const [emailVerifying, setEmailVerifying] = React.useState(false);
       const [emailCooldown, setEmailCooldown] = React.useState(0);
+      const [captchaToken, setCaptchaToken] = React.useState('');
+      const turnstileElRef = React.useRef(null);
+      const turnstileWidgetRef = React.useRef(null);
       const initialTab = new URLSearchParams(window.location.search).get('tab') === 'notebook' ? 'notebook' : 'gallery';
       const [activeTab, setActiveTab] = React.useState(initialTab);
       const [gallerySearch, setGallerySearch] = React.useState('');
@@ -239,6 +245,32 @@
         const t = setTimeout(() => setEmailCooldown(emailCooldown - 1), 1000);
         return () => clearTimeout(t);
       }, [emailCooldown]);
+      React.useEffect(() => {
+        if (!captchaEnabled || !emailLoginOpen) return;
+        let cancelled = false;
+        setCaptchaToken('');
+        const render = () => {
+          if (cancelled) return;
+          if (window.turnstile && turnstileElRef.current) {
+            try { if (turnstileWidgetRef.current) window.turnstile.remove(turnstileWidgetRef.current); } catch (e) {}
+            turnstileElRef.current.innerHTML = '';
+            turnstileWidgetRef.current = window.turnstile.render(turnstileElRef.current, {
+              sitekey: turnstileSiteKey,
+              callback: (t) => setCaptchaToken(t),
+              'expired-callback': () => setCaptchaToken(''),
+              'error-callback': () => setCaptchaToken(''),
+            });
+          } else {
+            setTimeout(render, 300);
+          }
+        };
+        render();
+        return () => {
+          cancelled = true;
+          try { if (turnstileWidgetRef.current) window.turnstile.remove(turnstileWidgetRef.current); } catch (e) {}
+          turnstileWidgetRef.current = null;
+        };
+      }, [emailLoginOpen, emailStep]);
 
       async function loginWorkshop(values) {
         setWorkshopLoginLoading(true);
@@ -268,12 +300,18 @@
         }
       }
 
+      function resetCaptcha() {
+        setCaptchaToken('');
+        try { if (window.turnstile && turnstileWidgetRef.current) window.turnstile.reset(turnstileWidgetRef.current); } catch (e) {}
+      }
+
       async function sendEmailCode(values) {
         const email = (values.email || '').trim();
         if (!email) return;
+        if (captchaEnabled && !captchaToken) { message.warning('Please complete the verification first'); return; }
         setEmailSending(true);
         try {
-          const res = await fetch('/auth/email/request-code', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ email }) });
+          const res = await fetch('/auth/email/request-code', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ email, captcha_token: captchaToken }) });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Failed to send code');
           setEmailValue(email);
@@ -281,6 +319,7 @@
           setEmailCooldown(data.cooldown || 60);
           message.success('Verification code sent. Please check your inbox.');
         } catch (err) {
+          if (captchaEnabled) resetCaptcha();
           message.error(err.message || 'Failed to send code');
         } finally {
           setEmailSending(false);
@@ -289,9 +328,10 @@
 
       async function resendEmailCode() {
         if (emailCooldown > 0 || !emailValue) return;
+        if (captchaEnabled && !captchaToken) { message.warning('Please complete the verification first'); return; }
         setEmailSending(true);
         try {
-          const res = await fetch('/auth/email/request-code', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ email: emailValue }) });
+          const res = await fetch('/auth/email/request-code', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ email: emailValue, captcha_token: captchaToken }) });
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.detail || 'Failed to resend code');
           setEmailCooldown(data.cooldown || 60);
@@ -299,6 +339,7 @@
         } catch (err) {
           message.error(err.message || 'Failed to resend code');
         } finally {
+          if (captchaEnabled) resetCaptcha();
           setEmailSending(false);
         }
       }
@@ -468,12 +509,14 @@
             ? React.createElement(Form, { form:emailForm, layout:'vertical', onFinish:sendEmailCode },
                 React.createElement('p', { style:{color:'#566175', marginTop:0} }, 'Enter your email and we will send you a 6-digit verification code.'),
                 React.createElement(Form.Item, { name:'email', label:'Email', rules:[{required:true,message:'Email is required'},{type:'email',message:'Enter a valid email'}] }, React.createElement(Input, { placeholder:'you@example.com', autoComplete:'email' })),
+                captchaEnabled && React.createElement('div', { ref:turnstileElRef, style:{marginBottom:12} }),
                 React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:emailSending }, 'Send code')
               )
             : React.createElement(Form, { form:emailForm, layout:'vertical', onFinish:verifyEmailCode },
                 React.createElement('p', { style:{color:'#566175', marginTop:0} }, ['Code sent to ', React.createElement('strong', { key:'e' }, emailValue), '. It expires in a few minutes.']),
                 React.createElement(Form.Item, { name:'code', label:'Verification code', rules:[{required:true,message:'Enter the 6-digit code'},{pattern:/^\d{6}$/, message:'The code is 6 digits'}] }, React.createElement(Input, { placeholder:'123456', maxLength:6, inputMode:'numeric' })),
                 React.createElement(Button, { type:'primary', htmlType:'submit', block:true, loading:emailVerifying }, 'Verify & sign in'),
+                captchaEnabled && React.createElement('div', { ref:turnstileElRef, style:{marginTop:12} }),
                 React.createElement('div', { style:{marginTop:12, textAlign:'center'} },
                   React.createElement(Button, { type:'link', disabled:emailCooldown>0 || emailSending, onClick:resendEmailCode }, emailCooldown>0 ? ('Resend code in ' + emailCooldown + 's') : 'Resend code'),
                   React.createElement(Button, { type:'link', onClick:()=>{ setEmailStep('email'); emailForm.resetFields(['code']); } }, 'Change email')

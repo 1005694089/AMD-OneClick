@@ -257,6 +257,15 @@ class Settings:
     EMAIL_OTP_MAX_ATTEMPTS: int = int(os.getenv("EMAIL_OTP_MAX_ATTEMPTS", "5"))
     EMAIL_OTP_REQUESTS_PER_HOUR: int = int(os.getenv("EMAIL_OTP_REQUESTS_PER_HOUR", "5"))
 
+    # Cloudflare Turnstile CAPTCHA on the email-login request-code path, to block
+    # automated mass registration. Env-gated (default off). The site key is public
+    # (rendered in the browser); the secret key must stay server-side. When enabled,
+    # request-code requires a valid token verified against TURNSTILE_VERIFY_URL.
+    CAPTCHA_ENABLED: bool = os.getenv("CAPTCHA_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    TURNSTILE_SITE_KEY: str = os.getenv("TURNSTILE_SITE_KEY", "")
+    TURNSTILE_SECRET_KEY: str = os.getenv("TURNSTILE_SECRET_KEY", "")
+    TURNSTILE_VERIFY_URL: str = os.getenv("TURNSTILE_VERIFY_URL", "https://challenges.cloudflare.com/turnstile/v0/siteverify")
+
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     NODE_PORT_BASE: int = int(os.getenv("NODE_PORT_BASE", "30000"))

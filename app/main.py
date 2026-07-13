@@ -889,6 +889,8 @@ async def index(request: Request):
             "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
             "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
             "email_login_enabled": settings.EMAIL_LOGIN_ENABLED,
+            "captcha_enabled": settings.CAPTCHA_ENABLED,
+            "turnstile_site_key": settings.TURNSTILE_SITE_KEY,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
             "disk_size_min_gb": settings.DISK_SIZE_MIN_GB,
@@ -1125,6 +1127,26 @@ def _email_otp_hash(email: str, code: str) -> str:
     return hmac.new(settings.SESSION_SECRET.encode("utf-8"), f"{email}:{code}".encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _verify_captcha(token: str, remote_ip: str) -> bool:
+    """Verify a Cloudflare Turnstile token server-side. Returns True when CAPTCHA
+    is disabled; fails closed (False) on misconfiguration, missing token, or a
+    failed/unreachable verification so bots can never bypass by omitting it."""
+    if not settings.CAPTCHA_ENABLED:
+        return True
+    if not settings.TURNSTILE_SECRET_KEY or not token:
+        return False
+    try:
+        resp = requests.post(
+            settings.TURNSTILE_VERIFY_URL,
+            data={"secret": settings.TURNSTILE_SECRET_KEY, "response": token, "remoteip": remote_ip},
+            timeout=6,
+        )
+        return bool(resp.status_code == 200 and resp.json().get("success"))
+    except Exception as e:
+        logger.warning("Turnstile verification error: %s", e)
+        return False
+
+
 @app.post("/auth/email/request-code")
 async def email_request_code(request: Request):
     if not settings.EMAIL_LOGIN_ENABLED:
@@ -1134,6 +1156,9 @@ async def email_request_code(request: Request):
     email = _normalize_email(str(payload.get("email", "")))
     if not email:
         raise HTTPException(status_code=400, detail="Please enter a valid email address")
+    captcha_token = str(payload.get("captcha_token") or payload.get("cf_turnstile_response") or "")
+    if not _verify_captcha(captcha_token, _client_ip(request)):
+        raise HTTPException(status_code=400, detail="Captcha verification failed. Please try again.")
     redis = get_redis()
     if redis is None:
         raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
