@@ -26,6 +26,39 @@ secrets.
 
 ---
 
+## 2026-07-13 (1545) — v2 TEST: GeeTest v4 CAPTCHA on email request-code
+
+**Code commit:** `8fb073862247f6ef88c7ff22c95e9495c980af8b` (branch
+`feature/oauth-credit-manager`, pushed). Adds a GeeTest v4 (行为验4) CAPTCHA gate on
+`/auth/email/request-code` to block automated mass registration. Replaces an
+earlier Cloudflare Turnstile attempt (`af9bb87`) that could not load behind the
+GFW — GeeTest's `static.geetest.com` / `gcaptcha4.geetest.com` are China-hosted and
+load reliably. Frontend loads `gt4.js` + `initGeetest4({captchaId})` in the email
+login modal; backend re-verifies the result server-side against
+`gcaptcha4.geetest.com/validate` with an HMAC-SHA256(`lot_number`, key) `sign_token`.
+Fail-closed on rejected/forged params (`8fb0738`); fail-open only on GeeTest
+transport outage (`GEETEST_FAIL_OPEN`, backstopped by rate limits).
+
+Deployed via `kubectl set env` + `set image` (test iteration, no manifest snapshot).
+Env set on `amd-oneclick-manager-v2-test`: `CAPTCHA_ENABLED=true`,
+`GEETEST_CAPTCHA_ID=57d37973395d92ae75f3a4b38c32cb64`, `EMAIL_LOGIN_ENABLED=true`,
+removed stale `TURNSTILE_SITE_KEY`. Secret `amd-oneclick-secrets-v2-test`:
+`GEETEST_CAPTCHA_KEY` added (value not recorded), stale `TURNSTILE_SECRET_KEY` removed.
+
+| Service / Port | Image (`:tag`) | Digest | Rollback |
+|----------------|----------------|--------|----------|
+| v2 test / 30288 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-test-geetest-20260713-1545` | `sha256:ec2d015deb99744ef85f1177c608bb03b08cf9ca46cee76b7d3f9f5c007913b5` | `kubectl -n default set env deploy/amd-oneclick-manager-v2-test CAPTCHA_ENABLED-` (disable), or `rollout undo` |
+
+**Verified:** pod env correct (`CAPTCHA_ENABLED=true`, id set, key len 32,
+`EMAIL_LOGIN_ENABLED=true`, `TURNSTILE_SITE_KEY` empty); `request-code` with no
+captcha → 400, with forged complete params → 400 (fail-closed); cluster reaches
+`static.geetest.com` (gt4.js 200) and `gcaptcha4.geetest.com/validate` (200);
+browser: email modal renders the GeeTest v4 widget (`initGeetest4` fn present,
+`geetest_captcha`/`geetest_holder` DOM mounted). Not yet promoted to prod —
+awaiting user confirmation that the widget loads from a mainland China Telecom
+network before prod rollout. Prod email login remains disabled from the prior
+abuse stopgap.
+
 ## 2026-07-10 (1748) — PR1 Zijun manager sync to online branch (token factory)
 
 **Code commit:** `3241b24aa863a362c53ce0a49bbeaaeb40209b10`
