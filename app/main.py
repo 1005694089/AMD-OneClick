@@ -890,7 +890,7 @@ async def index(request: Request):
             "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
             "email_login_enabled": settings.EMAIL_LOGIN_ENABLED,
             "captcha_enabled": settings.CAPTCHA_ENABLED,
-            "turnstile_site_key": settings.TURNSTILE_SITE_KEY,
+            "geetest_captcha_id": settings.GEETEST_CAPTCHA_ID,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
             "disk_size_min_gb": settings.DISK_SIZE_MIN_GB,
@@ -1127,24 +1127,49 @@ def _email_otp_hash(email: str, code: str) -> str:
     return hmac.new(settings.SESSION_SECRET.encode("utf-8"), f"{email}:{code}".encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _verify_captcha(token: str, remote_ip: str) -> bool:
-    """Verify a Cloudflare Turnstile token server-side. Returns True when CAPTCHA
-    is disabled; fails closed (False) on misconfiguration, missing token, or a
-    failed/unreachable verification so bots can never bypass by omitting it."""
+def _verify_captcha(captcha: dict) -> bool:
+    """Verify a GeeTest v4 result server-side against GEETEST_API_SERVER/validate.
+
+    Returns True when CAPTCHA is disabled. Fails closed (False) on
+    misconfiguration or a missing/incomplete result so bots cannot bypass by
+    omitting the fields, and on an explicit GeeTest ``fail`` result. When GeeTest
+    itself is unreachable it follows GEETEST_FAIL_OPEN (default open) per GeeTest's
+    guidance, with the per-IP/per-email rate limits as the backstop."""
     if not settings.CAPTCHA_ENABLED:
         return True
-    if not settings.TURNSTILE_SECRET_KEY or not token:
+    if not settings.GEETEST_CAPTCHA_KEY:
         return False
+    lot_number = str((captcha or {}).get("lot_number") or "")
+    captcha_output = str((captcha or {}).get("captcha_output") or "")
+    pass_token = str((captcha or {}).get("pass_token") or "")
+    gen_time = str((captcha or {}).get("gen_time") or "")
+    if not (lot_number and captcha_output and pass_token and gen_time):
+        return False
+    sign_token = hmac.new(
+        settings.GEETEST_CAPTCHA_KEY.encode("utf-8"), lot_number.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
     try:
         resp = requests.post(
-            settings.TURNSTILE_VERIFY_URL,
-            data={"secret": settings.TURNSTILE_SECRET_KEY, "response": token, "remoteip": remote_ip},
+            f"{settings.GEETEST_API_SERVER.rstrip('/')}/validate",
+            params={"captcha_id": settings.GEETEST_CAPTCHA_ID},
+            data={
+                "lot_number": lot_number,
+                "captcha_output": captcha_output,
+                "pass_token": pass_token,
+                "gen_time": gen_time,
+                "sign_token": sign_token,
+            },
             timeout=6,
         )
-        return bool(resp.status_code == 200 and resp.json().get("success"))
+        body = resp.json()
+        if resp.status_code == 200 and str(body.get("status")) == "success":
+            return str(body.get("result")) == "success"
+        # status != success means GeeTest could not process the request itself.
+        logger.warning("GeeTest validate non-success: %s", body)
+        return bool(settings.GEETEST_FAIL_OPEN)
     except Exception as e:
-        logger.warning("Turnstile verification error: %s", e)
-        return False
+        logger.warning("GeeTest validation error (fail_open=%s): %s", settings.GEETEST_FAIL_OPEN, e)
+        return bool(settings.GEETEST_FAIL_OPEN)
 
 
 @app.post("/auth/email/request-code")
@@ -1156,8 +1181,8 @@ async def email_request_code(request: Request):
     email = _normalize_email(str(payload.get("email", "")))
     if not email:
         raise HTTPException(status_code=400, detail="Please enter a valid email address")
-    captcha_token = str(payload.get("captcha_token") or payload.get("cf_turnstile_response") or "")
-    if not _verify_captcha(captcha_token, _client_ip(request)):
+    captcha = payload.get("captcha") if isinstance(payload.get("captcha"), dict) else payload
+    if not _verify_captcha(captcha):
         raise HTTPException(status_code=400, detail="Captcha verification failed. Please try again.")
     redis = get_redis()
     if redis is None:

@@ -257,14 +257,19 @@ class Settings:
     EMAIL_OTP_MAX_ATTEMPTS: int = int(os.getenv("EMAIL_OTP_MAX_ATTEMPTS", "5"))
     EMAIL_OTP_REQUESTS_PER_HOUR: int = int(os.getenv("EMAIL_OTP_REQUESTS_PER_HOUR", "5"))
 
-    # Cloudflare Turnstile CAPTCHA on the email-login request-code path, to block
-    # automated mass registration. Env-gated (default off). The site key is public
-    # (rendered in the browser); the secret key must stay server-side. When enabled,
-    # request-code requires a valid token verified against TURNSTILE_VERIFY_URL.
+    # GeeTest v4 (行为验4) CAPTCHA on the email-login request-code path, to block
+    # automated mass registration. Env-gated (default off). GeeTest is a mainland
+    # China provider, so its JS/verify domains load reliably behind the GFW
+    # (unlike Cloudflare Turnstile). The captcha id is public (rendered in the
+    # browser); the captcha key must stay server-side and is used to sign the
+    # server-to-server /validate call against GEETEST_API_SERVER.
     CAPTCHA_ENABLED: bool = os.getenv("CAPTCHA_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-    TURNSTILE_SITE_KEY: str = os.getenv("TURNSTILE_SITE_KEY", "")
-    TURNSTILE_SECRET_KEY: str = os.getenv("TURNSTILE_SECRET_KEY", "")
-    TURNSTILE_VERIFY_URL: str = os.getenv("TURNSTILE_VERIFY_URL", "https://challenges.cloudflare.com/turnstile/v0/siteverify")
+    GEETEST_CAPTCHA_ID: str = os.getenv("GEETEST_CAPTCHA_ID", "")
+    GEETEST_CAPTCHA_KEY: str = os.getenv("GEETEST_CAPTCHA_KEY", "")
+    GEETEST_API_SERVER: str = os.getenv("GEETEST_API_SERVER", "https://gcaptcha4.geetest.com")
+    # GeeTest recommends failing open when their service is unreachable so a GeeTest
+    # outage does not lock users out; per-IP/per-email rate limits remain the backstop.
+    GEETEST_FAIL_OPEN: bool = os.getenv("GEETEST_FAIL_OPEN", "true").lower() in {"1", "true", "yes", "on"}
 
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
