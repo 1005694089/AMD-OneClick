@@ -202,6 +202,14 @@ def cleanup_job():
                         continue
                 status_details = k8s_client.get_pod_status_details(record["email"], instance_id=record["instance_id"])
                 if status_details is None:
+                    logger.warning(
+                        "Cleanup: marking DB instance deleted because pod is missing instance_id=%s email=%s user_id=%s status=%s billing_session_id=%s",
+                        record["instance_id"],
+                        record.get("email"),
+                        record.get("user_id"),
+                        record.get("status"),
+                        record.get("billing_session_id"),
+                    )
                     mark_instance_deleted(record["instance_id"])
                     continue
                 live_status = status_details.get("status")
@@ -232,6 +240,15 @@ def cleanup_job():
                         int(record["gpu_count"]),
                     )
                     if result == "charged":
+                        logger.info(
+                            "Billing: charged usage unit instance_id=%s user_id=%s email=%s billing_session_id=%s unit=%s gpu_count=%s",
+                            record["instance_id"],
+                            record["user_id"],
+                            record.get("email"),
+                            billing_session_id,
+                            unit,
+                            int(record["gpu_count"]),
+                        )
                         from .telemetry import report_gpu_hour_charged_event
 
                         _fire_and_forget(report_gpu_hour_charged_event(
@@ -242,6 +259,15 @@ def cleanup_job():
                             gpu_count=int(record["gpu_count"]),
                         ))
                     if result == "insufficient":
+                        logger.warning(
+                            "Billing: insufficient credits; deleting instance instance_id=%s user_id=%s email=%s billing_session_id=%s unit=%s gpu_count=%s",
+                            record["instance_id"],
+                            record["user_id"],
+                            record.get("email"),
+                            billing_session_id,
+                            unit,
+                            int(record["gpu_count"]),
+                        )
                         if k8s_client.delete_instance_by_id(record["instance_id"]):
                             mark_instance_deleted(record["instance_id"])
                             cleaned.append({

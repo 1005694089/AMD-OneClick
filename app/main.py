@@ -2,8 +2,10 @@
 FastAPI main application for AMD OneClick Notebook Manager
 """
 import hashlib
+import hmac
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import base64
@@ -19,7 +21,7 @@ from urllib.parse import quote, urlencode, urlparse
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Response, Cookie, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.background import BackgroundTask
 from starlette.middleware.sessions import SessionMiddleware
@@ -31,7 +33,7 @@ from kubernetes.client.rest import ApiException
 
 from .config import settings, INSTANCE_TYPES, APP_FRAMEWORK_PRESETS
 from .harbor_mirror import resolve_existing_harbor_ref, image_matches_harbor_source, MirrorError
-from .redis_client import rate_limit_ok
+from .redis_client import rate_limit_ok, rate_limit_at_capacity, get_redis
 from .models import (
     NotebookRequest, 
     NotebookStatus, 
@@ -87,6 +89,7 @@ from .store import (
     get_template_preview_asset,
     get_template_preview_cache,
     get_user_by_provider,
+    get_user_by_email,
     get_user,
     bump_user_token_version,
     ensure_user_min_credits,
@@ -141,6 +144,24 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+if settings.MANAGER_LOG_PATH:
+    try:
+        os.makedirs(os.path.dirname(settings.MANAGER_LOG_PATH), exist_ok=True)
+        file_handler = RotatingFileHandler(
+            settings.MANAGER_LOG_PATH,
+            maxBytes=50 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        app_logger = logging.getLogger("app")
+        app_logger.setLevel(logging.INFO)
+        app_logger.addHandler(file_handler)
+        logger.info("Persistent manager log enabled at %s", settings.MANAGER_LOG_PATH)
+    except Exception as e:
+        logger.warning("Failed to enable persistent manager log at %s: %s", settings.MANAGER_LOG_PATH, e)
 
 
 @asynccontextmanager
@@ -328,13 +349,13 @@ def _establish_session(request: Request, user: dict):
     request.session["sv"] = int(user.get("token_version", 0))
 
 
-def _enforce_signup_quota(request: Request, user: dict):
-    """When a login just created a new account, cap new accounts per IP per day."""
-    if not user.get("_created"):
+def _enforce_new_signup_quota(request: Request, existing_user: Optional[dict]):
+    """Reserve signup capacity before creating a new account."""
+    if existing_user:
         return
     ip = _client_ip(request)
     if not rate_limit_ok(f"signup:{ip}", settings.SIGNUP_RATE_LIMIT_PER_DAY, 86400):
-        logger.warning("Signup quota exceeded for ip=%s (new user_id=%s)", ip, user.get("id"))
+        logger.warning("Signup quota exceeded for ip=%s", ip)
         raise HTTPException(status_code=429, detail="Too many new accounts from this network today")
 
 
@@ -1006,10 +1027,35 @@ def _preview_cache_public(cache: Optional[dict]) -> dict:
     }
 
 
-def _validate_oauth_state(request: Request, provider: str, state: str):
-    expected = request.session.pop(f"{provider}_oauth_state", None)
-    if not expected or not secrets.compare_digest(expected, state or ""):
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+def _validate_oauth_state(request: Request, provider: str, state: str) -> bool:
+    """Validate the CSRF state that was stored at login start.
+
+    Non-consuming (``get``, not ``pop``): a successful callback finishes by
+    calling ``_establish_session()``, which clears the whole session -- including
+    this state -- so a duplicate or late callback for an already-completed login
+    naturally fails this check and is handled idempotently by
+    ``_begin_oauth_callback``. Keeping this session-only (no Redis) means base
+    OAuth login keeps working even when Redis is unavailable.
+    """
+    expected = request.session.get(f"{provider}_oauth_state")
+    return bool(expected and secrets.compare_digest(expected, state or ""))
+
+
+async def _begin_oauth_callback(request: Request, provider: str, state: str) -> Optional[RedirectResponse]:
+    """Return a redirect for a duplicate/late callback, or None to proceed.
+
+    A duplicate or late provider callback for a login that already succeeded (its
+    state was cleared when the session was established) is idempotent, not an
+    error. We deliberately do NOT re-establish the session here: the browser is
+    already authenticated, and rebinding it from whatever ``user_id`` currently
+    sits in the session could race an in-flight primary callback and pin the user
+    to a stale account. Just send them home.
+    """
+    if _validate_oauth_state(request, provider, state):
+        return None
+    if request.session.get("user_id"):
+        return RedirectResponse("/")
+    raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
 
 # Proxy hot-path service-IP resolution is cached in k8s_client (see resolve_service_ip),
@@ -1378,6 +1424,9 @@ async def index(request: Request):
             ),
             "workshop_login_enabled": settings.WORKSHOP_LOGIN_ENABLED,
             "admin_login_enabled": settings.ADMIN_LOGIN_ENABLED,
+            "email_login_enabled": settings.EMAIL_LOGIN_ENABLED,
+            "captcha_enabled": settings.CAPTCHA_ENABLED,
+            "geetest_captcha_id": settings.GEETEST_CAPTCHA_ID,
             "resource_profiles_json": json.dumps(RESOURCE_PROFILES),
             "auto_resource_profile_by_gpu_json": json.dumps(AUTO_RESOURCE_PROFILE_BY_GPU),
             "disk_size_min_gb": settings.DISK_SIZE_MIN_GB,
@@ -1409,6 +1458,8 @@ async def profile_page(request: Request):
 @app.get("/auth/github/login")
 async def github_login(request: Request):
     _enforce_login_rate_limit(request)
+    if settings.CAPTCHA_ENABLED and not _consume_captcha_gate(request, "github"):
+        return _captcha_interstitial("github", request.url.path)
     if not settings.GITHUB_CLIENT_ID:
         raise HTTPException(status_code=500, detail="GitHub OAuth is not configured")
     params = {
@@ -1423,7 +1474,9 @@ async def github_login(request: Request):
 @app.get("/auth/github/callback", name="github_callback")
 async def github_callback(request: Request, code: str = Query(...), state: str = Query("")):
     _enforce_login_rate_limit(request)
-    _validate_oauth_state(request, "github", state)
+    duplicate_response = await _begin_oauth_callback(request, "github", state)
+    if duplicate_response:
+        return duplicate_response
     try:
         async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
             token_resp = await client.post(
@@ -1457,8 +1510,9 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
     email = profile.get("email") or next((e["email"] for e in emails if e.get("primary")), None)
     if not email:
         raise HTTPException(status_code=400, detail="GitHub account has no accessible email")
+    existing_user = get_user_by_provider("github", str(profile["id"])) or get_user_by_email(email)
+    _enforce_new_signup_quota(request, existing_user)
     user = get_or_create_user("github", str(profile["id"]), email, profile.get("name") or profile.get("login") or "", profile.get("avatar_url") or "")
-    _enforce_signup_quota(request, user)
     if user.get("_created"):
         from .telemetry import report_user_registered_event
 
@@ -1470,6 +1524,8 @@ async def github_callback(request: Request, code: str = Query(...), state: str =
 @app.get("/auth/modelscope/login")
 async def modelscope_login(request: Request):
     _enforce_login_rate_limit(request)
+    if settings.CAPTCHA_ENABLED and not _consume_captcha_gate(request, "modelscope"):
+        return _captcha_interstitial("modelscope", request.url.path)
     if not settings.MODELSCOPE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="ModelScope OAuth is not configured")
     params = {
@@ -1485,9 +1541,9 @@ async def modelscope_login(request: Request):
 @app.get("/auth/modelscope/callback", name="modelscope_callback")
 async def modelscope_callback(request: Request, code: str = Query(...), state: str = Query("")):
     _enforce_login_rate_limit(request)
-    # Fail closed on OAuth state, matching the GitHub path. A missing/mismatched
-    # state is a CSRF/login-fixation signal and must not be allowed through.
-    _validate_oauth_state(request, "modelscope", state)
+    duplicate_response = await _begin_oauth_callback(request, "modelscope", state)
+    if duplicate_response:
+        return duplicate_response
     try:
         async with httpx.AsyncClient(timeout=_oauth_timeout()) as client:
             token_resp = await client.post(
@@ -1554,8 +1610,9 @@ async def modelscope_callback(request: Request, code: str = Query(...), state: s
         )
         raise HTTPException(status_code=400, detail="ModelScope login failed: no verifiable account identity")
     email = claims.get("email") or f"{provider_id}@modelscope.local"
+    existing_user = get_user_by_provider("modelscope", provider_id) or get_user_by_email(email)
+    _enforce_new_signup_quota(request, existing_user)
     user = get_or_create_user("modelscope", provider_id, email, claims.get("name") or claims.get("username") or provider_id, claims.get("avatar_url") or claims.get("avatar") or "")
-    _enforce_signup_quota(request, user)
     if user.get("_created"):
         from .telemetry import report_user_registered_event
 
@@ -1600,6 +1657,334 @@ async def admin_login(request: Request):
     return {"user": user}
 
 
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _normalize_email(raw: str) -> Optional[str]:
+    email = (raw or "").strip().lower()
+    if not email or len(email) > 254 or not _EMAIL_RE.match(email):
+        return None
+    return email
+
+
+def _email_otp_hash(email: str, code: str) -> str:
+    """HMAC the code with the server secret so the stored value is not the raw code."""
+    return hmac.new(settings.SESSION_SECRET.encode("utf-8"), f"{email}:{code}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+async def _verify_captcha(captcha: dict) -> bool:
+    """Verify a GeeTest v4 result server-side against GEETEST_API_SERVER/validate.
+
+    Returns True when CAPTCHA is disabled. Fails closed (False) on
+    misconfiguration or a missing/incomplete result so bots cannot bypass by
+    omitting the fields, and on an explicit GeeTest ``fail`` result. When GeeTest
+    itself is unreachable it follows GEETEST_FAIL_OPEN (default closed) with the
+    per-IP/per-email rate limits as the backstop."""
+    if not settings.CAPTCHA_ENABLED:
+        return True
+    if not settings.GEETEST_CAPTCHA_KEY:
+        return False
+    lot_number = str((captcha or {}).get("lot_number") or "")
+    captcha_output = str((captcha or {}).get("captcha_output") or "")
+    pass_token = str((captcha or {}).get("pass_token") or "")
+    gen_time = str((captcha or {}).get("gen_time") or "")
+    if not (lot_number and captcha_output and pass_token and gen_time):
+        return False
+    sign_token = hmac.new(
+        settings.GEETEST_CAPTCHA_KEY.encode("utf-8"), lot_number.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            resp = await client.post(
+                f"{settings.GEETEST_API_SERVER.rstrip('/')}/validate",
+                params={"captcha_id": settings.GEETEST_CAPTCHA_ID},
+                data={
+                    "lot_number": lot_number,
+                    "captcha_output": captcha_output,
+                    "pass_token": pass_token,
+                    "gen_time": gen_time,
+                    "sign_token": sign_token,
+                },
+            )
+        body = resp.json()
+        if resp.status_code == 200 and str(body.get("status")) == "success":
+            return str(body.get("result")) == "success"
+        # A 200 with status="error" means GeeTest rejected the *submission* (e.g.
+        # forged/expired params like "illegal gen_time"), which is an attacker
+        # signal, not a GeeTest outage. Fail closed so garbage params cannot bypass;
+        # fail-open is reserved for genuine transport failures (the except below).
+        logger.warning("GeeTest validate rejected submission: %s", body)
+        return False
+    except Exception as e:
+        logger.warning("GeeTest unreachable (fail_open=%s): %s", settings.GEETEST_FAIL_OPEN, e)
+        return bool(settings.GEETEST_FAIL_OPEN)
+
+
+CAPTCHA_GATE_COOKIE = "amd_oneclick_captcha_gate"
+
+
+def _captcha_gate_binding(request: Request) -> str:
+    value = request.session.get("captcha_gate_binding")
+    if not value:
+        value = secrets.token_urlsafe(24)
+        request.session["captcha_gate_binding"] = value
+    return value
+
+
+def _issue_captcha_gate(request: Request, provider: str) -> str:
+    redis = get_redis()
+    if redis is None:
+        raise HTTPException(status_code=503, detail="Captcha verification is temporarily unavailable")
+    token = secrets.token_urlsafe(32)
+    binding_hash = hashlib.sha256(f"{_captcha_gate_binding(request)}:{provider}".encode("utf-8")).hexdigest()
+    try:
+        redis.setex(
+            f"captcha_gate:{token}",
+            int(settings.CAPTCHA_GATE_TTL_SECONDS),
+            binding_hash,
+        )
+    except Exception as e:
+        logger.error("Failed to store CAPTCHA gate: %s", e)
+        raise HTTPException(status_code=503, detail="Captcha verification is temporarily unavailable")
+    return token
+
+
+def _consume_captcha_gate(request: Request, provider: str) -> bool:
+    token = request.cookies.get(CAPTCHA_GATE_COOKIE, "")
+    binding = request.session.get("captcha_gate_binding")
+    if not token or not binding:
+        return False
+    redis = get_redis()
+    if redis is None:
+        return False
+    expected = hashlib.sha256(f"{binding}:{provider}".encode("utf-8")).hexdigest()
+    key = f"captcha_gate:{token}"
+    try:
+        consumed = redis.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then redis.call('del', KEYS[1]); return 1 else return 0 end",
+            1,
+            key,
+            expected,
+        )
+    except Exception as e:
+        logger.warning("Failed to consume CAPTCHA gate for %s: %s", provider, e)
+        return False
+    return int(consumed or 0) == 1
+
+
+def _captcha_interstitial(provider: str, return_url: str) -> HTMLResponse:
+    """Self-contained page that renders the GeeTest widget, then POSTs the result
+    to /auth/captcha/gate and returns the user to ``return_url`` (the OAuth login
+    start). Used so every entry point into GitHub/ModelScope login is gated without
+    editing each link."""
+    cid = json.dumps(settings.GEETEST_CAPTCHA_ID)
+    ret = json.dumps(return_url)
+    label = "GitHub" if provider == "github" else ("ModelScope" if provider == "modelscope" else provider)
+    html = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>安全验证 / Security check</title>
+<script src="https://static.geetest.com/v4/gt4.js"></script>
+<style>
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f6f8;color:#1f2430;display:flex;min-height:100vh;align-items:center;justify-content:center}
+  .card{background:#fff;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.08);padding:28px 32px;max-width:360px;width:calc(100% - 40px);text-align:center}
+  h3{margin:0 0 6px;font-size:18px}
+  p{margin:6px 0;color:#566175;font-size:14px}
+  #cap{margin:18px 0 6px;display:flex;justify-content:center}
+  #status{min-height:18px;font-size:13px}
+  a{color:#1677ff;text-decoration:none;font-size:13px}
+</style></head><body>
+<div class="card">
+  <h3>安全验证</h3>
+  <p>请完成验证后继续使用 __LABEL__ 登录<br>Complete the check to continue to __LABEL__ login.</p>
+  <div id="cap"></div>
+  <p id="status"></p>
+  <a href="/">返回首页 / Back to home</a>
+</div>
+<script>
+  var CAPTCHA_ID = __CID__, RETURN_URL = __RET__;
+  var st = document.getElementById('status');
+  function boot(){
+    if(!window.initGeetest4){ return setTimeout(boot, 300); }
+    window.initGeetest4({ captchaId: CAPTCHA_ID, product: 'popup', language: 'zho', riskType: 'slide' }, function(c){
+      c.appendTo('#cap');
+      c.onSuccess(function(){
+        st.textContent = '验证中… / Verifying…';
+        fetch('/auth/captcha/gate', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ provider: __PROVIDER__, captcha: c.getValidate() }) })
+          .then(function(r){ if(r.ok){ st.textContent='已验证,正在跳转… / Verified, redirecting…'; location.replace(RETURN_URL); } else { st.textContent='验证失败,请重试 / Verification failed, please retry'; try{c.reset();}catch(e){} } })
+          .catch(function(){ st.textContent='网络错误,请重试 / Network error, please retry'; try{c.reset();}catch(e){} });
+      });
+      c.onError(function(){ st.textContent='验证组件加载失败,请刷新 / Widget failed to load, please refresh'; });
+    });
+  }
+  boot();
+</script></body></html>"""
+    html = html.replace("__LABEL__", label).replace("__CID__", cid).replace("__RET__", ret).replace("__PROVIDER__", json.dumps(provider))
+    return HTMLResponse(html)
+
+
+@app.post("/auth/captcha/gate")
+async def captcha_gate(request: Request):
+    """Verify a GeeTest result and, on success, set the short-lived gate cookie so
+    the follow-up OAuth login start can proceed."""
+    if not settings.CAPTCHA_ENABLED:
+        return JSONResponse({"ok": True})
+    _enforce_login_rate_limit(request)
+    payload = await request.json()
+    provider = str(payload.get("provider") or "")
+    if provider not in {"github", "modelscope"}:
+        raise HTTPException(status_code=400, detail="Invalid OAuth provider")
+    captcha = payload.get("captcha") if isinstance(payload.get("captcha"), dict) else payload
+    if not await _verify_captcha(captcha):
+        raise HTTPException(status_code=400, detail="Captcha verification failed. Please try again.")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        CAPTCHA_GATE_COOKIE,
+        _issue_captcha_gate(request, provider),
+        max_age=int(settings.CAPTCHA_GATE_TTL_SECONDS),
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    return resp
+
+
+@app.post("/auth/email/request-code")
+async def email_request_code(request: Request):
+    if not settings.EMAIL_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Email login is not enabled")
+    _enforce_login_rate_limit(request)
+    payload = await request.json()
+    email = _normalize_email(str(payload.get("email", "")))
+    if not email:
+        raise HTTPException(status_code=400, detail="Please enter a valid email address")
+    captcha = payload.get("captcha") if isinstance(payload.get("captcha"), dict) else payload
+    if not await _verify_captcha(captcha):
+        raise HTTPException(status_code=400, detail="Captcha verification failed. Please try again.")
+    redis = get_redis()
+    if redis is None:
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+    # Per-email hourly request cap (independent of the per-IP login limit above).
+    # Checked before reserving the cooldown so a rate-capped request never leaves
+    # a cooldown key that would block the next legitimate attempt.
+    if not rate_limit_ok(f"emailotp_req:{email}", settings.EMAIL_OTP_REQUESTS_PER_HOUR, 3600):
+        raise HTTPException(status_code=429, detail="Too many code requests for this email. Please try again later.")
+    # Per-email resend cooldown. Reserve it atomically so concurrent requests
+    # cannot send multiple codes and leave only the last one usable.
+    cd_key = f"emailotp_cd:{email}"
+    try:
+        cooldown_reserved = redis.set(
+            cd_key,
+            "1",
+            ex=int(settings.EMAIL_OTP_COOLDOWN_SECONDS),
+            nx=True,
+        )
+        if not cooldown_reserved:
+            raise HTTPException(status_code=429, detail="A code was just sent. Please wait before requesting another.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to reserve email OTP cooldown for %s: %s", email, e)
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    ttl = int(settings.EMAIL_OTP_TTL_SECONDS)
+    try:
+        redis.setex(f"emailotp:{email}", ttl, _email_otp_hash(email, code))
+        redis.delete(f"emailotp_att:{email}")
+    except Exception as e:
+        logger.error("Failed to store email OTP for %s: %s", email, e)
+        # Release the cooldown so a transient store failure doesn't lock the user out.
+        try:
+            redis.delete(cd_key)
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+
+    from .email_service import send_verification_code_email
+
+    if not await asyncio.to_thread(send_verification_code_email, email, code):
+        # Do not keep a code that could not be delivered.
+        try:
+            redis.delete(f"emailotp:{email}")
+            redis.delete(cd_key)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail="Failed to send verification email. Please try again later.")
+    return {"ok": True, "cooldown": int(settings.EMAIL_OTP_COOLDOWN_SECONDS)}
+
+
+@app.post("/auth/email/verify")
+async def email_verify_code(request: Request):
+    if not settings.EMAIL_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Email login is not enabled")
+    _enforce_login_rate_limit(request)
+    payload = await request.json()
+    email = _normalize_email(str(payload.get("email", "")))
+    code = str(payload.get("code", "")).strip()
+    if not email or not code.isdigit() or len(code) != 6:
+        raise HTTPException(status_code=400, detail="Invalid email or code")
+    redis = get_redis()
+    if redis is None:
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+
+    # Resolve account status before consuming the OTP so a signup-quota rejection
+    # does not waste a valid code. This peek is non-consuming; the signup slot is
+    # only reserved after the code verifies (below), so wrong-code attempts never
+    # burn signup capacity.
+    existing_user = get_user_by_provider("email", email) or get_user_by_email(email)
+    if existing_user is None and rate_limit_at_capacity(
+        f"signup:{_client_ip(request)}", settings.SIGNUP_RATE_LIMIT_PER_DAY
+    ):
+        raise HTTPException(status_code=429, detail="Too many new accounts from this network today")
+
+    otp_key = f"emailotp:{email}"
+    att_key = f"emailotp_att:{email}"
+    expected_hash = _email_otp_hash(email, code)
+    try:
+        result = redis.eval(
+            "local stored = redis.call('get', KEYS[1]); "
+            "if not stored then return -1 end; "
+            "local attempts = redis.call('incr', KEYS[2]); "
+            "if attempts == 1 then redis.call('expire', KEYS[2], ARGV[3]) end; "
+            "if attempts > tonumber(ARGV[2]) then redis.call('del', KEYS[1]); return -2 end; "
+            "if stored ~= ARGV[1] then return 0 end; "
+            "redis.call('del', KEYS[1]); redis.call('del', KEYS[2]); return 1",
+            2,
+            otp_key,
+            att_key,
+            expected_hash,
+            int(settings.EMAIL_OTP_MAX_ATTEMPTS),
+            int(settings.EMAIL_OTP_TTL_SECONDS),
+        )
+    except Exception as e:
+        logger.error("Failed to verify email OTP for %s: %s", email, e)
+        raise HTTPException(status_code=503, detail="Email login is temporarily unavailable, please retry later")
+    result = int(result)
+    if result == -1:
+        raise HTTPException(status_code=400, detail="Code expired or already used. Please request a new one.")
+    if result == -2:
+        raise HTTPException(status_code=429, detail="Too many incorrect attempts. Please request a new code.")
+    if result == 0:
+        raise HTTPException(status_code=401, detail="Incorrect verification code")
+
+    # Re-resolve after verification so an account created concurrently (between the
+    # pre-verify peek and here) is treated as a returning user rather than wrongly
+    # consuming a signup slot.
+    existing_user = get_user_by_provider("email", email) or get_user_by_email(email)
+    _enforce_new_signup_quota(request, existing_user)
+    user = get_or_create_user("email", email, email, email.split("@", 1)[0], "")
+    if user.get("_created"):
+        try:
+            from .telemetry import report_user_registered_event
+
+            await report_user_registered_event(user)
+        except Exception:
+            pass
+    _establish_session(request, user)
+    return {"user": user}
+
+
 @app.get("/api/me")
 async def api_me(user: dict = Depends(current_user)):
     return user
@@ -1611,7 +1996,17 @@ async def redeem_credits(req: CouponRedeemRequest, user: dict = Depends(current_
         raise HTTPException(status_code=503, detail=settings.COUPON_REDEEM_DISABLED_MESSAGE)
     coupon = _decode_credit_coupon(req.coupon)
     try:
-        return redeem_user_coupon(user["id"], coupon)
+        result = redeem_user_coupon(user["id"], coupon)
+        logger.info(
+            "Credits redeemed user_id=%s email=%s coupon_id=%s card_hours=%s credits_added=%s new_balance=%s",
+            user["id"],
+            user.get("email"),
+            coupon.get("coupon_id"),
+            coupon.get("card_hours"),
+            result.get("credits_added"),
+            result.get("credits"),
+        )
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1643,6 +2038,19 @@ async def _provision_notebook_instance(user: dict, email: str, image: str, param
     )
     record_instance_launch_event(user["id"], email, instance["id"], image, instance_type, gpu_count,
                                  pod_type=pod_type)
+    logger.info(
+        "Instance created source=notebook_request instance_id=%s user_id=%s email=%s image=%s instance_type=%s gpu_count=%s node_port=%s resource_profile=%s disk_size_gb=%s pod_type=%s",
+        instance["id"],
+        user["id"],
+        email,
+        image,
+        instance_type,
+        gpu_count,
+        instance.get("node_port"),
+        params.get("resource_profile", "auto"),
+        params.get("disk_size_gb"),
+        pod_type,
+    )
     from .telemetry import report_gpu_instance_created_event
 
     await report_gpu_instance_created_event(
@@ -1689,6 +2097,18 @@ async def _provision_template_instance(user: dict, email: str, template: dict, p
     record_instance_launch_event(
         user["id"], email, instance["id"], template["image"], template_instance_type, gpu_count,
         template_id=template["id"], template_title=template["title"],
+    )
+    logger.info(
+        "Instance created source=template_launch instance_id=%s user_id=%s email=%s template_id=%s template_title=%s image=%s instance_type=%s gpu_count=%s node_port=%s",
+        instance["id"],
+        user["id"],
+        email,
+        template["id"],
+        template["title"],
+        template["image"],
+        template_instance_type,
+        gpu_count,
+        instance.get("node_port"),
     )
     from .telemetry import report_gpu_instance_created_event
 
@@ -1778,6 +2198,13 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     if active:
         if k8s_client.get_instance_by_id(active["instance_id"]):
             raise HTTPException(status_code=400, detail="Each user can only have one active instance")
+        logger.warning(
+            "Marking stale active DB record deleted before new notebook request instance_id=%s user_id=%s email=%s status=%s",
+            active["instance_id"],
+            user["id"],
+            email,
+            active.get("status"),
+        )
         mark_instance_deleted(active["instance_id"])
 
     if int(user["credits"]) < gpu_count:
@@ -1978,6 +2405,12 @@ async def destroy_current_notebook(user: dict = Depends(current_user)):
         # the backstop that force-finalizes if the background task dies.
         mark_instance_deleting(instance_id)
         _spawn_background_delete(instance_id)
+        logger.info(
+            "Delete instance source=user_current user_id=%s email=%s instance_id=%s result=scheduled",
+            user["id"],
+            user.get("email"),
+            instance_id,
+        )
         return DestroyResponse(
             success=True,
             message=f"Instance {instance_id} is shutting down",
@@ -2706,6 +3139,14 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
     if active:
         if k8s_client.get_instance_by_id(active["instance_id"]):
             raise HTTPException(status_code=400, detail="Each user can only have one active instance")
+        logger.warning(
+            "Marking stale active DB record deleted before template launch instance_id=%s user_id=%s email=%s template_id=%s status=%s",
+            active["instance_id"],
+            user["id"],
+            user.get("email"),
+            template_id,
+            active.get("status"),
+        )
         mark_instance_deleted(active["instance_id"])
 
     if int(user["credits"]) < gpu_count:
@@ -4117,6 +4558,12 @@ async def destroy_instance(instance_id: str, username: str = Depends(verify_admi
         success = await asyncio.to_thread(k8s_client.delete_instance_by_id, instance_id)
         if success:
             mark_instance_deleted(instance_id)
+        logger.info(
+            "Delete instance source=admin_single actor=%s instance_id=%s result=%s",
+            username,
+            instance_id,
+            "deleted" if success else "not_found",
+        )
 
         return DestroyResponse(
             success=success,
@@ -4137,6 +4584,7 @@ async def destroy_all_instances(username: str = Depends(verify_admin)):
         count = await asyncio.to_thread(k8s_client.delete_all_instances)
         for inst in k8s_client.list_instances():
             mark_instance_deleted(inst["id"])
+        logger.info("Delete instances source=admin_all actor=%s destroyed_count=%s", username, count)
 
         return DestroyResponse(
             success=True,
@@ -4176,8 +4624,22 @@ async def bulk_destroy_instances(req: InstanceBulkDestroyRequest, username: str 
                 mark_instance_deleting(instance_id)
                 if k8s_client.delete_instance_by_id(instance_id):
                     mark_instance_deleted(instance_id)
+                    logger.info(
+                        "Bulk delete instance source=admin_bulk actor=%s matcher=%s instance_id=%s email=%s result=deleted",
+                        username,
+                        matcher,
+                        instance_id,
+                        inst.get("email"),
+                    )
                     _destroyed.append({"id": instance_id, "email": inst.get("email")})
                 else:
+                    logger.warning(
+                        "Bulk delete instance source=admin_bulk actor=%s matcher=%s instance_id=%s email=%s result=not_found",
+                        username,
+                        matcher,
+                        instance_id,
+                        inst.get("email"),
+                    )
                     _failed.append({"id": instance_id, "email": inst.get("email"), "reason": "not found"})
             except Exception as e:
                 logger.error("Bulk destroy failed for %s: %s", instance_id, e)

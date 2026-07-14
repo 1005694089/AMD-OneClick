@@ -262,6 +262,14 @@ spec:
               port: 8000
             initialDelaySeconds: 60
             periodSeconds: 10
+          volumeMounts:
+            - name: manager-logs
+              mountPath: /var/log/amd-oneclick
+      volumes:
+        - name: manager-logs
+          hostPath:
+            path: /var/lib/amd-oneclick/manager-logs
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

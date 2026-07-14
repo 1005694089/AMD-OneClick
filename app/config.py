@@ -457,6 +457,33 @@ class Settings:
     SMTP_PASSWORD: Optional[str] = os.getenv("SMTP_PASSWORD")
     SMTP_FROM: str = os.getenv("SMTP_FROM", "noreply@amd-oneclick.local")
 
+    # Passwordless email login (OTP): user enters email -> receives a 6-digit code
+    # -> code verified -> session established (auto-registers via get_or_create_user).
+    # Env-gated so production is unaffected until explicitly enabled. Requires SMTP
+    # and Redis (codes are stored in Redis with a TTL; fails closed without Redis).
+    EMAIL_LOGIN_ENABLED: bool = os.getenv("EMAIL_LOGIN_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    EMAIL_OTP_TTL_SECONDS: int = int(os.getenv("EMAIL_OTP_TTL_SECONDS", "600"))
+    EMAIL_OTP_COOLDOWN_SECONDS: int = int(os.getenv("EMAIL_OTP_COOLDOWN_SECONDS", "60"))
+    EMAIL_OTP_MAX_ATTEMPTS: int = int(os.getenv("EMAIL_OTP_MAX_ATTEMPTS", "5"))
+    EMAIL_OTP_REQUESTS_PER_HOUR: int = int(os.getenv("EMAIL_OTP_REQUESTS_PER_HOUR", "5"))
+
+    # GeeTest v4 (行为验4) CAPTCHA on the email-login request-code path, to block
+    # automated mass registration. Env-gated (default off). GeeTest is a mainland
+    # China provider, so its JS/verify domains load reliably behind the GFW
+    # (unlike Cloudflare Turnstile). The captcha id is public (rendered in the
+    # browser); the captcha key must stay server-side and is used to sign the
+    # server-to-server /validate call against GEETEST_API_SERVER.
+    CAPTCHA_ENABLED: bool = os.getenv("CAPTCHA_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    GEETEST_CAPTCHA_ID: str = os.getenv("GEETEST_CAPTCHA_ID", "")
+    GEETEST_CAPTCHA_KEY: str = os.getenv("GEETEST_CAPTCHA_KEY", "")
+    GEETEST_API_SERVER: str = os.getenv("GEETEST_API_SERVER", "https://gcaptcha4.geetest.com")
+    # GeeTest recommends failing open when their service is unreachable so a GeeTest
+    # outage does not lock users out; per-IP/per-email rate limits remain the backstop.
+    GEETEST_FAIL_OPEN: bool = os.getenv("GEETEST_FAIL_OPEN", "false").lower() in {"1", "true", "yes", "on"}
+    # After a passed CAPTCHA, a short-lived signed cookie lets the OAuth login
+    # start (GitHub/ModelScope) redirect without re-challenging on the same click.
+    CAPTCHA_GATE_TTL_SECONDS: int = int(os.getenv("CAPTCHA_GATE_TTL_SECONDS", "300"))
+
     SERVICE_HOST: str = os.getenv("SERVICE_HOST", "localhost")
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     NODE_PORT_BASE: int = int(os.getenv("NODE_PORT_BASE", "30000"))
@@ -519,6 +546,7 @@ class Settings:
     OAUTH_CONNECT_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_CONNECT_TIMEOUT_SECONDS", "5"))
     OAUTH_READ_TIMEOUT_SECONDS: float = float(os.getenv("OAUTH_READ_TIMEOUT_SECONDS", "15"))
     SLOW_REQUEST_THRESHOLD_SECONDS: float = float(os.getenv("SLOW_REQUEST_THRESHOLD_SECONDS", "2"))
+    MANAGER_LOG_PATH: str = os.getenv("MANAGER_LOG_PATH", "/var/log/amd-oneclick/manager.log")
     WORKSHOP_LOGIN_ENABLED: bool = os.getenv("WORKSHOP_LOGIN_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     WORKSHOP_USER_COUNT: int = int(os.getenv("WORKSHOP_USER_COUNT", "150"))
     WORKSHOP_CREDITS: int = int(os.getenv("WORKSHOP_CREDITS", "10000"))

@@ -28,6 +28,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    func,
     inspect,
     or_,
     select,
@@ -725,52 +726,85 @@ def ensure_default_blank_template(conn):
 
 def get_or_create_user(provider: str, provider_id: str, email: str, name: str = "", avatar_url: str = "") -> dict:
     now = utc_now()
-    with engine.begin() as conn:
-        existing = conn.execute(
-            select(users).where(users.c.provider == provider, users.c.provider_id == provider_id)
-        ).mappings().first()
-        if existing:
-            conn.execute(
-                update(users)
-                .where(users.c.id == existing["id"])
-                .values(email=email, name=name, avatar_url=avatar_url, updated_at=now)
-            )
-            user = row_to_dict(conn.execute(select(users).where(users.c.id == existing["id"])).mappings().first())
-            user["_created"] = False
-            return user
+    try:
+        with engine.begin() as conn:
+            existing = conn.execute(
+                select(users).where(users.c.provider == provider, users.c.provider_id == provider_id)
+            ).mappings().first()
+            if existing:
+                conn.execute(
+                    update(users)
+                    .where(users.c.id == existing["id"])
+                    .values(email=email, name=name, avatar_url=avatar_url, updated_at=now)
+                )
+                user = row_to_dict(conn.execute(select(users).where(users.c.id == existing["id"])).mappings().first())
+                user["_created"] = False
+                return user
 
-        by_email = conn.execute(select(users).where(users.c.email == email)).mappings().first()
-        if by_email:
+            by_email = conn.execute(select(users).where(func.lower(users.c.email) == (email or "").lower())).mappings().first()
+            if by_email:
+                conn.execute(
+                    update(users)
+                    .where(users.c.id == by_email["id"])
+                    .values(provider=provider, provider_id=provider_id, name=name, avatar_url=avatar_url, updated_at=now)
+                )
+                user = row_to_dict(conn.execute(select(users).where(users.c.id == by_email["id"])).mappings().first())
+                user["_created"] = False
+                return user
+
+            signup_bonus = int(settings.SIGNUP_BONUS_CREDITS)
+            result = conn.execute(
+                users.insert().values(
+                    provider=provider,
+                    provider_id=provider_id,
+                    email=email,
+                    name=name,
+                    avatar_url=avatar_url,
+                    credits=signup_bonus,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            user_id = result.inserted_primary_key[0]
+            if signup_bonus:
+                conn.execute(
+                    credit_ledger.insert().values(user_id=user_id, delta=signup_bonus, reason="signup_bonus", created_at=now)
+                )
+            user = row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
+            user["_created"] = True
+            return user
+    except IntegrityError:
+        with engine.begin() as conn:
+            provider_match = conn.execute(
+                select(users).where(users.c.provider == provider, users.c.provider_id == provider_id)
+            ).mappings().first()
+            if provider_match:
+                user = row_to_dict(provider_match)
+                user["_created"] = False
+                return user
+            email_match = conn.execute(select(users).where(func.lower(users.c.email) == (email or "").lower())).mappings().first()
+            if not email_match:
+                raise
+            # Mirror the normal by_email branch: link the provider the user just
+            # authenticated with instead of returning stale provider metadata.
             conn.execute(
                 update(users)
-                .where(users.c.id == by_email["id"])
+                .where(users.c.id == email_match["id"])
                 .values(provider=provider, provider_id=provider_id, name=name, avatar_url=avatar_url, updated_at=now)
             )
-            user = row_to_dict(conn.execute(select(users).where(users.c.id == by_email["id"])).mappings().first())
+            user = row_to_dict(conn.execute(select(users).where(users.c.id == email_match["id"])).mappings().first())
             user["_created"] = False
             return user
 
-        signup_bonus = int(settings.SIGNUP_BONUS_CREDITS)
-        result = conn.execute(
-            users.insert().values(
-                provider=provider,
-                provider_id=provider_id,
-                email=email,
-                name=name,
-                avatar_url=avatar_url,
-                credits=signup_bonus,
-                created_at=now,
-                updated_at=now,
-            )
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    # Case-insensitive: email login normalizes addresses to lowercase while OAuth
+    # providers may return mixed case. Matching on lower(email) avoids missing an
+    # existing account, which would otherwise skip linking and create a duplicate.
+    with engine.begin() as conn:
+        return row_to_dict(
+            conn.execute(select(users).where(func.lower(users.c.email) == (email or "").lower())).mappings().first()
         )
-        user_id = result.inserted_primary_key[0]
-        if signup_bonus:
-            conn.execute(
-                credit_ledger.insert().values(user_id=user_id, delta=signup_bonus, reason="signup_bonus", created_at=now)
-            )
-        user = row_to_dict(conn.execute(select(users).where(users.c.id == user_id)).mappings().first())
-        user["_created"] = True
-        return user
 
 
 def get_user_by_provider(provider: str, provider_id: str) -> Optional[dict]:

@@ -42,7 +42,7 @@ def get_redis():
             )
             client.ping()
             _client = client
-            logger.info("Connected to Redis at %s", settings.REDIS_URL)
+            logger.info("Connected to Redis")
         except Exception as e:  # pragma: no cover - infra dependent
             _log_error("Redis unavailable (%s); rate limiting fails open", e)
             _client = None
@@ -76,3 +76,24 @@ def rate_limit_ok(key: str, limit: int, window_seconds: int) -> bool:
     except Exception as e:  # pragma: no cover - infra dependent
         _log_error("Redis rate-limit check failed (%s); allowing request", e)
         return True
+
+
+def rate_limit_at_capacity(key: str, limit: int) -> bool:
+    """Non-consuming peek: True when the fixed-window counter for ``key`` is
+    already at or above ``limit``.
+
+    Unlike ``rate_limit_ok`` this does not increment the counter, so it is safe to
+    call as an early guard before an expensive/destructive step. Fails open
+    (returns False) when rate limiting is disabled or Redis is unavailable.
+    """
+    if not settings.RATE_LIMIT_ENABLED or limit <= 0:
+        return False
+    client = get_redis()
+    if client is None:
+        return False
+    try:
+        count = client.get(f"rl:{key}")
+        return count is not None and int(count) >= limit
+    except Exception as e:  # pragma: no cover - infra dependent
+        _log_error("Redis rate-limit peek failed (%s); allowing request", e)
+        return False
