@@ -2,6 +2,8 @@
 
 This guide is for frontend developers integrating with the Radeon Global Hugging Face demo notebook API.
 
+For the front-door provider's responsibilities, edge warning rules, rate limits, origin protection, response contract, and operational handoff, see [Front-Door Provider Warning Rules and Mechanism](FRONTDOOR_WARNING_RULES_AND_MECHANISM.md).
+
 ## Base URL
 
 ```text
