@@ -26,6 +26,45 @@ secrets.
 
 ---
 
+## 2026-07-14 (1116) — v2 PROD: GeeTest CAPTCHA on GitHub/ModelScope login + OAuth callback idempotency
+
+**Code commit:** `e6c711304a79e312f85811f4c88e8b8308778b38` (branch
+`feature/oauth-credit-manager`, pushed), validated on radeon-test as
+`v2-test-oauth-captcha-20260713-1755`. Two changes:
+
+1. **CAPTCHA gate on OAuth login start.** When `CAPTCHA_ENABLED`,
+   `/auth/{github,modelscope}/login` serves a self-contained GeeTest interstitial
+   until a short-lived signed gate cookie (set by the new `POST /auth/captcha/gate`
+   after a passed challenge) is present, then redirects to the provider as before.
+   Covers every entry point (menu, profile "Switch to…", gallery buttons) without
+   editing individual links. Reuses the existing `CAPTCHA_ENABLED` + `GEETEST_*`.
+2. **OAuth callback idempotency.** ModelScope (and occasionally GitHub) deliver the
+   callback twice for one login (different code, same state). `_validate_oauth_state`
+   consumed the state via `pop()`, so the second delivery failed with
+   "Invalid OAuth state" (the "Failed oauth state" users hit). Now reads with
+   `get()` (CSRF binding intact) and treats an already-logged-in duplicate/late
+   callback as an idempotent redirect home.
+
+Manifest-first: `kubectl diff` showed **image only** (env/secret/config unchanged —
+`CAPTCHA_ENABLED`/`GEETEST_*`/`EMAIL_LOGIN_ENABLED` already live from the 07-13 1700
+deploy). Image pre-imported on `wx-ms-w7900d-0005`.
+
+| Service / Port | Image (`:tag`) | Digest / ID | Local yaml + sha256 | Snapshot |
+|----------------|----------------|-------------|---------------------|----------|
+| v2 prod / 30088 | `crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick:v2-oauth-captcha-20260714-1116` | digest `sha256:191667f16fab28e2d513d92a4f5ff3c4c657160aa81a424dac0ae6522cee58f8` / id `sha256:b2218d4e35e08e425e6e12fc23791b4e1d4308192b10c8db81863db7ac1ae141` | `k8s-manager-v2-manager-only.local.yaml` sha256 `c0da0db50b27851a154d24a72123ee3a3bcb4e6108f7cc0ef40105c96ad756ba` | `local-deploy-history/v2-manager-only/2026-07-14-1116-v2-prod-oauth-captcha.local.yaml` |
+
+**Rollback:** `kubectl -n default rollout undo deployment/amd-oneclick-manager-v2`
+(prev image `v2-email-geetest-20260713-1700`); or disable all CAPTCHA via
+`kubectl -n default set env deploy/amd-oneclick-manager-v2 CAPTCHA_ENABLED-`.
+
+**Verified (prod):** rollout `1/1 ready`, pod `amd-oneclick-manager-v2-784bb69597-lsplt`;
+`/health` 200; `/auth/github/login` & `/auth/modelscope/login` (no cookie) → 200
+interstitial (gt4.js + captcha id + 安全验证); `POST /auth/captcha/gate` no-captcha → 400;
+`/auth/email/request-code` no-captcha → 400 (email CAPTCHA still enforced); with a valid
+gate cookie both OAuth starts → 307 to github.com / modelscope.cn authorize; duplicate
+ModelScope callback with the same state → both pass state validation (fail only at token
+exchange), confirming the "Invalid OAuth state" regression is gone.
+
 ## 2026-07-13 (1700) — v2 PROD: GeeTest v4 CAPTCHA + re-enable email login
 
 **Code commit:** `8fb073862247f6ef88c7ff22c95e9495c980af8b` (branch
