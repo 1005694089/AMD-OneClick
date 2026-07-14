@@ -24,6 +24,63 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-15 00:05 - radeon-global: merge feature/oauth-credit-manager (email OTP + CAPTCHA + audit logging) (DEPLOYED + live verified)
+
+**Status:** DEPLOYED `oauth-credit-mgr-20260714-2358`
+(`@sha256:355dc9f672f14c2ab48f65dc00f85356fbe514a9a51d0148c69f59abad900f75`) to
+`amd-oneclick-lablab` (3 replicas, RollingUpdate maxSurge=0/maxUnavailable=1),
+fronted by Azure Front Door `https://radeon-global.anruicloud.com` -> NodePort 30080.
+
+**Code commit:** `926942c` (on `merge/oauth-credit-manager`, pushed) = merge commit `f4dfa64`
+`Merge feature/oauth-credit-manager: email OTP + CAPTCHA + audit logging` + two docs-only commits
+(`FRONTDOOR_WARNING_RULES_AND_MECHANISM.md`, `huggingface-demo-api.md`); no app/template/static
+delta between f4dfa64 and the deployed tip. The merge is a two-parent commit (parents
+`b0b27c3` prod + `516fc8f` origin/feature/oauth-credit-manager).
+
+**Change:** selective merge that keeps prod's newer infra (`app/k8s_client.py` byte-identical to
+prod; no `WORKSPACE_NFS_*`; deploy-history docs unchanged) and ports only: passwordless email OTP
+login (`POST /auth/email/request-code`, `/auth/email/verify`; Redis HMAC codes, cooldown/hourly/
+attempt limits, auto-registration), GeeTest v4 CAPTCHA (`POST /auth/captcha/gate`, one-time Redis
+gate token bound to session+provider, OAuth-login interstitial), OAuth callback idempotency
+(non-consuming session `_validate_oauth_state`, no Redis hard-dependency), persistent manager
+logging (`RotatingFileHandler` + `MANAGER_LOG_PATH`) + lifecycle/billing/deletion audit logs, and
+pre-create signup-quota enforcement (+ case-insensitive email lookup, non-consuming
+`rate_limit_at_capacity` peek). **All new feature flags (`EMAIL_LOGIN_ENABLED`, `CAPTCHA_ENABLED`)
+default OFF** — this roll ships code only and does not activate email login or CAPTCHA. Reviewed by
+a 4-agent panel (Bugbot, security, code-quality, merge-fidelity) to no-blocking-issues over 4
+rounds; full suite **378 passed, 1 skipped**.
+
+**Image build:** THIN kaniko build — `FROM 10.5.10.89:1808/xinwei/amd-oneclick-manager:opencode-off-20260711-1101`
++ `COPY app/ templates/ static/` (`Dockerfile.thin`), build pod `manager-build-oauth-credit`
+(ns amd-oneclick-lablab), kaniko `--insecure*`/`--skip-tls-verify*` (base pulled from the same LAN
+Harbor). Pushed `10.5.10.89:1808/xinwei/amd-oneclick-manager:oauth-credit-mgr-20260714-2358`
+(digest `@sha256:355dc9f672f14c2ab48f65dc00f85356fbe514a9a51d0148c69f59abad900f75`). Runbook:
+`scripts/deploy-oauth-credit-manager.sh` ({status|build|verify|deploy|rollback|cleanup}).
+
+**Rollout:** `kubectl -n amd-oneclick-lablab set image deployment/amd-oneclick-lablab-manager
+manager=...:oauth-credit-mgr-20260714-2358` (**No yaml applied**). Rolled **3/3, 0 restarts** in ~67s
+(one replica served throughout). Pre-rollout throwaway-pod image verify: flags OFF, new routes/
+helpers present.
+
+**Snapshot:** PRE `local-deploy-history/radeon-global/20260715-0005-oauth-credit-mgr-PRE-deploy.yaml`;
+APPLIED `local-deploy-history/radeon-global/20260715-0005-oauth-credit-mgr-APPLIED-deploy.yaml`
+(sha256 `94786475599bad5652be4bca5ff87efb890e7631dd73d48f264173b2a535fbf3`). (git-ignored.)
+
+**Verification (live):** `/health` 200 `{"status":"healthy"}` in-cluster and via public edge; `GET /`
+200 (UI). New endpoints correct & gated OFF: `POST /auth/email/request-code` and `/auth/email/verify`
+-> 404 `{"detail":"Email login is not enabled"}`; `POST /auth/captcha/gate` -> 200 `{"ok":true}`
+(transparent when disabled) — both confirmed through the public edge (only exist in the new image).
+`GET /auth/github/login` -> 307 to `github.com/login/oauth/authorize` with
+`redirect_uri=https://radeon-global.anruicloud.com/auth/github/callback`. `GET /api/huggingface/images`
+(no token) -> 401. Persistent log file `/var/log/amd-oneclick/manager.log` actively written in-pod.
+
+**Notes:** the `manager-logs` hostPath volume was added to `k8s-deployment-v2.yaml` (the `default`/v2
+template) only; the lablab live deploy is `set image`-only, so file logging on lablab is
+container-local/ephemeral per pod — persisting it would need a separate volume patch to the live
+Deployment. `GET /auth/modelscope/login` -> 500 "ModelScope OAuth is not configured" is **pre-existing**
+lablab env config (no `MODELSCOPE_CLIENT_ID`), unrelated to this change. Rollback:
+`scripts/deploy-oauth-credit-manager.sh rollback` (-> `opencode-off-20260711-1101`).
+
 ## 2026-07-11 12:00 - radeon-global: disable OpenCode web + free its per-instance NodePorts (DEPLOYED + live verified)
 
 **Status:** DEPLOYED `opencode-off-20260711-1101`

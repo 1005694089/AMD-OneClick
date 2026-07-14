@@ -7,7 +7,7 @@
 # the shipped image is exactly (base deps) + (current working-tree source).
 #
 # Bump this FROM tag if a newer manager base is rolled out before this build runs.
-FROM 10.5.10.89:1808/xinwei/amd-oneclick-manager:hf-gpus-off-20260711-0316
+FROM 10.5.10.89:1808/xinwei/amd-oneclick-manager:opencode-off-20260711-1101
 
 WORKDIR /app
 
