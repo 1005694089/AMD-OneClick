@@ -1092,23 +1092,38 @@ def _proxy_headers(headers) -> dict:
 
 
 def _ensure_notebook_token_qs(query: Optional[str]) -> str:
-    """Append the shared notebook token to an upstream query string when the caller
-    didn't already supply one.
+    """Ensure the upstream query string carries the shared notebook token.
 
     Jupyter enforces token auth on every request (HTTP *and* WebSocket), and the
     manager proxy is the access boundary in front of it. A browser that reaches an
-    instance without ``?token=`` in the URL (a bookmarked/reloaded/shared link, or
-    after the token cookie expired) loads the JupyterLab shell but then gets 403 on
+    instance without a valid token loads the JupyterLab shell but then gets 403 on
     every API call — so terminals, kernels, and the file browser cannot be opened.
-    The WebSocket proxy already injects the token; doing the same for HTTP keeps the
-    two paths consistent so an instance is fully usable regardless of the query."""
-    qs = query or ""
-    if settings.NOTEBOOK_TOKEN and not any(
-        part.split("=", 1)[0] == "token" for part in qs.split("&") if part
-    ):
-        sep = "&" if qs else ""
-        qs = f"{qs}{sep}token={settings.NOTEBOOK_TOKEN}"
-    return qs
+
+    JupyterLab authenticates XHR with an ``Authorization`` header but must pass the
+    token as a query param on WebSockets (browsers can't set WS headers). When it
+    falls back to cookie auth it emits an *empty* ``token=`` — which the proxy strips
+    the session cookie from — so the upstream terminal/kernel WS is rejected with 403.
+    We therefore inject the shared token whenever it is missing *or blank*, replacing
+    an empty ``token=`` rather than treating the bare key as "already supplied"."""
+    if not settings.NOTEBOOK_TOKEN:
+        return query or ""
+    kept: list[str] = []
+    has_token = False
+    for part in (query or "").split("&"):
+        if not part:
+            continue
+        key, sep, value = part.partition("=")
+        if key == "token":
+            # Keep a caller-supplied non-empty token; drop a blank one so it is
+            # replaced below (a blank token otherwise authenticates as anonymous → 403).
+            if value:
+                has_token = True
+                kept.append(part)
+        else:
+            kept.append(part)
+    if not has_token:
+        kept.append(f"token={settings.NOTEBOOK_TOKEN}")
+    return "&".join(kept)
 
 
 def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
