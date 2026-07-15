@@ -24,6 +24,41 @@ secrets.
 | Snapshot | Path under `local-deploy-history/` (git-ignored) |
 | Notes | What changed / verification result |
 
+## 2026-07-15 11:40 - radeon-global: enable email OTP login + GeeTest CAPTCHA (config/secret only, no image change)
+
+**Status:** ENABLED on `amd-oneclick-lablab` (image UNCHANGED:
+`oauth-credit-mgr-20260714-2358`). Feature-flag/secret change only — the code was
+already deployed 2026-07-15 00:05. Two rolling restarts (`kubectl rollout restart`),
+each 3/3, 0 restarts, one replica served throughout.
+
+**ConfigMap `amd-oneclick-lablab-config` (non-secret) — keys added:**
+`EMAIL_LOGIN_ENABLED=true`, `SMTP_HOST=smtp.office365.com`, `SMTP_PORT=587`,
+`SMTP_FROM=AMD Radeon Cloud <noreply_radeoncloud@mail.developer.amd.com.cn>`,
+`CAPTCHA_ENABLED=true`, `GEETEST_CAPTCHA_ID=57d37973395d92ae75f3a4b38c32cb64` (public,
+client-side), `GEETEST_API_SERVER=https://gcaptcha4.geetest.com`, `GEETEST_FAIL_OPEN=false`
+(fail-closed).
+
+**Secret `amd-oneclick-lablab-secrets` — keys added (VALUES NOT COMMITTED):**
+`SMTP_USER`, `SMTP_PASSWORD`, `GEETEST_CAPTCHA_KEY`. Set via `kubectl patch secret --type merge`
+straight on-cluster; not written to any git-tracked file.
+
+**Verification (live, public edge `https://radeon-global.anruicloud.com`):**
+- Email login option renders in the header menu (`showEmailLogin`/`open-email-login`).
+- SMTP delivery confirmed BEFORE turning CAPTCHA on: `POST /auth/email/request-code`
+  `{"email":"noreply_radeoncloud@..."}` -> `200 {"ok":true,"cooldown":60}` (Office365
+  accepted + sent; a 502 would mean SMTP failure).
+- After CAPTCHA on: `POST /auth/email/request-code` without a token -> `400 Captcha verification
+  failed`; `GET /auth/github/login` -> `200` GeeTest interstitial ("安全验证 / Security check",
+  `initGeetest4`); `POST /auth/captcha/gate` with a bogus token -> `400` (fail-closed).
+- Redis-backed OTP store + one-time captcha gate; `EMAIL_OTP_*` limits at defaults
+  (600s TTL, 60s cooldown, 5 attempts, 5/hour).
+
+**Notes:** requires SMTP AUTH to stay enabled for the `noreply_radeoncloud@mail.developer.amd.com.cn`
+mailbox on Office365. The final browser login (email -> solve GeeTest -> receive code -> enter code)
+must be exercised in-browser since the code-request now requires a browser-solved GeeTest token.
+Rollback (disable features, keep image): set `EMAIL_LOGIN_ENABLED=false` / `CAPTCHA_ENABLED=false`
+in the ConfigMap + `kubectl rollout restart`.
+
 ## 2026-07-15 00:05 - radeon-global: merge feature/oauth-credit-manager (email OTP + CAPTCHA + audit logging) (DEPLOYED + live verified)
 
 **Status:** DEPLOYED `oauth-credit-mgr-20260714-2358`
