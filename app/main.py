@@ -1091,6 +1091,26 @@ def _proxy_headers(headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in skip}
 
 
+def _ensure_notebook_token_qs(query: Optional[str]) -> str:
+    """Append the shared notebook token to an upstream query string when the caller
+    didn't already supply one.
+
+    Jupyter enforces token auth on every request (HTTP *and* WebSocket), and the
+    manager proxy is the access boundary in front of it. A browser that reaches an
+    instance without ``?token=`` in the URL (a bookmarked/reloaded/shared link, or
+    after the token cookie expired) loads the JupyterLab shell but then gets 403 on
+    every API call — so terminals, kernels, and the file browser cannot be opened.
+    The WebSocket proxy already injects the token; doing the same for HTTP keeps the
+    two paths consistent so an instance is fully usable regardless of the query."""
+    qs = query or ""
+    if settings.NOTEBOOK_TOKEN and not any(
+        part.split("=", 1)[0] == "token" for part in qs.split("&") if part
+    ):
+        sep = "&" if qs else ""
+        qs = f"{qs}{sep}token={settings.NOTEBOOK_TOKEN}"
+    return qs
+
+
 def _rewrite_location(location: str, instance_id: str, target_base: str) -> str:
     public_prefix = f"/instances/{instance_id}/"
     if location.startswith(target_base):
@@ -3896,8 +3916,9 @@ async def proxy_instance_http(instance_id: str, path: str, request: Request):
     """Proxy HTTP traffic to a Jupyter instance using its path-based base_url."""
     target_base = await _instance_service_base_async(instance_id)
     target_url = f"{target_base}/instances/{instance_id}/{path}"
-    if request.url.query:
-        target_url += f"?{request.url.query}"
+    qs = _ensure_notebook_token_qs(request.url.query)
+    if qs:
+        target_url += f"?{qs}"
 
     body = await request.body()
     client = _get_proxy_client()
@@ -3946,11 +3967,9 @@ async def proxy_instance_websocket(websocket: WebSocket, instance_id: str, path:
     try:
         target_base = (await _instance_service_base_async(instance_id)).replace("http://", "ws://")
         target_url = f"{target_base}/instances/{instance_id}/{path}"
-        qs = websocket.url.query or ""
-        if "token=" not in qs:
-            sep = "&" if qs else ""
-            qs = f"{qs}{sep}token={settings.NOTEBOOK_TOKEN}"
-        target_url += f"?{qs}"
+        qs = _ensure_notebook_token_qs(websocket.url.query)
+        if qs:
+            target_url += f"?{qs}"
 
         headers = []
         if websocket.headers.get("cookie"):
