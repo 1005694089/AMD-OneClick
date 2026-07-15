@@ -635,14 +635,6 @@ class Settings:
     CUSTOM_IMAGE_PULL_SECRET_NAME: str = os.getenv("CUSTOM_IMAGE_PULL_SECRET_NAME", "")
     # Name of the dockerconfigjson secret the legacy ACR agent used to push (referenced for docs).
     ACR_PUSH_SECRET_NAME: str = os.getenv("ACR_PUSH_SECRET_NAME", "acr-push-secret")
-    CUSTOM_IMAGE_GC_ENABLED: bool = os.getenv("CUSTOM_IMAGE_GC_ENABLED", "true").lower() in {"1", "true", "yes"}
-    CUSTOM_IMAGE_GC_DISK_PATH: str = os.getenv("CUSTOM_IMAGE_GC_DISK_PATH", "/disk/ssd1/containerd")
-    CUSTOM_IMAGE_GC_DISK_THRESHOLD_PERCENT: float = float(os.getenv("CUSTOM_IMAGE_GC_DISK_THRESHOLD_PERCENT", "85"))
-    CUSTOM_IMAGE_GC_INTERVAL_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_INTERVAL_SECONDS", "300"))
-    # Idle window after a custom image's last launch before it becomes eligible for full delete
-    # (node layers + P2P caches + registry tag). Default 5 days per the auto-delete contract.
-    CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS: int = int(os.getenv("CUSTOM_IMAGE_GC_LAUNCH_GRACE_SECONDS", "432000"))
-
     # Internal build-agent channel (R9700 -> manager). Token guards /api/internal/builds/*.
     BUILD_AGENT_TOKEN: str = os.getenv("BUILD_AGENT_TOKEN", "")
     BUILD_AGENT_ALLOWED_IPS: list = [
@@ -653,15 +645,6 @@ class Settings:
         os.getenv("CUSTOM_IMAGE_BUILD_LEASE_TIMEOUT_SECONDS", "3600")
     )
 
-    # Isolated Image Service — the sole image-management system. Image distribution goes through the
-    # image_jobs queue consumed by the off-cluster daemon (save | ssh ctr import). The legacy prepull
-    # DaemonSet / pull-probe path has been removed.
-    # Default FALSE: when enabled, create_instance resolves a target GPU node and HARD-PINS the pod via
-    # spec.nodeName so the image can be preloaded there — which also disables the pod's soft nodeAffinity
-    # (affinity is only applied to un-pinned pods). Off by default so launches stay un-pinned and the
-    # workspace warm-relaunch soft-affinity actually takes effect; set true only where the off-cluster
-    # image daemon is running and image preloading is required.
-    IMAGE_SERVICE_ENABLED: bool = os.getenv("IMAGE_SERVICE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     # The Image-Service host is itself a labelled prepull node; node-target resolution must drop it
     # so it never receives distributions. Must exactly match its `kubectl get nodes` name.
     IMAGE_SERVICE_NODE_NAME: str = os.getenv("IMAGE_SERVICE_NODE_NAME", "")
@@ -681,12 +664,6 @@ class Settings:
     # Default TRUE: this only affects the previously-broken 0/N manual rows. Mirror rows (preheat DS)
     # and image-service rows are unaffected — they keep their own status paths.
     NODE_IMAGE_SCAN_ENABLED: bool = os.getenv("NODE_IMAGE_SCAN_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-    # Self-hosted LAN registry (zot) on node 0042 — the durable source of truth for the P2P
-    # transport (host:port, e.g. "10.5.10.43:5000"). EMPTY => P1 push behavior is dormant: the
-    # `push` chain step is not inserted and readiness still gates on node-loaded rows only, so
-    # deploying P1 code before the registry env is wired is a no-op (safe/revertible). When set,
-    # admin/custom builds push here and "ready" gates on the pushed digest being recorded.
-    LAN_REGISTRY: str = os.getenv("LAN_REGISTRY", "").strip().rstrip("/")
     # --- Harbor image sources + node preheat (in-cluster image distribution) ---
     # Ordered list of Harbor registry/project pairs to search when the admin adds an image.
     # The image is assumed to already exist in one of these locations; the system verifies via
@@ -717,33 +694,7 @@ class Settings:
     # Deploying this flips POST /api/custom-images/build to 403 immediately and
     # hides the build UI; existing built images stay launchable/deletable. Set to true to re-enable.
     USER_CUSTOM_BUILDS_ENABLED: bool = os.getenv("USER_CUSTOM_BUILDS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-    # P4 complete-delete fan-out gate. FALSE (default) => delete/idle paths keep the pre-P4 single
-    # `evict` (node-layer removal), so shipping P4 code is INERT for delete and production delete
-    # keeps working exactly as before. TRUE => the 6-surface purge fan-out (purge_node/p2p/seed/
-    # registry_delete/purge_builder/purge_meta). Flip to TRUE only AFTER the P2P cutover, once every
-    # node/seed actually runs a dfdaemon (else purge_p2p/purge_seed have nothing to talk to and would
-    # stick purge_meta). This makes P3/P4 code shippable to prod with zero delete-behavior change.
-    PURGE_FANOUT_ENABLED: bool = os.getenv("PURGE_FANOUT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-    # P4 manager-executed purge (purge_p2p/purge_seed run via `kubectl exec dfctl task rm` into the
-    # in-cluster dfdaemon/seed pods — the 0042 agent cannot reach the overlay-only seeds, and the real
-    # v1.4.0 delete CLI is `dfctl task rm <task_id>`, socket-local). The manager drains these kinds on
-    # the scheduler leader. Namespace + workload names of the Dragonfly install:
-    DRAGONFLY_NAMESPACE: str = os.getenv("DRAGONFLY_NAMESPACE", "dragonfly-system")
-    # DaemonSet pod name prefix for the per-node client dfdaemon (label app selection is used; this is
-    # the container name to exec into).
-    DRAGONFLY_CLIENT_CONTAINER: str = os.getenv("DRAGONFLY_CLIENT_CONTAINER", "client")
-    DRAGONFLY_SEED_CONTAINER: str = os.getenv("DRAGONFLY_SEED_CONTAINER", "seed-client")
-    # Label selector to find the per-node client dfdaemon pods (DaemonSet).
-    DRAGONFLY_CLIENT_SELECTOR: str = os.getenv("DRAGONFLY_CLIENT_SELECTOR", "app=dragonfly,component=client")
-    DRAGONFLY_SEED_SELECTOR: str = os.getenv("DRAGONFLY_SEED_SELECTOR", "app=dragonfly,component=seed-client")
-    # dfctl binary path + daemon socket inside the pods (v1.4.0 defaults).
-    DRAGONFLY_DFCTL: str = os.getenv("DRAGONFLY_DFCTL", "dfctl")
-    # How many manager-side purge jobs to drain per scheduler tick (bounded so one tick can't run away).
-    PURGE_DRAIN_BATCH: int = int(os.getenv("PURGE_DRAIN_BATCH", "20"))
-    # How often the manager drains purge_p2p/purge_seed/purge_meta. Deletes are interactive, so keep
-    # this brisk. Inert unless PURGE_FANOUT_ENABLED.
-    PURGE_DRAIN_INTERVAL_SECONDS: int = int(os.getenv("PURGE_DRAIN_INTERVAL_SECONDS", "15"))
-    
+
     # Optional proxy prefix for raw GitHub fetches. raw.githubusercontent.com is intermittently
     # throttled from the cn-shanghai region (~1/3 of fetches time out), so route through a GitHub
     # mirror: the fetch URL becomes f"{GITHUB_RAW_PROXY}{raw_url}". Default gh-proxy.org (Cloudflare,
@@ -759,12 +710,6 @@ class Settings:
     GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS: int = int(os.getenv("GITHUB_DOCKERFILE_FETCH_TIMEOUT_SECONDS", "10"))
     # Retries for the raw Dockerfile fetch (the proxy/github can still blip intermittently).
     GITHUB_DOCKERFILE_FETCH_RETRIES: int = int(os.getenv("GITHUB_DOCKERFILE_FETCH_RETRIES", "3"))
-    # An image is considered outdated (eligible for node eviction) this many days after its last launch.
-    IMAGE_OUTDATED_DAYS: int = int(os.getenv("IMAGE_OUTDATED_DAYS", "5"))
-    # image_jobs whose lease is older than this are reaped back to pending (or failed) by the scheduler.
-    JOB_LEASE_TIMEOUT_SECONDS: int = int(os.getenv("JOB_LEASE_TIMEOUT_SECONDS", "3600"))
-    # The daemon refuses a distribute job when the target node's containerd-root free space is below this.
-    IMAGE_NODE_MIN_FREE_DISK_GB: int = int(os.getenv("IMAGE_NODE_MIN_FREE_DISK_GB", "50"))
     # A node whose containerd wedged (import timed out / liveness probe failed) is quarantined for this
     # long: the reaper will not requeue distribute/evict onto it and launches route around it. After the
     # window expires it becomes eligible again (recovery may have cleared the wedge in the meantime).
@@ -844,7 +789,7 @@ class Settings:
     # Fraction of eligible prepull nodes that must have pulled before the admin
     # UI shows the image as "ready" (display only; does not hide the image).
     PREPULL_READY_THRESHOLD: float = float(os.getenv("PREPULL_READY_THRESHOLD", "0.8"))
-    IMAGE_SYNC_REFRESH_INTERVAL_SECONDS: int = int(os.getenv("IMAGE_SYNC_REFRESH_INTERVAL_SECONDS", "120"))
+    IMAGE_SYNC_REFRESH_INTERVAL_SECONDS: int = int(os.getenv("IMAGE_SYNC_REFRESH_INTERVAL_SECONDS", "300"))
 
 
 settings = Settings()

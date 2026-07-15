@@ -1,3 +1,5 @@
+> **DEPRECATED / REMOVED:** the Dragonfly P2P purge fan-out, the `image_jobs` distribution queue, the off-cluster image daemon, and `IMAGE_SERVICE_ENABLED` launch gating have been removed. Kubelet now pulls images on demand; Harbor preheat + node image scan + the admin image catalog remain. This document is retained for historical context only.
+
 # Image Service Architecture (Dragonfly P2P + self-hosted zot registry)
 
 How the AMD-OneClick image-service distributes and deletes GPU-notebook images across the fleet,

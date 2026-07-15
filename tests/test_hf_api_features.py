@@ -19,7 +19,6 @@ os.close(_DB_FD)
 os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
 os.environ["ADMIN_PASSWORD"] = "testpass"
 os.environ["NOTEBOOK_NODE_NAME"] = "fake-node"
-os.environ["IMAGE_SERVICE_ENABLED"] = "false"
 os.environ["HUGGINGFACE_DEMO_API_TOKENS"] = "tok-test"
 
 from tests.kube_stub import install  # noqa: E402
@@ -43,7 +42,6 @@ def _set_credits(user_id, value):
 def _pin_settings():
     main_module.settings.ADMIN_PASSWORD = "testpass"
     main_module.settings.HUGGINGFACE_DEMO_API_TOKENS = "tok-test"
-    main_module.settings.IMAGE_SERVICE_ENABLED = False
 
 
 class _FakeK8s:

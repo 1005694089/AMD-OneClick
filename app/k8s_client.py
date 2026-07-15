@@ -2890,26 +2890,13 @@ fi
             notebook_container["command"] = ["/bin/bash", "-c"]
             notebook_container["args"] = [startup_script]
 
-        # When the Image Service has already imported this ref into containerd on the
-        # resolved target node, the image is present locally with no registry behind it:
-        # pull IfNotPresent and drop the registry pull secrets entirely.
-        image_preloaded = bool(
-            settings.IMAGE_SERVICE_ENABLED
-            and notebook_node_name
-            and store.image_loaded_on_node(image, notebook_node_name)
-        )
-
         # Custom images reuse the tag user-{id}:{name} across rebuilds, so IfNotPresent could
         # launch a stale cached layer on the node after a delete+rebuild. Force Always for the
         # custom registry so the freshly pushed image is always pulled.
         is_custom_image = bool(
             settings.CUSTOM_IMAGE_REGISTRY and image.startswith(settings.CUSTOM_IMAGE_REGISTRY)
         )
-        if image_preloaded:
-            notebook_pull_policy = "IfNotPresent"
-        else:
-            notebook_pull_policy = "Always" if is_custom_image else "IfNotPresent"
-        notebook_container["imagePullPolicy"] = notebook_pull_policy
+        notebook_container["imagePullPolicy"] = "Always" if is_custom_image else "IfNotPresent"
 
         # Opt-in SSH: inject the launching user's public key and force key-only
         # auth via a postStart hook. This runs regardless of the container's main
@@ -2972,20 +2959,17 @@ fi
             if affinity:
                 spec["affinity"] = affinity
 
-        # A preloaded ref is served from the node's local containerd store, so no
-        # registry credentials are needed (and attaching them is wrong — the ref has
-        # no registry). Only attach pull secrets when a registry pull may happen.
-        if not image_preloaded:
-            image_pull_secrets = []
-            image_pull_secret_name = settings.IMAGE_PULL_SECRET_NAME.strip()
-            if image_pull_secret_name:
-                image_pull_secrets.append({"name": image_pull_secret_name})
-            # Additionally attach the custom-registry pull secret for images from the custom
-            # registry, when one is configured. Other images keep relying on node-level credentials.
-            if settings.CUSTOM_IMAGE_PULL_SECRET_NAME and image.startswith(settings.CUSTOM_IMAGE_REGISTRY):
-                image_pull_secrets.append({"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME})
-            if image_pull_secrets:
-                spec["imagePullSecrets"] = image_pull_secrets
+        # Attach registry pull secrets so kubelet can pull the image on demand.
+        image_pull_secrets = []
+        image_pull_secret_name = settings.IMAGE_PULL_SECRET_NAME.strip()
+        if image_pull_secret_name:
+            image_pull_secrets.append({"name": image_pull_secret_name})
+        # Additionally attach the custom-registry pull secret for images from the custom
+        # registry, when one is configured. Other images keep relying on node-level credentials.
+        if settings.CUSTOM_IMAGE_PULL_SECRET_NAME and image.startswith(settings.CUSTOM_IMAGE_REGISTRY):
+            image_pull_secrets.append({"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME})
+        if image_pull_secrets:
+            spec["imagePullSecrets"] = image_pull_secrets
 
         return {
             "apiVersion": "v1",
@@ -3403,18 +3387,6 @@ exit 0
             targets.append({"node": name, "ip": internal_ip})
         return targets
 
-    def resolve_node_targets(self, node_names: Optional[list[str]] = None) -> list[dict]:
-        """Resolve distribute/evict targets ({"node","ip"}) for the daemon.
-
-        The Manager owns target resolution (it has kubectl; the daemon does not). Returns
-        every eligible target when node_names is None, else the eligible targets whose node
-        name is in node_names (silently dropping names that are not eligible/resolvable)."""
-        targets = self._eligible_target_nodes()
-        if node_names is None:
-            return targets
-        wanted = {n for n in node_names if n}
-        return [t for t in targets if t["node"] in wanted]
-
     def _select_target_gpu_node(self, gpu_count: int = 1) -> Optional[str]:
         """Pick an eligible node with enough free GPUs for a node-pinned launch.
 
@@ -3666,28 +3638,6 @@ exit 0
         )
         return len(pods.items)
 
-    def sync_image_to_nodes(self, image_id: int, image: str) -> dict:
-        """Distribute a catalog image to every eligible GPU node.
-
-        Image-service is the sole image-management system: this enqueues a
-        `distribute` job (the out-of-cluster daemon does the actual
-        `save | ssh ctr import`) and synthesizes status from `image_nodes`.
-        The legacy prepull-DaemonSet / pull-probe path has been removed — no
-        manager process ever creates an image-pull DaemonSet on a node, so a
-        prepull pull can never co-tenant a node and race a same-digest
-        image-service import on containerd's chain-ID unpack mutex."""
-        image = image.strip()
-        if not image:
-            raise ValueError("image must not be empty")
-        targets = self._eligible_target_nodes()
-        store.enqueue_image_job(
-            kind="distribute",
-            ref=image,
-            image_id=image_id,
-            payload={"targets": targets, "concurrency": 2},
-        )
-        return self.get_image_sync_status(image_id, image)
-
     def get_image_sync_status(self, image_id: int, image: Optional[str] = None) -> dict:
         """Return distribution status for an image catalog entry (image-service only)."""
         ref = (image or "").strip()
@@ -3696,13 +3646,10 @@ exit 0
         desired = len(target_names)
         loaded_nodes = set(store.list_nodes_for_image(ref)) if ref else set()
         ready = len(loaded_nodes & target_names) if target_names else len(loaded_nodes)
-        # Readiness = image loaded on every eligible node. Registry durability is guaranteed
-        # STRUCTURALLY, not via a digest gate here: the chain runs push BEFORE distribute, so a node
-        # can only reach "loaded" after the push succeeded. Gating additionally on a recorded digest
-        # would (a) flip every pre-P1 image — which has digest=NULL — from ready to pulling the
-        # instant LAN_REGISTRY is set, and (b) strand an image whose digest couldn't be parsed even
-        # though it pushed fine. The digest column is still recorded (P5 delete-by-digest) but must
-        # NOT gate readiness. See tests/test_p1_registry_push.py.
+        # Readiness = image loaded on every eligible node. Readiness is NOT gated on a recorded
+        # manifest digest: an image with digest=NULL would otherwise never read as ready even though
+        # it is resident on the nodes and launches fine. The digest column is retained for
+        # bookkeeping but must not gate readiness.
         if desired > 0 and ready >= desired:
             status = "ready"
         elif desired == 0:
@@ -4550,10 +4497,6 @@ exit 0
 
         workspace_quota_node_name = self._ensure_workspace_quota(instance_id)
         notebook_node_name = self._resolve_notebook_node_name(workspace_quota_node_name)
-        # When no node is pinned by config/quota, let the Image Service pick a GPU node
-        # with free capacity so its image can be preloaded onto that same node.
-        if not notebook_node_name and settings.IMAGE_SERVICE_ENABLED:
-            notebook_node_name = self._select_target_gpu_node(gpu_count)
         network_disk_claim_name = self._ensure_network_disk(instance_id)
         # Two-tier localcache: ensure the durable shards exist (idempotent; startup already does this,
         # this covers a shard that failed to bind then), and look up the instance's last node for the

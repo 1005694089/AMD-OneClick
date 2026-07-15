@@ -136,45 +136,6 @@ class BuildResultRequest(BaseModel):
     status: str  # ready | failed
 
 
-class BuildEvictRequest(BaseModel):
-    """Build-agent notification that node-local image content was reclaimed."""
-    agent_id: str
-    image_ids: list[int] = []
-
-
-class ImageJobClaimRequest(BaseModel):
-    """Image-service request to lease the next pending job, optionally filtered by kind."""
-    agent_id: str
-    kinds: Optional[list[str]] = None
-
-
-class ImageJobLogRequest(BaseModel):
-    """Image-service log chunk for a job"""
-    agent_id: str
-    log: str
-
-
-class ImageJobHeartbeatRequest(BaseModel):
-    """Image-service liveness ping for a long-running job (keeps the lease fresh)."""
-    agent_id: str
-
-
-class ImageJobResultRequest(BaseModel):
-    """Image-service terminal result for a job"""
-    agent_id: str
-    status: str  # succeeded | failed
-    result: Optional[dict] = None
-
-
-class ImageNodeStatusRequest(BaseModel):
-    """Image-service report of a node's status for an image ref (importing | quarantined | loaded)."""
-    agent_id: str
-    node: str
-    ref: str
-    status: str
-    quarantine_seconds: Optional[int] = None
-
-
 class GitHubNotebookInfo(BaseModel):
     """GitHub notebook information"""
     org: str

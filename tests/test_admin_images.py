@@ -8,7 +8,6 @@ os.close(_DB_FD)
 os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
 os.environ["ADMIN_PASSWORD"] = "testpass"
 os.environ["NOTEBOOK_NODE_NAME"] = "fake-node"
-os.environ["IMAGE_SERVICE_ENABLED"] = "true"
 
 # (b) Install the kube stub before importing app.main.
 from tests.kube_stub import install
@@ -33,11 +32,9 @@ class AdminImageRouteTests(unittest.TestCase):
         # different env) by another test module first, so pin the values here.
         self._orig = (
             main_module.settings.ADMIN_PASSWORD,
-            main_module.settings.IMAGE_SERVICE_ENABLED,
             main_module.settings.NOTEBOOK_NODE_NAME,
         )
         main_module.settings.ADMIN_PASSWORD = "testpass"
-        main_module.settings.IMAGE_SERVICE_ENABLED = True
         main_module.settings.NOTEBOOK_NODE_NAME = "fake-node"
         store.init_db()
         self.client = TestClient(main_module.app)
@@ -46,7 +43,6 @@ class AdminImageRouteTests(unittest.TestCase):
     def tearDown(self):
         (
             main_module.settings.ADMIN_PASSWORD,
-            main_module.settings.IMAGE_SERVICE_ENABLED,
             main_module.settings.NOTEBOOK_NODE_NAME,
         ) = self._orig
         with store.engine.begin() as conn:

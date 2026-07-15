@@ -97,10 +97,6 @@ data:
   # Image Service owns preloading when IMAGE_SERVICE_ENABLED=true; the legacy pull probe
   # (which requires a single pinned NOTEBOOK_NODE_NAME) is mutually exclusive with auto-spread.
   IMAGE_PULL_PROBE_ENABLED: "false"
-  # Distribute images itself to GPU nodes (save | ssh ctr import) instead of node-side ACR
-  # pulls. Requires the image-service daemon running on node 0042. Keep "false" until that
-  # daemon is up and 0043+0044 are labeled amd-oneclick-prepull=enabled (see runbook).
-  IMAGE_SERVICE_ENABLED: "true"
   # Custom-image local tag MUST be registry-qualified (host with a dot before the first "/"),
   # or nerdctl/containerd normalize the ref to docker.io/... and the distribute save|ctr-import
   # fails ("not found" / "unrecognized image format"). Image stays node-local (never pushed);

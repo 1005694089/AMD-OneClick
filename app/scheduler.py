@@ -25,8 +25,6 @@ scheduler = AsyncIOScheduler(executors={"default": APThreadPoolExecutor(max_work
 # Source types for Harbor-preheat rows (current + legacy stamp). Duplicated from main.py
 # to avoid an import cycle.
 _HARBOR_SOURCE_TYPES = frozenset({"harbor", "harbor_mirror"})
-# Legacy image-service source_type keys — these rows are owned by the build/distribute pipeline.
-_IMAGE_SERVICE_SOURCE_TYPES = frozenset({"acr_pull", "dockerhub_pull", "github_build"})
 
 
 def _resolve_row_is_stale(image: dict) -> bool:
@@ -315,116 +313,6 @@ async def reap_stale_builds_job():
             logger.warning("Reaped %s stale custom image build(s)", reaped)
     except Exception as e:
         logger.error(f"Stale build reaper failed: {e}")
-
-
-async def reap_stale_image_jobs_job():
-    """Requeue (or fail) image_jobs whose agent lease has expired (daemon died/stalled).
-
-    Harmless when RUN_SCHEDULER is off: the image-service daemon also reaps stale jobs.
-    """
-    if _skip_not_leader("reap_stale_image_jobs_job"):
-        return
-    from .store import reap_stale_image_jobs, requeue_failed_purges
-
-    try:
-        reaped = reap_stale_image_jobs(settings.JOB_LEASE_TIMEOUT_SECONDS)
-        if reaped:
-            logger.warning("Reaped %s stale image job(s)", reaped)
-    except Exception as e:
-        logger.error(f"Stale image job reaper failed: {e}")
-
-    # P4 delete-completeness: the stale reaper above only requeues LEASED jobs. A purge-surface job
-    # that REPORTED failure is terminal and would otherwise never retry, leaving orphaned bytes. Flip
-    # such failed purges back to pending (bounded by max_attempts) so a delete converges to complete.
-    try:
-        requeued = requeue_failed_purges()
-        if requeued:
-            logger.warning("Re-enqueued %s failed purge job(s) for delete-completeness", requeued)
-    except Exception as e:
-        logger.error(f"Failed-purge requeue failed: {e}")
-
-
-MANAGER_PURGE_AGENT_ID = "manager-purge"
-# Kinds the manager itself drains in-cluster (the 0042 agent cannot reach overlay seeds and lacks the
-# k8s API). purge_p2p/purge_seed exec `dfctl task rm`; purge_meta drops DB handles.
-MANAGER_PURGE_KINDS = ("purge_p2p", "purge_seed", "purge_meta")
-
-
-def _drain_manager_purges_sync() -> int:
-    """Claim + execute manager-side purge jobs until none remain (bounded). Returns count processed.
-
-    Runs the SAME path the agent result-report endpoint runs: finish_image_job(...) +
-    _sync_image_job_lifecycle(...). purge_p2p/purge_seed call the in-cluster dfctl-exec handlers;
-    purge_meta has no execution body of its own (the lifecycle branch drops the rows) so it finishes
-    'succeeded' and the lifecycle does the DB cleanup + prereq re-check.
-
-    Blocking (k8s exec + DB) — the caller runs it in a thread so it can't stall the event loop.
-    """
-    import json as _json
-
-    from . import main as main_module
-    from . import purge_exec
-    from .k8s_client import k8s_client
-    from .store import claim_next_image_job, finish_image_job
-
-    processed = 0
-    for _ in range(max(1, settings.PURGE_DRAIN_BATCH)):
-        job = claim_next_image_job(MANAGER_PURGE_AGENT_ID, kinds=list(MANAGER_PURGE_KINDS))
-        if not job:
-            break
-        kind = job.get("kind")
-        # Normalize payload to a dict (claim returns the raw row; payload is a JSON string).
-        payload = job.get("payload")
-        if isinstance(payload, str):
-            try:
-                payload = _json.loads(payload) if payload else {}
-            except (ValueError, TypeError):
-                payload = {}
-        job["payload"] = payload or {}
-
-        status = "succeeded"
-        result = {"ref": job.get("ref")}
-        try:
-            if kind == "purge_p2p":
-                result = purge_exec.run_purge_p2p_manager(k8s_client.core_v1, job)
-                if any(n.get("error") for n in result.get("nodes", [])):
-                    status = "failed"
-            elif kind == "purge_seed":
-                result = purge_exec.run_purge_seed_manager(k8s_client.core_v1, job)
-                if not result.get("seed_deleted") and not result.get("skipped"):
-                    status = "failed"
-            elif kind == "purge_meta":
-                # No execution body — the lifecycle branch (re-checks prereqs) drops the DB rows.
-                result = {"ref": job.get("ref")}
-            else:
-                continue
-        except Exception as e:
-            logger.error("Manager purge %s (job %s) raised: %s", kind, job.get("id"), e)
-            status = "failed"
-            result = {"ref": job.get("ref"), "error": f"manager_purge_exception:{type(e).__name__}"}
-
-        finished = finish_image_job(job["id"], status, agent_id=MANAGER_PURGE_AGENT_ID, result=_json.dumps(result))
-        if finished and status == "succeeded":
-            try:
-                main_module._sync_image_job_lifecycle(finished, result)
-            except Exception as e:
-                logger.error("Manager purge lifecycle sync failed for job %s (%s): %s", job.get("id"), kind, e)
-        processed += 1
-    return processed
-
-
-async def drain_manager_purges_job():
-    """Scheduler tick: drain manager-side purge jobs (leader-only). Inert unless the fan-out is on."""
-    if not settings.PURGE_FANOUT_ENABLED:
-        return
-    if _skip_not_leader("drain_manager_purges_job"):
-        return
-    try:
-        n = await asyncio.to_thread(_drain_manager_purges_sync)
-        if n:
-            logger.info("Manager drained %s purge job(s)", n)
-    except Exception as e:
-        logger.error("Manager purge drain failed: %s", e)
 
 
 async def idle_reaper_job():
@@ -756,7 +644,6 @@ def image_sync_refresh_job():
             try:
                 source_type = (image.get("source_type") or "").strip()
                 is_harbor_row = source_type in _HARBOR_SOURCE_TYPES
-                is_image_service_row = source_type in _IMAGE_SERVICE_SOURCE_TYPES
                 if is_harbor_row:
                     status = image.get("sync_status")
                     image_in_harbor = image_matches_harbor_source(image.get("image") or "")
@@ -774,8 +661,6 @@ def image_sync_refresh_job():
                                 image["id"], "ready", 0, 0, "In Harbor (preheat disabled)", True)
                         continue
                     sync = k8s_client.reconcile_preheat_ds(image["id"], image.get("image"))
-                elif is_image_service_row:
-                    continue
                 else:
                     if settings.NODE_IMAGE_SCAN_ENABLED:
                         sync = k8s_client.get_image_node_scan_status(image["id"], image.get("image"))
@@ -820,7 +705,7 @@ def start_scheduler():
     job_defaults = dict(coalesce=True, misfire_grace_time=120, max_instances=1)
     scheduler.add_job(
         cleanup_job,
-        trigger=IntervalTrigger(minutes=1),
+        trigger=IntervalTrigger(minutes=5),
         id="cleanup_job",
         name="Bill running instances per GPU-hour",
         replace_existing=True,
@@ -865,20 +750,6 @@ def start_scheduler():
         name="Reap stale custom image builds",
         replace_existing=True,
     )
-    scheduler.add_job(
-        reap_stale_image_jobs_job,
-        trigger=IntervalTrigger(minutes=5),
-        id="reap_stale_image_jobs_job",
-        name="Reap stale image jobs",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        drain_manager_purges_job,
-        trigger=IntervalTrigger(seconds=settings.PURGE_DRAIN_INTERVAL_SECONDS),
-        id="drain_manager_purges_job",
-        name="Drain manager-side purge jobs (purge_p2p/seed/meta)",
-        replace_existing=True,
-    )
     if (settings.WORKSPACE_VOLUME_TYPE or "").strip().lower() == "localcache":
         scheduler.add_job(
             workspace_local_cache_reaper_job,
@@ -915,7 +786,7 @@ def start_scheduler():
             )
     scheduler.start()
     logger.info(
-        "Scheduler started; cleanup 1m, template preview 2m, reconcile %ss (%s), image sync %ss, telemetry %s",
+        "Scheduler started; cleanup 5m, template preview 2m, reconcile %ss (%s), image sync %ss, telemetry %s",
         settings.RECONCILE_INTERVAL_SECONDS,
         "on" if settings.RECONCILE_ENABLED else "off",
         settings.IMAGE_SYNC_REFRESH_INTERVAL_SECONDS,

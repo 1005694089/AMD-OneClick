@@ -9,3 +9,11 @@ app/__pycache__/
 
 # operator runbook (local notes, not source)
 image-service-node-0042-setup.md
+
+# local env files with real secrets (OAuth, session, admin, DB)
+.env.local
+.env.*.local
+
+# signing keys / credentials — never commit
+secrets/
+*.pem

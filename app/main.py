@@ -53,12 +53,6 @@ from .models import (
     BuildClaimRequest,
     BuildLogRequest,
     BuildResultRequest,
-    BuildEvictRequest,
-    ImageJobClaimRequest,
-    ImageJobLogRequest,
-    ImageJobHeartbeatRequest,
-    ImageJobResultRequest,
-    ImageNodeStatusRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .notebook_sources import (
@@ -76,9 +70,6 @@ from .store import (
     delete_image,
     delete_notebook_template,
     get_active_instance_for_user,
-    upsert_launch_intent,
-    get_launch_intent,
-    delete_launch_intent,
     get_admin_daily_stats,
     get_charged_credits_for_instance,
     get_image_by_value,
@@ -122,20 +113,9 @@ from .store import (
     delete_custom_image,
     get_ready_custom_image_by_value,
     get_custom_image_by_value,
-    list_gc_candidates,
-    mark_custom_image_evicted,
     mark_custom_image_launched,
     requeue_custom_image_build,
-    enqueue_image_job,
-    claim_next_image_job,
-    append_image_job_log,
-    heartbeat_image_job,
-    finish_image_job,
-    upsert_image_node,
-    image_loaded_on_node,
-    clear_image_node,
     touch_image_node,
-    list_outdated_images,
 )
 
 # Configure logging
@@ -838,43 +818,6 @@ def _stamp_launch(user: dict, image: str, node_name: Optional[str]) -> None:
             touch_image_node(image, node_name)
     except Exception as e:
         logger.warning("Failed to stamp launch for image %s on node %s: %s", image, node_name, e)
-
-
-def _ensure_image_on_node(image: str, gpu_count: int) -> Optional[str]:
-    """Resolve the GPU node a launch will land on, distributing the image first if needed.
-
-    Return contract:
-      - a node name: the image is already loaded on that node; launch may proceed (pinned there).
-      - None: distribution was enqueued; the caller must return a 'distributing' status instead of
-        calling create_instance — the off-cluster daemon never runs inside the request handler
-        (the single uvicorn worker would block all clients).
-      - "" (empty string): no gating — proceed on the normal scheduling path. Returned when
-        IMAGE_SERVICE_ENABLED is off (legacy DaemonSet/ACR path untouched) or no target node could
-        be resolved.
-    """
-    if not settings.IMAGE_SERVICE_ENABLED:
-        return ""
-    node = k8s_client._select_target_gpu_node(gpu_count)
-    if not node:
-        return ""
-    if image_loaded_on_node(image, node):
-        return node
-    # The Manager resolves the single node's target now; the daemon never expands scope.
-    targets = k8s_client.resolve_node_targets([node])
-    # P5 transport: use warm (P2P self-pull of the zot ref) when this image is durable in the LAN
-    # registry (digest recorded by a prior push); otherwise fall back to the SSH byte-push. warm needs
-    # the zot ref, so carry lan_target_ref. Legacy images never pushed to zot keep using distribute.
-    lan_target_ref = _lan_registry_target_ref(image)
-    use_warm = bool(lan_target_ref) and store.image_digest_present(image)
-    payload = {"scope": f"node:{node}", "targets": targets}
-    if use_warm:
-        payload["lan_target_ref"] = lan_target_ref
-    enqueue_image_job(
-        kind="warm" if use_warm else "distribute",
-        ref=image,
-        payload=payload,
-    )
-    return None
 
 
 def _normalize_github_raw_url(url: str) -> str:
@@ -2157,47 +2100,6 @@ async def _provision_template_instance(user: dict, email: str, template: dict, p
     return instance
 
 
-async def _resume_distributing_launch(user: dict) -> Optional[str]:
-    """Resume a launch that was waiting on image distribution.
-
-    Returns "ready" (instance created — caller should report allocating/pending), "distributing"
-    (image still not on a node — keep waiting), or None (no pending intent / unrecoverable, intent
-    cleared). Called from the status poll, which the frontend already drives every few seconds.
-    """
-    intent = get_launch_intent(user["id"])
-    if not intent:
-        return None
-    email = user["email"].lower()
-    image = intent["image"]
-    params = intent.get("params") or {}
-    gpu_count = params.get("gpu_count", 1)
-    # An instance may already exist (the user raced or a prior resume succeeded).
-    if get_active_instance_for_user(user["id"]):
-        delete_launch_intent(user["id"])
-        return None
-    if int(user["credits"]) < gpu_count:
-        delete_launch_intent(user["id"])
-        return None
-    target_node = _ensure_image_on_node(image, gpu_count)
-    if target_node is None:
-        return "distributing"  # still copying; re-enqueue is deduped by enqueue_image_job
-    try:
-        if intent["kind"] == "template":
-            template_id = params.get("template_id")
-            template = _template_accessible_to_user(int(template_id), user) if template_id else None
-            if not template:
-                delete_launch_intent(user["id"])
-                return None
-            await _provision_template_instance(user, email, template, params, target_node)
-        else:
-            await _provision_notebook_instance(user, email, image, params, target_node)
-    except Exception as e:
-        logger.error("Failed to resume distributing launch for %s: %s", email, e)
-        return "distributing"  # transient; let the next poll retry rather than fail hard
-    delete_launch_intent(user["id"])
-    return "ready"
-
-
 @app.post("/api/notebook/request", response_model=NotebookStatus)
 async def request_notebook(request: Request, req: NotebookRequest, user: dict = Depends(current_user)):
     """Request a notebook instance"""
@@ -2245,25 +2147,6 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
     if int(user["credits"]) < gpu_count:
         raise HTTPException(status_code=400, detail="Insufficient credits")
 
-    target_node = _ensure_image_on_node(image, gpu_count)
-    if target_node is None:
-        # Image is being copied to the node; persist the launch so /api/notebook/status can
-        # resume it once distribution finishes (otherwise it dead-ends with no instance row).
-        upsert_launch_intent(user["id"], email, image, "notebook", {
-            "instance_type": instance_type,
-            "gpu_count": gpu_count,
-            "resource_profile": resource_profile,
-            "disk_size_gb": disk_size_gb,
-            "pod_type": pod_type,
-            "use_pvc": req.use_pvc,
-        })
-        return NotebookStatus(
-            status="distributing",
-            message="Loading image onto the GPU node…",
-            url=None,
-            email=email,
-        )
-
     try:
         instance = await _provision_notebook_instance(user, email, image, {
             "instance_type": instance_type,
@@ -2272,7 +2155,7 @@ async def request_notebook(request: Request, req: NotebookRequest, user: dict = 
             "disk_size_gb": disk_size_gb,
             "pod_type": pod_type,
             "use_pvc": req.use_pvc,
-        }, target_node)
+        }, None)
         return NotebookStatus(
             status="allocating",
             message="Allocating resources for your instance...",
@@ -2300,24 +2183,11 @@ async def check_status(request: Request, email: Optional[str] = Query(None, desc
     try:
         active = get_active_instance_for_user(user["id"])
         if not active:
-            # A launch waiting on image distribution has no instance row yet. Resume it (create the
-            # pod once the image lands) instead of reporting not_found, which the UI treats as a
-            # terminal failure and would strand the launch forever.
-            resume = await _resume_distributing_launch(user)
-            if resume == "ready":
-                active = get_active_instance_for_user(user["id"])
-            elif resume == "distributing":
-                return NotebookStatus(
-                    status="distributing",
-                    message="Loading image onto the GPU node…",
-                    email=email,
-                )
-            if not active:
-                return NotebookStatus(
-                    status="not_found",
-                    message="No notebook instance found for this user",
-                    email=email
-                )
+            return NotebookStatus(
+                status="not_found",
+                message="No notebook instance found for this user",
+                email=email
+            )
         instance = await asyncio.to_thread(k8s_client.get_instance_by_id, active["instance_id"])
         
         if not instance:
@@ -2420,9 +2290,6 @@ def _spawn_background_delete(instance_id: str) -> None:
 @app.delete("/api/notebook/current", response_model=DestroyResponse)
 async def destroy_current_notebook(user: dict = Depends(current_user)):
     """Destroy the current user's active notebook instance."""
-    # Cancelling during image distribution: drop the pending intent so a later status poll does
-    # not resurrect a pod the user just cancelled.
-    delete_launch_intent(user["id"])
     active = get_active_instance_for_user(user["id"])
     if not active:
         return DestroyResponse(
@@ -2500,26 +2367,6 @@ async def build_custom_image(req: CustomImageBuildRequest, user: dict = Depends(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if settings.IMAGE_SERVICE_ENABLED:
-        # Build on the image-service host (node 0042) so run_build exports a docker tarball; the
-        # launch-time distribute (_ensure_image_on_node) then ships it via `cat tar | ctr import`.
-        # Without this the row is only built by the LEGACY build-agent, which writes no tarball, so
-        # distribute falls back to `nerdctl save` (nonexistent on 0042) and the launch never lands.
-        # Enqueue the RAW dockerfile — claim_image_job appends DOCKERFILE_SUFFIX at claim time
-        # (do NOT append it here or it would be duplicated).
-        # When the LAN registry is wired, chain a `push` after build so a custom image is durable in
-        # zot (its "ready" gate). The build branch defers the ready flip to push in that case.
-        build_payload = {"dockerfile": dockerfile}
-        lan_target_ref = _lan_registry_target_ref(image_tag)
-        if lan_target_ref:
-            build_payload["chain"] = ["push"]
-            build_payload["lan_target_ref"] = lan_target_ref
-        enqueue_image_job(
-            kind="build",
-            ref=image_tag,
-            custom_image_id=record["id"],
-            payload=build_payload,
-        )
     return _custom_image_public(record)
 
 
@@ -2533,44 +2380,14 @@ async def custom_image_status(image_id: int, user: dict = Depends(current_user))
 
 @app.delete("/api/custom-images/{image_id}")
 async def delete_my_custom_image(image_id: int, user: dict = Depends(current_user)):
-    # Compute blobs UNIQUE to this image BEFORE deleting its row (the row's blob_list is one of the
-    # inputs; after delete_custom_image it's gone). Blobs shared with a live image are excluded so the
-    # P2P/seed cache purge never removes a still-referenced blob.
-    _pre = get_custom_image(image_id, user_id=user["id"])
-    unique_blobs = store.unique_blob_ids_for_ref(_pre.get("image")) if _pre and _pre.get("image") else []
     try:
         record = delete_custom_image(image_id, user["id"])
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     if not record:
         raise HTTPException(status_code=404, detail="Custom image not found")
-    # Image-service is the only image-management system: removing the catalog row must also evict
-    # the image's layers from the nodes it was distributed to (the legacy prepull cleanup that used
-    # to run here is gone). The Manager resolves evict targets (the daemon has no kubectl): prefer
-    # the nodes recorded as holding this ref, falling back to all eligible nodes when none recorded.
-    image_ref = record.get("image")
-    if image_ref:
-        try:
-            recorded = store.list_nodes_for_image(image_ref)
-            targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
-            # P4 complete-delete fan-out — GATED (see admin_delete_image). Until PURGE_FANOUT_ENABLED,
-            # keep the single `evict`. Do NOT link custom_image_id in either branch: the row was
-            # already deleted above, and image_jobs has a plain FK to custom_images — a link to a
-            # missing row would raise ForeignKeyViolation.
-            if settings.PURGE_FANOUT_ENABLED:
-                enqueue_purge_fanout(
-                    image_ref,
-                    targets,
-                    digest=record.get("digest"),
-                    lan_target_ref=_lan_registry_target_ref(image_ref),
-                    image_id=None,
-                    blob_ids=unique_blobs,
-                )
-            else:
-                enqueue_image_job(kind="evict", ref=image_ref,
-                                  payload={"scope": "all", "targets": targets})
-        except Exception as e:
-            logger.warning("Failed to enqueue purge fan-out for custom image %s (%s): %s", image_id, image_ref, e)
+    # The catalog row is removed. Node-layer eviction via the off-cluster daemon is no longer
+    # available; kubelet-cached layers age out on their own. Deleting the DB row is the whole op.
     return {"success": True}
 
 
@@ -2580,12 +2397,6 @@ async def delete_my_custom_image(image_id: int, user: dict = Depends(current_use
 
 @app.post("/api/internal/builds/claim")
 async def claim_build(req: BuildClaimRequest, _agent: bool = Depends(verify_build_agent)):
-    # When the image-service is on, custom builds are owned by the new kind=build image_job path
-    # (which exports a distributable tarball). The legacy node-local build-agent must NOT also claim
-    # the same pending custom_images row — that double-build marks the row 'ready' with no tarball,
-    # so launch-time distribute fails. Starve the legacy claimer in image-service mode.
-    if settings.IMAGE_SERVICE_ENABLED:
-        return {"job": None}
     job = claim_next_build(req.agent_id)
     if not job:
         return {"job": None}
@@ -2614,368 +2425,6 @@ async def report_build_result(image_id: int, req: BuildResultRequest, _agent: bo
     # The node-local builder writes the image straight into the GPU node's containerd `k8s.io`
     # namespace. Ready means the launch path can use imagePullPolicy=IfNotPresent without pulling.
     return {"ok": True}
-
-
-@app.post("/api/internal/builds/gc-candidates")
-async def build_gc_candidates(req: BuildClaimRequest, mode: str = "idle", _agent: bool = Depends(verify_build_agent)):
-    """Custom-image GC candidates. mode='idle' (default) returns only images past the 5-day idle
-    window; mode='disk_pressure' returns all ready node-local images coldest-first so an
-    over-threshold disk can reclaim the coldest image regardless of the idle window."""
-    gc_mode = "disk_pressure" if mode == "disk_pressure" else "idle"
-    candidates = [
-        {"id": row["id"], "tag": row["image"], "last_launched_at": row.get("last_launched_at")}
-        for row in list_gc_candidates(mode=gc_mode)
-    ]
-    return {"candidates": candidates}
-
-
-@app.post("/api/internal/builds/evicted")
-async def report_evicted(req: BuildEvictRequest, _agent: bool = Depends(verify_build_agent)):
-    evicted = []
-    for image_id in req.image_ids:
-        if mark_custom_image_evicted(image_id):
-            evicted.append(image_id)
-    return {"evicted": evicted}
-
-
-# =============================================================================
-# Internal Image-Service Job API (off-cluster daemon; token-guarded)
-# =============================================================================
-
-def _resolve_chain_targets(scope: str) -> list[dict]:
-    """Resolve distribute targets for a chain step from its scope. The Manager owns target
-    resolution (the daemon has no kubectl): scope 'all' -> every eligible node; 'node:<name>'
-    -> just that node; anything else -> empty (daemon will fail fast on no_targets)."""
-    scope = (scope or "").strip()
-    if scope == "node:" or scope.startswith("node:"):
-        node_name = scope.split(":", 1)[1].strip()
-        return k8s_client.resolve_node_targets([node_name]) if node_name else []
-    if scope == "all":
-        return k8s_client.resolve_node_targets(None)
-    return k8s_client.resolve_node_targets(None)
-
-
-def _enqueue_next_chain_step(job: dict, payload: dict) -> None:
-    """Manager-driven chaining: pop the next kind off payload['chain'] and enqueue it, carrying
-    the remaining chain forward. Targets for a 'distribute' step are resolved NOW (the daemon
-    never resolves node IPs); 'acr_backup' carries acr_target_ref."""
-    chain = list(payload.get("chain") or [])
-    if not chain:
-        return
-    next_kind = chain.pop(0)
-    ref = job.get("ref")
-    next_payload: dict = {"chain": chain}
-    if payload.get("scope"):
-        next_payload["scope"] = payload["scope"]
-    if next_kind in ("distribute", "warm"):
-        # warm forks distribute's target model exactly — Manager resolves node IPs (the daemon has
-        # no kubectl); the daemon triggers a per-node pull through the P2P mirror.
-        next_payload["targets"] = _resolve_chain_targets(payload.get("scope") or "all")
-    elif next_kind == "acr_backup":
-        acr_target_ref = payload.get("acr_target_ref")
-        if acr_target_ref:
-            next_payload["acr_target_ref"] = acr_target_ref
-    elif next_kind == "push":
-        lan_target_ref = payload.get("lan_target_ref")
-        if lan_target_ref:
-            next_payload["lan_target_ref"] = lan_target_ref
-    # Carry the LAN ref forward through non-push steps too, so a later push step in the same chain
-    # (or the lifecycle's digest recording) still sees it.
-    if payload.get("lan_target_ref") and "lan_target_ref" not in next_payload:
-        next_payload["lan_target_ref"] = payload["lan_target_ref"]
-    enqueue_image_job(
-        kind=next_kind,
-        ref=ref,
-        image_id=job.get("image_id"),
-        custom_image_id=job.get("custom_image_id"),
-        payload=next_payload,
-    )
-
-
-def _sync_image_job_lifecycle(job: dict, result: Optional[dict]) -> None:
-    """Apply a succeeded job's effect to the linked image/node lifecycle tables."""
-    kind = job.get("kind")
-    ref = job.get("ref")
-    result = result or {}
-    payload = job.get("payload")
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload) if payload else {}
-        except (ValueError, TypeError):
-            payload = {}
-    payload = payload or {}
-
-    if kind == "build":
-        custom_image_id = job.get("custom_image_id")
-        if custom_image_id and "push" not in (payload.get("chain") or []):
-            # Flip the custom image to ready. In IMAGE_SERVICE_ENABLED mode the custom_images row is
-            # never 'building'/claimed (the kind=build image_job owns the lifecycle; the legacy
-            # claim_build path that set 'building' is starved), so guarding on
-            # require_claimed_by=<job agent> would match 0 rows and leave it stuck 'pending'.
-            # finish_image_job already verified the image_job's own ownership before we get here.
-            #
-            # When a `push` step follows in the chain (LAN registry wired), DEFER the ready flip to
-            # the push branch so "ready" means the image is durable in the registry, not merely
-            # built on 0042. The row stays 'pending' (UI renders "Building...") until push succeeds.
-            update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
-    elif kind in ("pull",):
-        # Source bytes now exist on the Image-Service host; distribution follows as its own job.
-        pass
-    elif kind == "push":
-        # Registry-durable: record the manifest digest and flip readiness. digest is agent-reported
-        # (the manager has no route to the LAN registry). A null digest still counts as pushed but
-        # can't gate on digest for this ref (logged agent-side).
-        digest = result.get("digest")
-        blob_ids = result.get("blob_ids") or []
-        image_id = job.get("image_id")
-        if image_id is not None:
-            store.set_image_digest(image_id, digest)
-            if blob_ids:
-                store.set_image_blob_list(image_id, blob_ids)
-        custom_image_id = job.get("custom_image_id")
-        if custom_image_id:
-            store.set_custom_image_digest(custom_image_id, digest)
-            if blob_ids:
-                store.set_custom_image_blob_list(custom_image_id, blob_ids)
-            update_custom_image_status(custom_image_id, status="ready", require_claimed_by=None)
-    elif kind in ("distribute", "warm"):
-        # warm writes the SAME 'loaded' rows distribute did — the per-node results contract is
-        # identical, so upload->ready-on-all counting is unchanged whichever transport ran.
-        for node in result.get("nodes", []) or []:
-            node_name = node.get("node") if isinstance(node, dict) else node
-            if node and (not isinstance(node, dict) or node.get("loaded")):
-                if node_name:
-                    upsert_image_node(node_name=node_name, image_ref=ref, status="loaded", size_bytes=(node.get("size_bytes") if isinstance(node, dict) else None))
-    elif kind == "evict":
-        for node in result.get("nodes", []) or []:
-            node_name = node.get("node") if isinstance(node, dict) else node
-            if node and (not isinstance(node, dict) or node.get("removed")):
-                if node_name:
-                    clear_image_node(ref, node_name)
-        custom_image_id = job.get("custom_image_id")
-        if custom_image_id:
-            mark_custom_image_evicted(custom_image_id)
-    elif kind == "purge_node":
-        # P4: clear the image_nodes row for each node whose layers were actually removed. A node
-        # that failed keeps its row (the durable retry handle); requeue_failed_purges retries it.
-        for node in result.get("nodes", []) or []:
-            node_name = node.get("node") if isinstance(node, dict) else node
-            if node and (not isinstance(node, dict) or node.get("removed")):
-                if node_name:
-                    clear_image_node(ref, node_name)
-    elif kind in ("purge_p2p", "purge_seed", "registry_delete", "purge_builder"):
-        # P4 byte-surface purges with no image_nodes-row effect (P2P cache / seed / registry tag /
-        # 0042 tarball). Success is recorded by the job's terminal status; the purge_meta claim-gate
-        # reads that. Nothing to write here.
-        pass
-    elif kind == "purge_meta":
-        # P4 FINAL step — drops the remaining DB handles (image_nodes rows + custom_images mark).
-        # RE-CHECK prereqs at execution time, not just at claim: requeue_failed_purges can flip a
-        # prereq failed->pending AFTER purge_meta was claimed but before this result lands. Dropping
-        # the rows then would orphan that surface's bytes. If any prereq regressed, abort by
-        # re-enqueuing purge_meta (it will defer again at claim until prereqs re-succeed).
-        if not store.purge_prereqs_satisfied(ref):
-            logger.warning("purge_meta for %s aborted: a byte-surface prereq regressed; re-enqueuing", ref)
-            enqueue_image_job(kind="purge_meta", ref=ref, custom_image_id=job.get("custom_image_id"),
-                              payload=payload)
-        else:
-            store.delete_orphan_image_nodes(ref)
-            custom_image_id = job.get("custom_image_id")
-            if custom_image_id:
-                mark_custom_image_evicted(custom_image_id)
-    elif kind == "acr_backup":
-        image_id = job.get("image_id")
-        if image_id is not None:
-            store.set_image_acr_backup(image_id, result.get("acr_backup_ref") or ref, "ok")
-
-    # Manager-driven chaining: any successful job carrying a non-empty chain enqueues the next
-    # step, resolving distribute targets here (the daemon has no kubectl).
-    _enqueue_next_chain_step(job, payload)
-
-
-@app.post("/api/internal/jobs/claim")
-async def claim_image_job(req: ImageJobClaimRequest, _agent: bool = Depends(verify_build_agent)):
-    job = claim_next_image_job(req.agent_id, kinds=req.kinds)
-    if not job:
-        return {"job": None}
-    payload = job.get("payload")
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload) if payload else {}
-        except (ValueError, TypeError):
-            payload = {}
-    payload = payload or {}
-    # A build job always builds with the Jupyter + OpenCode suffix appended, exactly as claim_build does.
-    if job.get("kind") == "build" and payload.get("dockerfile"):
-        payload["dockerfile"] = payload["dockerfile"] + "\n" + settings.DOCKERFILE_SUFFIX
-    return {
-        "job": {
-            "id": job["id"],
-            "kind": job.get("kind"),
-            "ref": job.get("ref"),
-            "image_id": job.get("image_id"),
-            "custom_image_id": job.get("custom_image_id"),
-            "payload": payload,
-        }
-    }
-
-
-@app.post("/api/internal/jobs/{job_id}/log")
-async def push_image_job_log(job_id: int, req: ImageJobLogRequest, _agent: bool = Depends(verify_build_agent)):
-    if not append_image_job_log(job_id, req.log or "", agent_id=req.agent_id):
-        raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
-    return {"ok": True}
-
-
-@app.post("/api/internal/jobs/{job_id}/heartbeat")
-async def push_image_job_heartbeat(job_id: int, req: ImageJobHeartbeatRequest, _agent: bool = Depends(verify_build_agent)):
-    """Refresh a long-running job's lease so the reaper does not requeue it mid-pull."""
-    if not heartbeat_image_job(job_id, agent_id=req.agent_id):
-        raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
-    return {"ok": True}
-
-
-@app.post("/api/internal/jobs/{job_id}/result")
-async def report_image_job_result(job_id: int, req: ImageJobResultRequest, _agent: bool = Depends(verify_build_agent)):
-    status = (req.status or "").strip().lower()
-    if status not in ("succeeded", "failed"):
-        raise HTTPException(status_code=400, detail="status must be 'succeeded' or 'failed'")
-    result_json = json.dumps(req.result) if req.result is not None else None
-    job = finish_image_job(job_id, status, agent_id=req.agent_id, result=result_json)
-    if not job:
-        raise HTTPException(status_code=409, detail="Job not claimed by this agent or not running")
-    # Quarantine any node the daemon reported as containerd_wedged, regardless of overall job status
-    # (a distribute can partially succeed while one node wedged). The agent also quarantines inline,
-    # but doing it here too is the durable backstop and covers agents that die before reporting.
-    if isinstance(req.result, dict):
-        ref = job.get("ref")
-        for node in req.result.get("nodes", []) or []:
-            if isinstance(node, dict) and node.get("error") == "containerd_wedged" and node.get("node"):
-                try:
-                    store.quarantine_node(node["node"], ref, settings.NODE_QUARANTINE_SECONDS)
-                    logger.warning("Quarantined node %s (containerd_wedged) for %ss", node["node"], settings.NODE_QUARANTINE_SECONDS)
-                except Exception as e:
-                    logger.warning("Failed to quarantine node %s: %s", node.get("node"), e)
-    if status == "succeeded":
-        try:
-            _sync_image_job_lifecycle(job, req.result)
-        except Exception as e:
-            logger.error("Failed to sync lifecycle for image job %s (%s): %s", job_id, job.get("kind"), e)
-    else:
-        # A failed distribute must not leave nodes stuck in the transient `importing` state (which
-        # reads as "not loaded" forever). Clear any importing rows for this ref so status reflects
-        # reality. Fix-1 guarantees a previously-loaded row was never downgraded to importing, so
-        # this only drops genuinely-incomplete imports.
-        if job.get("kind") == "distribute" and job.get("ref"):
-            try:
-                store.clear_importing_nodes(job["ref"])
-            except Exception as e:
-                logger.warning("Failed to clear importing rows for %s: %s", job.get("ref"), e)
-        # A failed step aborts the chain (no next step is enqueued). Surface the failure on the
-        # linked catalog image so it shows 'failed' instead of spinning in 'pulling'/'distributing'.
-        image_id = job.get("image_id")
-        if image_id is not None:
-            err = req.result.get("error") if isinstance(req.result, dict) else None
-            update_image_sync_status(
-                image_id, "failed", 0, 0,
-                f"{job.get('kind')} job {job_id} failed: {err or 'see job log'}", False,
-            )
-        custom_image_id = job.get("custom_image_id")
-        if custom_image_id is not None:
-            try:
-                update_custom_image_status(custom_image_id, status="failed", require_claimed_by=None)
-            except Exception as e:
-                logger.warning("Could not mark custom image %s failed: %s", custom_image_id, e)
-    return {"ok": True}
-
-
-@app.post("/api/internal/nodes/status")
-async def report_image_node_status(req: ImageNodeStatusRequest, _agent: bool = Depends(verify_build_agent)):
-    """Image-service reports a node's status for an image ref (importing | quarantined | loaded).
-
-    `quarantined` additionally stamps quarantined_until = now + (quarantine_seconds or the configured
-    NODE_QUARANTINE_SECONDS) so the reaper routes around the wedged node (Part D)."""
-    status = (req.status or "").strip().lower()
-    if status not in ("importing", "quarantined", "loaded"):
-        raise HTTPException(status_code=400, detail="status must be importing|quarantined|loaded")
-    try:
-        if status == "quarantined":
-            seconds = req.quarantine_seconds if req.quarantine_seconds is not None else settings.NODE_QUARANTINE_SECONDS
-            store.quarantine_node(req.node, req.ref, seconds)
-        else:
-            store.set_image_node_status(req.node, req.ref, status)
-    except Exception as e:
-        logger.warning("Failed to record node status %s for %s/%s: %s", status, req.node, req.ref, e)
-        raise HTTPException(status_code=500, detail="failed to record node status")
-    return {"ok": True}
-
-
-@app.get("/api/internal/nodes/{node}/user-pods")
-async def node_user_pod_count(node: str, _agent: bool = Depends(verify_build_agent)):
-    """Return the count of running (non-terminal) USER notebook pods on `node`.
-
-    The image-service consults this before any automated containerd restart: a restart is only ever
-    issued to a node with zero user pods (pod-safety gate, Part C). Fail-safe: on any kube error the
-    count is reported as unknown so the agent treats the node as "pods present" and refuses to
-    restart — automated recovery must never destroy a user pod."""
-    try:
-        count = k8s_client.count_user_pods_on_node(node)
-        return {"node": node, "user_pods": count, "ok": True}
-    except Exception as e:
-        logger.warning("Failed to count user pods on %s: %s", node, e)
-        return {"node": node, "user_pods": None, "ok": False}
-
-
-@app.post("/api/internal/images/outdated")
-async def list_outdated_image_targets(req: ImageJobClaimRequest, _agent: bool = Depends(verify_build_agent)):
-    """Compute outdated (ref,node) pairs and enqueue one evict job per ref server-side.
-
-    The daemon only triggers this pass; the Manager resolves targets (it has kubectl) and
-    enqueues. enqueue_image_job's non-terminal (kind, ref) guard dedupes repeated polls.
-    """
-    outdated = list_outdated_images()
-    by_ref: dict[str, list[str]] = {}
-    cid_by_ref: dict[str, int] = {}
-    for row in outdated:
-        ref = row.get("image_ref")
-        node = row.get("node_name")
-        if not ref or not node:
-            continue
-        by_ref.setdefault(ref, []).append(node)
-        # Carry the custom_image_id (idle custom images) so the evict job flips the row to
-        # 'evicted' via mark_custom_image_evicted; catalog rows have none.
-        cid = row.get("custom_image_id")
-        if cid is not None:
-            cid_by_ref[ref] = cid
-    enqueued = 0
-    for ref, node_names in by_ref.items():
-        targets = k8s_client.resolve_node_targets(node_names)
-        # P4: idle-delete must be a COMPLETE purge (node layers + P2P caches + seed + registry tag +
-        # 0042 tarball + rows) — the same hard "remove every byte" contract as an explicit delete,
-        # not the layers-only `evict`. Relaunch rebuilds from the stored Dockerfile. digest is looked
-        # up so registry_delete can DELETE the zot manifest. custom_image_id rides on purge_meta so
-        # mark_custom_image_evicted flips the idle custom row to 'evicted'.
-        cid = cid_by_ref.get(ref)
-        if settings.PURGE_FANOUT_ENABLED:
-            enqueue_purge_fanout(
-                ref,
-                targets,
-                digest=store.get_digest_for_ref(ref),
-                lan_target_ref=_lan_registry_target_ref(ref),
-                image_id=None,
-                blob_ids=store.unique_blob_ids_for_ref(ref),
-            )
-            if cid is not None:
-                # Re-stamp custom_image_id onto the purge_meta job (fan-out enqueued it with
-                # image_id=None; the custom mark needs the link). Safe: same-ref purge_meta is unique.
-                store.link_purge_meta_custom_image(ref, cid)
-        else:
-            # Pre-cutover: the original layers-only evict, carrying custom_image_id so an idle custom
-            # image is still marked 'evicted' (the P0/R2c behavior). Unchanged from before P4.
-            enqueue_image_job(kind="evict", ref=ref, custom_image_id=cid,
-                              payload={"targets": targets, "scope": "outdated"})
-        enqueued += 1
-    return {"images": outdated, "enqueued": enqueued}
 
 
 # =============================================================================
@@ -3188,22 +2637,9 @@ async def launch_notebook_template(template_id: int, request: Request, req: Temp
         raise HTTPException(status_code=400, detail="Insufficient credits")
 
     email = user["email"].lower()
-    target_node = _ensure_image_on_node(template["image"], gpu_count)
-    if target_node is None:
-        # Persist so /api/notebook/status can resume the template launch once the image lands.
-        upsert_launch_intent(user["id"], email, template["image"], "template", {
-            "gpu_count": gpu_count,
-            "template_id": template["id"],
-        })
-        return NotebookStatus(
-            status="distributing",
-            message="Loading image onto the GPU node…",
-            url=None,
-            email=email,
-        )
     try:
         instance = await _provision_template_instance(
-            user, email, template, {"gpu_count": gpu_count}, target_node
+            user, email, template, {"gpu_count": gpu_count}, None
         )
         return NotebookStatus(
             status="allocating",
@@ -3414,7 +2850,7 @@ async def launch_huggingface_demo_notebook(
             model_mount=hf_model_mount,
             user_is_editor=False,
         ))
-        _stamp_launch(user, image, k8s_client._select_target_gpu_node(gpu_count) if settings.IMAGE_SERVICE_ENABLED else None)
+        _stamp_launch(user, image, None)
         record_instance(user["id"], email, instance["id"], image, "jupyter", gpu_count,
                         instance.get("node_port"), instance.get("opencode_node_port"),
                         pod_type=pod_type, api_launched=True)
@@ -3731,14 +3167,6 @@ async def create_github_notebook(
             github_info=github_info,
             custom_instance_id=instance_id
         ))
-        if settings.IMAGE_SERVICE_ENABLED:
-            try:
-                node_name = k8s_client._select_target_gpu_node()
-                if node_name:
-                    touch_image_node(settings.DEFAULT_IMAGE, node_name)
-            except Exception as e:
-                logger.warning("Failed to stamp launch for github notebook image: %s", e)
-
         # Set cookie to remember this instance
         response.set_cookie(
             key="amd_oneclick_gh_instance",
@@ -4316,16 +3744,11 @@ async def admin_sync_template_preview(template_id: int, username: str = Depends(
 
 @app.get("/api/admin/images")
 async def admin_list_images(username: str = Depends(verify_admin)):
-    _IMAGE_SERVICE_SOURCE_TYPES = frozenset({"acr_pull", "dockerhub_pull", "github_build"})
     for image in list_images(enabled_only=False):
         row_source_type = (image.get("source_type") or "").strip()
         # Harbor rows (harbor/harbor_mirror) are tracked by the preheat DaemonSet, whose progress
         # the scheduler writes to the row. Skip the legacy refresh and return stored status.
         if row_source_type in {"harbor", "harbor_mirror"}:
-            continue
-        # Legacy image-service rows (acr_pull/dockerhub_pull/github_build) are owned by the
-        # build/distribute pipeline. Leave these rows to the pipeline.
-        if row_source_type in _IMAGE_SERVICE_SOURCE_TYPES:
             continue
         try:
             # Legacy 'manual' rows have no image_nodes rows (nothing writes them), so the DB-backed
@@ -4334,7 +3757,7 @@ async def admin_list_images(username: str = Depends(verify_admin)):
             # Both branches do BLOCKING k8s/DB work (get_image_node_scan_status can take the shared
             # node-list lock and issue a blocking list_node() apiserver call, contending with the
             # scheduler thread). This is an async endpoint on the single uvicorn worker, so run it in
-            # a thread to avoid stalling the event loop (matches the sync_image_to_nodes call sites).
+            # a thread to avoid stalling the event loop.
             if settings.NODE_IMAGE_SCAN_ENABLED:
                 sync = await asyncio.to_thread(
                     k8s_client.get_image_node_scan_status, image["id"], image["image"])
@@ -4367,7 +3790,6 @@ async def admin_list_images(username: str = Depends(verify_admin)):
 # Source types for Harbor-preheat rows (current and legacy). Used in routing logic.
 HARBOR_SOURCE_TYPE = "harbor"
 _HARBOR_SOURCE_TYPES = frozenset({"harbor", "harbor_mirror"})
-_IMAGE_SERVICE_SOURCE_TYPES_GLOBAL = frozenset({"acr_pull", "dockerhub_pull", "github_build"})
 
 
 def _upsert_image_with_source(name, image, description, enabled, image_id, source_type, source_ref):
@@ -4376,52 +3798,6 @@ def _upsert_image_with_source(name, image, description, enabled, image_id, sourc
         name, image, description, enabled, image_id=image_id,
         source_type=source_type, source_ref=source_ref,
     )
-
-
-def enqueue_purge_fanout(ref: str, targets: list, *, digest: Optional[str] = None,
-                         lan_target_ref: Optional[str] = None, image_id: Optional[int] = None,
-                         blob_ids: Optional[list] = None) -> None:
-    """P4 complete-delete: enqueue one INDEPENDENT job per byte-surface (§ six surfaces).
-
-    Each is idempotent and — critically — its FAILURE is re-enqueued by requeue_failed_purges until
-    it succeeds (the stale reaper only requeues LEASED jobs, so a reported failure would otherwise
-    never retry and leave orphaned bytes). purge_meta (the DB-row cleanup) is enqueued too but the
-    claim-gate holds it until every byte-surface for this ref has SUCCEEDED.
-
-    digest + lan_target_ref ride in the payload (captured NOW) because the DB row may be deleted
-    before/while the purge runs — the ref string + payload are the durable handles, not the row.
-    Per-node surfaces carry the full targets[] LIST (the proven distribute/evict model) so the
-    (kind,ref) dedup can't collapse them. image_id is linked only where the caller keeps the row
-    until after enqueue (admin path); custom path passes image_id=None (row already deleted).
-
-    blob_ids are this image's dfdaemon task-ids UNIQUE to it (blobs shared with a live image are
-    excluded by the caller so we never delete a still-referenced blob). They ride on purge_p2p +
-    purge_seed so the manager's dfctl-exec handlers know exactly what to `task rm`. Empty/None =>
-    those surfaces skip the cache purge (nothing addressable; Dragonfly taskTTL reaps the tail)."""
-    base = {"ref": ref, "digest": digest, "lan_target_ref": lan_target_ref}
-    cache_base = {**base, "blob_ids": list(blob_ids or [])}
-    enqueue_image_job(kind="purge_node", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
-    enqueue_image_job(kind="purge_p2p", ref=ref, image_id=image_id, payload={**cache_base, "scope": "all", "targets": targets})
-    enqueue_image_job(kind="purge_seed", ref=ref, image_id=image_id, payload={**cache_base})
-    enqueue_image_job(kind="registry_delete", ref=ref, image_id=image_id, payload={**base})
-    enqueue_image_job(kind="purge_builder", ref=ref, image_id=image_id, payload={**base})
-    enqueue_image_job(kind="purge_meta", ref=ref, image_id=image_id, payload={**base, "scope": "all", "targets": targets})
-
-
-def _lan_registry_target_ref(ref: str) -> Optional[str]:
-    """Compute the LAN-registry (zot) ref for an image: <LAN_REGISTRY>/<repo:tag>.
-
-    Returns None when LAN_REGISTRY is unset, which is the signal that P1 push is dormant (no push
-    step is chained and readiness gates on node-loaded rows only, exactly as before P1)."""
-    registry = (settings.LAN_REGISTRY or "").strip().rstrip("/")
-    if not registry:
-        return None
-    repo = ref.strip()
-    first = repo.split("/", 1)[0]
-    # Strip an existing registry host (has a dot/port or is localhost) so we re-home under zot.
-    if "." in first or ":" in first or first == "localhost":
-        repo = repo.split("/", 1)[1] if "/" in repo else repo
-    return f"{registry}/{repo}"
 
 
 async def _resolve_and_preheat_admin_image(name, source_ref, description, enabled, image_id):
@@ -4533,11 +3909,6 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
     image = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
-    src_type = (image.get("source_type") or "").strip()
-    if src_type in _IMAGE_SERVICE_SOURCE_TYPES_GLOBAL:
-        raise HTTPException(
-            status_code=400,
-            detail="This image is managed by the image-service pipeline and cannot be synced here")
     source = (image.get("source_ref") or image.get("image") or "").strip()
     return await _resolve_and_preheat_admin_image(
         image["name"], source, image.get("description"), image.get("enabled", True), image_id)
@@ -4545,34 +3916,8 @@ async def admin_sync_image(image_id: int, username: str = Depends(verify_admin))
 
 @app.delete("/api/admin/images/{image_id}")
 async def admin_delete_image(image_id: int, username: str = Depends(verify_admin)):
-    _del_existing = next((img for img in list_images(enabled_only=False) if img["id"] == image_id), None)
-    _del_src_type = (_del_existing.get("source_type") or "").strip() if _del_existing else ""
-    _is_image_service_row = _del_src_type in _IMAGE_SERVICE_SOURCE_TYPES_GLOBAL and _del_existing is not None
-
-    if _is_image_service_row and settings.IMAGE_SERVICE_ENABLED:
-        existing = _del_existing
-        recorded = store.list_nodes_for_image(existing["image"])
-        targets = k8s_client.resolve_node_targets(recorded) if recorded else k8s_client.resolve_node_targets(None)
-        if settings.PURGE_FANOUT_ENABLED:
-            unique_blobs = store.unique_blob_ids_for_ref(existing["image"])
-            enqueue_purge_fanout(
-                existing["image"], targets,
-                digest=existing.get("digest"),
-                lan_target_ref=_lan_registry_target_ref(existing["image"]),
-                image_id=image_id, blob_ids=unique_blobs,
-            )
-        else:
-            enqueue_image_job(kind="evict", ref=existing["image"], image_id=image_id,
-                              payload={"scope": "all", "targets": targets})
-        try:
-            k8s_client.delete_image_sync(image_id)
-        except Exception as e:
-            logger.warning("delete_image_sync failed for image %s: %s", image_id, e)
-        if not delete_image(image_id):
-            raise HTTPException(status_code=404, detail="Image not found")
-        return {"success": True}
-
-    # Harbor / harbor_mirror / manual / unknown rows: delete row + tear down preheat DS.
+    # Delete the catalog row and tear down its preheat DaemonSet (Tier C). Node-layer eviction via
+    # the off-cluster daemon is no longer available; kubelet-cached layers age out on their own.
     if not delete_image(image_id):
         raise HTTPException(status_code=404, detail="Image not found")
     try:
