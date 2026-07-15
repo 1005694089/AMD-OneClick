@@ -73,6 +73,9 @@ kubectl apply -f k8s-deployment.yaml
 
 Manager deployments to the radeon-beta stack are recorded in [`docs/ops/deploy-ledger.md`](docs/ops/deploy-ledger.md).
 
+The optional managed FRP public-access integration is documented in
+[`docs/FRP_TUNNEL_INTEGRATION.md`](docs/FRP_TUNNEL_INTEGRATION.md). It is disabled by default.
+
 ## Local Development
 
 ```bash

@@ -29,7 +29,7 @@
 <body>
   <div id="root"></div>
   <script>
-    const { Avatar, Button, Card, Descriptions, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Select, Space, Statistic, Switch, Table, Tag, Typography, Alert, message } = antd;
+    const { Avatar, Button, Card, Descriptions, Divider, Dropdown, Form, Input, Layout, Menu, Modal, Popconfirm, Select, Space, Statistic, Switch, Table, Tag, Typography, Alert, message } = antd;
     const { Header, Content } = Layout;
     const { Title, Text, Paragraph } = Typography;
     const __apiCardStyle = document.createElement('style');
@@ -42,6 +42,8 @@
     const couponRedeemEnabled = {{ coupon_redeem_enabled | tojson }};
     const couponRedeemDisabledMessage = {{ coupon_redeem_disabled_message | tojson }};
     const customBuildsEnabled = {{ custom_builds_enabled | tojson }};
+    const frpTunnelEnabled = {{ frp_tunnel_enabled | tojson }};
+    const frpDomainSuffix = {{ frp_domain_suffix | tojson }};
     const JUPYTER_LOGO = 'https://cdn.jsdelivr.net/npm/simple-icons@13/icons/jupyter.svg';
     const OPENCODE_LOGO = 'https://opencode.ai/favicon.svg';
     // Render a brand logo with a small, always-visible one-word label next to it.
@@ -89,6 +91,11 @@
       if (inst.live_reason === 'Unschedulable') return 'No suitable GPU node is available yet. You can keep waiting or destroy and retry later.';
       if (inst.live_status === 'distributing') return 'The image is being copied to the GPU node before your workspace starts.';
       return inst.live_reason || '';
+    }
+
+    function apiErrorMessage(data, fallback) {
+      if (data && typeof data.detail === 'object' && data.detail.message) return data.detail.message;
+      return (data && (data.detail || data.message)) || fallback;
     }
 
     function UserMenu() {
@@ -158,6 +165,11 @@
       const [buildLoading, setBuildLoading] = React.useState(false);
       const [logModal, setLogModal] = React.useState({ open: false, title: '', log: '' });
       const [buildForm] = Form.useForm();
+      const [tunnelForm] = Form.useForm();
+      const [tunnelState, setTunnelState] = React.useState(null);
+      const [tunnelLoading, setTunnelLoading] = React.useState(false);
+      const [tunnelSaving, setTunnelSaving] = React.useState(false);
+      const [tunnelModalOpen, setTunnelModalOpen] = React.useState(false);
       // null = still checking, true = pod ready, false = pod still starting/pulling image
       const [instanceReady, setInstanceReady] = React.useState(null);
       const [sshKey, setSshKey] = React.useState((user && user.ssh_public_key) || '');
@@ -173,6 +185,119 @@
       const remainingRunHours = activeGpuCount > 0 ? Math.floor(Number(user.credits || 0) / activeGpuCount) : 0;
       const creditsLow = !!(activeInstance && activeInstance.instance_id && remainingRunHours <= 6);
       const activeReady = !!(activeInstance && activeInstance.instance_id && (activeInstance.live_status === 'ready' || instanceReady === true));
+
+      async function loadTunnel(silent=false) {
+        if (!frpTunnelEnabled || !activeInstance || !activeInstance.instance_id) return;
+        if (!silent) setTunnelLoading(true);
+        try {
+          const res = await fetch('/api/notebook/tunnel', { cache:'no-store' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(apiErrorMessage(data, 'Failed to load public access'));
+          setTunnelState(data);
+        } catch (e) {
+          if (!silent) message.error(e.message || 'Failed to load public access');
+        } finally {
+          if (!silent) setTunnelLoading(false);
+        }
+      }
+
+      function openTunnelModal() {
+        tunnelForm.setFieldsValue({
+          domain_prefix: (tunnelState && tunnelState.domain_prefix) || '',
+          local_port: (tunnelState && tunnelState.local_port) || activeInstance.app_port || 8888,
+        });
+        setTunnelModalOpen(true);
+      }
+
+      async function validateTunnelPrefix(_, value) {
+        const prefix = (value || '').trim().toLowerCase();
+        if (!/^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$/.test(prefix)) return Promise.resolve();
+        const res = await fetch(`/api/notebook/tunnel/domain-availability?prefix=${encodeURIComponent(prefix)}`, {cache:'no-store'});
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) return Promise.reject(new Error(apiErrorMessage(data, 'Unable to check domain')));
+        if (!data.available) return Promise.reject(new Error(data.reason === 'reserved' ? 'Domain prefix is reserved' : 'Domain prefix is not available'));
+        return Promise.resolve();
+      }
+
+      async function configureTunnel(values) {
+        setTunnelSaving(true);
+        try {
+          const res = await fetch('/api/notebook/tunnel', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+              domain_prefix:(values.domain_prefix || '').trim().toLowerCase(),
+              local_port:Number(values.local_port),
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(apiErrorMessage(data, 'Failed to configure public access'));
+          setTunnelState(data);
+          setTunnelModalOpen(false);
+          message.success('Public access is being activated');
+          window.setTimeout(() => loadTunnel(true), 2500);
+        } catch (e) {
+          message.error(e.message || 'Failed to configure public access');
+        } finally {
+          setTunnelSaving(false);
+        }
+      }
+
+      async function removeTunnel() {
+        setTunnelSaving(true);
+        try {
+          const res = await fetch('/api/notebook/tunnel', { method:'DELETE' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(apiErrorMessage(data, 'Failed to disable public access'));
+          setTunnelState(data);
+          message.success(data.warning || 'Public access disabled');
+        } catch (e) {
+          message.error(e.message || 'Failed to disable public access');
+        } finally {
+          setTunnelSaving(false);
+        }
+      }
+
+      function renderTunnelAccess() {
+        if (!frpTunnelEnabled) return null;
+        const state = tunnelState || {};
+        const activeStatuses = ['pending','connecting','active','degraded'];
+        const activeTunnel = !!state.configured && activeStatuses.includes(state.status);
+        const statusColor = state.status === 'active' ? 'green' : (state.status === 'degraded' || state.status === 'delete_pending' ? 'orange' : 'blue');
+        return React.createElement(React.Fragment, null,
+          React.createElement(Divider, {style:{margin:'20px 0 16px'}}),
+          React.createElement(Space, {direction:'vertical', size:12, style:{width:'100%'}},
+            React.createElement(Space, {style:{width:'100%',justifyContent:'space-between'}, wrap:true},
+              React.createElement(Text, {strong:true}, 'Public Access'),
+              state.status && React.createElement(Tag, {color:statusColor}, state.status)
+            ),
+            tunnelLoading && !tunnelState ? React.createElement(Text, {type:'secondary'}, 'Loading...') : null,
+            state.configured ? React.createElement(Descriptions, {column:1, size:'small', items:[
+              state.fqdn ? {key:'domain',label:'Domain',children:React.createElement(Text,{copyable:true},state.fqdn)} : null,
+              state.local_port ? {key:'port',label:'Container Port',children:String(state.local_port)} : null,
+            ].filter(Boolean)}) : React.createElement(Text, {type:'secondary'}, `No public endpoint configured for this instance.`),
+            state.control_available === false && React.createElement(Alert, {type:'warning',showIcon:true,message:state.warning || 'Tunnel control service is temporarily unavailable'}),
+            React.createElement(Space, {wrap:true},
+              state.status === 'active' && state.url && React.createElement(Button, {type:'primary',href:state.url,target:'_blank',rel:'noreferrer'}, 'Open Public URL'),
+              !activeTunnel && React.createElement(Button, {onClick:openTunnelModal,disabled:!activeReady,loading:tunnelLoading}, 'Configure Public Access'),
+              activeTunnel && React.createElement(Popconfirm, {
+                title:'Disable public access?',
+                description:'The domain prefix will enter a 24-hour release period.',
+                okText:'Disable',
+                okButtonProps:{danger:true},
+                onConfirm:removeTunnel,
+              }, React.createElement(Button, {danger:true,loading:tunnelSaving}, 'Disable Public Access'))
+            )
+          )
+        );
+      }
+
+      React.useEffect(() => { loadTunnel(); }, [activeInstance && activeInstance.instance_id]);
+      React.useEffect(() => {
+        if (!tunnelState || !['pending','connecting','delete_pending'].includes(tunnelState.status)) return;
+        const timer = window.setInterval(() => loadTunnel(true), 5000);
+        return () => window.clearInterval(timer);
+      }, [tunnelState && tunnelState.status]);
 
       async function loadEditorTemplates() {
         if (!user || !user.email) return;
@@ -550,6 +675,7 @@
                 activeInstance.live_status && !activeReady && activeInstance.live_status !== 'ready' && React.createElement(Alert, {type:activeInstance.live_status === 'failed' ? 'error' : 'info', showIcon:true, style:{marginTop:16}, message:displayInstanceStatus(activeInstance) || 'Instance is not ready yet', description:displayInstanceDetail(activeInstance) || undefined}),
                 activeInstance.api_base_url && renderApiAccessCard(activeInstance.api_base_url, activeInstance.api_key, activeInstance.api_model),
                 renderSshAccessCard(activeInstance),
+                renderTunnelAccess(),
                 React.createElement(Space, {style:{marginTop:16}, wrap:true},
                   (activeInstance.url && !activeInstance.api_base_url) && React.createElement(Button, {type:'primary', ghost:!['gradio','streamlit','comfyui'].includes((activeInstance.instance_type||'').trim()), href:activeReady ? activeInstance.url : undefined, target:'_blank', disabled:!activeReady, loading:!activeReady && instanceReady === null, title:['gradio','streamlit','comfyui'].includes((activeInstance.instance_type||'').trim()) ? 'Open App' : 'Open Notebook (Jupyter)'}, activeReady ? (['gradio','streamlit','comfyui'].includes((activeInstance.instance_type||'').trim()) ? 'Open App' : brandContent(JUPYTER_LOGO, 'Jupyter', 'Jupyter')) : 'Preparing...'),
                   (activeInstance.opencode_url && !activeInstance.api_base_url) && React.createElement(Button, {type:'primary', ghost:true, href:activeReady ? activeInstance.opencode_url : undefined, target:'_blank', disabled:!activeReady, title:'Open in OpenCode'}, brandContent(OPENCODE_LOGO, 'OpenCode', 'OpenCode')),
@@ -557,6 +683,30 @@
                 ),
                 activeReady && activeInstance.opencode_url && !activeInstance.api_base_url && opencodeCredentials(activeInstance.opencode_username, activeInstance.opencode_password)
               ) : React.createElement(Alert, {type:'info', showIcon:true, message:'No active instance', description:'Go to Notebook and launch your environment.'}))
+            ),
+            React.createElement(Modal, {title:'Configure Public Access', open:tunnelModalOpen, onCancel:()=>setTunnelModalOpen(false), footer:null, destroyOnClose:true},
+              React.createElement(Form, {form:tunnelForm, layout:'vertical', onFinish:configureTunnel},
+                React.createElement(Form.Item, {
+                  name:'domain_prefix',
+                  label:'Domain Prefix',
+                  normalize:(value)=>(value || '').trim().toLowerCase(),
+                  rules:[
+                    {required:true,message:'Domain prefix is required'},
+                    {pattern:/^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$/,message:'Use 3-32 lowercase letters, numbers, or hyphens'},
+                    {validator:validateTunnelPrefix},
+                  ],
+                  validateTrigger:'onBlur',
+                }, React.createElement(Input, {addonAfter:`.${frpDomainSuffix}`,maxLength:32,autoComplete:'off'})),
+                React.createElement(Form.Item, {
+                  name:'local_port',
+                  label:'Container Port',
+                  rules:[
+                    {required:true,message:'Container port is required'},
+                    {validator:(_,value)=>{const port=Number(value);return Number.isInteger(port)&&port>=1024&&port<=65535?Promise.resolve():Promise.reject(new Error('Port must be between 1024 and 65535'));}},
+                  ],
+                }, React.createElement(Input, {type:'number',min:1024,max:65535,step:1,inputMode:'numeric'})),
+                React.createElement(Button, {type:'primary',htmlType:'submit',block:true,loading:tunnelSaving}, 'Activate Public Access')
+              )
             ),
             React.createElement(Modal, {title:'Redeem Credits', open:redeemModalOpen, onCancel:()=>setRedeemModalOpen(false), footer:null, destroyOnClose:true},
               React.createElement(Form, {form:redeemForm, layout:'vertical', onFinish:redeemCredits},

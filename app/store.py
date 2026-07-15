@@ -55,6 +55,33 @@ if DATABASE_URL.startswith("sqlite:///"):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=1800)
+
+_tunnel_locks: dict[str, threading.Lock] = {}
+_tunnel_locks_guard = threading.Lock()
+
+
+@contextmanager
+def instance_tunnel_lock(instance_id: str):
+    """Serialize tunnel mutations for one instance across manager replicas."""
+    if engine.dialect.name == "postgresql":
+        key = int.from_bytes(
+            hashlib.sha256(f"frp-tunnel:{instance_id}".encode("utf-8")).digest()[:8], "big"
+        ) & 0x7FFFFFFFFFFFFFFF
+        connection = engine.connect()
+        try:
+            connection.execute(text("SELECT pg_advisory_lock(:key)"), {"key": key})
+            yield
+        finally:
+            try:
+                connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+            finally:
+                connection.close()
+        return
+
+    with _tunnel_locks_guard:
+        lock = _tunnel_locks.setdefault(instance_id, threading.Lock())
+    with lock:
+        yield
 metadata = MetaData()
 
 # Row-level locking (FOR UPDATE SKIP LOCKED) lets concurrent agents claim different pending jobs
@@ -210,6 +237,14 @@ instance_records = Table(
     Column("deleted_at", String(64)),
     Column("pod_type", String(64)),
     Column("api_launched", Boolean, nullable=False, default=False),
+    # FRP credentials are never persisted here. Only non-secret control-plane
+    # metadata is retained so cleanup and status refresh survive manager restarts.
+    Column("frp_tunnel_id", String(255)),
+    Column("frp_domain_prefix", String(32)),
+    Column("frp_fqdn", String(255)),
+    Column("frp_local_port", Integer),
+    Column("frp_tunnel_status", String(32)),
+    Column("frp_tunnel_updated_at", String(64)),
 )
 
 instance_launch_events = Table(
@@ -504,6 +539,18 @@ def ensure_schema_columns(conn):
     # instances are never retroactively billed when the scheduler is enabled.
     if "api_launched" not in instance_columns:
         conn.execute(text("ALTER TABLE instance_records ADD COLUMN api_launched BOOLEAN NOT NULL DEFAULT FALSE"))
+    if "frp_tunnel_id" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN frp_tunnel_id VARCHAR(255)"))
+    if "frp_domain_prefix" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN frp_domain_prefix VARCHAR(32)"))
+    if "frp_fqdn" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN frp_fqdn VARCHAR(255)"))
+    if "frp_local_port" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN frp_local_port INTEGER"))
+    if "frp_tunnel_status" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN frp_tunnel_status VARCHAR(32)"))
+    if "frp_tunnel_updated_at" not in instance_columns:
+        conn.execute(text("ALTER TABLE instance_records ADD COLUMN frp_tunnel_updated_at VARCHAR(64)"))
     launch_event_columns = {col["name"] for col in inspector.get_columns("instance_launch_events")}
     if "pod_type" not in launch_event_columns:
         conn.execute(text("ALTER TABLE instance_launch_events ADD COLUMN pod_type VARCHAR(64)"))
@@ -2128,6 +2175,16 @@ def get_active_instance_for_user(user_id: int) -> Optional[dict]:
         )
 
 
+def get_instance_record(instance_id: str) -> Optional[dict]:
+    """Return the persisted instance row, including a deleting/deleted row."""
+    with engine.begin() as conn:
+        return row_to_dict(
+            conn.execute(
+                select(instance_records).where(instance_records.c.instance_id == instance_id)
+            ).mappings().first()
+        )
+
+
 def record_instance(user_id: int, email: str, instance_id: str, image: str, instance_type: str, gpu_count: int, node_port: int, opencode_node_port: Optional[int] = None, pod_type: Optional[str] = None, api_launched: bool = False):
     now = utc_now()
     billing_session_id = f"{instance_id}:{uuid.uuid4().hex[:12]}"
@@ -2152,11 +2209,62 @@ def record_instance(user_id: int, email: str, instance_id: str, image: str, inst
             deleted_at=None,
             pod_type=pod_type,
             api_launched=bool(api_launched),
+            frp_tunnel_id=None,
+            frp_domain_prefix=None,
+            frp_fqdn=None,
+            frp_local_port=None,
+            frp_tunnel_status=None,
+            frp_tunnel_updated_at=None,
         )
         if existing:
             conn.execute(update(instance_records).where(instance_records.c.id == existing["id"]).values(**values))
         else:
             conn.execute(instance_records.insert().values(**values, instance_id=instance_id))
+
+
+def set_instance_tunnel(
+    instance_id: str,
+    tunnel_id: str,
+    domain_prefix: str,
+    fqdn: str,
+    local_port: int,
+    status: str,
+) -> Optional[dict]:
+    """Persist non-secret tunnel metadata and return the updated instance row."""
+    now = utc_now()
+    with engine.begin() as conn:
+        conn.execute(
+            update(instance_records)
+            .where(instance_records.c.instance_id == instance_id)
+            .values(
+                frp_tunnel_id=tunnel_id,
+                frp_domain_prefix=domain_prefix,
+                frp_fqdn=fqdn,
+                frp_local_port=int(local_port),
+                frp_tunnel_status=status,
+                frp_tunnel_updated_at=now,
+            )
+        )
+        return row_to_dict(
+            conn.execute(
+                select(instance_records).where(instance_records.c.instance_id == instance_id)
+            ).mappings().first()
+        )
+
+
+def update_instance_tunnel_status(instance_id: str, status: str) -> Optional[dict]:
+    """Update tunnel status without discarding its audit/cleanup identifiers."""
+    with engine.begin() as conn:
+        conn.execute(
+            update(instance_records)
+            .where(instance_records.c.instance_id == instance_id)
+            .values(frp_tunnel_status=status, frp_tunnel_updated_at=utc_now())
+        )
+        return row_to_dict(
+            conn.execute(
+                select(instance_records).where(instance_records.c.instance_id == instance_id)
+            ).mappings().first()
+        )
 
 
 def record_instance_launch_event(

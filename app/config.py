@@ -221,6 +221,37 @@ def _int_env(name: str, default: int) -> int:
 class Settings:
     K8S_NAMESPACE: str = os.getenv("K8S_NAMESPACE", "default")
 
+    # Optional FRP public-tunnel integration. It is deliberately off by default so
+    # deploying this code cannot alter existing notebook Pods until operators have
+    # installed the platform Secret, agent image, Control API route, and RBAC.
+    FRP_TUNNEL_ENABLED: bool = os.getenv("FRP_TUNNEL_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    FRP_CONTROL_API_URL: str = os.getenv("FRP_CONTROL_API_URL", "").strip().rstrip("/")
+    FRP_CONTROL_API_TOKEN_FILE: str = os.getenv(
+        "FRP_CONTROL_API_TOKEN_FILE", "/run/secrets/frp-control-api/token"
+    ).strip()
+    # Environment fallback is intended for local tests only. Production should
+    # mount FRP_CONTROL_API_TOKEN_FILE so the token is absent from process env.
+    FRP_CONTROL_API_TOKEN: str = os.getenv("FRP_CONTROL_API_TOKEN", "")
+    FRP_CONTROL_API_CA_FILE: str = os.getenv("FRP_CONTROL_API_CA_FILE", "").strip()
+    FRP_CONTROL_CONNECT_TIMEOUT_SECONDS: int = _int_env("FRP_CONTROL_CONNECT_TIMEOUT_SECONDS", 5)
+    FRP_CONTROL_READ_TIMEOUT_SECONDS: int = _int_env("FRP_CONTROL_READ_TIMEOUT_SECONDS", 15)
+    FRP_CLUSTER_ID: str = os.getenv("FRP_CLUSTER_ID", "host").strip()
+    FRP_DOMAIN_SUFFIX: str = os.getenv("FRP_DOMAIN_SUFFIX", "radeon.firstdg.ai").strip().lower().strip(".")
+    FRP_AGENT_IMAGE: str = os.getenv("FRP_AGENT_IMAGE", "").strip()
+    FRP_AGENT_IMAGE_PULL_POLICY: str = os.getenv("FRP_AGENT_IMAGE_PULL_POLICY", "IfNotPresent").strip()
+    FRP_AGENT_IMAGE_PULL_SECRET_NAME: str = os.getenv("FRP_AGENT_IMAGE_PULL_SECRET_NAME", "").strip()
+    FRP_PLATFORM_SECRET_NAME: str = os.getenv("FRP_PLATFORM_SECRET_NAME", "amd-oneclick-frp-platform").strip()
+    FRP_PLATFORM_TOKEN_KEY: str = os.getenv("FRP_PLATFORM_TOKEN_KEY", "global-token").strip()
+    FRP_LOG_INGEST_URL: str = os.getenv(
+        "FRP_LOG_INGEST_URL", "https://radeon.firstdg.ai:7443/__frp_logs/v1/logs"
+    ).strip()
+    FRP_BANDWIDTH_LIMIT: str = os.getenv("FRP_BANDWIDTH_LIMIT", "2500KB").strip()
+    FRP_RESERVED_PREFIXES: str = os.getenv(
+        "FRP_RESERVED_PREFIXES",
+        "www,api,admin,manager,frps,frpc,auth,login,status,health,pilot,support,static",
+    )
+    FRP_EXCLUDED_PORTS: str = os.getenv("FRP_EXCLUDED_PORTS", "7400,19090")
+
     DEFAULT_IMAGE: str = os.getenv(
         "DEFAULT_IMAGE",
         "crpi-xhg6joi134vrkpzq.cn-shanghai.personal.cr.aliyuncs.com/vivienfanghua/amd-oneclick-base:rocm7.2.1-py3.12-v20260416"

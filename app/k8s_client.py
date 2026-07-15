@@ -146,6 +146,133 @@ class K8sClient:
             "email-hash": hashlib.md5(email.lower().encode()).hexdigest()[:16],
         }
 
+    @staticmethod
+    def tunnel_secret_name(instance_id: str) -> str:
+        """Return a deterministic DNS-label Secret name for one notebook Pod."""
+        safe = re.sub(r"[^a-z0-9-]", "-", instance_id.lower()).strip("-") or "instance"
+        digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()[:10]
+        prefix = "frp-tunnel-"
+        available = 63 - len(prefix) - len(digest) - 1
+        return f"{prefix}{safe[:available].rstrip('-')}-{digest}"
+
+    def get_pod_identity(self, instance_id: str) -> dict:
+        """Read authoritative Pod identity; browser-supplied UIDs are never trusted."""
+        pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+        if getattr(pod.metadata, "deletion_timestamp", None) is not None:
+            raise RuntimeError("instance Pod is terminating")
+        uid = str(getattr(pod.metadata, "uid", "") or "")
+        if not uid:
+            raise RuntimeError("instance Pod UID is unavailable")
+        return {"namespace": self.namespace, "pod_name": pod.metadata.name, "pod_uid": uid}
+
+    def upsert_tunnel_secret(self, instance_id: str, tunnel: dict, credentials: dict) -> str:
+        """Create or replace one Pod-scoped FRPC credential Secret."""
+        identity = self.get_pod_identity(instance_id)
+        if not all(tunnel.get(key) not in (None, "") for key in ("domain_prefix", "local_port")):
+            raise ValueError("Control API tunnel response is incomplete")
+        if not all(
+            credentials.get(key) not in (None, "")
+            for key in ("client_id", "client_secret", "server_address", "server_port")
+        ):
+            raise ValueError("Control API agent credentials are incomplete")
+
+        name = self.tunnel_secret_name(instance_id)
+        body = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": name,
+                "namespace": self.namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "amd-oneclick-manager",
+                    "amd-oneclick/tunnel-credential": "true",
+                    "instance-id": instance_id,
+                },
+                "ownerReferences": [
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": identity["pod_name"],
+                        "uid": identity["pod_uid"],
+                        "controller": False,
+                        "blockOwnerDeletion": False,
+                    }
+                ],
+            },
+            "type": "Opaque",
+            "stringData": {
+                "client-id": str(credentials["client_id"]),
+                "client-secret": str(credentials["client_secret"]),
+                "server-address": str(credentials["server_address"]),
+                "server-port": str(credentials["server_port"]),
+                "domain-prefix": str(tunnel["domain_prefix"]),
+                "local-port": str(tunnel["local_port"]),
+            },
+        }
+        try:
+            self.core_v1.create_namespaced_secret(namespace=self.namespace, body=body)
+        except ApiException as exc:
+            if exc.status != 409:
+                raise
+            self.core_v1.patch_namespaced_secret(name=name, namespace=self.namespace, body=body)
+        logger.info("Installed FRP tunnel credentials for instance %s", instance_id)
+        return name
+
+    def delete_tunnel_secret(self, instance_id: str) -> bool:
+        """Remove Pod-scoped credentials so the supervisor stops FRPC immediately."""
+        try:
+            self.core_v1.delete_namespaced_secret(
+                name=self.tunnel_secret_name(instance_id),
+                namespace=self.namespace,
+                body=client.V1DeleteOptions(propagation_policy="Background"),
+            )
+            logger.info("Removed FRP tunnel credentials for instance %s", instance_id)
+            return True
+        except ApiException as exc:
+            if exc.status == 404:
+                return False
+            raise
+
+    def disable_tunnel_secret(self, instance_id: str) -> bool:
+        """Atomically clear projected credentials while retaining the Pod-owned Secret.
+
+        Deleting a mounted Secret can leave its last projection visible until a
+        kubelet refresh. Updating it to empty data gives the agent an explicit
+        desired-state transition; owner-reference GC removes the empty object
+        when the Pod is later deleted.
+        """
+        try:
+            self.core_v1.patch_namespaced_secret(
+                name=self.tunnel_secret_name(instance_id),
+                namespace=self.namespace,
+                body=[{"op": "add", "path": "/data", "value": {}}],
+                _content_type="application/json-patch+json",
+            )
+            logger.info("Cleared FRP tunnel credentials for instance %s", instance_id)
+            return True
+        except ApiException as exc:
+            if exc.status == 404:
+                return False
+            raise
+
+    def tunnel_secret_exists(self, instance_id: str) -> bool:
+        try:
+            self.core_v1.read_namespaced_secret(
+                name=self.tunnel_secret_name(instance_id), namespace=self.namespace
+            )
+            return True
+        except ApiException as exc:
+            if exc.status == 404:
+                return False
+            raise
+
+    def pod_has_container(self, instance_id: str, container_name: str) -> bool:
+        pod = self.core_v1.read_namespaced_pod(name=instance_id, namespace=self.namespace)
+        return any(
+            getattr(container, "name", None) == container_name
+            for container in (getattr(pod.spec, "containers", None) or [])
+        )
+
     def _image_ready_label_key(self, image_ref: str) -> str:
         """Node label key marking that a specific image is warm on the node.
 
@@ -2325,6 +2452,9 @@ exec {cmd}
             annotations["amd-oneclick/pod-type"] = pod_type
         if api_launched:
             annotations["amd-oneclick/api-launched"] = "true"
+        if settings.FRP_TUNNEL_ENABLED:
+            annotations["amd-oneclick/frp-agent"] = "waiting"
+            annotations["amd-oneclick/frp-credential-secret"] = self.tunnel_secret_name(instance_id)
 
         if github_info:
             annotations["amd-oneclick/github-org"] = github_info.get("org", "")
@@ -2408,6 +2538,38 @@ exec {cmd}
                 }
             },
         ]
+        if settings.FRP_TUNNEL_ENABLED:
+            if not settings.FRP_AGENT_IMAGE or not settings.FRP_PLATFORM_SECRET_NAME:
+                raise RuntimeError(
+                    "FRP tunnel integration is enabled but the agent image or platform Secret is unset"
+                )
+            volumes.extend(
+                [
+                    {
+                        "name": "frp-platform",
+                        "secret": {
+                            "secretName": settings.FRP_PLATFORM_SECRET_NAME,
+                            # This volume is mounted only in the isolated FRPC
+                            # container. World-readable mode inside that mount
+                            # avoids applying a Pod-wide fsGroup to user PVCs.
+                            "defaultMode": 0o444,
+                            "items": [
+                                {"key": settings.FRP_PLATFORM_TOKEN_KEY, "path": "global-token"}
+                            ],
+                        },
+                    },
+                    {
+                        "name": "frp-tunnel-credentials",
+                        "secret": {
+                            "secretName": self.tunnel_secret_name(instance_id),
+                            "optional": True,
+                            "defaultMode": 0o444,
+                        },
+                    },
+                    {"name": "frp-agent-runtime", "emptyDir": {"sizeLimit": "4Mi"}},
+                    {"name": "frp-agent-logs", "emptyDir": {"sizeLimit": "32Mi"}},
+                ]
+            )
         if hf_cache_uses_empty_dir:
             hf_cache_empty_dir = {}
             if settings.HF_CACHE_EMPTYDIR_SIZE_LIMIT.strip():
@@ -2907,6 +3069,90 @@ fi
                 "exec": {"command": ["/bin/sh", "-c", self._ssh_poststart_script()]}
             }
 
+        pod_containers = [notebook_container]
+        if settings.FRP_TUNNEL_ENABLED:
+            # Prepare only the FRP-owned emptyDirs for the non-root supervisor.
+            # A Pod-level fsGroup would also traverse notebook PVCs and could
+            # change ownership or make large-volume startup unexpectedly slow.
+            init_containers.append(
+                {
+                    "name": "frp-agent-init",
+                    "image": settings.FRP_AGENT_IMAGE,
+                    "imagePullPolicy": settings.FRP_AGENT_IMAGE_PULL_POLICY,
+                    "command": ["/bin/sh", "-c"],
+                    "args": [
+                        "chown 10001:10001 /var/lib/frp-agent /var/log/frpc"
+                    ],
+                    "resources": {
+                        "requests": {"cpu": "5m", "memory": "8Mi"},
+                        "limits": {"cpu": "50m", "memory": "32Mi"},
+                    },
+                    "securityContext": {
+                        "runAsUser": 0,
+                        "runAsGroup": 0,
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {"drop": ["ALL"], "add": ["CHOWN"]},
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "volumeMounts": [
+                        {"name": "frp-agent-runtime", "mountPath": "/var/lib/frp-agent"},
+                        {"name": "frp-agent-logs", "mountPath": "/var/log/frpc"},
+                    ],
+                }
+            )
+            pod_containers.append(
+                {
+                    "name": "frpc",
+                    "image": settings.FRP_AGENT_IMAGE,
+                    "imagePullPolicy": settings.FRP_AGENT_IMAGE_PULL_POLICY,
+                    "env": [
+                        {"name": "FRP_DOMAIN_SUFFIX", "value": settings.FRP_DOMAIN_SUFFIX},
+                        {"name": "FRP_BANDWIDTH_LIMIT", "value": settings.FRP_BANDWIDTH_LIMIT},
+                        {"name": "FRP_LOG_INGEST_URL", "value": settings.FRP_LOG_INGEST_URL},
+                        {
+                            "name": "POD_NAMESPACE",
+                            "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}},
+                        },
+                        {
+                            "name": "POD_NAME",
+                            "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
+                        },
+                        {
+                            "name": "POD_UID",
+                            "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}},
+                        },
+                        {
+                            "name": "NODE_NAME",
+                            "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}},
+                        },
+                    ],
+                    "resources": {
+                        "requests": {"cpu": "10m", "memory": "24Mi"},
+                        "limits": {"cpu": "200m", "memory": "96Mi"},
+                    },
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {"drop": ["ALL"]},
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "volumeMounts": [
+                        {"name": "frp-platform", "mountPath": "/run/frp/platform", "readOnly": True},
+                        {
+                            "name": "frp-tunnel-credentials",
+                            "mountPath": "/run/frp/tunnel",
+                            "readOnly": True,
+                        },
+                        {"name": "frp-agent-runtime", "mountPath": "/var/lib/frp-agent"},
+                        {"name": "frp-agent-logs", "mountPath": "/var/log/frpc"},
+                    ],
+                }
+            )
+
         # NOTE: no localcache preStop flush on the notebook container — the local -> durable flush is
         # driven out-of-pod by the manager (_flush_workspace_to_durable) reading the host-resident
         # SSD copy after the pod is gone. This makes the flush fire regardless of how the pod died
@@ -2914,7 +3160,7 @@ fi
 
         spec = {
             "securityContext": {
-                "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS
+                "supplementalGroups": settings.GPU_SUPPLEMENTAL_GROUPS,
             },
             # Notebook pods don't call the K8s API; dropping the token reduces blast
             # radius if a user (root in their pod) tries to reach the apiserver.
@@ -2934,9 +3180,7 @@ fi
                 }
             ],
             "tolerations": self._notebook_tolerations(),
-            "containers": [
-                notebook_container
-            ],
+            "containers": pod_containers,
             "volumes": volumes,
             "restartPolicy": "Always"
         }
@@ -2968,6 +3212,12 @@ fi
         # registry, when one is configured. Other images keep relying on node-level credentials.
         if settings.CUSTOM_IMAGE_PULL_SECRET_NAME and image.startswith(settings.CUSTOM_IMAGE_REGISTRY):
             image_pull_secrets.append({"name": settings.CUSTOM_IMAGE_PULL_SECRET_NAME})
+        if (
+            settings.FRP_TUNNEL_ENABLED
+            and settings.FRP_AGENT_IMAGE_PULL_SECRET_NAME
+            and {"name": settings.FRP_AGENT_IMAGE_PULL_SECRET_NAME} not in image_pull_secrets
+        ):
+            image_pull_secrets.append({"name": settings.FRP_AGENT_IMAGE_PULL_SECRET_NAME})
         if image_pull_secrets:
             spec["imagePullSecrets"] = image_pull_secrets
 
@@ -4809,6 +5059,19 @@ exit 0
                     session_token = store.stamp_workspace_stopped(instance_id, node_name)
                 except Exception as e:
                     logger.debug("stamp_workspace_stopped failed for %s: %s", instance_id, e)
+
+        # Stop the FRPC data plane before deleting the workload. This hook is at
+        # the shared K8s deletion chokepoint, so user, admin, billing, idle-reaper,
+        # and reconcile deletions all get the same tunnel cleanup behavior.
+        try:
+            from .frp_tunnel import cleanup_instance_tunnel
+
+            cleanup_instance_tunnel(instance_id, self)
+        except Exception as e:
+            # Notebook deletion must remain available when the external Control
+            # API is degraded. Secret removal and FRPS stale-session quarantine
+            # are independent safety nets.
+            logger.error("FRP tunnel cleanup failed for %s (continuing delete): %s", instance_id, e)
 
         self._delete_service(instance_id)
         self._delete_pod(instance_id)

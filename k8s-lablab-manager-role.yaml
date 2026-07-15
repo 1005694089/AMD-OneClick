@@ -1,6 +1,6 @@
 # FULL merged Role for the manager SA — replaces the live Role in one apply.
 # PolicyRule lists have no merge key, so this MUST contain every existing rule
-# (daemonsets, pods+log, services, pvc) PLUS the new leases rule, or perms are wiped.
+# (daemonsets, pods+log, services, pvc, tunnel secrets, leases), or perms are wiped.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -19,6 +19,12 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  # Dynamic per-Pod tunnel credentials. Kubernetes RBAC cannot restrict
+  # create/patch to a Secret name prefix, so this is namespace-scoped and omits
+  # list/watch. The application only accepts the deterministic frp-tunnel-* name.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch", "delete"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update"]

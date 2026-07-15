@@ -20,6 +20,12 @@ class NotebookRequest(BaseModel):
     use_pvc: Optional[bool] = None
 
 
+class TunnelRequest(BaseModel):
+    """User request for one managed public HTTP/WebSocket tunnel."""
+    domain_prefix: str
+    local_port: int
+
+
 class ImageRequest(BaseModel):
     """Request model for managing image catalog entries"""
     name: str

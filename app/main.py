@@ -53,6 +53,7 @@ from .models import (
     BuildClaimRequest,
     BuildLogRequest,
     BuildResultRequest,
+    TunnelRequest,
 )
 from .k8s_client import AUTO_RESOURCE_PROFILE_BY_GPU, RESOURCE_PROFILES, k8s_client
 from .notebook_sources import (
@@ -65,6 +66,14 @@ from . import store
 from .email_service import send_notebook_url_email
 from .scheduler import start_scheduler, stop_scheduler
 from .template_sync import sync_template_preview
+from .frp_tunnel import (
+    FrpTunnelError,
+    create_tunnel as create_managed_tunnel,
+    delete_tunnel as delete_managed_tunnel,
+    domain_availability as managed_domain_availability,
+    get_tunnel_status as get_managed_tunnel_status,
+    validate_configuration as validate_frp_configuration,
+)
 from .store import (
     clear_template_preview_cache,
     delete_image,
@@ -149,6 +158,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     logger.info("Starting AMD OneClick Notebook Manager")
+    validate_frp_configuration()
     if settings.OPENCODE_PASSWORD_SECRET == "change-me-for-production":
         logger.warning(
             "OPENCODE_PASSWORD_SECRET is unset and SESSION_SECRET is the insecure default "
@@ -1429,6 +1439,8 @@ async def profile_page(request: Request):
             "coupon_redeem_enabled": settings.COUPON_REDEEM_ENABLED,
             "coupon_redeem_disabled_message": settings.COUPON_REDEEM_DISABLED_MESSAGE,
             "custom_builds_enabled": settings.USER_CUSTOM_BUILDS_ENABLED,
+            "frp_tunnel_enabled": settings.FRP_TUNNEL_ENABLED,
+            "frp_domain_suffix": settings.FRP_DOMAIN_SUFFIX,
         },
     )
 
@@ -2256,6 +2268,78 @@ async def notebook_logs(user: dict = Depends(current_user)):
     except Exception as e:
         logger.error("Error fetching pod logs for %s: %s", active["instance_id"], e)
         return {"events": [], "container": "", "status": "error"}
+
+
+def _active_tunnel_instance(user: dict) -> dict:
+    if not settings.FRP_TUNNEL_ENABLED:
+        raise HTTPException(status_code=404, detail="Public tunnels are not enabled")
+    active = get_active_instance_for_user(user["id"])
+    if not active:
+        raise HTTPException(status_code=404, detail="No active instance found")
+    return active
+
+
+def _raise_tunnel_http_error(exc: FrpTunnelError) -> None:
+    raise HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": str(exc)},
+    ) from exc
+
+
+@app.get("/api/notebook/tunnel")
+async def notebook_tunnel_status(response: Response, user: dict = Depends(current_user)):
+    """Return only non-secret tunnel state for the current user's active instance."""
+    response.headers["Cache-Control"] = "no-store"
+    active = _active_tunnel_instance(user)
+    try:
+        return await asyncio.to_thread(get_managed_tunnel_status, user, active)
+    except FrpTunnelError as exc:
+        _raise_tunnel_http_error(exc)
+
+
+@app.get("/api/notebook/tunnel/domain-availability")
+async def notebook_tunnel_domain_availability(
+    response: Response,
+    prefix: str = Query(..., min_length=1, max_length=64),
+    user: dict = Depends(current_user),
+):
+    response.headers["Cache-Control"] = "no-store"
+    _active_tunnel_instance(user)
+    try:
+        return await asyncio.to_thread(managed_domain_availability, user, prefix)
+    except FrpTunnelError as exc:
+        _raise_tunnel_http_error(exc)
+
+
+@app.post("/api/notebook/tunnel")
+async def configure_notebook_tunnel(
+    request_data: TunnelRequest,
+    response: Response,
+    user: dict = Depends(current_user),
+):
+    response.headers["Cache-Control"] = "no-store"
+    active = _active_tunnel_instance(user)
+    try:
+        return await asyncio.to_thread(
+            create_managed_tunnel,
+            user,
+            active,
+            request_data.domain_prefix,
+            request_data.local_port,
+            k8s_client,
+        )
+    except FrpTunnelError as exc:
+        _raise_tunnel_http_error(exc)
+
+
+@app.delete("/api/notebook/tunnel")
+async def remove_notebook_tunnel(response: Response, user: dict = Depends(current_user)):
+    response.headers["Cache-Control"] = "no-store"
+    active = _active_tunnel_instance(user)
+    try:
+        return await asyncio.to_thread(delete_managed_tunnel, user, active, k8s_client)
+    except FrpTunnelError as exc:
+        _raise_tunnel_http_error(exc)
 
 
 def _background_delete(instance_id: str) -> None:
